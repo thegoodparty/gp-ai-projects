@@ -1,8 +1,8 @@
-#Getting started
+# Getting started
 
 make sure you have uv on your computer
 
-##Setup
+## Setup
 run these commands to get set up
 
 ```bash
@@ -10,7 +10,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-##Running
+## Running
 run this to check each section
 
 ```bash
