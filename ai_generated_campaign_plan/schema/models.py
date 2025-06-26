@@ -58,41 +58,15 @@ class CampaignInfo(BaseModel):
             }
         }
 
-
-class CleanedCampaignInfo(CampaignInfo):
-    """Extended campaign information with parsed and cleaned fields."""
+class AdditionalCampaignInfo(BaseModel):
+    """Additional campaign information schema."""
     
     city: str = Field(..., description="The city name extracted from the jurisdiction")
     state: str = Field(..., description="The state name or abbreviation extracted from the jurisdiction")
     state_full: str = Field(..., description="The full state name (e.g., Massachusetts)")
     election_date_formatted: str = Field(..., description="The election date formatted as YYYY-MM-DD")
+    has_primary: bool = Field(..., description="Whether the election has a primary")
     primary_date_formatted: Optional[str] = Field(None, description="The primary date formatted as YYYY-MM-DD if exists")
-    
-    class Config:
-        """Pydantic model configuration."""
-        use_enum_values = True
-        json_encoders = {
-            date: lambda v: v.strftime("%m/%d/%Y") if v else None
-        }
-        json_schema_extra = {
-            "example": {
-                "candidate_name": "Jane Smith",
-                "primary_date": "09/15/2024",
-                "election_date": "11/05/2024",
-                "office_and_jurisdiction": "School Board, At-Large, Chicopee, MA",
-                "incumbent_status": "N/A",
-                "race_type": "Nonpartisan",
-                "seats_available": 3,
-                "number_of_opponents": 7,
-                "win_number": 2500,
-                "total_likely_voters": 8500,
-                "available_cell_phones": 1200,
-                "available_landlines": 300,
-                "additional_race_context": "Focus on education funding and infrastructure improvements",
-                "city": "Chicopee",
-                "state": "MA",
-                "state_full": "Massachusetts",
-                "election_date_formatted": "2024-11-05",
-                "primary_date_formatted": "2024-09-15"
-            }
-        }
+
+class CleanedCampaignInfo(CampaignInfo, AdditionalCampaignInfo):
+    """Extended campaign information with parsed and cleaned fields."""
