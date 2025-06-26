@@ -7,36 +7,44 @@ from together import Together
 from dotenv import load_dotenv
 
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, AdditionalCampaignInfo
+from shared.llm import LLMClient
 from shared.logger import get_logger
-
 
 load_dotenv()
 
-
-def clean_campaign_info(campaign_info: CampaignInfo) -> CleanedCampaignInfo:
+class CampaignInfoProcessor:
     """
-    Convert CampaignInfo to CleanedCampaignInfo using Together AI to extract and format additional fields.
+    A class for processing and cleaning campaign information using LLM services.
+    """
     
-    Args:
-        campaign_info: The original campaign information
+    def __init__(self, llm_client: LLMClient = None):
+        """
+        Initialize the campaign info processor.
         
-    Returns:
-        CleanedCampaignInfo: Enhanced campaign info with parsed location and formatted dates
-    """
-    logger = get_logger(__name__)
-    together_client = Together(api_key=os.getenv("TOGETHER_API_KEY"))
+        Args:
+            llm_client: LLMClient instance. If None, creates a default one.
+        """
+        self.llm_client = llm_client or LLMClient()
+        self.logger = get_logger(__name__)
     
-    extraction_prompt = f"""
-Given the following campaign information
+    def clean_campaign_info(self, campaign_info: CampaignInfo) -> CleanedCampaignInfo:
+        """
+        Convert CampaignInfo to CleanedCampaignInfo using LLM to extract and format additional fields.
+        
+        Args:
+            campaign_info: The original campaign information
+            
+        Returns:
+            CleanedCampaignInfo: Enhanced campaign info with parsed location and formatted dates
+        """
+        extraction_prompt = f"""
+Given the following campaign information:
 
-CAMPAIGN INFO:
 - Office and Jurisdiction: {campaign_info.office_and_jurisdiction}
 - Election Date: {campaign_info.election_date}
 - Primary Date: {campaign_info.primary_date}
 
 extract the following fields as a JSON object:
-
-EXTRACT:
     city: str = Field(..., description="The city name extracted from the jurisdiction")
     state: str = Field(..., description="The state name or abbreviation extracted from the jurisdiction")
     state_full: str = Field(..., description="The full state name (e.g., Massachusetts)")
@@ -45,36 +53,27 @@ EXTRACT:
     primary_date_formatted: Optional[str] = Field(None, description="The primary date formatted as YYYY-MM-DD if exists")
 """
 
-    max_retries = 5
-    base_delay = 1  
-    
-    for attempt in range(max_retries):
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert at parsing location and date information from campaign data. Extract the required fields accurately and format dates consistently. Only respond in JSON format.",
+            },
+            {
+                "role": "user",
+                "content": extraction_prompt,
+            },
+        ]
+        
         try:
-            logger.info(f"Attempting to extract campaign info using Together AI (attempt {attempt + 1}/{max_retries})")
-            
-            result = together_client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert at parsing location and date information from campaign data. Extract the required fields accurately and format dates consistently. Only respond in JSON format.",
-                    },
-                    {
-                        "role": "user",
-                        "content": extraction_prompt,
-                    },
-                ],
-                model="Qwen/Qwen3-235B-A22B-fp8-tput",
-                response_format={
-                    "type": "json_schema",
-                    "schema": AdditionalCampaignInfo.model_json_schema(),
-                },
-                max_tokens=300,
+            self.logger.info("Extracting campaign info using LLM")
+            extracted_fields = self.llm_client.create_structured_completion(
+                messages=messages,
+                response_schema=AdditionalCampaignInfo,
+                max_tokens=300
             )
             
-            output = json.loads(result.choices[0].message.content)
-            extracted_fields = AdditionalCampaignInfo(**output)
-            print(extracted_fields)
-
+            self.logger.debug(f"Extracted fields: {extracted_fields}")
+            
             cleaned_info = CleanedCampaignInfo(
                 candidate_name=campaign_info.candidate_name,
                 primary_date=campaign_info.primary_date,
@@ -97,23 +96,31 @@ EXTRACT:
                 primary_date_formatted=extracted_fields.primary_date_formatted
             )
             
-            logger.info("Successfully extracted and cleaned campaign info")
+            self.logger.info("Successfully extracted and cleaned campaign info")
             return cleaned_info
             
         except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed with error: {str(e)}")
-            
-            if attempt < max_retries - 1: 
-                delay = base_delay * (2 ** attempt)  
-                logger.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                logger.error(f"All {max_retries} attempts failed. Unable to extract campaign info using Together AI.")
-                raise RuntimeError(f"Failed to clean campaign info using Together AI after {max_retries} attempts. Last error: {str(e)}")
+            self.logger.error(f"Failed to clean campaign info: {str(e)}")
+            raise RuntimeError(f"Failed to clean campaign info: {str(e)}")
+
+
+def clean_campaign_info(campaign_info: CampaignInfo) -> CleanedCampaignInfo:
+    """
+    Convenience function that creates a CampaignInfoProcessor and cleans the campaign info.
+    
+    Args:
+        campaign_info: The original campaign information
+        
+    Returns:
+        CleanedCampaignInfo: Enhanced campaign info with parsed location and formatted dates
+    """
+    processor = CampaignInfoProcessor()
+    return processor.clean_campaign_info(campaign_info)
 
 
 if __name__ == "__main__":
-    clean_campaign_info(CampaignInfo(
+    processor = CampaignInfoProcessor()
+    processor.clean_campaign_info(CampaignInfo(
         candidate_name="John Doe",
         primary_date=None,
         election_date=date(2024, 11, 5),
