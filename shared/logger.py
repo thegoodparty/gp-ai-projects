@@ -2,9 +2,45 @@ import logging
 import logging.handlers
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 from enum import Enum
+
+
+class Colors:
+    """ANSI color codes for terminal output"""
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    DARK_RED = '\033[31m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter that adds colors to log levels"""
+    
+    LEVEL_COLORS = {
+        logging.DEBUG: Colors.GREEN,
+        logging.INFO: Colors.GREEN,
+        logging.WARNING: Colors.YELLOW,
+        logging.ERROR: Colors.RED,
+        logging.CRITICAL: Colors.DARK_RED + Colors.BOLD,
+    }
+    
+    def format(self, record):
+        original_levelname = record.levelname
+        
+        if record.levelno in self.LEVEL_COLORS:
+            colored_levelname = f"{self.LEVEL_COLORS[record.levelno]}{record.levelname}{Colors.RESET}"
+            record.levelname = colored_levelname
+        
+        formatted = super().format(record)
+        
+        record.levelname = original_levelname
+        
+        return formatted
 
 
 class LogLevel(Enum):
@@ -44,11 +80,11 @@ class Logger:
         self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
         
-        # Determine environment
+        self.session_id = str(uuid.uuid4())[:8]
+        
         self.environment = os.getenv('ENVIRONMENT', 'development').lower()
         self.is_production = self.environment == 'production'
         
-        # Set default log level based on environment
         if self.is_production:
             self.default_level = LogLevel.INFO
         else:
@@ -70,31 +106,38 @@ class Logger:
         
         logger = logging.getLogger(name)
         
-        # Clear any existing handlers to avoid duplicates
         logger.handlers.clear()
         
-        # Set log level
         log_level = level.value if level else self.default_level.value
         logger.setLevel(log_level)
         
-        # Create formatters
         detailed_formatter = logging.Formatter(
-            fmt='%(asctime)s | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
+            fmt=f'%(asctime)s | {self.session_id} | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
         simple_formatter = logging.Formatter(
-            fmt='%(asctime)s | %(levelname)s | %(message)s',
+            fmt=f'%(asctime)s | {self.session_id} | %(levelname)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # Console handler
+        # Colored formatters for console output
+        colored_detailed_formatter = ColoredFormatter(
+            fmt=f'%(asctime)s | {self.session_id} | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        colored_simple_formatter = ColoredFormatter(
+            fmt=f'%(asctime)s | {self.session_id} | %(levelname)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
         console_handler = logging.StreamHandler(sys.stdout)
         if self.is_production:
-            console_handler.setFormatter(simple_formatter)
+            console_handler.setFormatter(colored_simple_formatter)
             console_handler.setLevel(logging.INFO)
         else:
-            console_handler.setFormatter(detailed_formatter)
+            console_handler.setFormatter(colored_detailed_formatter)
             console_handler.setLevel(logging.DEBUG)
         
         logger.addHandler(console_handler)
@@ -141,6 +184,29 @@ class Logger:
         """Set log level for a specific logger"""
         if name in self._loggers:
             self._loggers[name].setLevel(level.value)
+    
+    def get_session_id(self) -> str:
+        """Get the current session ID"""
+        return self.session_id
+    
+    def set_session_id(self, session_id: str):
+        """
+        Set a custom session ID for all future loggers.
+        
+        Note: This will only affect newly created loggers.
+        Existing loggers will keep their original session ID format.
+        """
+        self.session_id = session_id
+    
+    def generate_new_session_id(self) -> str:
+        """
+        Generate a new session ID and return it.
+        
+        Note: This will only affect newly created loggers.
+        Existing loggers will keep their original session ID format.
+        """
+        self.session_id = str(uuid.uuid4())[:8]
+        return self.session_id
     
     def configure_for_production(self):
         """Configure all loggers for production environment"""
@@ -199,6 +265,21 @@ def set_debug_mode():
     logger_manager.configure_for_debug()
 
 
+def get_session_id() -> str:
+    """Get the current session ID"""
+    return logger_manager.get_session_id()
+
+
+def set_session_id(session_id: str):
+    """Set a custom session ID for tracking logs across a session"""
+    logger_manager.set_session_id(session_id)
+
+
+def generate_new_session_id() -> str:
+    """Generate and set a new session ID, returning the new ID"""
+    return logger_manager.generate_new_session_id()
+
+
 class LogLevelContext:
     """Context manager for temporarily changing log levels"""
     
@@ -228,3 +309,12 @@ def with_log_level(logger_name: str, level: LogLevel):
             logger.debug("This will be logged even in production")
     """
     return LogLevelContext(logger_name, level)
+
+
+if __name__ == "__main__":
+    logger = get_logger(__name__)
+    logger.info("This is an info message")
+    logger.debug("Debug information")
+    logger.error("An error occurred")
+    logger.warning("This is a warning message")
+    logger.critical("This is a critical message")

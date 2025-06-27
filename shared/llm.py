@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 from typing import Optional, Dict, Any, List
 from together import Together
 from dotenv import load_dotenv
@@ -43,13 +44,27 @@ class LLMClient:
         
         self.client = Together(api_key=self.api_key)
     
+    def clean_response_content(self, content: str) -> str:
+        """
+        Clean LLM response content by removing think tags and other unwanted patterns.
+        
+        Args:
+            content: Raw content from LLM response
+            
+        Returns:
+            str: Cleaned content
+        """
+        cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        return cleaned_content
+    
     def create_completion(
         self,
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
-        max_tokens: int = 300,
+        max_tokens: int = 3000,
         response_format: Optional[Dict[str, Any]] = None,
         temperature: float = 0.7,
+        clean_response: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -61,6 +76,7 @@ class LLMClient:
             max_tokens: Maximum tokens to generate
             response_format: Response format specification for structured output
             temperature: Sampling temperature
+            clean_response: Whether to clean the response content
             **kwargs: Additional parameters to pass to the API
             
         Returns:
@@ -87,6 +103,11 @@ class LLMClient:
                     completion_args["response_format"] = response_format
                 
                 result = self.client.chat.completions.create(**completion_args)
+                
+                if clean_response and result.choices and len(result.choices) > 0:
+                    original_content = result.choices[0].message.content
+                    cleaned_content = self.clean_response_content(original_content)
+                    result.choices[0].message.content = cleaned_content
                 
                 self.logger.info("Successfully created completion")
                 return result
@@ -145,3 +166,14 @@ class LLMClient:
         except (json.JSONDecodeError, ValueError) as e:
             self.logger.error(f"Failed to parse structured response: {str(e)}")
             raise RuntimeError(f"Failed to parse structured response: {str(e)}")
+
+
+if __name__ == "__main__":
+    llm_client = LLMClient()
+    result = llm_client.create_completion(
+        messages=[
+            {"role": "system", "content": "You are an expert campaign strategist. You are given a campaign info and you are to generate a know your community section for the campaign."},
+            {"role": "user", "content": "What is the capital of France?"}
+        ]
+    )
+    print(result)
