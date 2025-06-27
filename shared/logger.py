@@ -121,7 +121,6 @@ class Logger:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # Colored formatters for console output
         colored_detailed_formatter = ColoredFormatter(
             fmt=f'%(asctime)s | {self.session_id} | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'

@@ -68,7 +68,6 @@ class SharedTavilyClient:
         self.logger.debug(f"Search parameters: depth={search_depth}, topic={topic}, max_results={max_results}")
         
         try:
-            # Prepare search parameters
             search_params = {
                 "query": query,
                 "search_depth": search_depth,
@@ -79,7 +78,6 @@ class SharedTavilyClient:
                 "include_images": include_images
             }
             
-            # Add optional parameters
             if days is not None:
                 search_params["days"] = days
             if include_domains:
@@ -87,7 +85,6 @@ class SharedTavilyClient:
             if exclude_domains:
                 search_params["exclude_domains"] = exclude_domains
             
-            # Perform the search asynchronously to avoid blocking the event loop
             result = await asyncio.to_thread(self.client.search, **search_params)
             
             self.logger.info(f"Tavily search completed successfully. Found {len(result.get('results', []))} results")
