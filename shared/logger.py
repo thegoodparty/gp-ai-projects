@@ -82,13 +82,16 @@ class Logger:
         
         self.session_id = str(uuid.uuid4())[:8]
         
-        self.environment = os.getenv('ENVIRONMENT', 'development').lower()
+        self.environment = os.getenv('ENVIRONMENT', '').lower()
         self.is_production = self.environment == 'production'
+        self.is_development = self.environment == 'development'
         
         if self.is_production:
             self.default_level = LogLevel.INFO
-        else:
+        elif self.is_development:
             self.default_level = LogLevel.DEBUG
+        else:
+            self.default_level = LogLevel.WARNING
     
     def get_logger(self, name: str, level: Optional[LogLevel] = None) -> logging.Logger:
         """
@@ -135,9 +138,12 @@ class Logger:
         if self.is_production:
             console_handler.setFormatter(colored_simple_formatter)
             console_handler.setLevel(logging.INFO)
-        else:
+        elif self.is_development:
             console_handler.setFormatter(colored_detailed_formatter)
             console_handler.setLevel(logging.DEBUG)
+        else:
+            console_handler.setFormatter(colored_simple_formatter)
+            console_handler.setLevel(logging.WARNING)
         
         logger.addHandler(console_handler)
         
@@ -169,10 +175,10 @@ class Logger:
         error_handler.setLevel(logging.WARNING)
         logger.addHandler(error_handler)
         
-        if not self.is_production:
+        if self.is_development:
             debug_handler = logging.handlers.RotatingFileHandler(
                 filename=self.log_dir / f"{name.replace('.', '_')}_debug.log",
-                maxBytes=5 * 1024 * 1024,  # 5MB
+                maxBytes=5 * 1024 * 1024, 
                 backupCount=3
             )
             debug_handler.setFormatter(formatter)
@@ -221,6 +227,7 @@ class Logger:
     def configure_for_debug(self):
         """Configure all loggers for debug environment"""
         self.is_production = False
+        self.is_development = True
         self.default_level = LogLevel.DEBUG
         
         for logger in self._loggers.values():

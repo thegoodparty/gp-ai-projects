@@ -6,6 +6,22 @@ from shared.llm import LLMClient
 from shared.logger import get_logger
 from shared.tavily_client import SharedTavilyClient
 
+output_format = """
+# KNOW YOUR COMMUNITY
+## Community Events & Civic Presence
+ - City Commission & Parks Meetings (June 12 & 16): opportunities to speak or attend.
+ - "Save a Life" / Veterans Event (June 24): civic visibility and voter interaction.
+ - Library & Bookmobile Events (June 11–17): reach families and educators.
+ - Chicopee Chamber (June 9, 11, 27): networking and visibility events.
+## Earned Media & Press Outreach
+ - WWLP-22News: broadcast coverage.
+ - NEPM (PBS/NPR): regional trust and reach.
+ - The Chicopee Register: hyper-local coverage.
+ - WACE 730 AM: faith-based and local listenership.
+ - Patch.com – Chicopee: digital visibility hub.
+
+ *Check the dates for accuracy. Regular searching of community calendars and websites is recommended to find new events.*
+"""
 
 class KnowYourCommunityGenerator:
     """
@@ -168,31 +184,22 @@ RULES:
 - community event list can be up to 10 events.
 - media info can be up to 7 media outlets.
 - pick the most relevant media outlets and events for the campaign.
+- give dates where it is available.
 
-
-this section should look like this:
-```
-# KNOW YOUR COMMUNITY
-## Community Events & Civic Presence
- - City Commission & Parks Meetings (June 12 & 16): opportunities to speak or attend.
- - June 24 "Save a Life" / Veterans Event: civic visibility and voter interaction.
- - Library & Bookmobile Events (June 11–17): reach families and educators.
- - Chicopee Chamber: June 9, 11, 27 networking and visibility events.
-## Earned Media & Press Outreach
- - WWLP-22News: broadcast coverage.
- - NEPM (PBS/NPR): regional trust and reach.
- - The Chicopee Register: hyper-local coverage.
- - WACE 730 AM: faith-based and local listenership.
- - Patch.com – Chicopee: digital visibility hub.
-
- *Check the dates for accuracy. Regular searching of community calendars and websites is recommended to find new events.*
-```
+this section should look like this with no other text or formatting notes:
+{output_format}
 """
             self.logger.debug(f"Prompt: {prompt}")
-            self.logger.debug(f"running llm with prompt")
-            llm_response = self.llm_client.create_completion(
+            self.logger.debug(f"running llm with reflection and regeneration")
+            
+            reflection_criteria = f"""
+this section should look like this with no other text or formatting notes:
+{output_format}
+"""
+            
+            llm_response = self.llm_client.create_completion_with_structural_reflection(
                 max_tokens=10000,
-                model="deepseek-ai/DeepSeek-R1",
+                model="deepseek-ai/DeepSeek-V3",
                 messages=[
                     {
                         "role": "system",
@@ -203,10 +210,18 @@ this section should look like this:
                         "content": prompt,
                     },
                 ],
-                temperature=0.0
+                reflection_criteria=reflection_criteria,
+                reflection_model="deepseek-ai/DeepSeek-R1",
+                temperature=0.0,
+                max_iterations=3
             )
             
             result = llm_response.choices[0].message.content
+            
+            if hasattr(llm_response, 'reflection_metadata'):
+                self.logger.info(f"Reflection metadata: {llm_response.reflection_metadata}")
+            else:
+                self.logger.info("No reflection metadata available")
 
             self.logger.info("Successfully generated community section")
             self.logger.debug(f"Generated section length: {len(result)} characters")

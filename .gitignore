@@ -14,3 +14,6 @@ wheels/
 
 # Logs
 logs/
+
+#local testing files
+local_testing.py
