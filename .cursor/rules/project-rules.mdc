@@ -1,0 +1,6 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+use logger found in [logger.py](mdc:shared/logger.py) to debug and to log in production.

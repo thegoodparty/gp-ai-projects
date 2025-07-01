@@ -11,3 +11,9 @@ wheels/
 
 # Environment variables
 .env
+
+# Logs
+logs/
+
+#local testing files
+local_testing.py
