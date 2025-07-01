@@ -309,6 +309,8 @@ class LLMClient:
         self.logger.debug(f"Main model: {model}, Reflection model: {reflection_model}")
         self.logger.debug(f"Reflection criteria: {reflection_criteria}")
         self.logger.debug(f"Temperature: {temperature}, Max tokens: {max_tokens}")
+        
+        original_response = None
                 
         for iteration in range(max_iterations):
             try:
@@ -321,18 +323,17 @@ class LLMClient:
                     **kwargs
                 )
 
-                print(f"iteration: {iteration}")
-                if iteration == 0:
+                if original_response is None:
                     original_response = response
                 
                 generated_content = response.choices[0].message.content
                 self.logger.debug(f"Generated content length: {len(generated_content)}")
                 
                 if iteration == max_iterations - 1:
-                    self.logger.info("Final iteration reached, returning original response.")
-                    self.logger.warning(f"Reached maximum iterations ({max_iterations}). Returning the original response.")
+                    self.logger.info("Final iteration reached, returning response.")
+                    self.logger.warning(f"Reached maximum iterations ({max_iterations}). Returning response.")
 
-                    return original_response
+                    return original_response if original_response is not None else response
                 
                 reflection_messages = [
                     {
