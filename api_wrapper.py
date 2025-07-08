@@ -455,8 +455,8 @@ async def download_pdf(session_id: str):
     )
 
 async def cleanup_session(session_id: str):
-    """Clean up session data after 5 minutes."""
-    await asyncio.sleep(300)  # Wait 5 minutes (300 seconds)
+    """Clean up session data after 15 minutes."""
+    await asyncio.sleep(900)  # Wait 15 minutes (300 seconds)
     if session_id in progress_store:
         logger.info(f"Cleaning up session {session_id}")
         del progress_store[session_id]
