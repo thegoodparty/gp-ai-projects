@@ -1,21 +1,18 @@
 from datetime import date
-from typing import Optional
+from typing import Optional, List
 from enum import Enum
 from pydantic import BaseModel, Field
-
 
 class RaceType(str, Enum):
     """Race type enumeration."""
     PARTISAN = "Partisan"
     NONPARTISAN = "Nonpartisan"
 
-
 class IncumbentStatus(str, Enum):
     """Incumbent status enumeration."""
     ELECTED = "Elected"
     APPOINTED = "Appointed"
     NOT_APPLICABLE = "N/A"
-
 
 class CampaignInfo(BaseModel):
     """Campaign information schema."""
@@ -34,30 +31,6 @@ class CampaignInfo(BaseModel):
     available_landlines: int = Field(..., ge=0, description="Number of available landline contacts")
     additional_race_context: Optional[str] = Field(None, description="Additional context about race themes, district dynamics, turnout trends, etc.")
     
-    class Config:
-        """Pydantic model configuration."""
-        use_enum_values = True
-        json_encoders = {
-            date: lambda v: v.strftime("%m/%d/%Y") if v else None
-        }
-        json_schema_extra = {
-            "example": {
-                "candidate_name": "Jane Smith",
-                "primary_date": "09/15/2024",
-                "election_date": "11/05/2024",
-                "office_and_jurisdiction": "School Board, At-Large, Chicopee, MA",
-                "incumbent_status": "N/A",
-                "race_type": "Nonpartisan",
-                "seats_available": 3,
-                "number_of_opponents": 7,
-                "win_number": 2500,
-                "total_likely_voters": 8500,
-                "available_cell_phones": 1200,
-                "available_landlines": 300,
-                "additional_race_context": "Focus on education funding and infrastructure improvements"
-            }
-        }
-
 class AdditionalCampaignInfo(BaseModel):
     """Additional campaign information schema."""
     
@@ -68,5 +41,16 @@ class AdditionalCampaignInfo(BaseModel):
     has_primary: bool = Field(..., description="Whether the election has a primary")
     primary_date_formatted: Optional[str] = Field(None, description="The primary date formatted as YYYY-MM-DD if exists")
 
+class ContactOptimization(BaseModel):
+    """Contact optimization schema for voter contact planning."""
+    
+    p2p_texts: int = Field(..., ge=0, le=4, description="Number of P2P text messages (0-4)")
+    robocalls: int = Field(..., ge=0, le=3, description="Number of robocalls (0-3)")
+
 class CleanedCampaignInfo(CampaignInfo, AdditionalCampaignInfo):
     """Extended campaign information with parsed and cleaned fields."""
+
+class SearchTermsList(BaseModel):
+    """Pydantic model for a list of search terms."""
+    search_terms: List[str] = Field(..., description="List of search terms")
+

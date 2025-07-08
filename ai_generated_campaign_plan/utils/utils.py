@@ -1,25 +1,20 @@
 from datetime import date
-import os
-import json
-import time
-import logging
-from together import Together
 from dotenv import load_dotenv
 
-from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, AdditionalCampaignInfo
+from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, AdditionalCampaignInfo, ContactOptimization
 from shared.llm import LLMClient
 from shared.logger import get_logger
 
 load_dotenv()
 
-class CampaignInfoProcessor:
+class CampaignUtils:
     """
-    A class for processing and cleaning campaign information using LLM services.
+    A unified utility class for campaign information processing and optimization.
     """
     
     def __init__(self, llm_client: LLMClient = None):
         """
-        Initialize the campaign info processor.
+        Initialize the campaign utilities.
         
         Args:
             llm_client: LLMClient instance. If None, creates a default one.
@@ -103,27 +98,51 @@ extract the following fields as a JSON object:
             self.logger.error(f"Failed to clean campaign info: {str(e)}")
             raise RuntimeError(f"Failed to clean campaign info: {str(e)}")
 
-
-def clean_campaign_info(campaign_info: CampaignInfo) -> CleanedCampaignInfo:
-    """
-    Convenience function that creates a CampaignInfoProcessor and cleans the campaign info.
-    
-    Args:
-        campaign_info: The original campaign information
+    def optimize_contact_strategy(self, start_date: date, end_date: date) -> ContactOptimization:
+        """
+        Determine optimal number of contacts based on campaign parameters.
         
-    Returns:
-        CleanedCampaignInfo: Enhanced campaign info with parsed location and formatted dates
-    """
-    processor = CampaignInfoProcessor()
-    return processor.clean_campaign_info(campaign_info)
+        Args:
+            start_date: Campaign start date
+            end_date: Campaign end date
+            
+        Returns:
+            ContactOptimization: Optimized contact strategy with reasoning
+        """
+        days_available = (end_date - start_date).days
+        
+        self.logger.info(f"Optimizing contact strategy")
+        self.logger.debug(f"Days available: {days_available}")
+        
+        if days_available <= 21:
+            optimization = ContactOptimization(
+                p2p_texts=2,
+                robocalls=2,
+            )
+        elif days_available <= 45:
+            optimization = ContactOptimization(
+                p2p_texts=3,
+                robocalls=2,
+            )
+        else:
+            optimization = ContactOptimization(
+                p2p_texts=4,
+                robocalls=3,
+            )
+        
+        self.logger.info(f"Contact optimization complete: {optimization.p2p_texts} texts, {optimization.robocalls} robocalls")
+        
+        return optimization
+    
+
 
 
 if __name__ == "__main__":
-    processor = CampaignInfoProcessor()
-    processor.clean_campaign_info(CampaignInfo(
+    processor = CampaignUtils()
+    cleaned_campaign_info = processor.clean_campaign_info(CampaignInfo(
         candidate_name="John Doe",
-        primary_date=None,
-        election_date=date(2024, 11, 5),
+        primary_date=date(2025, 9, 15),
+        election_date=date(2025, 11, 5),
         office_and_jurisdiction="School Board, At-Large, Chicopee, MA",
         incumbent_status=IncumbentStatus.NOT_APPLICABLE,
         race_type=RaceType.NONPARTISAN,
@@ -135,3 +154,8 @@ if __name__ == "__main__":
         available_landlines=3780,
         additional_race_context="Focus on education funding and infrastructure improvements"
     ))
+    print(cleaned_campaign_info)
+    print("--------------------------------")
+    print(processor.optimize_contact_strategy(date.today(), cleaned_campaign_info.primary_date))
+    print("--------------------------------")
+    print(processor.optimize_contact_strategy(cleaned_campaign_info.primary_date, cleaned_campaign_info.election_date))

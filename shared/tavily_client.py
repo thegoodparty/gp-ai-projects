@@ -127,7 +127,7 @@ class SharedTavilyClient:
                 max_results=max_results,
                 include_domains=include_domains,
                 exclude_domains=exclude_domains,
-                include_answer=True,
+                include_answer=False,
                 include_raw_content=True
             )
             
