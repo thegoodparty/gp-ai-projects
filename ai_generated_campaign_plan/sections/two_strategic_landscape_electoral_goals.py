@@ -105,7 +105,7 @@ Challenges:
         
         try:
             response = self.llm_client.create_completion(
-                max_tokens=6000,
+                max_tokens=10000,
                 messages=[
                     {
                         "role": "system",

@@ -107,7 +107,7 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
                         "content": media_prompt
                     }
                 ],
-                max_tokens=5000,
+                max_tokens=10000,
                 temperature=0.0
             )
             

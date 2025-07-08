@@ -1,6 +1,10 @@
 ---
-description: 
-globs: 
+description:
+globs:
 alwaysApply: false
 ---
+
+use shared llm found in [llm.py](mdc:shared/llm.py) to call ai powered completions
 use logger found in [logger.py](mdc:shared/logger.py) to debug and to log in production.
+do not add comments
+modularize code

@@ -10,6 +10,11 @@ dependencies = [
     "tavily-python>=0.7.8",
     "brave-search>=0.1.8",
     "openai>=1.93.1",
+    "fastapi>=0.116.0",
+    "uvicorn>=0.35.0",
+    "reportlab>=4.4.2",
+    "jinja2>=3.1.6",
+    "python-multipart>=0.0.20",
 ]
 
 [build-system]

@@ -102,7 +102,7 @@ Example format:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=5000
+                max_tokens=10000
             )
             
             voter_contact_plan = response.choices[0].message.content

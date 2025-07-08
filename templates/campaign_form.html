@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Campaign Plan Generator</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f5f5f5;
+      }
+      .container {
+        background-color: white;
+        padding: 30px;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      h1 {
+        color: #2c3e50;
+        text-align: center;
+        margin-bottom: 30px;
+      }
+      .form-group {
+        margin-bottom: 20px;
+      }
+      label {
+        display: block;
+        margin-bottom: 5px;
+        font-weight: bold;
+        color: #34495e;
+      }
+      input[type="text"],
+      input[type="date"],
+      input[type="number"],
+      select,
+      textarea {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 16px;
+        box-sizing: border-box;
+      }
+      textarea {
+        height: 100px;
+        resize: vertical;
+      }
+      select {
+        height: 45px;
+      }
+      .form-row {
+        display: flex;
+        gap: 20px;
+      }
+      .form-row .form-group {
+        flex: 1;
+      }
+      .submit-btn {
+        background-color: #3498db;
+        color: white;
+        padding: 15px 30px;
+        border: none;
+        border-radius: 5px;
+        font-size: 18px;
+        cursor: pointer;
+        width: 100%;
+        margin-top: 20px;
+      }
+      .submit-btn:hover {
+        background-color: #2980b9;
+      }
+      .submit-btn:disabled {
+        background-color: #bdc3c7;
+        cursor: not-allowed;
+      }
+      .help-text {
+        font-size: 14px;
+        color: #7f8c8d;
+        margin-top: 5px;
+      }
+      .section-title {
+        font-size: 20px;
+        color: #2c3e50;
+        margin-top: 30px;
+        margin-bottom: 15px;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 5px;
+      }
+      .loading {
+        display: none;
+        text-align: center;
+        margin-top: 20px;
+      }
+      .spinner {
+        border: 4px solid #f3f3f3;
+        border-top: 4px solid #3498db;
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto;
+      }
+      @keyframes spin {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Campaign Plan Generator</h1>
+      <p style="text-align: center; color: #7f8c8d; margin-bottom: 30px">
+        Generate a comprehensive campaign plan by filling out the form below.
+        The system will create a detailed PDF document with strategic
+        recommendations.
+      </p>
+
+      <form
+        id="campaignForm"
+        action="/generate-campaign-plan-form"
+        method="post"
+      >
+        <div class="section-title">Candidate Information</div>
+
+        <div class="form-group">
+          <label for="candidate_name">Candidate Name *</label>
+          <input
+            type="text"
+            id="candidate_name"
+            name="candidate_name"
+            required
+          />
+          <div class="help-text">
+            Full name of the candidate (e.g., "John Smith")
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="office_and_jurisdiction">Office and Jurisdiction *</label>
+          <input
+            type="text"
+            id="office_and_jurisdiction"
+            name="office_and_jurisdiction"
+            required
+          />
+          <div class="help-text">
+            e.g., "School Board, At-Large, Chicopee, MA" or "City Council,
+            District 3, Boston, MA"
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="race_type">Race Type *</label>
+            <select id="race_type" name="race_type" required>
+              <option value="">Select Race Type</option>
+              <option value="Partisan">Partisan</option>
+              <option value="Nonpartisan">Nonpartisan</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="incumbent_status">Incumbent Status *</label>
+            <select id="incumbent_status" name="incumbent_status" required>
+              <option value="">Select Status</option>
+              <option value="Elected">Elected Incumbent</option>
+              <option value="Appointed">Appointed Incumbent</option>
+              <option value="N/A">Not Applicable (Not Incumbent)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="section-title">Election Dates</div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="election_date">Election Date *</label>
+            <input
+              type="date"
+              id="election_date"
+              name="election_date"
+              required
+            />
+            <div class="help-text">General election date</div>
+          </div>
+
+          <div class="form-group">
+            <label for="primary_date">Primary Date (if applicable)</label>
+            <input type="date" id="primary_date" name="primary_date" />
+            <div class="help-text">Leave blank if no primary election</div>
+          </div>
+        </div>
+
+        <div class="section-title">Race Details</div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="seats_available">Seats Available *</label>
+            <input
+              type="number"
+              id="seats_available"
+              name="seats_available"
+              min="1"
+              required
+            />
+            <div class="help-text">Number of seats up for election</div>
+          </div>
+
+          <div class="form-group">
+            <label for="number_of_opponents">Number of Opponents *</label>
+            <input
+              type="number"
+              id="number_of_opponents"
+              name="number_of_opponents"
+              min="0"
+              required
+            />
+            <div class="help-text">Number of other candidates in the race</div>
+          </div>
+        </div>
+
+        <div class="section-title">Voter Information</div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="win_number">Win Number *</label>
+            <input
+              type="number"
+              id="win_number"
+              name="win_number"
+              min="1"
+              required
+            />
+            <div class="help-text">Estimated number of votes needed to win</div>
+          </div>
+
+          <div class="form-group">
+            <label for="total_likely_voters">Total Likely Voters *</label>
+            <input
+              type="number"
+              id="total_likely_voters"
+              name="total_likely_voters"
+              min="0"
+              required
+            />
+            <div class="help-text">
+              Total number of likely voters in the jurisdiction
+            </div>
+          </div>
+        </div>
+
+        <div class="section-title">Contact Information</div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="available_cell_phones">Available Cell Phones *</label>
+            <input
+              type="number"
+              id="available_cell_phones"
+              name="available_cell_phones"
+              min="0"
+              required
+            />
+            <div class="help-text">Number of cell phone contacts available</div>
+          </div>
+
+          <div class="form-group">
+            <label for="available_landlines">Available Landlines *</label>
+            <input
+              type="number"
+              id="available_landlines"
+              name="available_landlines"
+              min="0"
+              required
+            />
+            <div class="help-text">Number of landline contacts available</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="additional_race_context">Additional Race Context</label>
+          <textarea
+            id="additional_race_context"
+            name="additional_race_context"
+            placeholder="Optional: Include any additional context about race themes, district dynamics, turnout trends, key issues, etc."
+          ></textarea>
+        </div>
+
+        <button type="submit" class="submit-btn" id="submitBtn">
+          Generate Campaign Plan PDF
+        </button>
+      </form>
+
+      <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Generating your campaign plan... This may take a few minutes.</p>
+      </div>
+    </div>
+
+    <script>
+      function resetLoadingState() {
+        document.getElementById("loading").style.display = "none";
+        document.getElementById("submitBtn").disabled = false;
+        document.getElementById("submitBtn").textContent =
+          "Generate Campaign Plan PDF";
+      }
+
+      function showDownloadComplete() {
+        // Show a temporary success message
+        const successMsg = document.createElement("div");
+        successMsg.style.cssText = `
+          position: fixed;
+          top: 20px;
+          right: 20px;
+          background: #2ecc71;
+          color: white;
+          padding: 15px 20px;
+          border-radius: 5px;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          z-index: 1000;
+          font-weight: bold;
+        `;
+        successMsg.textContent = "✓ PDF download started!";
+        document.body.appendChild(successMsg);
+
+        // Remove the message after 3 seconds
+        setTimeout(function () {
+          if (successMsg.parentNode) {
+            successMsg.parentNode.removeChild(successMsg);
+          }
+        }, 3000);
+      }
+
+      function showError(message) {
+        const errorMsg = document.createElement("div");
+        errorMsg.style.cssText = `
+          position: fixed;
+          top: 20px;
+          right: 20px;
+          background: #e74c3c;
+          color: white;
+          padding: 15px 20px;
+          border-radius: 5px;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          z-index: 1000;
+          font-weight: bold;
+        `;
+        errorMsg.textContent = "❌ " + message;
+        document.body.appendChild(errorMsg);
+
+        // Remove the message after 5 seconds
+        setTimeout(function () {
+          if (errorMsg.parentNode) {
+            errorMsg.parentNode.removeChild(errorMsg);
+          }
+        }, 5000);
+      }
+
+      async function submitForm(formData) {
+        try {
+          const response = await fetch("/generate-campaign-plan-form", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (response.ok) {
+            // Get the PDF blob
+            const blob = await response.blob();
+
+            // Create download link
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+
+            // Get filename from response headers or use default
+            const contentDisposition = response.headers.get(
+              "Content-Disposition"
+            );
+            let filename = "campaign_plan.pdf";
+            if (contentDisposition) {
+              const matches = contentDisposition.match(/filename=([^;]+)/);
+              if (matches && matches[1]) {
+                filename = matches[1].replace(/['"]/g, "");
+              }
+            }
+
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+
+            // Clean up
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+
+            // Reset loading state and show success
+            resetLoadingState();
+            showDownloadComplete();
+          } else {
+            // Handle error response
+            const errorData = await response.json();
+            resetLoadingState();
+            showError(errorData.detail || "Failed to generate PDF");
+          }
+        } catch (error) {
+          console.error("Error:", error);
+          resetLoadingState();
+          showError("Network error. Please try again.");
+        }
+      }
+
+      document
+        .getElementById("campaignForm")
+        .addEventListener("submit", function (e) {
+          e.preventDefault(); // Always prevent default form submission
+
+          // Show loading spinner
+          document.getElementById("loading").style.display = "block";
+          document.getElementById("submitBtn").disabled = true;
+          document.getElementById("submitBtn").textContent = "Generating...";
+
+          // Validate dates
+          const electionDate = document.getElementById("election_date").value;
+          const primaryDate = document.getElementById("primary_date").value;
+
+          if (primaryDate && primaryDate >= electionDate) {
+            alert("Primary date must be before election date");
+            resetLoadingState();
+            return;
+          }
+
+          // Validate win number vs total voters
+          const winNumber = parseInt(
+            document.getElementById("win_number").value
+          );
+          const totalVoters = parseInt(
+            document.getElementById("total_likely_voters").value
+          );
+
+          if (winNumber > totalVoters) {
+            alert("Win number cannot be greater than total likely voters");
+            resetLoadingState();
+            return;
+          }
+
+          // Create FormData and submit via fetch
+          const formData = new FormData(this);
+          submitForm(formData);
+        });
+
+      // Set minimum date to today
+      const today = new Date().toISOString().split("T")[0];
+      document.getElementById("election_date").min = today;
+      document.getElementById("primary_date").min = today;
+    </script>
+  </body>
+</html>
