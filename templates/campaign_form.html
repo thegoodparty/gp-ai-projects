@@ -89,27 +89,147 @@
         border-bottom: 2px solid #3498db;
         padding-bottom: 5px;
       }
-      .loading {
+
+      /* Progress tracking styles */
+      .progress-container {
         display: none;
-        text-align: center;
-        margin-top: 20px;
+        margin-top: 30px;
+        padding: 20px;
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        border: 1px solid #dee2e6;
       }
-      .spinner {
-        border: 4px solid #f3f3f3;
-        border-top: 4px solid #3498db;
+      .progress-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+      }
+      .progress-title {
+        font-size: 18px;
+        font-weight: bold;
+        color: #2c3e50;
+      }
+      .progress-percentage {
+        font-size: 16px;
+        color: #3498db;
+        font-weight: bold;
+      }
+      .progress-bar {
+        width: 100%;
+        height: 25px;
+        background-color: #e9ecef;
+        border-radius: 15px;
+        overflow: hidden;
+        margin-bottom: 15px;
+        position: relative;
+      }
+      .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #3498db, #2ecc71);
+        transition: width 0.3s ease;
+        border-radius: 15px;
+      }
+      .progress-message {
+        font-size: 14px;
+        color: #495057;
+        margin-bottom: 15px;
+        min-height: 20px;
+      }
+      .log-container {
+        max-height: 200px;
+        overflow-y: auto;
+        background-color: #2c3e50;
+        color: #ecf0f1;
+        padding: 15px;
+        border-radius: 5px;
+        font-family: "Courier New", monospace;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      .log-entry {
+        margin-bottom: 5px;
+        padding: 2px 0;
+        border-bottom: 1px solid #34495e;
+      }
+      .log-entry:last-child {
+        border-bottom: none;
+      }
+      .download-btn {
+        background-color: #27ae60;
+        color: white;
+        padding: 15px 30px;
+        border: none;
+        border-radius: 5px;
+        font-size: 18px;
+        cursor: pointer;
+        width: 100%;
+        margin-top: 15px;
+        display: none;
+      }
+      .download-btn:hover {
+        background-color: #219a52;
+      }
+      .error-message {
+        background-color: #e74c3c;
+        color: white;
+        padding: 15px;
+        border-radius: 5px;
+        margin-top: 15px;
+        display: none;
+      }
+
+      /* Loading animations */
+      .loading-dots {
+        display: inline-block;
+        position: relative;
+        width: 80px;
+        height: 20px;
+      }
+      .loading-dots div {
+        position: absolute;
+        top: 8px;
+        width: 6px;
+        height: 6px;
         border-radius: 50%;
-        width: 40px;
-        height: 40px;
-        animation: spin 1s linear infinite;
-        margin: 0 auto;
+        background: #3498db;
+        animation: loading-dots 1.2s linear infinite;
       }
-      @keyframes spin {
-        0% {
-          transform: rotate(0deg);
-        }
+      .loading-dots div:nth-child(1) {
+        left: 8px;
+        animation-delay: 0s;
+      }
+      .loading-dots div:nth-child(2) {
+        left: 32px;
+        animation-delay: -0.4s;
+      }
+      .loading-dots div:nth-child(3) {
+        left: 56px;
+        animation-delay: -0.8s;
+      }
+      @keyframes loading-dots {
+        0%,
+        80%,
         100% {
-          transform: rotate(360deg);
+          transform: scale(0);
         }
+        40% {
+          transform: scale(1);
+        }
+      }
+
+      /* Status indicators */
+      .status-starting {
+        color: #f39c12;
+      }
+      .status-processing {
+        color: #3498db;
+      }
+      .status-completed {
+        color: #27ae60;
+      }
+      .status-error {
+        color: #e74c3c;
       }
     </style>
   </head>
@@ -122,11 +242,7 @@
         recommendations.
       </p>
 
-      <form
-        id="campaignForm"
-        action="/generate-campaign-plan-form"
-        method="post"
-      >
+      <form id="campaignForm">
         <div class="section-title">Candidate Information</div>
 
         <div class="form-group">
@@ -298,88 +414,167 @@
         </button>
       </form>
 
-      <div class="loading" id="loading">
-        <div class="spinner"></div>
-        <p>Generating your campaign plan... This may take a few minutes.</p>
+      <!-- Progress tracking container -->
+      <div class="progress-container" id="progressContainer">
+        <div class="progress-header">
+          <div class="progress-title">Generating Campaign Plan</div>
+          <div class="progress-percentage" id="progressPercentage">0%</div>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-message" id="progressMessage">
+          Initializing...
+          <div class="loading-dots">
+            <div></div>
+            <div></div>
+            <div></div>
+          </div>
+        </div>
+        <div class="log-container" id="logContainer">
+          <div class="log-entry">
+            System initialized. Waiting for generation to start...
+          </div>
+        </div>
+        <button class="download-btn" id="downloadBtn">Download PDF</button>
+        <div class="error-message" id="errorMessage"></div>
       </div>
     </div>
 
     <script>
-      function resetLoadingState() {
-        document.getElementById("loading").style.display = "none";
-        document.getElementById("submitBtn").disabled = false;
-        document.getElementById("submitBtn").textContent =
-          "Generate Campaign Plan PDF";
-      }
-
-      function showDownloadComplete() {
-        // Show a temporary success message
-        const successMsg = document.createElement("div");
-        successMsg.style.cssText = `
-          position: fixed;
-          top: 20px;
-          right: 20px;
-          background: #2ecc71;
-          color: white;
-          padding: 15px 20px;
-          border-radius: 5px;
-          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-          z-index: 1000;
-          font-weight: bold;
-        `;
-        successMsg.textContent = "✓ PDF download started!";
-        document.body.appendChild(successMsg);
-
-        // Remove the message after 3 seconds
-        setTimeout(function () {
-          if (successMsg.parentNode) {
-            successMsg.parentNode.removeChild(successMsg);
-          }
-        }, 3000);
-      }
+      let currentSessionId = null;
+      let eventSource = null;
 
       function showError(message) {
-        const errorMsg = document.createElement("div");
-        errorMsg.style.cssText = `
-          position: fixed;
-          top: 20px;
-          right: 20px;
-          background: #e74c3c;
-          color: white;
-          padding: 15px 20px;
-          border-radius: 5px;
-          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-          z-index: 1000;
-          font-weight: bold;
-        `;
-        errorMsg.textContent = "❌ " + message;
-        document.body.appendChild(errorMsg);
+        const errorDiv = document.getElementById("errorMessage");
+        if (errorDiv) {
+          errorDiv.textContent = message;
+          errorDiv.style.display = "block";
+        } else {
+          console.error("Error message element not found:", message);
+          alert("Error: " + message);
+        }
 
-        // Remove the message after 5 seconds
-        setTimeout(function () {
-          if (errorMsg.parentNode) {
-            errorMsg.parentNode.removeChild(errorMsg);
-          }
+        // Hide progress elements
+        const progressMessage = document.getElementById("progressMessage");
+        const progressBar = document.getElementById("progressBar");
+        if (progressMessage) progressMessage.style.display = "none";
+        if (progressBar) progressBar.style.display = "none";
+
+        // Reset form
+        setTimeout(() => {
+          resetForm();
         }, 5000);
       }
 
-      async function submitForm(formData) {
+      function resetForm() {
+        document.getElementById("progressContainer").style.display = "none";
+        document.getElementById("submitBtn").disabled = false;
+        document.getElementById("submitBtn").textContent =
+          "Generate Campaign Plan PDF";
+
+        // Close event source if open
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+
+        currentSessionId = null;
+      }
+
+      function updateProgress(data) {
+        const progressFill = document.getElementById("progressFill");
+        const progressPercentage =
+          document.getElementById("progressPercentage");
+        const progressMessage = document.getElementById("progressMessage");
+        const logContainer = document.getElementById("logContainer");
+        const downloadBtn = document.getElementById("downloadBtn");
+        const errorDiv = document.getElementById("errorMessage");
+
+        // Update progress bar
+        progressFill.style.width = data.progress + "%";
+        progressPercentage.textContent = data.progress + "%";
+
+        // Update message with status styling
+        progressMessage.innerHTML = `
+          <span class="status-${data.status}">${data.message}</span>
+          ${
+            data.status === "processing"
+              ? '<div class="loading-dots"><div></div><div></div><div></div></div>'
+              : ""
+          }
+        `;
+
+        // Update logs
+        if (data.logs && data.logs.length > 0) {
+          logContainer.innerHTML = data.logs
+            .map((log) => `<div class="log-entry">${log}</div>`)
+            .join("");
+
+          // Auto-scroll to bottom
+          logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        // Handle completion
+        if (data.status === "completed") {
+          progressMessage.innerHTML =
+            '<span class="status-completed">✓ ' + data.message + "</span>";
+          downloadBtn.style.display = "block";
+          downloadBtn.onclick = () => downloadPDF();
+
+          // Close event source
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+        }
+
+        // Handle error
+        if (data.status === "error") {
+          showError(data.message);
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+        }
+      }
+
+      function startProgressTracking(sessionId) {
+        currentSessionId = sessionId;
+
+        // Show progress container
+        document.getElementById("progressContainer").style.display = "block";
+
+        // Start Server-Sent Events
+        eventSource = new EventSource(`/progress-stream/${sessionId}`);
+
+        eventSource.onmessage = function (event) {
+          const data = JSON.parse(event.data);
+          updateProgress(data);
+        };
+
+        eventSource.onerror = function (event) {
+          console.error("EventSource error:", event);
+          showError("Connection to server lost. Please try again.");
+        };
+      }
+
+      async function downloadPDF() {
+        if (!currentSessionId) {
+          showError("No session found for download");
+          return;
+        }
+
         try {
-          const response = await fetch("/generate-campaign-plan-form", {
-            method: "POST",
-            body: formData,
-          });
+          const response = await fetch(`/download/${currentSessionId}`);
 
           if (response.ok) {
-            // Get the PDF blob
             const blob = await response.blob();
-
-            // Create download link
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
 
-            // Get filename from response headers or use default
+            // Get filename from response headers
             const contentDisposition = response.headers.get(
               "Content-Disposition"
             );
@@ -394,23 +589,57 @@
             a.download = filename;
             document.body.appendChild(a);
             a.click();
-
-            // Clean up
-            window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
 
-            // Reset loading state and show success
-            resetLoadingState();
-            showDownloadComplete();
+            // Show success message
+            const successMsg = document.createElement("div");
+            successMsg.style.cssText = `
+              position: fixed;
+              top: 20px;
+              right: 20px;
+              background: #2ecc71;
+              color: white;
+              padding: 15px 20px;
+              border-radius: 5px;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+              z-index: 1000;
+              font-weight: bold;
+            `;
+            successMsg.textContent = "✓ PDF downloaded successfully!";
+            document.body.appendChild(successMsg);
+
+            setTimeout(() => {
+              if (successMsg.parentNode) {
+                successMsg.parentNode.removeChild(successMsg);
+              }
+            }, 3000);
           } else {
-            // Handle error response
             const errorData = await response.json();
-            resetLoadingState();
-            showError(errorData.detail || "Failed to generate PDF");
+            showError(errorData.detail || "Failed to download PDF");
+          }
+        } catch (error) {
+          console.error("Download error:", error);
+          showError("Network error during download. Please try again.");
+        }
+      }
+
+      async function submitForm(formData) {
+        try {
+          const response = await fetch("/start-campaign-plan-generation", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            startProgressTracking(data.session_id);
+          } else {
+            const errorData = await response.json();
+            showError(errorData.detail || "Failed to start generation");
           }
         } catch (error) {
           console.error("Error:", error);
-          resetLoadingState();
           showError("Network error. Please try again.");
         }
       }
@@ -418,12 +647,12 @@
       document
         .getElementById("campaignForm")
         .addEventListener("submit", function (e) {
-          e.preventDefault(); // Always prevent default form submission
+          e.preventDefault();
 
-          // Show loading spinner
-          document.getElementById("loading").style.display = "block";
+          // Disable submit button
           document.getElementById("submitBtn").disabled = true;
-          document.getElementById("submitBtn").textContent = "Generating...";
+          document.getElementById("submitBtn").textContent =
+            "Starting Generation...";
 
           // Validate dates
           const electionDate = document.getElementById("election_date").value;
@@ -431,7 +660,7 @@
 
           if (primaryDate && primaryDate >= electionDate) {
             alert("Primary date must be before election date");
-            resetLoadingState();
+            resetForm();
             return;
           }
 
@@ -445,11 +674,11 @@
 
           if (winNumber > totalVoters) {
             alert("Win number cannot be greater than total likely voters");
-            resetLoadingState();
+            resetForm();
             return;
           }
 
-          // Create FormData and submit via fetch
+          // Submit form
           const formData = new FormData(this);
           submitForm(formData);
         });
@@ -458,6 +687,13 @@
       const today = new Date().toISOString().split("T")[0];
       document.getElementById("election_date").min = today;
       document.getElementById("primary_date").min = today;
+
+      // Cleanup event source on page unload
+      window.addEventListener("beforeunload", function () {
+        if (eventSource) {
+          eventSource.close();
+        }
+      });
     </script>
   </body>
 </html>
