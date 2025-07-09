@@ -24,7 +24,7 @@ def generate_campaign_overview(incumbent_status: Optional[IncumbentStatus], offi
     logger.debug(f"Determined election type: {election_type} (is_incumbent={is_incumbent})")
     
     overview_text = f"""
-## 1. Campaign Strategy Overview
+## 1. CAMPAIGN STRATEGY OVERVIEW
 
 This plan provides a **comprehensive campaign roadmap** for your {election_type} to the {office_and_jurisdiction}. It is designed to translate strategic objectives into actionable fieldwork, communications, and voter outreach benchmarks. The plan supports alignment of resources, messaging, and execution around a single priority: reaching and turning out enough voters to win.
 """
