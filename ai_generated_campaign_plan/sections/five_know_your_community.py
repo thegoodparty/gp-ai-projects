@@ -5,6 +5,7 @@ from ai_generated_campaign_plan.utils.utils import CampaignUtils
 from shared.llm import LLMClient
 from shared.logger import get_logger
 from shared.tavily_client import SharedTavilyClient
+from shared.llm_gemini import GeminiClient
 
 class KnowYourCommunityGenerator:
     """
@@ -41,6 +42,7 @@ class KnowYourCommunityGenerator:
         self.logger = get_logger(__name__)
         self.tavily_client = SharedTavilyClient()
         self.llm_client = LLMClient()
+        self.gemini_client = GeminiClient()
         
         self.logger.info("KnowYourCommunityGenerator initialized")
 
@@ -150,6 +152,26 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
         except Exception as e:
             self.logger.error(f"Failed to fetch media outreach information: {str(e)}")
             return f"Error fetching media information: {str(e)}"
+        
+    async def _fetch_community_events_with_gemini_search(self, cleaned_campaign_info: CleanedCampaignInfo) -> str:
+        """
+        Fetch community events for the campaign using Gemini search.
+        """
+        self.logger.info(f"Fetching community events for candidate with gemini search: {cleaned_campaign_info.candidate_name}")
+        self.logger.debug(f"Campaign info details: {cleaned_campaign_info}")
+        prompt = f"""
+        You are an expert campaign strategist. find community events for this campaign that will help the candidate connect with voters.
+        CAMPAIGN CONTEXT:
+        - Office: {cleaned_campaign_info.office_and_jurisdiction}
+        - Location: {cleaned_campaign_info.city}, {cleaned_campaign_info.state_full}
+        - Election Date: {cleaned_campaign_info.election_date}
+        - Today's Date: {date.today()}
+        """
+        self.logger.debug(f"Prompt: {prompt}")
+        response = self.gemini_client.generate_with_search(prompt)
+        self.logger.debug(f"Response: {response}")
+        return response
+        
 
     async def _generate_community_events_section(self, cleaned_campaign_info: CleanedCampaignInfo) -> str:
         """
@@ -164,7 +186,13 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
         self.logger.info(f"Generating community events section for candidate: {cleaned_campaign_info.candidate_name}")
         
         try:
-            community_events = await self._fetch_community_events_for_campaign(cleaned_campaign_info)
+            community_events = None
+            try:
+                community_events = await self._fetch_community_events_with_gemini_search(cleaned_campaign_info)
+            except Exception as e:
+                self.logger.error(f"Failed to fetch community events with gemini search: {str(e)}")
+                community_events = await self._fetch_community_events_for_campaign(cleaned_campaign_info)
+            
             self.logger.info("Filtering events for best voter reach potential")
             filtered_formatted_list = await self._filter_best_events(community_events, cleaned_campaign_info)
             
@@ -260,7 +288,7 @@ Return exactly 3 search terms, one per line, with no bullets or formatting.
         """
         Fetch community events for the campaign using AI-generated search terms.
         """
-        self.logger.info(f"Fetching community events for candidate: {cleaned_campaign_info.candidate_name}")
+        self.logger.info(f"Fetching community events for candidate with tavily search: {cleaned_campaign_info.candidate_name}")
         self.logger.debug(f"Campaign info details: {cleaned_campaign_info}")
         
         try:
@@ -442,7 +470,7 @@ if __name__ == "__main__":
         candidate_name="John Doe",
         primary_date=date(2025, 7, 10),
         election_date=date(2025, 11, 5),
-        office_and_jurisdiction="School Board, At-Large, Chicopee, MA",
+        office_and_jurisdiction="Alderman, ward 50, IL",
         incumbent_status=IncumbentStatus.NOT_APPLICABLE,
         race_type=RaceType.NONPARTISAN,
         seats_available=1,
@@ -464,101 +492,4 @@ if __name__ == "__main__":
     
     generator = KnowYourCommunityGenerator()
     result = asyncio.run(generator.generate_section(cleaned_campaign_info))
-
-    example_search_output = """
-=== Chicopee MA community events school related Fall 2025 ===
-
-Search Results:
-
-1. Holiday: Fall events Events & Tickets in Chicopee, MA | Eventbrite
-   URL: https://www.eventbrite.com/b/ma--chicopee/holiday/fall-events/
-   Content: Classes ; Autumn Candle-Making Workshop at Mighty Squirrel Brewing Co. – Waltham. Mon, Sep 22 • 6:00 PM. Mighty Squirrel Brewing Co. From $47.73 ; Autumn Wreath...
-
-2. Events around Chicopee, MA - Community Calendar - AARP Local
-   URL: https://local.aarp.org/chicopee-ma/events/
-   Content: Image 4: spinner imageImage 5: the help icon Image 6: spinner imageImage 7: the help icon Image 8: spinner imageImage 9: AARP's Eye Center Image 58: spinner imageImage 59: illustration of a map with an icon of a person helping another person with a cane navigate towards caregiving Image 64: spinner imageImage 65: AARP Right Again Trivia and AARP Rewards Image 66: spinner imageImage 67: AARP Right Again Trivia Sports and AARP Rewards Image 70: spinner imageImage 71: Throwback Thursday Crossword a...
-
-3. Calendar • Chicopee, MA • CivicEngage
-   URL: https://www.chicopeema.gov/Calendar.aspx
-   Content: 1.   - [x]  All Calendars   6.   - [x]  City Events Calendar   1.   - [x]  Meetings Calendar   July 8,2025,4:30 PM @ Fire Department Headquarters   Ambulance Commission Meeting Notice 2025-07-08T16:30:00 Fire Department Headquarters 80 Church Street Chicopee MA 01020 More Details July 9,2025,6:30 PM @ Chicopee City Hall Auditorium   Chicopee School Committee Meeting Notice 2025-07-09T18:30:00 Chicopee City Hall Auditorium 274 Front St.Chicopee MA 01013 More Details July 10,2025,11:00 AM @ Board ...
-
-4. Chicopee Public Schools: Home
-   URL: https://www.chicopeeps.org/en-US
-   Content: | |  |  |  |  | | --- | --- | --- | | |  | | --- | | Superintendent Ware Congratulates Freshmen in Carpentry    During a recent visit to Chicopee Comprehensive High School, Superintendent Ware stopped by the Carpentry shop and recognized freshmen students who were proudly receiving acceptance into the program—displayed in certificate frames they built themselves. We look forward to sharing more updates soon as we continue building a strong, shared vision for the future of Chicopee Public Schools...
-
-5. Athletics - Chicopee Public Schools
-   URL: https://www.chicopeeps.org/en-US/athletics-ca110258
-   Content: All student athletes participating in athletics for the Chicopee Public Schools must register online. Below are detailed instructions for registration....
-
-=== Chicopee MA public forums school district 2025 ===
-
-Search Results:
-
-1. 2024-2025 School Calendar - Chicopee Public Schools
-   URL: https://www.chicopeeps.org/en-US/printable-calendar-9f32c23b/2024-2025-school-calendar-e05bda76
-   Content: 2024-2025 School Calendar - Chicopee Public Schools Language Select your language Set your preferred language. Language English Powered by Image 1: Google TranslateTranslate skip to main contentskip to navigation *    Tech Support *    Menus *    School Brains Portal *    Athletics *   Skip to Navigation Image 2: Chicopee Public Schools Chicopee Public Schools ======================= Login *   Links & Resources *   Departments *   Calendars *   Schools *   Staff Directory *   Contact Printable C...
-
-2. Chicopee School Committee approves School Choice slots
-   URL: https://thereminder.com/local-news/hampden-county/chicopee/chicopee-school-committee-approves-school-choice-slots/
-   Content: The School Committee unanimously approved offering 31 School Choice slots for grades 1 through 5 for the 2025-26 school year....
-
-3. Chicopee Public Schools - Facebook
-   URL: https://m.facebook.com/story.php/?story_fbid=1023178026482973&id=100063723542962
-   Content: Summer is winding down and we are gearing up for the start of the 2024-2025 school year! As a friendly reminder, the First Day of School for Grades 1-12...
-
-4. Chicopee Area Community Forum | Facebook
-   URL: https://www.facebook.com/groups/1337735189714040/
-   Content: Log into Facebook Image 1: Facebook _Notice_ You must log in to continue. Log Into Facebook You must log in to continue. Log In Forgot account? Create new account *   English (US) *   Español *   Français (France)") *   中文(简体)") *   العربية *   Português (Brasil)") *   Italiano *   한국어 *   Deutsch *   हिन्दी *   日本語 *   Sign Up *   Log In *   Messenger *   Facebook Lite *   Video *   Meta Pay *   Meta Store *   Meta Quest *   Ray-Ban Meta *   Meta AI *   Instagram *   Threads *   Voting Informat...
-
-5. Chicopee Public Schools: Home
-   URL: https://www.chicopeeps.org/en-US
-   Content: | |  |  |  |  | | --- | --- | --- | | |  | | --- | | Superintendent Ware Congratulates Freshmen in Carpentry    During a recent visit to Chicopee Comprehensive High School, Superintendent Ware stopped by the Carpentry shop and recognized freshmen students who were proudly receiving acceptance into the program—displayed in certificate frames they built themselves. We look forward to sharing more updates soon as we continue building a strong, shared vision for the future of Chicopee Public Schools...
-
-=== Chicopee MA local civic meetings education topics 2025 ===
-
-Search Results:
-
-1. Meetings Calendar - Chicopee, MA
-   URL: https://www.chicopeema.gov/calendar.aspx?CID=39
-   Content: July 9, 2025, 6:30 PM. @. Chicopee City Hall Auditorium. Chicopee School Committee Meeting Notice2025-07-09T18:30:00. Chicopee City Hall Auditorium274 Front St....
-
-2. Agenda Center - Chicopee, MA
-   URL: https://www.chicopeema.gov/AgendaCenter
-   Content: | ### **Apr 1, 2025** — Posted Mar 28, 2025 1:22 PM City Council Meeting (PDF) | Image 12: Minutes Opens in new windowAgenda center file City Council Meeting (PDF) | Download▼ City Council Meeting (PDF) 1. | ### **Mar 4, 2025** — Posted Feb 28, 2025 12:21 PM City Council Meeting Agenda (PDF) | Image 15: Minutes Opens in new windowAgenda center file City Council Meeting Agenda (PDF) | Download▼ City Council Meeting Agenda (PDF) 1. | ### **Feb 4, 2025** — Posted Jan 31, 2025 1:31 PM City Council M...
-
-3. 6-3-25 City Council - YouTube
-   URL: https://www.youtube.com/watch?v=XwgLiWjNhcw
-   Content: Chicopee TV New 8 views · 2:30. Go to channel · Councilwoman Michele Fiore walks out of City Council meeting as public comment gets heated. 8...
-
-4. Chicopee Public Schools: Home
-   URL: https://www.chicopeeps.org/en-US
-   Content: | |  |  |  |  | | --- | --- | --- | | |  | | --- | | Superintendent Ware Congratulates Freshmen in Carpentry    During a recent visit to Chicopee Comprehensive High School, Superintendent Ware stopped by the Carpentry shop and recognized freshmen students who were proudly receiving acceptance into the program—displayed in certificate frames they built themselves. We look forward to sharing more updates soon as we continue building a strong, shared vision for the future of Chicopee Public Schools...
-
-=== Community Events Chicopee Massachusetts with dates from 7 2025 ===
-
-Search Results:
-
-1. Calendar • Chicopee, MA • CivicEngage
-   URL: https://www.chicopeema.gov/Calendar.aspx
-   Content: 1.   - [x]  All Calendars   6.   - [x]  City Events Calendar   1.   - [x]  Meetings Calendar   July 8,2025,4:30 PM @ Fire Department Headquarters   Ambulance Commission Meeting Notice 2025-07-08T16:30:00 Fire Department Headquarters 80 Church Street Chicopee MA 01020 More Details July 9,2025,6:30 PM @ Chicopee City Hall Auditorium   Chicopee School Committee Meeting Notice 2025-07-09T18:30:00 Chicopee City Hall Auditorium 274 Front St.Chicopee MA 01013 More Details July 10,2025,11:00 AM @ Board ...
-
-2. Event List | Chicopee Chamber of Commerce
-   URL: https://business.chicopeechamber.org/events?from=10/24/2024&to=10/24/2027&o=alpha
-   Content: Event List | Chicopee Chamber of Commerce *   Business Resources *   2023 Business Resource Guide & Member Directory 2024 Business After Hours at Goodwork... ##### 2024 Business After Hours at Goodworks Coffee House *   Wednesday Dec 4, 2024 Categories:Chamber Of Commerce Networking Categories:Festivals & Celebrations Arts & Culture Community Chamber Of Commerce Networking Categories:Festivals & Celebrations Arts & Culture Community Chamber Of Commerce Networking Categories:Festivals & Celebrati...
-
-3. Chicopee, MA Events, Calendar & Tickets | Eventbrite
-   URL: https://www.eventbrite.com/d/ma--chicopee/events/
-   Content: Chicopee, MA Events, Calendar & Tickets | Eventbrite  *       *   Find Events *   Event Ticketing *       *   Find Events *   Event Ticketing 4.   Events in Chicopee Image 19: Career Fair: Exclusive Tech Hiring Event-New Tickets Available primary image Image 27: Career Fair: Exclusive Tech Hiring Event-New Tickets Available primary image _Save this event: Project Management Techniques Training in Chicopee, MA_ _Share this event: Project Management Techniques Training in Chicopee, MA_ _Save this ...
-
-4. Community Events in Chicopee, MA - Local Gatherings & Activities
-   URL: https://www.eventbrite.com/b/ma--chicopee/community/
-   Content: Community Events in Chicopee, MA - Local Gatherings & Activities | Eventbrite  *       *   Find Events *   Event Ticketing *   Event Types Event Types *   Online Events *   Contact your event organizer *       *   Find Events *   Event Ticketing *   Event Types *   Online Events *   Contact your event organizer 4.   Events in Chicopee/ Community events *   Image 3: LGBTQIA+ events LGBTQIA+ *   Image 4: State events State *   Image 5: Historic events Historic *   Image 6: Heritage events Heritage...
-
-5. Calendar • Golf Commission Meeting Notice - Chicopee, MA
-   URL: https://www.chicopeema.gov/Calendar.aspx?EID=8298
-   Content: Image 1: Loading Image 4 - [x] Show Past Events Select a Calendar 1.   - [x]  All Calendars   2.   - [x]  Building Department   3.   - [x]  Chicopee Public Library   4.   - [x]  City Clerks   5.   - [x]  City Council   6.   - [x]  City Events Calendar   7.   - [x]  Community Development   2.   - [x]  Engineering   3.   - [x]  Fire Department   4.   - [x]  Health Department   7.   - [x]  License Commission   1.   - [x]  Meetings Calendar   3.   - [x]  Planning Department   4.   - [x]  Police Depa...
-   """
-
-
-    result = asyncio.run(generator._filter_best_events(example_search_output, cleaned_campaign_info))
     print(result)

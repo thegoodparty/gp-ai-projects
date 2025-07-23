@@ -327,7 +327,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         response_schema: BaseModel,
         model: Optional[str] = None,
-        max_tokens: int = 3000,
+        max_tokens: int = 5000,
         **kwargs
     ) -> BaseModel:
         """

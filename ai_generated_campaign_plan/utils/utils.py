@@ -64,7 +64,6 @@ extract the following fields as a JSON object:
             extracted_fields = self.llm_client.create_structured_completion(
                 messages=messages,
                 response_schema=AdditionalCampaignInfo,
-                max_tokens=1000
             )
             
             self.logger.debug(f"Extracted fields: {extracted_fields}")
