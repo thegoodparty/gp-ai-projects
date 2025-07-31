@@ -3,8 +3,10 @@ import re
 import json
 import asyncio
 import uuid
+import os
 from datetime import date
 from typing import Optional, Dict, Any
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -24,7 +26,11 @@ from shared.logger import get_logger
 app = FastAPI(title="Campaign Plan Generator API", version="1.0.0")
 logger = get_logger(__name__)
 
-templates = Jinja2Templates(directory="templates")
+# Get the directory where this script is located
+current_dir = Path(__file__).parent
+templates_dir = current_dir / "templates"
+
+templates = Jinja2Templates(directory=str(templates_dir))
 
 # Store for progress tracking
 progress_store: Dict[str, Dict[str, Any]] = {}

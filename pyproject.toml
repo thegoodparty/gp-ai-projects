@@ -12,9 +12,14 @@ dependencies = [
     "fastapi>=0.116.0",
     "uvicorn>=0.35.0",
     "reportlab>=4.4.2",
+    "google-genai>=1.24.0",
+    "databricks-sql-connector>=4.0.5",
+    "pandas>=2.2.3",
+    "pyarrow>=21.0.0",
+    "tqdm>=4.67.1",
+    "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "python-multipart>=0.0.20",
-    "google-genai>=1.24.0",
 ]
 
 [build-system]

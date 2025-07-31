@@ -7,6 +7,12 @@ from typing import Optional, Dict, Any, List
 import openai
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from google import genai
+import numpy as np
+import asyncio
+import httpx
+from tqdm.asyncio import tqdm as atqdm
+from tqdm import tqdm
 
 from shared.logger import get_logger
 
@@ -21,9 +27,17 @@ class ReflectionResponse(BaseModel):
     improvement_suggestions: List[str]
 
 
+# DEPRECATION NOTICE: This LLMClient will be deprecated in favor of specialized clients.
+# For embedding operations, please use GeminiEmbeddingClient from shared.llm_gemini
+# For Gemini-specific operations, please use GeminiClient from shared.llm_gemini
+
 class LLMClient:
     """
     A client class that abstracts LLM interactions using OpenAI standards with built-in retry logic and provider fallback.
+    
+    DEPRECATED: Use specialized clients from shared.llm_gemini instead:
+    - GeminiEmbeddingClient for embeddings with rate limiting and parallel processing
+    - GeminiClient for general content generation
     """
     
     def __init__(
@@ -632,6 +646,269 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
             })
         
         return results
+    
+    def create_embeddings(
+        self,
+        texts: List[str],
+        model: str = "gemini-embedding-001",
+        batch_size: int = 100,
+        max_retries: int = 5
+    ) -> np.ndarray:
+        """
+        Create embeddings for texts using Gemini embedding model with retry logic.
+        
+        Args:
+            texts: List of texts to embed
+            model: Embedding model to use
+            batch_size: Number of texts to process per batch
+            max_retries: Maximum retry attempts per batch
+            
+        Returns:
+            numpy array of embeddings
+            
+        Raises:
+            RuntimeError: If embedding generation fails after all retries
+        """
+        self.logger.info(f"Creating embeddings for {len(texts)} texts using {model}")
+        
+        # Initialize Gemini client for embeddings
+        gemini_api_key = os.getenv('GEMINI_API_KEY')
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+        
+        genai_client = genai.Client(api_key=gemini_api_key)
+        embeddings = []
+        
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        
+        with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                
+                self.logger.debug(f"Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
+                
+                last_exception = None
+                
+                for attempt in range(max_retries):
+                    try:
+                        batch_embeddings = []
+                        for text in batch:
+                            result = genai_client.models.embed_content(
+                                model=model,
+                                contents=text
+                            )
+                            batch_embeddings.append(result.embeddings[0].values)
+                        
+                        embeddings.extend(batch_embeddings)
+                        self.logger.debug(f"Batch {batch_num} completed successfully")
+                        pbar.update(1)
+                        break
+                        
+                    except Exception as e:
+                        last_exception = e
+                        self.logger.warning(f"Batch {batch_num} attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                        
+                        if attempt < max_retries - 1:
+                            delay = self.base_delay * (2 ** attempt)
+                            self.logger.debug(f"Retrying batch {batch_num} in {delay} seconds...")
+                            time.sleep(delay)
+                        else:
+                            self.logger.error(f"Batch {batch_num} failed after {max_retries} attempts")
+                            pbar.update(1)  # Update progress even on failure
+                            raise RuntimeError(f"Failed to create embeddings for batch {batch_num} after {max_retries} attempts. Last error: {str(last_exception)}")
+        
+        self.logger.info(f"Successfully created {len(embeddings)} embeddings")
+        return np.array(embeddings)
+    
+    async def create_embeddings_parallel(
+        self,
+        texts: List[str],
+        model: str = "gemini-embedding-001",
+        batch_size: int = 100,
+        max_retries: int = 5,
+        max_concurrent_batches: int = 3,  # Reduced default to avoid 429s
+        rate_limit_delay: float = 1.0,  # Base delay between batches
+        adaptive_rate_limiting: bool = True
+    ) -> np.ndarray:
+        """
+        Create embeddings for texts using parallel batch processing with adaptive rate limiting.
+        
+        Args:
+            texts: List of texts to embed
+            model: Embedding model to use
+            batch_size: Number of texts to process per batch
+            max_retries: Maximum retry attempts per batch
+            max_concurrent_batches: Maximum number of concurrent batches
+            rate_limit_delay: Base delay between batches (seconds)
+            adaptive_rate_limiting: Whether to adapt delays based on 429 errors
+            
+        Returns:
+            numpy array of embeddings
+            
+        Raises:
+            RuntimeError: If embedding generation fails after all retries
+        """
+        self.logger.info(f"Creating embeddings for {len(texts)} texts using {model} (parallel)")
+        
+        # Initialize Gemini API key
+        gemini_api_key = os.getenv('GEMINI_API_KEY')
+        if not gemini_api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables")
+        
+        # Split texts into batches
+        batches = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batches.append((i // batch_size, batch))
+        
+        total_batches = len(batches)
+        self.logger.info(f"Processing {total_batches} batches with max {max_concurrent_batches} concurrent")
+        
+        # Adaptive rate limiting state
+        current_delay = rate_limit_delay
+        consecutive_429s = 0
+        
+        # Process batches in parallel with concurrency limit and progress bar
+        semaphore = asyncio.Semaphore(max_concurrent_batches)
+        progress_bar = atqdm(total=total_batches, desc="Processing batches", unit="batch")
+        
+        async def process_batch_with_retry(batch_num: int, batch_texts: List[str]) -> tuple:
+            """Process a single batch with adaptive retry logic"""
+            nonlocal current_delay, consecutive_429s
+            
+            async with semaphore:
+                last_exception = None
+                
+                # Add rate limiting delay before processing
+                if batch_num > 0:  # Don't delay the first batch
+                    await asyncio.sleep(current_delay)
+                
+                for attempt in range(max_retries):
+                    try:
+                        async with httpx.AsyncClient(timeout=60.0) as client:
+                            batch_embeddings = []
+                            
+                            for text in batch_texts:
+                                # Use Gemini REST API directly for async calls
+                                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
+                                headers = {
+                                    "Content-Type": "application/json",
+                                    "x-goog-api-key": gemini_api_key
+                                }
+                                data = {
+                                    "content": {"parts": [{"text": text}]},
+                                    "taskType": "RETRIEVAL_DOCUMENT"
+                                }
+                                
+                                response = await client.post(url, json=data, headers=headers)
+                                response.raise_for_status()
+                                
+                                result = response.json()
+                                embedding = result["embedding"]["values"]
+                                batch_embeddings.append(embedding)
+                            
+                            # Reset consecutive 429s on success
+                            if adaptive_rate_limiting and consecutive_429s > 0:
+                                consecutive_429s = 0
+                                current_delay = max(rate_limit_delay, current_delay * 0.8)  # Gradually reduce delay
+                                self.logger.debug(f"Reduced rate limit delay to {current_delay:.2f}s after success")
+                            
+                            progress_bar.update(1)
+                            self.logger.debug(f"Batch {batch_num + 1} completed successfully ({len(batch_embeddings)} embeddings)")
+                            return (batch_num, batch_embeddings)
+                            
+                    except httpx.HTTPStatusError as e:
+                        last_exception = e
+                        
+                        # Handle 429 rate limit errors specially
+                        if e.response.status_code == 429:
+                            consecutive_429s += 1
+                            
+                            if adaptive_rate_limiting:
+                                # Exponentially increase delay for 429 errors
+                                current_delay = min(current_delay * 2, 30.0)  # Cap at 30 seconds
+                                self.logger.warning(f"429 Rate limit hit (consecutive: {consecutive_429s}). Increasing delay to {current_delay:.2f}s")
+                            
+                            # For 429 errors, wait longer before retry
+                            retry_delay = current_delay * (2 ** attempt)
+                            self.logger.warning(f"Batch {batch_num + 1} attempt {attempt + 1}/{max_retries} rate limited. Retrying in {retry_delay:.1f}s")
+                            
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_delay)
+                                continue
+                        
+                        self.logger.warning(f"Batch {batch_num + 1} attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                        
+                        if attempt < max_retries - 1:
+                            delay = self.base_delay * (2 ** attempt)
+                            await asyncio.sleep(delay)
+                        else:
+                            progress_bar.update(1)  # Update progress even on failure
+                            raise RuntimeError(f"Failed to create embeddings for batch {batch_num + 1} after {max_retries} attempts. Last error: {str(last_exception)}")
+                    
+                    except Exception as e:
+                        last_exception = e
+                        self.logger.warning(f"Batch {batch_num + 1} attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                        
+                        if attempt < max_retries - 1:
+                            delay = self.base_delay * (2 ** attempt)
+                            await asyncio.sleep(delay)
+                        else:
+                            progress_bar.update(1)  # Update progress even on failure
+                            raise RuntimeError(f"Failed to create embeddings for batch {batch_num + 1} after {max_retries} attempts. Last error: {str(last_exception)}")
+        
+        # Execute all batches concurrently
+        tasks = [process_batch_with_retry(batch_num, batch_texts) for batch_num, batch_texts in batches]
+        
+        try:
+            results = await asyncio.gather(*tasks)
+            progress_bar.close()
+            
+            # Sort results by batch number and flatten
+            results.sort(key=lambda x: x[0])
+            all_embeddings = []
+            for _, batch_embeddings in results:
+                all_embeddings.extend(batch_embeddings)
+            
+            self.logger.info(f"Successfully created {len(all_embeddings)} embeddings using parallel processing")
+            return np.array(all_embeddings)
+            
+        except Exception as e:
+            progress_bar.close()
+            self.logger.error(f"Parallel embedding generation failed: {str(e)}")
+            raise RuntimeError(f"Parallel embedding generation failed: {str(e)}")
+    
+    def create_embeddings_sync_or_async(
+        self,
+        texts: List[str],
+        parallel: bool = True,
+        max_concurrent_batches: int = 2,  # Conservative default
+        rate_limit_delay: float = 2.0,    # Conservative default
+        **kwargs
+    ) -> np.ndarray:
+        """
+        Convenience method to create embeddings with optional parallel processing and rate limiting.
+        
+        Args:
+            texts: List of texts to embed
+            parallel: Whether to use parallel processing
+            max_concurrent_batches: Maximum concurrent batches (lower = fewer 429s)
+            rate_limit_delay: Base delay between batches in seconds
+            **kwargs: Additional arguments for embedding methods
+            
+        Returns:
+            numpy array of embeddings
+        """
+        if parallel and len(texts) > 100:  # Only use parallel for larger datasets
+            return asyncio.run(self.create_embeddings_parallel(
+                texts, 
+                max_concurrent_batches=max_concurrent_batches,
+                rate_limit_delay=rate_limit_delay,
+                **kwargs
+            ))
+        else:
+            return self.create_embeddings(texts, **kwargs)
 
 
 if __name__ == "__main__":
