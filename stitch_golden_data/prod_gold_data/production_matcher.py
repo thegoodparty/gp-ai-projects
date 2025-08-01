@@ -403,7 +403,7 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
                     self.llm.generate_structured_content,
                     prompt=prompt,
                     response_schema=response_schema,
-                    model=GeminiModelType.PRO
+                    model=GeminiModelType.FLASH
                 )
                 break  # Success, exit retry loop
                 
