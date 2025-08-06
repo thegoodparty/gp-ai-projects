@@ -32,7 +32,7 @@ class StrategicLandscapeElectoralGoalsGenerator:
         
         win_number = campaign_info.win_number
         total_likely_voters = campaign_info.total_likely_voters
-        voter_contact_goal = int(win_number * 1.5)
+        voter_contact_goal = int(win_number * 3)
         cell_phones = campaign_info.available_cell_phones
         landlines = campaign_info.available_landlines
         
