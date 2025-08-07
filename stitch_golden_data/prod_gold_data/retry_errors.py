@@ -3,8 +3,8 @@
 Retry Error Records Script
 
 This script reads parquet files from the output directory, identifies records with 
-"Processing error" in the llm_reason field, and retries them using the same 
-production matching logic.
+"Processing error" in the llm_reason field or "QUOTA_ERROR" in the l2_district_name 
+field, and retries them using the same production matching logic.
 
 Usage:
     uv run stitch_golden_data/prod_gold_data/retry_errors.py [--file FILENAME] [--all]
@@ -22,18 +22,19 @@ import sys
 import asyncio
 import pandas as pd
 import argparse
-from typing import List, Dict, Optional
+from typing import List, Optional
 from dataclasses import dataclass
 
 # Add parent directory to path to import shared modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from production_matcher import ProductionMatcher, MatchingStats
+from production_matcher import ProductionMatcher
 from shared.logger import get_logger
 
 @dataclass
 class RetryStats:
     total_error_records: int = 0
+    total_quota_errors: int = 0
     successfully_retried: int = 0
     still_failed: int = 0
     quota_exhausted: int = 0
@@ -70,22 +71,39 @@ class ErrorRetryProcessor:
             return sorted(parquet_files)
     
     def identify_error_records(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Identify records that have processing errors"""
-        if 'llm_reason' not in df.columns:
-            self.logger.warning("No 'llm_reason' column found in DataFrame")
+        """Identify records that have processing errors or quota errors"""
+        if 'llm_reason' not in df.columns and 'l2_district_name' not in df.columns:
+            self.logger.warning("No 'llm_reason' or 'l2_district_name' column found in DataFrame")
             return pd.DataFrame()
         
-        # Find records with "Processing error" in llm_reason
-        error_mask = df['llm_reason'].str.contains('Processing error', case=False, na=False)
+        # Find records with "Processing error" in llm_reason OR QUOTA_ERROR in l2_district_name
+        error_mask = pd.Series([False] * len(df))
+        
+        if 'llm_reason' in df.columns:
+            error_mask |= df['llm_reason'].str.contains('Processing error', case=False, na=False)
+        
+        if 'l2_district_name' in df.columns:
+            error_mask |= df['l2_district_name'] == 'QUOTA_ERROR'
+        
         error_records = df[error_mask].copy()
         
-        self.logger.info(f"Found {len(error_records)} error records out of {len(df)} total records")
+        self.logger.info(f"Found {len(error_records)} error/quota records out of {len(df)} total records")
         
         if len(error_records) > 0:
+            # Count different error types
+            quota_errors = (error_records['l2_district_name'] == 'QUOTA_ERROR').sum() if 'l2_district_name' in error_records.columns else 0
+            processing_errors = len(error_records) - quota_errors
+            
+            self.logger.info(f"  - Processing errors: {processing_errors}")
+            self.logger.info(f"  - Quota errors: {quota_errors}")
+            
             # Show sample of error reasons
-            sample_errors = error_records['llm_reason'].head(3).tolist()
-            for i, error in enumerate(sample_errors, 1):
-                self.logger.info(f"Sample error {i}: {error[:100]}...")
+            sample_errors = error_records.head(3)
+            for i, (_, row) in enumerate(sample_errors.iterrows(), 1):
+                if row.get('l2_district_name') == 'QUOTA_ERROR':
+                    self.logger.info(f"Sample error {i}: QUOTA_ERROR - {row.get('llm_reason', 'N/A')[:100]}...")
+                else:
+                    self.logger.info(f"Sample error {i}: {row.get('llm_reason', 'N/A')[:100]}...")
         
         return error_records
     
@@ -138,10 +156,11 @@ class ErrorRetryProcessor:
     def merge_retried_records(self, original_df: pd.DataFrame, error_records: pd.DataFrame, retried_records: pd.DataFrame) -> pd.DataFrame:
         """Merge retried records back into the original DataFrame"""
         if retried_records.empty:
-            return original_df
+            return original_df, []
         
         # Create a copy of the original DataFrame
         updated_df = original_df.copy()
+        fixed_row_indices = []
         
         # Update the rows that were retried
         for idx, retried_row in retried_records.iterrows():
@@ -158,14 +177,16 @@ class ErrorRetryProcessor:
                 )
             
             if match_mask.any():
+                # Track which rows were fixed
+                fixed_row_indices.extend(updated_df[match_mask].index.tolist())
                 # Update the matched rows with retried data
                 for col in retried_row.index:
                     if col in updated_df.columns:
                         updated_df.loc[match_mask, col] = retried_row[col]
         
-        return updated_df
+        return updated_df, fixed_row_indices
     
-    def save_updated_file(self, df: pd.DataFrame, original_filepath: str):
+    def save_updated_file(self, df: pd.DataFrame, original_filepath: str, fixed_row_indices: List[int], error_records: pd.DataFrame):
         """Save the updated DataFrame to the fixed output directory"""
         # Get the original filename
         original_filename = os.path.basename(original_filepath)
@@ -181,16 +202,62 @@ class ErrorRetryProcessor:
         # Save TSV version with metadata
         df.to_csv(fixed_tsv_path, index=False, sep='\t')
         
-        # Append metadata to TSV
-        metadata = [
-            f"\n# RETRY PROCESSING METADATA",
+        # Read original TSV to get original metadata if exists
+        original_tsv_path = original_filepath.replace('.parquet', '.tsv')
+        original_metadata = []
+        if os.path.exists(original_tsv_path):
+            with open(original_tsv_path, 'r') as f:
+                lines = f.readlines()
+                capturing = False
+                for line in lines:
+                    if line.strip().startswith('# PRODUCTION MATCHING METADATA'):
+                        capturing = True
+                    if capturing:
+                        original_metadata.append(line.rstrip())
+        
+        # Calculate retry statistics
+        successfully_fixed = len([idx for idx in fixed_row_indices if df.iloc[idx]['is_matched'] or 'NOT_MATCHED' in str(df.iloc[idx]['llm_reason'])])
+        
+        # Get sample of fixed records for metadata
+        fixed_samples = []
+        for i, idx in enumerate(fixed_row_indices[:5]):  # First 5 fixed records
+            row = df.iloc[idx]
+            district_name = row.get('l2_district_name', 'Unknown')
+            fixed_samples.append(f"#   Row {idx+1}: {row['name']} -> {district_name if row['is_matched'] else 'NOT_MATCHED'}")
+        
+        # Append both original and retry metadata to TSV
+        metadata = []
+        
+        # Add original metadata if found
+        if original_metadata:
+            metadata.extend(["\n# ORIGINAL FILE METADATA:"])
+            metadata.extend(original_metadata)
+        
+        # Add retry processing metadata
+        metadata.extend([
+            f"\n# RETRY PROCESSING METADATA:",
             f"# Original file: {original_filename}",
-            f"# Processing timestamp: {pd.Timestamp.now().isoformat()}",
-            f"# Total error records found: {self.retry_stats.total_error_records}",
-            f"# Successfully retried: {self.retry_stats.successfully_retried}",
-            f"# Still failed: {self.retry_stats.still_failed}",
-            f"# Quota exhausted: {self.retry_stats.quota_exhausted}"
-        ]
+            f"# Retry timestamp: {pd.Timestamp.now().isoformat()}",
+            f"# Total records in file: {len(df):,}",
+            f"# Error records found: {len(error_records)}",
+            f"# Records successfully retried: {self.retry_stats.successfully_retried}",
+            f"# Records still failed: {self.retry_stats.still_failed}",
+            f"# Quota exhausted during retry: {self.retry_stats.quota_exhausted}",
+            f"# Row indices fixed (1-based): {', '.join(str(idx+1) for idx in sorted(fixed_row_indices[:20]))}{'...' if len(fixed_row_indices) > 20 else ''}",
+            f"# Number of rows fixed: {len(fixed_row_indices)}",
+            f"# Fixed records now matched: {successfully_fixed}",
+            f"# Sample of fixed records:"
+        ])
+        metadata.extend(fixed_samples)
+        
+        # Add cost information if available
+        if hasattr(self.matcher, 'stats') and self.matcher.stats.total_cost > 0:
+            metadata.extend([
+                f"# Retry processing costs:",
+                f"#   Total Cost: ${self.matcher.stats.total_cost:.6f}",
+                f"#   Embedding Cost: ${self.matcher.stats.embedding_cost:.6f}",
+                f"#   LLM Cost: ${self.matcher.stats.llm_cost:.6f}"
+            ])
         
         with open(fixed_tsv_path, 'a') as f:
             f.write('\n'.join(metadata))
@@ -218,6 +285,11 @@ class ErrorRetryProcessor:
             error_records = self.identify_error_records(df)
             self.retry_stats.total_error_records += len(error_records)
             
+            # Count quota errors
+            if 'l2_district_name' in error_records.columns:
+                quota_error_count = (error_records['l2_district_name'] == 'QUOTA_ERROR').sum()
+                self.retry_stats.total_quota_errors += quota_error_count
+            
             if error_records.empty:
                 self.logger.info("✅ No error records found - nothing to retry")
                 return
@@ -226,10 +298,10 @@ class ErrorRetryProcessor:
             retried_records = await self.retry_error_records(error_records)
             
             # Merge retried records back into original DataFrame
-            updated_df = self.merge_retried_records(df, error_records, retried_records)
+            updated_df, fixed_row_indices = self.merge_retried_records(df, error_records, retried_records)
             
             # Save fixed file to output/fixed directory
-            output_paths = self.save_updated_file(updated_df, filepath)
+            output_paths = self.save_updated_file(updated_df, filepath, fixed_row_indices, error_records)
             
             # Report on this file
             success_count = len(error_records) - self.retry_stats.still_failed
@@ -258,9 +330,11 @@ class ErrorRetryProcessor:
         self.logger.info(f"ERROR RETRY FINAL SUMMARY")
         self.logger.info(f"{'='*80}")
         self.logger.info(f"Total Error Records Found: {self.retry_stats.total_error_records:,}")
+        self.logger.info(f"  - Processing Errors: {self.retry_stats.total_error_records - self.retry_stats.total_quota_errors:,}")
+        self.logger.info(f"  - Quota Errors: {self.retry_stats.total_quota_errors:,}")
         self.logger.info(f"Successfully Retried: {self.retry_stats.successfully_retried:,}")
         self.logger.info(f"Still Failed: {self.retry_stats.still_failed:,}")
-        self.logger.info(f"Quota Exhausted: {self.retry_stats.quota_exhausted:,}")
+        self.logger.info(f"Quota Exhausted During Retry: {self.retry_stats.quota_exhausted:,}")
         
         if self.retry_stats.total_error_records > 0:
             success_rate = (self.retry_stats.successfully_retried / self.retry_stats.total_error_records) * 100

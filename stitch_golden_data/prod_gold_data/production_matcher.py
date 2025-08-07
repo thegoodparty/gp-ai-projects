@@ -239,6 +239,10 @@ class ProductionMatcher:
 
     async def get_embeddings_for_queries(self, queries: List[str]) -> List[np.ndarray]:
         """Get embeddings for multiple queries using the consistent create_embeddings method"""
+        # Check kill switch before making embedding call
+        if QUOTA_KILL_SWITCH.is_killed():
+            raise RuntimeError(f"Processing killed due to quota exhaustion: {QUOTA_KILL_SWITCH.get_reason()}")
+            
         if not queries:
             return []
         
@@ -339,6 +343,10 @@ class ProductionMatcher:
 
     async def llm_select_best_match(self, br_name: str, districts: List[EmbeddingDistrict]) -> Optional[LLMSelection]:
         """LLM selection with enhanced context"""
+        # Check kill switch before making LLM call
+        if QUOTA_KILL_SWITCH.is_killed():
+            raise RuntimeError(f"Processing killed due to quota exhaustion: {QUOTA_KILL_SWITCH.get_reason()}")
+            
         if not districts:
             return None
         
@@ -403,7 +411,8 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
                     self.llm.generate_structured_content,
                     prompt=prompt,
                     response_schema=response_schema,
-                    model=GeminiModelType.FLASH
+                    model=GeminiModelType.FLASH,
+                    temperature=0.0,
                 )
                 break  # Success, exit retry loop
                 
@@ -490,6 +499,10 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
 
     async def match_single_record(self, row: pd.Series) -> pd.Series:
         """Process a single BR record and return enhanced row with matching results"""
+        # Check kill switch before processing
+        if QUOTA_KILL_SWITCH.is_killed():
+            raise RuntimeError(f"Processing killed due to quota exhaustion: {QUOTA_KILL_SWITCH.get_reason()}")
+        
         br_name = row['name']
         state = row['state']
         
@@ -609,16 +622,20 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
             group_tasks = tasks[i:i + group_size]
             try:
                 group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
-                results.extend(group_results)
                 
-                # Check for quota exhaustion in this group immediately
+                # Check for quota exhaustion in this group immediately before extending results
                 for result in group_results:
                     if isinstance(result, Exception):
                         error_str = str(result).lower()
-                        if ("daily quota exhausted" in error_str or "resource_exhausted" in error_str):
-                            self.logger.error(f"🚨 QUOTA EXHAUSTED in batch {batch_num} group - breaking out of batch processing")
-                            # Add this result and break immediately
-                            break
+                        if ("daily quota exhausted" in error_str or "resource_exhausted" in error_str or 
+                            "processing killed due to quota exhaustion" in error_str):
+                            self.logger.error(f"🚨 QUOTA EXHAUSTED in batch {batch_num} group - stopping immediately")
+                            # Trigger kill switch if not already triggered
+                            if not QUOTA_KILL_SWITCH.is_killed():
+                                QUOTA_KILL_SWITCH.trigger(f"Batch {batch_num} quota exhausted: {str(result)}")
+                            raise result
+                
+                results.extend(group_results)
                 
                 # Double-check kill switch after processing group
                 if QUOTA_KILL_SWITCH.is_killed():
@@ -628,8 +645,12 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
             except Exception as e:
                 # If any task raises an exception that wasn't caught by return_exceptions=True
                 error_str = str(e).lower()
-                if ("daily quota exhausted" in error_str or "resource_exhausted" in error_str):
+                if ("daily quota exhausted" in error_str or "resource_exhausted" in error_str or
+                    "processing killed due to quota exhaustion" in error_str):
                     self.logger.error(f"🚨 QUOTA EXHAUSTED during group gather - stopping processing")
+                    # Trigger kill switch if not already triggered
+                    if not QUOTA_KILL_SWITCH.is_killed():
+                        QUOTA_KILL_SWITCH.trigger(f"Group processing quota exhausted: {str(e)}")
                     raise
                 else:
                     raise
@@ -641,19 +662,10 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
             records_per_second = batch_size / max(0.1, duration)
             self.logger.debug(f"⚡ Batch {batch_num} completed: {batch_size} records in {duration:.1f}s ({records_per_second:.1f} rec/sec)")
         
-        # Check kill switch first
+        # Check kill switch one final time before processing results
         if QUOTA_KILL_SWITCH.is_killed():
             self.logger.error(f"🚨 KILL SWITCH TRIGGERED in batch {batch_num} - stopping immediately: {QUOTA_KILL_SWITCH.get_reason()}")
             raise RuntimeError(f"Processing killed due to quota exhaustion: {QUOTA_KILL_SWITCH.get_reason()}")
-        
-        # Check for quota exhaustion in any result FIRST - before processing anything
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                error_str = str(result).lower()
-                if ("daily quota exhausted" in error_str or "resource_exhausted" in error_str):
-                    self.logger.error(f"🚨 QUOTA EXHAUSTED in batch {batch_num} - triggering kill switch")
-                    QUOTA_KILL_SWITCH.trigger(f"Batch {batch_num} quota exhausted: {str(result)}")
-                    raise result
         
         # Process results and handle non-quota exceptions
         processed_rows = []
@@ -708,6 +720,9 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
 
     async def run_production_matching(self, states: Optional[List[str]] = None, limit: Optional[int] = None, batch_size: int = 100, output_filename: str = "production_matching_results.tsv") -> str:
         """Run production matching on BR database"""
+        # Reset kill switch at the start of a new run
+        QUOTA_KILL_SWITCH.reset()
+        
         self.logger.info(f"\n{'='*80}")
         self.logger.info(f"PRODUCTION BR-L2 MATCHING")
         self.logger.info(f"{'='*80}")
@@ -790,6 +805,11 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
                 'stats': MatchingStats()
             }
         
+        # Log prominent state start
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"🚀 STARTING STATE: {state}")
+        self.logger.info(f"{'='*60}")
+        
         # Reset stats for this state
         state_stats = MatchingStats()
         
@@ -840,7 +860,11 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
         state_output_paths = self.save_enhanced_results_with_stats(state_results_df, state_filename, state_stats)
         
         success_rate = (state_stats.successful_matches / max(1, state_stats.total_processed) * 100)
-        self.logger.info(f"✅ {state} Complete: {state_stats.successful_matches:,}/{state_stats.total_processed:,} matched ({success_rate:.1f}%) - ${state_stats.total_cost:.6f}")
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"✅ {state} COMPLETED")
+        self.logger.info(f"   Matched: {state_stats.successful_matches:,}/{state_stats.total_processed:,} ({success_rate:.1f}%)")
+        self.logger.info(f"   Cost: ${state_stats.total_cost:.6f}")
+        self.logger.info(f"{'='*60}\n")
         
         return {
             'state': state,
@@ -940,6 +964,9 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
 
     async def run_all_states_individual(self, batch_size: int = 100, output_prefix: str = "state_matching", max_concurrent_states: int = 3) -> Dict[str, str]:
         """Run production matching for all available states with controlled concurrent processing"""
+        # Reset kill switch at the start of a new run
+        QUOTA_KILL_SWITCH.reset()
+        
         self.logger.info(f"\n{'='*80}")
         self.logger.info(f"PRODUCTION BR-L2 MATCHING - ALL STATES CONCURRENT")
         self.logger.info(f"{'='*80}")
@@ -976,8 +1003,11 @@ IMPORTANT: Return 0 if no candidate represents a reasonable match. Base decision
             with tqdm(total=len(available_states), desc="States Progress", unit="state", 
                      position=0, ncols=100, colour="blue", leave=True) as states_pbar:
                 
-                for state in available_states:
+                for state_idx, state in enumerate(available_states, 1):
                     try:
+                        # Log state number prominently
+                        self.logger.info(f"\n🏳️ STATE {state_idx}/{len(available_states)}: {state}")
+                        
                         result = await process_state_with_semaphore(state)
                         
                         state = result['state']
