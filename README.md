@@ -14,15 +14,15 @@ Generates comprehensive political campaign plans using LLM providers (Gemini →
 - Parallel processing with cost tracking
 - PDF generation and structured data models
 
-### 2. L2-BR Political District Matcher (`stitch_golden_data/L2_BR_MATCH_LA_POC.py`)
-Louisiana proof-of-concept for matching Ballot Ready political positions to L2 voter districts using a two-step approach: embedding similarity search + LLM selection.
+### 2. Data Stitching & Analysis (`stitch_golden_data/`)
+Data analysis and matching tools for political district matching and voter data processing.
 
 **Key Features:**
-- Embedding-first matching (top 10 districts via semantic similarity)
-- LLM-powered final district selection with confidence scoring
-- Vector storage with automatic embedding generation
+- Production-grade matching algorithms in `prod_gold_data/`
+- Vector embeddings and similarity search
+- Comprehensive data exploration and analysis
 - Batch processing with parallel execution
-- Comprehensive cost tracking and TSV output
+- Output generation in multiple formats
 
 ## Setup
 
@@ -76,14 +76,19 @@ uv run ai_generated_campaign_plan/sections/five_know_your_community.py
 uv run ai_generated_campaign_plan/orchestrator.py
 ```
 
-### 🔗 L2-BR District Matching (Louisiana POC)
+### 🔗 Data Analysis & Matching
 
-**Run the complete matching workflow:**
+**Run production matching:**
 ```bash
-uv run stitch_golden_data/L2_BR_MATCH_LA_POC.py
+uv run stitch_golden_data/prod_gold_data/production_matcher.py
 ```
 
-**Output:** Results saved to `stitch_golden_data/output/` as TSV files with cost analysis.
+**Explore data:**
+```bash
+uv run stitch_golden_data/merge_all_states.py
+```
+
+**Output:** Results saved to `stitch_golden_data/output/` and `stitch_golden_data/prod_gold_data/output/`
 
 ## Debug Mode & Logging
 
@@ -92,8 +97,8 @@ Set the `ENVIRONMENT` variable to see detailed debug logs:
 
 ```bash
 # Enable debug logging for any script
-ENVIRONMENT=development uv run stitch_golden_data/L2_BR_MATCH_LA_POC.py
-ENVIRONMENT=development uv run ai_generated_campaign_plan/orchestrator.py
+ ENVIRONMENT=development   uv run stitch_golden_data/prod_gold_data/production_matcher.py  all_states --batch-size 150 --max-concurrent-states 1   
+ ENVIRONMENT=development uv run ai_generated_campaign_plan/orchestrator.py
 ```
 
 ### Log Levels
@@ -110,7 +115,8 @@ gp-ai-projects/
 │   ├── schema/                    # Data models
 │   └── utils/                     # Campaign utilities
 ├── stitch_golden_data/            # Data analysis & matching
-│   ├── L2_BR_MATCH_LA_POC.py     # L2-BR matching POC (main)
+│   ├── prod_gold_data/            # Production matching algorithms
+│   ├── merge_all_states.py        # State data merging
 │   ├── offline_data/              # Cached data files
 │   ├── vector_store/              # Embedding storage
 │   └── output/                    # Generated results
