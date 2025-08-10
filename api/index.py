@@ -18,3 +18,6 @@ from api_wrapper import app as fastapi_app  # noqa: E402
 
 # Vercel expects the ASGI app to be available as 'app'
 app = fastapi_app
+
+# Also expose as handler for compatibility
+handler = app

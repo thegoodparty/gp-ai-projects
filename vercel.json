@@ -1,13 +1,13 @@
 {
   "functions": {
-    "api/*.py": {
+    "api/index.py": {
       "maxDuration": 300
     }
   },
-  "rewrites": [
+  "routes": [
     {
-      "source": "/(.*)",
-      "destination": "/api/index"
+      "src": "/(.*)",
+      "dest": "/api/index"
     }
   ]
 }
