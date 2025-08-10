@@ -75,13 +75,19 @@ curl -X POST "https://your-api-url/generate-campaign-plan" \
 ### Setup
 
 ```bash
-# Install dependencies
-pip install -r requirements_api.txt
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-# Set environment variables
-export GEMINI_API_KEY="your_gemini_api_key"
-export TOGETHER_API_KEY="your_together_api_key"
-export TAVILY_API_KEY="your_tavily_api_key"
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up environment variables
+cp .env.example .env
+# Edit .env file and add your API keys:
+# TAVILY_API_KEY=your_tavily_api_key
+# GEMINI_API_KEY=your_gemini_api_key
+# TOGETHER_API_KEY=your_together_api_key (optional)
 
 # Run development server
 python api_wrapper.py
