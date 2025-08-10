@@ -29,7 +29,7 @@ templates = Jinja2Templates(directory="templates")
 # Store for progress tracking
 progress_store: Dict[str, Dict[str, Any]] = {}
 
-def parse_timeline_tasks(timeline_content: str) -> List[Dict[str, Any]]:
+def parse_timeline_tasks(timeline_content: str, election_date: date) -> List[Dict[str, Any]]:
     """Parse timeline tasks from section 3 content into structured format."""
     tasks = []
     lines = timeline_content.split('\n')
@@ -47,8 +47,8 @@ def parse_timeline_tasks(timeline_content: str) -> List[Dict[str, Any]]:
                 # Try to parse the date
                 try:
                     # Handle formats like "July 15" or "August 1"
-                    current_year = date.today().year
-                    date_with_year = f"{date_str}, {current_year}"
+                    election_year = election_date.year
+                    date_with_year = f"{date_str}, {election_year}"
                     parsed_date = datetime.strptime(date_with_year, "%B %d, %Y").date()
                 except:
                     # If parsing fails, use the original string
@@ -64,7 +64,7 @@ def parse_timeline_tasks(timeline_content: str) -> List[Dict[str, Any]]:
     
     return tasks
 
-def parse_voter_contact_tasks(contact_content: str) -> List[Dict[str, Any]]:
+def parse_voter_contact_tasks(contact_content: str, election_date: date) -> List[Dict[str, Any]]:
     """Parse voter contact tasks from section 6 content into structured format."""
     tasks = []
     lines = contact_content.split('\n')
@@ -93,8 +93,8 @@ def parse_voter_contact_tasks(contact_content: str) -> List[Dict[str, Any]]:
                 
                 # Try to parse the date
                 try:
-                    current_year = date.today().year
-                    date_with_year = f"{date_str}, {current_year}"
+                    election_year = election_date.year
+                    date_with_year = f"{date_str}, {election_year}"
                     parsed_date = datetime.strptime(date_with_year, "%B %d, %Y").date()
                 except:
                     parsed_date = None
@@ -145,10 +145,10 @@ def convert_campaign_plan_to_json(campaign_plan_text: str, campaign_info: Campai
     voter_contact_tasks = []
     
     if 3 in sections:
-        timeline_tasks = parse_timeline_tasks(sections[3])
+        timeline_tasks = parse_timeline_tasks(sections[3], campaign_info.election_date)
     
     if 6 in sections:
-        voter_contact_tasks = parse_voter_contact_tasks(sections[6])
+        voter_contact_tasks = parse_voter_contact_tasks(sections[6], campaign_info.election_date)
     
     # Build JSON response
     json_response = {
@@ -717,7 +717,7 @@ async def generate_campaign_plan_form(
             additional_race_context=additional_race_context
         )
         
-        return await generate_campaign_plan_json(campaign_info)
+        return await generate_campaign_plan_json_only(campaign_info)
         
     except ValidationError as e:
         logger.error(f"Validation error: {str(e)}")
