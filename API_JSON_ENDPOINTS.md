@@ -51,7 +51,62 @@ curl -X POST "http://localhost:8000/generate-campaign-plan-json" \
   -d '{...campaign data...}'
 ```
 
-### 3. Download with Format Support
+### 3. Async Generation with Webhook
+
+**Endpoint:** `POST /generate-campaign-plan-async`  
+**Content-Type:** `application/json`  
+**Body:** CampaignInfo JSON object + optional webhook_url
+
+Start campaign plan generation in background with optional webhook callback.
+
+```bash
+curl -X POST "http://localhost:8000/generate-campaign-plan-async" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "candidate_name": "Jane Smith",
+    "election_date": "2025-11-05",
+    "office_and_jurisdiction": "City Council, District 3, Boston, MA",
+    "incumbent_status": "NOT_APPLICABLE",
+    "race_type": "NONPARTISAN",
+    "seats_available": 1,
+    "number_of_opponents": 3,
+    "win_number": 8000,
+    "total_likely_voters": 50000,
+    "available_cell_phones": 5000,
+    "available_landlines": 500,
+    "webhook_url": "https://your-api.com/campaign-plan-webhook"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "session_id": "abc123",
+  "status": "processing",
+  "progress_url": "/progress/abc123",
+  "download_url": "/download/abc123",
+  "download_json_url": "/download/abc123?format=json",
+  "webhook_url": "https://your-api.com/campaign-plan-webhook"
+}
+```
+
+**Webhook Payload:**
+When generation completes (or fails), your webhook URL will receive:
+
+```json
+{
+  "session_id": "abc123",
+  "status": "completed", // or "error"
+  "timestamp": "2025-01-10T15:30:00",
+  "data": {
+    // Full campaign plan JSON response (on success)
+    // or {"error": "error message"} (on failure)
+  }
+}
+```
+
+### 4. Download with Format Support
 
 **Endpoint:** `GET /download/{session_id}`  
 **Query Parameter:** `format` (optional, default: "pdf")
@@ -75,6 +130,11 @@ curl "http://localhost:8000/download/{session_id}"
 curl "http://localhost:8000/download-pdf/{session_id}"
 curl "http://localhost:8000/download-json/{session_id}"
 ```
+
+**Download Options:**
+
+- **PDF**: `GET /download/{session_id}` or `GET /download/{session_id}?format=pdf`
+- **JSON**: `GET /download/{session_id}?format=json` or `GET /download-json/{session_id}`
 
 ## JSON Response Format
 
@@ -203,6 +263,57 @@ const generateWithProgress = async (campaignData) => {
 
   return pollProgress();
 };
+```
+
+### Server-to-Server Usage (Recommended)
+
+For server-to-server calls where timeout is a concern, use the async endpoint:
+
+```javascript
+// Your API endpoint that generates campaign plans
+app.post("/api/generate-campaign", async (req, res) => {
+  try {
+    // Start async generation with webhook
+    const response = await fetch(
+      "http://campaign-api:8000/generate-campaign-plan-async",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...req.body,
+          webhook_url: "https://your-api.com/webhooks/campaign-complete",
+        }),
+      }
+    );
+
+    const { session_id } = await response.json();
+
+    // Return immediately - don't wait for completion
+    res.json({
+      session_id,
+      status: "processing",
+      message:
+        "Campaign plan generation started. You will receive a webhook when complete.",
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook endpoint to receive completion notification
+app.post("/webhooks/campaign-complete", (req, res) => {
+  const { session_id, status, data } = req.body;
+
+  if (status === "completed") {
+    // Store the campaign plan or notify user
+    console.log(`Campaign plan ${session_id} completed!`);
+    // data contains the full campaign plan JSON
+  } else if (status === "error") {
+    console.error(`Campaign plan ${session_id} failed:`, data.error);
+  }
+
+  res.status(200).send("OK");
+});
 ```
 
 ## Error Handling
