@@ -2,7 +2,7 @@
 Vercel serverless function handler for the Campaign Plan Generator API.
 
 This file wraps the existing FastAPI application to work with Vercel's serverless 
-infrastructure. It sets up the Python path and imports the main FastAPI app.
+infrastructure. It sets up the Python path and imports the main FastAPI app
 
 """
 
