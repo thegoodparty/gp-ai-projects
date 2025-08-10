@@ -736,7 +736,7 @@ async def generate_campaign_plan_form(
             additional_race_context=additional_race_context
         )
 
-        return await generate_campaign_plan_json(campaign_info)
+        return await generate_campaign_plan_json_only(campaign_info)
 
     except ValidationError as e:
         logger.error(f"Validation error: {e!s}")
