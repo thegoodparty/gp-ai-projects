@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Dict, List, Union
 
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Query, Request
@@ -31,9 +31,9 @@ logger = get_logger(__name__)
 templates = Jinja2Templates(directory="templates")
 
 # Store for progress tracking
-progress_store: dict[str, dict[str, Any]] = {}
+progress_store: Dict[str, Dict[str, Any]] = {}
 
-def parse_timeline_tasks(timeline_content: str) -> list[dict[str, Any]]:
+def parse_timeline_tasks(timeline_content: str) -> List[Dict[str, Any]]:
     """Parse timeline tasks from section 3 content into structured format."""
     tasks = []
     lines = timeline_content.split('\n')
@@ -68,7 +68,7 @@ def parse_timeline_tasks(timeline_content: str) -> list[dict[str, Any]]:
 
     return tasks
 
-def parse_voter_contact_tasks(contact_content: str) -> list[dict[str, Any]]:
+def parse_voter_contact_tasks(contact_content: str) -> List[Dict[str, Any]]:
     """Parse voter contact tasks from section 6 content into structured format."""
     tasks = []
     lines = contact_content.split('\n')
@@ -113,7 +113,7 @@ def parse_voter_contact_tasks(contact_content: str) -> list[dict[str, Any]]:
 
     return tasks
 
-def convert_campaign_plan_to_json(campaign_plan_text: str, campaign_info: CampaignInfo) -> dict[str, Any]:
+def convert_campaign_plan_to_json(campaign_plan_text: str, campaign_info: CampaignInfo) -> Dict[str, Any]:
     """Convert campaign plan text to structured JSON format."""
     # Split the plan into sections
     sections = {}
@@ -220,11 +220,11 @@ async def form_page(request: Request) -> HTMLResponse:
     """Serve the HTML form for non-technical users."""
     return templates.TemplateResponse("campaign_form.html", {"request": request})
 
-@app.post("/generate-campaign-plan")
+@app.post("/generate-campaign-plan", response_model=None)
 async def generate_campaign_plan(
     campaign_info: CampaignInfo, 
-    format: str = Query("pdf", regex="^(pdf|json)$")
-) -> StreamingResponse | JSONResponse:
+    format: str = Query("pdf", pattern="^(pdf|json)$")
+) -> Union[StreamingResponse, JSONResponse]:
     """Generate campaign plan from JSON input and return as PDF or JSON."""
     try:
         logger.info(f"Generating campaign plan for {campaign_info.candidate_name} in {format} format")
@@ -612,7 +612,7 @@ async def progress_stream(session_id: str):
     )
 
 @app.get("/download/{session_id}")
-async def download_pdf(session_id: str, format: str = Query("pdf", regex="^(pdf|json)$")):
+async def download_pdf(session_id: str, format: str = Query("pdf", pattern="^(pdf|json)$")):
     """Download the generated PDF or JSON."""
     logger.info(f"Download requested for session: {session_id}")
     logger.info(f"Available sessions: {list(progress_store.keys())}")
