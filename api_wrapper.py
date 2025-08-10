@@ -3,9 +3,9 @@ import re
 import json
 import asyncio
 import uuid
-from datetime import date
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Request, Form
+from datetime import date, datetime
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, HTTPException, Request, Form, Query
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -28,6 +28,160 @@ templates = Jinja2Templates(directory="templates")
 
 # Store for progress tracking
 progress_store: Dict[str, Dict[str, Any]] = {}
+
+def parse_timeline_tasks(timeline_content: str) -> List[Dict[str, Any]]:
+    """Parse timeline tasks from section 3 content into structured format."""
+    tasks = []
+    lines = timeline_content.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        # Look for lines matching: - Month DD | Event | Purpose
+        if line.startswith('- ') and ' | ' in line:
+            parts = line[2:].split(' | ')  # Remove '- ' prefix
+            if len(parts) >= 3:
+                date_str = parts[0].strip()
+                event = parts[1].strip()
+                purpose = parts[2].strip()
+                
+                # Try to parse the date
+                try:
+                    # Handle formats like "July 15" or "August 1"
+                    current_year = date.today().year
+                    date_with_year = f"{date_str}, {current_year}"
+                    parsed_date = datetime.strptime(date_with_year, "%B %d, %Y").date()
+                except:
+                    # If parsing fails, use the original string
+                    parsed_date = None
+                
+                tasks.append({
+                    "date": date_str,
+                    "parsed_date": parsed_date.isoformat() if parsed_date else None,
+                    "title": event,
+                    "description": purpose,
+                    "type": "timeline"
+                })
+    
+    return tasks
+
+def parse_voter_contact_tasks(contact_content: str) -> List[Dict[str, Any]]:
+    """Parse voter contact tasks from section 6 content into structured format."""
+    tasks = []
+    lines = contact_content.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        # Look for lines matching: - [MONTH DD] – Contact Type: Message
+        if line.startswith('- [') and '] –' in line:
+            # Extract date from brackets
+            date_start = line.find('[') + 1
+            date_end = line.find(']')
+            if date_end > date_start:
+                date_str = line[date_start:date_end].strip()
+                
+                # Extract the rest after ] –
+                rest = line[date_end + 2:].strip()  # Skip '] –'
+                
+                # Split on colon to get contact type and message
+                if ':' in rest:
+                    contact_parts = rest.split(':', 1)
+                    contact_type = contact_parts[0].strip()
+                    message = contact_parts[1].strip() if len(contact_parts) > 1 else ""
+                else:
+                    contact_type = rest
+                    message = ""
+                
+                # Try to parse the date
+                try:
+                    current_year = date.today().year
+                    date_with_year = f"{date_str}, {current_year}"
+                    parsed_date = datetime.strptime(date_with_year, "%B %d, %Y").date()
+                except:
+                    parsed_date = None
+                
+                tasks.append({
+                    "date": date_str,
+                    "parsed_date": parsed_date.isoformat() if parsed_date else None,
+                    "title": contact_type,
+                    "description": message,
+                    "type": "voter_contact"
+                })
+    
+    return tasks
+
+def convert_campaign_plan_to_json(campaign_plan_text: str, campaign_info: CampaignInfo) -> Dict[str, Any]:
+    """Convert campaign plan text to structured JSON format."""
+    # Split the plan into sections
+    sections = {}
+    current_section = None
+    current_content = []
+    
+    lines = campaign_plan_text.split('\n')
+    for line in lines:
+        # Check if this is a section header (## N. SECTION NAME)
+        if line.strip().startswith('## ') and '. ' in line:
+            # Save previous section if exists
+            if current_section is not None:
+                sections[current_section] = '\n'.join(current_content)
+            
+            # Start new section
+            section_match = re.match(r'## (\d+)\. (.+)', line.strip())
+            if section_match:
+                section_num = int(section_match.group(1))
+                section_name = section_match.group(2)
+                current_section = section_num
+                current_content = [line]
+            else:
+                current_content.append(line)
+        else:
+            current_content.append(line)
+    
+    # Save last section
+    if current_section is not None:
+        sections[current_section] = '\n'.join(current_content)
+    
+    # Parse tasks from sections 3 and 6
+    timeline_tasks = []
+    voter_contact_tasks = []
+    
+    if 3 in sections:
+        timeline_tasks = parse_timeline_tasks(sections[3])
+    
+    if 6 in sections:
+        voter_contact_tasks = parse_voter_contact_tasks(sections[6])
+    
+    # Build JSON response
+    json_response = {
+        "campaign_info": {
+            "candidate_name": campaign_info.candidate_name,
+            "office_and_jurisdiction": campaign_info.office_and_jurisdiction,
+            "election_date": campaign_info.election_date.isoformat(),
+            "primary_date": campaign_info.primary_date.isoformat() if campaign_info.primary_date else None,
+            "generated_date": date.today().isoformat()
+        },
+        "sections": {},
+        "tasks": {
+            "timeline": timeline_tasks,
+            "voter_contact": voter_contact_tasks,
+            "all_tasks": timeline_tasks + voter_contact_tasks
+        }
+    }
+    
+    # Add all sections with their content in markdown format
+    section_names = {
+        1: "overview",
+        2: "strategic_landscape_electoral_goals", 
+        3: "campaign_timeline",
+        4: "recommended_total_budget",
+        5: "know_your_community",
+        6: "voter_contact_plan"
+    }
+    
+    for section_num, content in sections.items():
+        section_key = section_names.get(section_num, f"section_{section_num}")
+        json_response["sections"][section_key] = content
+    
+    return json_response
 
 class ProgressTracker:
     def __init__(self, session_id: str):
@@ -63,32 +217,67 @@ async def form_page(request: Request):
     return templates.TemplateResponse("campaign_form.html", {"request": request})
 
 @app.post("/generate-campaign-plan")
-async def generate_campaign_plan_json(campaign_info: CampaignInfo):
-    """Generate campaign plan from JSON input and return as downloadable PDF."""
+async def generate_campaign_plan(campaign_info: CampaignInfo, format: str = Query("pdf", regex="^(pdf|json)$")):
+    """Generate campaign plan from JSON input and return as PDF or JSON."""
     try:
-        logger.info(f"Generating campaign plan for {campaign_info.candidate_name}")
+        logger.info(f"Generating campaign plan for {campaign_info.candidate_name} in {format} format")
         
         # Generate campaign plan using async method
         orchestrator = CampaignPlanOrchestrator()
         campaign_plan_text = await orchestrator.generate_complete_campaign_plan(campaign_info)
         
-        # Convert to PDF
-        pdf_buffer = create_pdf_from_text(campaign_plan_text, campaign_info)
+        if format == "json":
+            # Convert to structured JSON
+            json_data = convert_campaign_plan_to_json(campaign_plan_text, campaign_info)
+            return JSONResponse(content=json_data)
         
-        # Create filename
-        safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
-        filename = f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf"
-        
-        # Return as downloadable PDF
-        return StreamingResponse(
-            io.BytesIO(pdf_buffer.getvalue()),
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
+        else:  # format == "pdf"
+            # Convert to PDF
+            pdf_buffer = create_pdf_from_text(campaign_plan_text, campaign_info)
+            
+            # Create filename
+            safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            filename = f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf"
+            
+            # Return as downloadable PDF
+            return StreamingResponse(
+                io.BytesIO(pdf_buffer.getvalue()),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
         
     except Exception as e:
         logger.error(f"Error generating campaign plan: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating campaign plan: {str(e)}")
+
+@app.post("/generate-campaign-plan-json")
+async def generate_campaign_plan_json_only(campaign_info: CampaignInfo):
+    """Generate campaign plan from JSON input and return as JSON only."""
+    try:
+        logger.info(f"Generating JSON campaign plan for {campaign_info.candidate_name}")
+        
+        # Generate campaign plan using async method
+        orchestrator = CampaignPlanOrchestrator()
+        campaign_plan_text = await orchestrator.generate_complete_campaign_plan(campaign_info)
+        
+        # Convert to structured JSON
+        json_data = convert_campaign_plan_to_json(campaign_plan_text, campaign_info)
+        return JSONResponse(content=json_data)
+        
+    except Exception as e:
+        logger.error(f"Error generating JSON campaign plan: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating campaign plan: {str(e)}")
+
+# Add convenient aliases for download endpoints
+@app.get("/download-pdf/{session_id}")
+async def download_pdf_alias(session_id: str):
+    """Download the generated PDF (convenience alias)."""
+    return await download_pdf(session_id, format="pdf")
+
+@app.get("/download-json/{session_id}")
+async def download_json_alias(session_id: str):
+    """Download the generated JSON (convenience alias)."""
+    return await download_pdf(session_id, format="json")
 
 @app.post("/start-campaign-plan-generation")
 async def start_campaign_plan_generation(
@@ -317,9 +506,12 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             progress_store[progress_tracker.session_id] = {}
         
         try:
-            # Store the PDF data
+            # Store the PDF data and JSON data
             pdf_data = pdf_buffer.getvalue()
+            json_data = convert_campaign_plan_to_json(final_plan, campaign_info)
+            
             progress_store[progress_tracker.session_id]["pdf_data"] = pdf_data
+            progress_store[progress_tracker.session_id]["json_data"] = json_data
             progress_store[progress_tracker.session_id]["filename"] = filename
             
             # Debug logging
@@ -401,8 +593,8 @@ async def progress_stream(session_id: str):
     )
 
 @app.get("/download/{session_id}")
-async def download_pdf(session_id: str):
-    """Download the generated PDF."""
+async def download_pdf(session_id: str, format: str = Query("pdf", regex="^(pdf|json)$")):
+    """Download the generated PDF or JSON."""
     logger.info(f"Download requested for session: {session_id}")
     logger.info(f"Available sessions: {list(progress_store.keys())}")
     
@@ -426,33 +618,57 @@ async def download_pdf(session_id: str):
         else:
             raise HTTPException(status_code=400, detail=f"Generation not completed (status: {current_status})")
     
-    if "pdf_data" not in session_data:
-        logger.error(f"PDF data not found in session {session_id}")
-        logger.error(f"Session data contents: {list(session_data.keys())}")
+    if format == "json":
+        if "json_data" not in session_data:
+            logger.error(f"JSON data not found in session {session_id}")
+            logger.error(f"Session data contents: {list(session_data.keys())}")
+            
+            # Check if we have detailed error information
+            if "logs" in session_data:
+                logger.error(f"Session logs: {session_data['logs']}")
+            
+            raise HTTPException(status_code=404, detail="JSON not found - generation may have failed")
         
-        # Check if we have detailed error information
-        if "logs" in session_data:
-            logger.error(f"Session logs: {session_data['logs']}")
+        json_data = session_data["json_data"]
+        if not json_data:
+            logger.error(f"JSON data is empty for session {session_id}")
+            raise HTTPException(status_code=500, detail="JSON data is empty")
         
-        raise HTTPException(status_code=404, detail="PDF not found - generation may have failed")
+        logger.info(f"Serving JSON for session {session_id}")
+        
+        # Clean up session data after download
+        asyncio.create_task(cleanup_session(session_id))
+        
+        return JSONResponse(content=json_data)
     
-    # Additional validation
-    pdf_data = session_data["pdf_data"]
-    if not pdf_data or len(pdf_data) == 0:
-        logger.error(f"PDF data is empty for session {session_id}")
-        raise HTTPException(status_code=500, detail="PDF data is empty")
-    
-    filename = session_data.get("filename", "campaign_plan.pdf")
-    logger.info(f"Serving PDF: {filename}, size: {len(pdf_data)} bytes")
-    
-    # Clean up session data after download
-    asyncio.create_task(cleanup_session(session_id))
-    
-    return StreamingResponse(
-        io.BytesIO(pdf_data),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
+    else:  # format == "pdf"
+        if "pdf_data" not in session_data:
+            logger.error(f"PDF data not found in session {session_id}")
+            logger.error(f"Session data contents: {list(session_data.keys())}")
+            
+            # Check if we have detailed error information
+            if "logs" in session_data:
+                logger.error(f"Session logs: {session_data['logs']}")
+            
+            raise HTTPException(status_code=404, detail="PDF not found - generation may have failed")
+        
+        # Additional validation
+        pdf_data = session_data["pdf_data"]
+        if not pdf_data or len(pdf_data) == 0:
+            logger.error(f"PDF data is empty for session {session_id}")
+            raise HTTPException(status_code=500, detail="PDF data is empty")
+        
+        filename = session_data.get("filename", "campaign_plan.pdf")
+        logger.info(f"Serving PDF: {filename}, size: {len(pdf_data)} bytes")
+        
+        # Clean up session data after download
+        asyncio.create_task(cleanup_session(session_id))
+        
+        return StreamingResponse(
+            io.BytesIO(pdf_data),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
 
 async def cleanup_session(session_id: str):
     """Clean up session data after 15 minutes."""
