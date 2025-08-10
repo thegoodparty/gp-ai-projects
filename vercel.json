@@ -1,16 +1,7 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": {
-        "pythonVersion": "3.11"
-      }
-    }
-  ],
   "functions": {
     "api/index.py": {
+      "runtime": "python3.11",
       "maxDuration": 300,
       "memory": 512
     }
