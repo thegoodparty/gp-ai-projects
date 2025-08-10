@@ -5,14 +5,8 @@
       "src": "api/index.py",
       "use": "@vercel/python",
       "config": {
-        "pythonVersion": "3.13"
+        "pythonVersion": "3.11"
       }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "api/index.py"
     }
   ],
   "functions": {

@@ -13,9 +13,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from api_wrapper import app  # noqa: E402
+from api_wrapper import app as fastapi_app  # noqa: E402
 
-# For Vercel, we need to export the app as 'app' not 'handler'
-# Vercel's Python runtime will automatically handle the ASGI interface
-
-__all__ = ["app"]
+# Vercel expects the ASGI app to be available as 'app'
+app = fastapi_app
