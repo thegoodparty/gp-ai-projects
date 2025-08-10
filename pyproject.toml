@@ -3,7 +3,7 @@ name = "gp-ai-projects"
 version = "0.1.0"
 description = "AI projects at goodparty"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "python-dotenv>=1.1.1",
     "pydantic>=2.0.0",
@@ -35,7 +35,7 @@ packages = ["ai_generated_campaign_plan", "shared"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"  # set to your actual version from .python-version
+target-version = "py313"  # set to your actual version from .python-version
 exclude = ["*.venv*", ".venv", "build", "dist"]
 lint.select = ["E","F","W","I","B","C4","T20","UP","N","ANN","ARG","PL","RUF"]
 lint.ignore = ["ANN101","ANN102"]  # allow missing self/cls annotations if desired
@@ -51,7 +51,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.mypy]
-python_version = "3.11"  # set to match your project
+python_version = "3.13"  # set to match your project
 strict = false
 warn_unused_ignores = true
 warn_redundant_casts = true
