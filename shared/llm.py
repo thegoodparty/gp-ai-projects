@@ -1,9 +1,9 @@
-from datetime import date
-import os
 import json
-import time
+import os
 import re
-from typing import Optional, Dict, Any, List
+import time
+from typing import Any
+
 import openai
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -17,18 +17,18 @@ class ReflectionResponse(BaseModel):
     """Pydantic model for reflection evaluation response."""
     criteria_adherence_score: int
     meets_criteria: bool
-    issues_found: List[str]
-    improvement_suggestions: List[str]
+    issues_found: list[str]
+    improvement_suggestions: list[str]
 
 
 class LLMClient:
     """
     A client class that abstracts LLM interactions using OpenAI standards with built-in retry logic and provider fallback.
     """
-    
+
     def __init__(
         self,
-        providers: Optional[List[Dict[str, Any]]] = None,
+        providers: list[dict[str, Any]] | None = None,
         max_retries: int = 3,
         base_delay: float = 5.0,
         fallback_on_provider_failure: bool = True
@@ -46,18 +46,18 @@ class LLMClient:
         self.base_delay = base_delay
         self.fallback_on_provider_failure = fallback_on_provider_failure
         self.logger = get_logger(__name__)
-        
+
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_tokens = 0
         self.api_call_count = 0
-        
+
         # Setup providers
         if providers is None:
             self.providers = self._get_default_providers()
         else:
             self.providers = providers
-            
+
         # Initialize clients for each provider
         self.clients = []
         for provider in self.providers:
@@ -65,7 +65,7 @@ class LLMClient:
                 if not provider.get("api_key"):
                     self.logger.warning(f"No API key found for provider {provider['name']}, skipping")
                     continue
-                    
+
                 client = openai.OpenAI(
                     api_key=provider["api_key"],
                     base_url=provider["base_url"]
@@ -78,14 +78,14 @@ class LLMClient:
                 })
                 self.logger.info(f"Initialized provider: {provider['name']}")
             except Exception as e:
-                self.logger.warning(f"Failed to initialize provider {provider['name']}: {str(e)}")
-        
+                self.logger.warning(f"Failed to initialize provider {provider['name']}: {e!s}")
+
         if not self.clients:
             raise ValueError("No valid providers configured. Please check your API keys and configurations.")
-            
+
         self.logger.info(f"LLMClient initialized with {len(self.clients)} providers")
-    
-    def _get_default_providers(self) -> List[Dict[str, Any]]:
+
+    def _get_default_providers(self) -> list[dict[str, Any]]:
         """Get default provider configurations for Gemini + TogetherAI fallback."""
         return [
             {
@@ -103,8 +103,8 @@ class LLMClient:
                 "priority": 2
             }
         ]
-    
-    def get_current_provider_info(self) -> Dict[str, Any]:
+
+    def get_current_provider_info(self) -> dict[str, Any]:
         """Get information about available providers."""
         return {
             "total_providers": len(self.clients),
@@ -117,7 +117,7 @@ class LLMClient:
                 for client in self.clients
             ]
         }
-    
+
     def clean_response_content(self, content: str) -> str:
         """
         Clean LLM response content by removing think tags and other unwanted patterns.
@@ -131,13 +131,13 @@ class LLMClient:
         if content is None:
             self.logger.warning("Received None content for cleaning, returning empty string")
             return ""
-        
+
         self.logger.debug(f"Cleaning response content, original length: {len(content)}")
         cleaned_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         if len(cleaned_content) != len(content):
             self.logger.debug(f"Content cleaned, new length: {len(cleaned_content)}")
         return cleaned_content
-    
+
     def _track_token_usage(self, result) -> None:
         """
         Track token usage from API response and update running totals.
@@ -150,19 +150,19 @@ class LLMClient:
             prompt_tokens = getattr(usage, 'prompt_tokens', 0)
             completion_tokens = getattr(usage, 'completion_tokens', 0)
             total_tokens = getattr(usage, 'total_tokens', 0)
-            
+
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
             self.total_tokens += total_tokens
             self.api_call_count += 1
-            
+
             self.logger.debug(f"Token usage - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {total_tokens}")
             self.logger.debug(f"Session totals - Prompt: {self.total_prompt_tokens}, Completion: {self.total_completion_tokens}, Total: {self.total_tokens}, Calls: {self.api_call_count}")
         else:
             self.logger.debug("No usage information available in API response")
             self.api_call_count += 1
-    
-    def get_token_usage_stats(self) -> Dict[str, int]:
+
+    def get_token_usage_stats(self) -> dict[str, int]:
         """
         Get current token usage statistics for this client instance.
         
@@ -178,8 +178,8 @@ class LLMClient:
             "average_completion_tokens": self.total_completion_tokens // max(1, self.api_call_count),
             "average_total_tokens": self.total_tokens // max(1, self.api_call_count)
         }
-    
-    def get_usage_since_last_reset(self) -> Dict[str, Any]:
+
+    def get_usage_since_last_reset(self) -> dict[str, Any]:
         """
         Get usage statistics with provider information for cost tracking.
         
@@ -190,8 +190,8 @@ class LLMClient:
         stats["last_provider_used"] = getattr(self, '_last_provider_used', 'unknown')
         stats["last_model_used"] = getattr(self, '_last_model_used', 'unknown')
         return stats
-    
-    def reset_token_usage_stats(self) -> Dict[str, int]:
+
+    def reset_token_usage_stats(self) -> dict[str, int]:
         """
         Reset token usage statistics and return the previous totals.
         
@@ -199,21 +199,21 @@ class LLMClient:
             Dict containing the previous token usage statistics
         """
         previous_stats = self.get_token_usage_stats()
-        
+
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_tokens = 0
         self.api_call_count = 0
-        
+
         self.logger.info("Token usage statistics reset")
         return previous_stats
-    
+
     def create_completion(
         self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
+        messages: list[dict[str, str]],
+        model: str | None = None,
         max_tokens: int = 10000,
-        response_format: Optional[Dict[str, Any]] = None,
+        response_format: dict[str, Any] | None = None,
         temperature: float = 0.7,
         clean_response: bool = True,
         **kwargs
@@ -238,23 +238,23 @@ class LLMClient:
         """
         self.logger.debug(f"Starting completion with model: {model}, max_tokens: {max_tokens}, temperature: {temperature}")
         self.logger.debug(f"Message count: {len(messages)}")
-        
+
         last_exception = None
-        
+
         for provider_idx, provider_client in enumerate(self.clients):
             provider_name = provider_client["name"]
             client = provider_client["client"]
             default_model = provider_client["default_model"]
-            
+
             # Use provided model or fall back to provider's default
             current_model = model if model else default_model
-            
+
             self.logger.info(f"Trying provider {provider_idx + 1}/{len(self.clients)}: {provider_name} with model: {current_model}")
-            
+
             for attempt in range(self.max_retries):
                 try:
                     self.logger.debug(f"Provider {provider_name} attempt {attempt + 1}/{self.max_retries}")
-                    
+
                     completion_args = {
                         "messages": messages,
                         "model": current_model,
@@ -262,23 +262,23 @@ class LLMClient:
                         "temperature": temperature,
                         **kwargs
                     }
-                    
+
                     if response_format:
                         completion_args["response_format"] = response_format
                         self.logger.debug(f"Using response format: {response_format}")
-                    
+
                     result = client.chat.completions.create(**completion_args)
-                    
+
                     # Add provider info to result
                     result.provider_used = provider_name
                     result.model_used = current_model
-                    
+
                     # Track for cost calculation
                     self._last_provider_used = provider_name
                     self._last_model_used = current_model
-                    
+
                     self._track_token_usage(result)
-                    
+
                     # Check if we actually got content - if not, treat as failure
                     if result.choices and len(result.choices) > 0:
                         self.logger.debug(f"Provider {provider_name} returned choices: {result}")
@@ -289,19 +289,19 @@ class LLMClient:
                     else:
                         self.logger.warning(f"Provider {provider_name} returned no choices - treating as failure")
                         raise RuntimeError(f"Provider {provider_name} returned no choices")
-                    
+
                     if clean_response and result.choices and len(result.choices) > 0:
                         original_content = result.choices[0].message.content
                         cleaned_content = self.clean_response_content(original_content)
                         result.choices[0].message.content = cleaned_content
-                    
+
                     self.logger.info(f"Successfully created completion using {provider_name}")
                     return result
-                    
+
                 except Exception as e:
                     last_exception = e
-                    self.logger.warning(f"Provider {provider_name} attempt {attempt + 1} failed: {str(e)}")
-                    
+                    self.logger.warning(f"Provider {provider_name} attempt {attempt + 1} failed: {e!s}")
+
                     if attempt < self.max_retries - 1:
                         delay = self.base_delay * (2 ** attempt)
                         self.logger.debug(f"Retrying {provider_name} in {delay} seconds...")
@@ -309,7 +309,7 @@ class LLMClient:
                     else:
                         self.logger.warning(f"Provider {provider_name} failed after {self.max_retries} attempts")
                         break
-            
+
             # If we should fallback and there are more providers, continue to next provider
             if self.fallback_on_provider_failure and provider_idx < len(self.clients) - 1:
                 self.logger.info(f"Falling back from {provider_name} to next provider")
@@ -317,16 +317,16 @@ class LLMClient:
             else:
                 # If no fallback or this is the last provider, break
                 break
-        
+
         # If we get here, all providers failed
         self.logger.error(f"All providers failed after {self.max_retries} attempts each")
-        raise RuntimeError(f"Failed to create completion using all {len(self.clients)} providers. Last error: {str(last_exception)}")
-    
+        raise RuntimeError(f"Failed to create completion using all {len(self.clients)} providers. Last error: {last_exception!s}")
+
     def create_structured_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: list[dict[str, str]],
         response_schema: BaseModel,
-        model: Optional[str] = None,
+        model: str | None = None,
         max_tokens: int = 5000,
         **kwargs
     ) -> BaseModel:
@@ -347,10 +347,10 @@ class LLMClient:
             RuntimeError: If completion fails or response doesn't match schema
         """
         self.logger.debug(f"Creating structured completion with schema: {response_schema.__name__}")
-        
+
         try:
             schema = response_schema.model_json_schema()
-            
+
             result = self.create_completion(
                 messages=messages,
                 model=model,
@@ -366,30 +366,30 @@ class LLMClient:
                 },
                 **kwargs
             )
-            
+
             content = result.choices[0].message.content
             self.logger.debug(f"Raw JSON response: {content}")
-            
+
             parsed_json = json.loads(content)
             self.logger.debug(f"Parsed JSON: {parsed_json}")
-            
+
             structured_response = response_schema(**parsed_json)
             self.logger.debug(f"Successfully created structured response of type: {type(structured_response)}")
             self.logger.debug(f"Used provider: {getattr(result, 'provider_used', 'unknown')}")
             return structured_response
-            
+
         except (json.JSONDecodeError, ValueError) as e:
-            self.logger.error(f"Failed to parse structured response: {str(e)}")
-            raise RuntimeError(f"Failed to parse structured response: {str(e)}")
-    
+            self.logger.error(f"Failed to parse structured response: {e!s}")
+            raise RuntimeError(f"Failed to parse structured response: {e!s}")
+
     def create_completion_with_structural_reflection(
         self,
-        messages: List[Dict[str, str]],
+        messages: list[dict[str, str]],
         reflection_criteria: str,
-        model: Optional[str] = None,
+        model: str | None = None,
         max_tokens: int = 3000,
         max_iterations: int = 3,
-        reflection_model: Optional[str] = None,
+        reflection_model: str | None = None,
         temperature: float = 0.0,
         **kwargs
     ) -> Any:
@@ -422,9 +422,9 @@ class LLMClient:
         self.logger.debug(f"Main model: {model}, Reflection model: {reflection_model}")
         self.logger.debug(f"Reflection criteria: {reflection_criteria}")
         self.logger.debug(f"Temperature: {temperature}, Max tokens: {max_tokens}")
-        
+
         original_response = None
-                
+
         for iteration in range(max_iterations):
             try:
                 self.logger.info(f"Generation iteration {iteration + 1}/{max_iterations}")
@@ -438,16 +438,16 @@ class LLMClient:
 
                 if original_response is None:
                     original_response = response
-                
+
                 generated_content = response.choices[0].message.content
                 self.logger.debug(f"Generated content length: {len(generated_content)}")
-                
+
                 if iteration == max_iterations - 1:
                     self.logger.info("Final iteration reached, returning response.")
                     self.logger.warning(f"Reached maximum iterations ({max_iterations}). Returning response.")
 
                     return original_response if original_response is not None else response
-                
+
                 reflection_messages = [
                     {
                         "role": "system",
@@ -477,24 +477,24 @@ Respond with a JSON object containing:
 Evaluate ONLY formatting and structural adherence - ignore content quality, accuracy, or completeness. Be lenient on content while strict on format."""
                     }
                 ]
-                
+
                 self.logger.info("Performing reflection on generated content")
                 self.logger.debug(f"Reflection message count: {len(reflection_messages)}")
-                
+
                 reflection_data = self.create_structured_completion(
                     messages=reflection_messages,
                     response_schema=ReflectionResponse,
                     model=reflection_model,
                     max_tokens=1000
                 )
-                
+
                 criteria_adherence_score = reflection_data.criteria_adherence_score
                 meets_criteria = reflection_data.meets_criteria
                 issues_found = reflection_data.issues_found
                 improvement_suggestions = reflection_data.improvement_suggestions
-                
+
                 self.logger.info(f"Reflection results - Formatting adherence score: {criteria_adherence_score}/10, Meets formatting criteria: {meets_criteria}")
-                
+
                 if meets_criteria and criteria_adherence_score >= 7:
                     self.logger.info("Content meets formatting criteria and threshold, returning response")
                     response.reflection_metadata = {
@@ -504,7 +504,7 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
                         "reflection_data": reflection_data.model_dump()
                     }
                     return response
-                
+
                 self.logger.debug(f"Issues found: {issues_found}")
                 self.logger.debug(f"Improvement suggestions: {improvement_suggestions}")
 
@@ -516,30 +516,30 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
                     "\nPlease fix these FORMATTING issues in your response while keeping the content intact.",
                     "\nFocus only on formatting and structure corrections. Do not include formatting notes, rationale or any response to the feedback."
                 ])
-                
+
                 self.logger.debug(f"Adding improvement context: {improvement_context}")
-                
+
                 enhanced_messages = messages.copy()
                 if enhanced_messages:
                     enhanced_messages[-1]["content"] += f"\n\n{improvement_context}"
-                
+
                 messages = enhanced_messages
                 self.logger.debug("Enhanced messages with improvement context for next iteration")
-                
+
                 self.logger.info(f"Formatting adherence insufficient (score: {criteria_adherence_score}), regenerating...")
-                    
+
             except Exception as e:
-                self.logger.error(f"Error in reflection iteration {iteration + 1}: {str(e)}")
+                self.logger.error(f"Error in reflection iteration {iteration + 1}: {e!s}")
                 if iteration == max_iterations - 1:
-                    raise RuntimeError(f"Reflection workflow failed after {max_iterations} attempts. Last error: {str(e)}")
-        
+                    raise RuntimeError(f"Reflection workflow failed after {max_iterations} attempts. Last error: {e!s}")
+
         raise RuntimeError(f"Unexpected end of reflection workflow after {max_iterations} iterations")
 
     @classmethod
     def create_gemini_with_together_fallback(
         cls,
-        gemini_api_key: Optional[str] = None,
-        together_api_key: Optional[str] = None,
+        gemini_api_key: str | None = None,
+        together_api_key: str | None = None,
         max_retries: int = 3,
         base_delay: float = 1.0
     ) -> 'LLMClient':
@@ -571,15 +571,15 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
                 "priority": 2
             }
         ]
-        
+
         return cls(
             providers=providers,
             max_retries=max_retries,
             base_delay=base_delay,
             fallback_on_provider_failure=True
         )
-    
-    def test_provider_connectivity(self) -> Dict[str, Any]:
+
+    def test_provider_connectivity(self) -> dict[str, Any]:
         """
         Test connectivity to all configured providers.
         
@@ -590,14 +590,14 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
             "total_providers": len(self.clients),
             "providers": []
         }
-        
+
         for provider_client in self.clients:
             provider_name = provider_client["name"]
             client = provider_client["client"]
             default_model = provider_client["default_model"]
-            
+
             self.logger.info(f"Testing connectivity for provider: {provider_name}")
-            
+
             try:
                 # Simple test completion
                 response = client.chat.completions.create(
@@ -609,20 +609,20 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
                     max_tokens=10,
                     temperature=0
                 )
-                
+
                 status = "connected"
                 error = None
                 response_content = response.choices[0].message.content if response.choices else ""
-                
+
                 self.logger.info(f"Provider {provider_name} connectivity test successful")
-                
+
             except Exception as e:
                 status = "failed"
                 error = str(e)
                 response_content = None
-                
+
                 self.logger.warning(f"Provider {provider_name} connectivity test failed: {error}")
-            
+
             results["providers"].append({
                 "name": provider_name,
                 "default_model": default_model,
@@ -630,20 +630,20 @@ Evaluate ONLY formatting and structural adherence - ignore content quality, accu
                 "error": error,
                 "test_response": response_content
             })
-        
+
         return results
 
 
 if __name__ == "__main__":
     # Test basic completion
     llm_client = LLMClient()
-    
+
     print("=== Provider Information ===")
     provider_info = llm_client.get_current_provider_info()
     print(f"Total providers: {provider_info['total_providers']}")
     for provider in provider_info['providers']:
         print(f"  - {provider['name']}: {provider['default_model']}")
-    
+
     print("\n=== Connectivity Test ===")
     connectivity_results = llm_client.test_provider_connectivity()
     for provider in connectivity_results['providers']:
@@ -653,10 +653,10 @@ if __name__ == "__main__":
             print(f"    Error: {provider['error']}")
         if provider['test_response']:
             print(f"    Response: {provider['test_response']}")
-    
+
     print("\n=== Token Usage Stats (Initial) ===")
     print(llm_client.get_token_usage_stats())
-    
+
     print("\n=== Basic Completion Test ===")
     result = llm_client.create_completion(
         messages=[
@@ -670,13 +670,13 @@ if __name__ == "__main__":
 
     # Test structured completion
     print("\n=== Structured Completion Test ===")
-    
+
     class CityInfo(BaseModel):
         city: str
         country: str
         population: int
-        famous_landmarks: List[str]
-        
+        famous_landmarks: list[str]
+
     structured_result = llm_client.create_structured_completion(
         messages=[
             {"role": "system", "content": "You are a geography expert."},
@@ -684,7 +684,7 @@ if __name__ == "__main__":
         ],
         response_schema=CityInfo
     )
-    
+
     print("Structured Response:")
     print(f"City: {structured_result.city}")
     print(f"Country: {structured_result.country}")
@@ -708,10 +708,10 @@ if __name__ == "__main__":
     print(f"Provider used: {getattr(result, 'provider_used', 'unknown')}")
     print(f"Model used: {getattr(result, 'model_used', 'unknown')}")
     print(result.choices[0].message.content)
-    
+
     print("\n=== Final Token Usage Stats ===")
     print(llm_client.get_token_usage_stats())
-    
+
     print("\n=== Test Convenience Method ===")
     simple_client = LLMClient.create_gemini_with_together_fallback()
     print(f"Simple client has {len(simple_client.clients)} providers configured")

@@ -14,28 +14,33 @@ def generate_recommended_total_budget(campaign_info: CleanedCampaignInfo) -> str
         str: Formatted budget recommendation text
     """
     logger.info(f"Generating budget recommendation for candidate: {campaign_info.candidate_name}")
-    
+
     win_number = campaign_info.win_number
     logger.debug(f"Win number extracted: {win_number}")
-            
+
     calculated_budget = (win_number * 3) * 0.30 / 0.60
     logger.debug(f"Budget calculation: ({win_number} * 3) * 0.30 / 0.60 = {calculated_budget}")
-    
+
     budget_formatted = f"${calculated_budget:,.0f}"
     logger.debug(f"Budget formatted: {budget_formatted}")
-    
+
     logger.info(f"Budget recommendation generated successfully: {budget_formatted}")
-    
+
     return f"""## 4. RECOMMENDED TOTAL BUDGET
 
 A budget of roughly {budget_formatted} will support your full voter contact program, combining volunteer-powered in-person outreach with targeted paid digital communication strategies. The entirety of this budget will be invested in get out the vote tactics, assuming we are leveraging a combination of: peer to peer messaging, robocalls, and digital/newspaper advertising."""
 
 if __name__ == "__main__":
     from datetime import date
-    from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo, IncumbentStatus, RaceType
+
+    from ai_generated_campaign_plan.schema.models import (
+        CleanedCampaignInfo,
+        IncumbentStatus,
+        RaceType,
+    )
 
     logger.info("Starting budget generation test")
-    
+
     cleaned_campaign_info = CleanedCampaignInfo(
         candidate_name="John Doe",
         primary_date=None,
@@ -57,12 +62,12 @@ if __name__ == "__main__":
         has_primary=False,
         primary_date_formatted=None
     )
-    
+
     logger.debug("Test campaign info created")
     result = generate_recommended_total_budget(cleaned_campaign_info)
     logger.info("Test completed successfully")
     print(result)
-    
+
     logger.info("\n--- Testing with zero win number ---")
     zero_win_campaign = CleanedCampaignInfo(
         candidate_name="Jane Smith",
@@ -85,6 +90,6 @@ if __name__ == "__main__":
         has_primary=False,
         primary_date_formatted=None
     )
-    
+
     zero_result = generate_recommended_total_budget(zero_win_campaign)
     print("\n" + zero_result)
