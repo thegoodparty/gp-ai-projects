@@ -2,7 +2,7 @@ import os
 import json
 import time
 import asyncio
-from typing import Optional, Dict, Any, List, Union, Type, AsyncIterator, AsyncGenerator
+from typing import Optional, Dict, Any, List, Union, Type, Iterator
 from enum import Enum
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -272,7 +272,7 @@ class GeminiClient:
         system_instruction: Optional[str] = None,
         thinking_budget: Optional[int] = None,
         include_thoughts: Optional[bool] = None
-    ) -> AsyncGenerator[str, None]:
+    ) -> Iterator[str]:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
         
@@ -685,7 +685,7 @@ class GeminiChatClient:
         
         try:
             response = self.chat.send_message(message)
-            self._track_usage(response, model_name)
+            self._track_usage(response)
             return response.text
             
         except Exception as e:
@@ -697,7 +697,7 @@ class GeminiChatClient:
                 self.logger.error(f"Chat message failed: {str(e)}")
                 raise
     
-    def send_message_stream(self, message: str) -> AsyncGenerator[str, None]:
+    def send_message_stream(self, message: str) -> Iterator[str]:
         if not self.chat:
             self._initialize_chat()
         
@@ -822,7 +822,7 @@ class GeminiFunctionClient:
                 config=config
             )
             
-            self._track_usage(response, model_name)
+            self._track_usage(response)
             
             result = {
                 "text": response.text,
@@ -977,7 +977,7 @@ class GeminiEmbeddingClient:
     
     def _track_embedding_cost(self, texts: List[str], model: str = "gemini-embedding-001"):
         """Track cost for embedding creation."""
-        total_chars = sum(len(text) for text in texts)
+        # total_chars = sum(len(text) for text in texts)  # Not currently used
         estimated_tokens = self._estimate_token_count(' '.join(texts))
         
         # Calculate cost using pricing
@@ -1045,21 +1045,21 @@ class GeminiEmbeddingClient:
                 # Check if it's a daily quota error and try alternate API key once, then throw
                 error_str = str(e).lower()
                 if ("resource_exhausted" in error_str or "quota" in error_str) and len(self.api_keys) > 1:
-                    old_key_index = self.current_key_index
+                    # old_key_index = self.current_key_index  # Not currently used
                     self.rotate_api_key()
                     self.logger.warning(f"Quota exhausted - trying alternate key #{self.current_key_index + 1}")
                     # Try once with alternate key, then throw if it fails
                     try:
-                        response = self.client.embed_content(
+                        alternate_client = genai.Client(api_key=self.get_current_api_key())
+                        result = alternate_client.models.embed_content(
                             model=model,
-                            content=text,
-                            task_type="retrieval_document"
+                            contents=text
                         )
-                        embedding = np.array(response.embedding)
-                        self.total_embeddings_created += 1
-                        self.total_input_tokens += len(text.split())
-                        self.total_cost += 0.00001 * len(text.split())
-                        return embedding
+                        
+                        # Track cost
+                        self._track_embedding_cost([text], model)
+                        
+                        return np.array(result.embeddings[0].values)
                     except Exception as alternate_error:
                         self.logger.error(f"Alternate API key also quota exhausted: {str(alternate_error)}")
                         raise RuntimeError(f"All API keys quota exhausted. Original error: {str(e)}")
@@ -1133,22 +1133,28 @@ class GeminiEmbeddingClient:
                         # Check if it's a daily quota error and try alternate API key once, then throw
                         error_str = str(e).lower()
                         if ("resource_exhausted" in error_str or "quota" in error_str) and len(self.api_keys) > 1:
-                            old_key_index = self.current_key_index
+                            # old_key_index = self.current_key_index  # Not currently used
                             self.rotate_api_key()
                             self.logger.warning(f"Quota exhausted - trying alternate key #{self.current_key_index + 1}")
                             # Try once with alternate key, then throw if it fails
                             try:
-                                response = self.client.embed_content(
-                                    model=model,
-                                    content=batch_texts,
-                                    task_type="retrieval_document"
-                                )
-                                batch_embeddings = [np.array(embedding) for embedding in response.embedding]
-                                self.total_embeddings_created += len(batch_texts)
-                                total_tokens = sum(len(text.split()) for text in batch_texts)
-                                self.total_input_tokens += total_tokens
-                                self.total_cost += 0.00001 * total_tokens
-                                return batch_embeddings
+                                alternate_client = genai.Client(api_key=self.get_current_api_key())
+                                batch_embeddings = []
+                                for text in batch:
+                                    result = alternate_client.models.embed_content(
+                                        model=model,
+                                        contents=text
+                                    )
+                                    batch_embeddings.append(result.embeddings[0].values)
+                                
+                                embeddings.extend(batch_embeddings)
+                                
+                                # Track cost for this batch
+                                self._track_embedding_cost(batch, model)
+                                
+                                self.logger.debug(f"Batch {batch_num} completed successfully with alternate key")
+                                pbar.update(1)
+                                break
                             except Exception as alternate_error:
                                 self.logger.error(f"Alternate API key also quota exhausted: {str(alternate_error)}")
                                 raise RuntimeError(f"All API keys quota exhausted. Original error: {str(e)}")
@@ -1260,7 +1266,7 @@ class GeminiEmbeddingClient:
                         
                         # Check if this is daily quota exhaustion (don't retry)
                         error_text = str(e).lower()
-                        if "resource_exhausted" in error_text or "quota exceeded" in error_text:
+                        if ("resource_exhausted" in error_text or "quota" in error_text):
                             self.logger.error(f"Batch {batch_num + 1}: Daily quota exhausted. Cannot retry.")
                             raise
                         
@@ -1276,9 +1282,9 @@ class GeminiEmbeddingClient:
                         
                         # Try rotating API key if available (for all 4xx+ errors)
                         if len(self.api_keys) > 1 and e.response.status_code >= 400:
-                            old_key_index = self.current_key_index
+                            # old_key_index = self.current_key_index  # Not currently used
                             self.rotate_api_key()
-                            self.logger.warning(f"HTTP {e.response.status_code} error. Rotated from key #{old_key_index + 1} to key #{self.current_key_index + 1}")
+                            self.logger.warning(f"HTTP {e.response.status_code} error. Rotated to key #{self.current_key_index + 1}")
                         
                         # Exponential backoff for all retryable errors
                         retry_delay = current_delay * (2 ** attempt)
@@ -1318,7 +1324,7 @@ class GeminiEmbeddingClient:
             # Sort results by batch number and flatten
             results.sort(key=lambda x: x[0])
             all_embeddings = []
-            for batch_num, batch_embeddings, batch_texts in results:
+            for _, batch_embeddings, batch_texts in results:
                 all_embeddings.extend(batch_embeddings)
                 # Track cost for this batch
                 self._track_embedding_cost(batch_texts, model)
@@ -1381,16 +1387,16 @@ class GeminiEmbeddingClient:
                     
                     # Check if this is daily quota exhaustion (don't retry)
                     error_text = str(e).lower()
-                    if "resource_exhausted" in error_text or "quota exceeded" in error_text:
+                    if ("resource_exhausted" in error_text or "quota" in error_text):
                         self.logger.error(f"Batch {batch_idx}: Daily quota exhausted. Cannot retry.")
                         raise
                     
                     # For all other HTTP errors, retry with exponential backoff
                     # Try rotating API key if available (especially for 4xx errors)
                     if len(self.api_keys) > 1 and (e.response.status_code >= 400):
-                        old_key_index = self.current_key_index
+                        # old_key_index = self.current_key_index  # Not currently used
                         self.rotate_api_key()
-                        self.logger.warning(f"Batch {batch_idx}: HTTP {e.response.status_code} error. Rotated from key #{old_key_index + 1} to key #{self.current_key_index + 1}")
+                        self.logger.warning(f"Batch {batch_idx}: HTTP {e.response.status_code} error. Rotated to key #{self.current_key_index + 1}")
                     
                     # Exponential backoff for all retryable errors
                     retry_delay = 2.0 * (2 ** attempt)

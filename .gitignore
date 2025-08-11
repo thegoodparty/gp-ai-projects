@@ -26,7 +26,8 @@ offline_data/
 CLAUDE.md
 
 #output files
-output/
+output*/
 
 #vector store files
 vector_store/
+
