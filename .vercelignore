@@ -39,11 +39,3 @@ setup-dev.sh
 
 # Large data files
 research/results/
-
-# Exclude everything except api/ and necessary files
-/*
-!/api/
-!/pyproject.toml
-!/templates/
-!/shared/
-!/ai_generated_campaign_plan/
