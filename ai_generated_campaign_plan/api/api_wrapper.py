@@ -1,9 +1,7 @@
 import io
-import re
 import json
 import asyncio
 import uuid
-import os
 from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -21,6 +19,7 @@ from ai_generated_campaign_plan.api.json_storage import JSONStorage
 from ai_generated_campaign_plan.api.pdf_generator import CampaignPlanPDFGenerator
 from ai_generated_campaign_plan.api.json_extractor import CampaignPlanJSONExtractor
 from shared.logger import get_logger
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -449,10 +448,47 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
 @app.get("/progress/{session_id}")
 async def get_progress(session_id: str):
     """Get progress for a specific session."""
-    if session_id not in progress_store:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # First check if session is in memory (active generation)
+    if session_id in progress_store:
+        return progress_store[session_id]
     
-    return progress_store[session_id]
+    # Check if completed files exist on disk
+    has_pdf = pdf_storage.get_pdf_path(session_id) is not None
+    has_json = json_storage.get_json_path(session_id) is not None
+    
+    if has_pdf and has_json:
+        # Session completed, build response from file metadata
+        pdf_metadata = pdf_storage.get_metadata(session_id)
+        if pdf_metadata:
+            created_at = datetime.fromisoformat(pdf_metadata["created_at"])
+            expiration_time = created_at + timedelta(hours=24)
+            
+            # Check if expired
+            if datetime.now() > expiration_time:
+                raise HTTPException(status_code=404, detail="Session expired")
+            
+            return {
+                "progress": 100,
+                "status": "completed",
+                "message": "Campaign plan generation complete!",
+                "logs": ["Files available for download"],
+                "timestamp": created_at.date().isoformat(),
+                "has_pdf": True,
+                "has_json": True,
+                "expires_at": expiration_time.isoformat(),
+                "expires_at_formatted": expiration_time.strftime("%B %d, %Y at %I:%M %p"),
+                "download_links": {
+                    "pdf": f"/download-pdf/{session_id}",
+                    "json": f"/download-json/{session_id}"
+                },
+                "files_ready": {
+                    "pdf": True,
+                    "json": True,
+                    "total": 2
+                }
+            }
+    
+    raise HTTPException(status_code=404, detail="Session not found")
 
 @app.get("/progress-stream/{session_id}")
 async def progress_stream(session_id: str):
@@ -462,6 +498,7 @@ async def progress_stream(session_id: str):
         last_progress = -1
         while True:
             if session_id in progress_store:
+                # Active generation - stream progress updates
                 current_data = progress_store[session_id]
                 current_progress = current_data.get("progress", 0)
                 
@@ -503,6 +540,37 @@ async def progress_stream(session_id: str):
                 # Stop streaming if completed or error
                 if current_data.get("status") in ["completed", "error"]:
                     break
+            else:
+                # Check if completed files exist on disk
+                has_pdf = pdf_storage.get_pdf_path(session_id) is not None
+                has_json = json_storage.get_json_path(session_id) is not None
+                
+                if has_pdf and has_json:
+                    # Session completed, send final status
+                    final_data = {
+                        "progress": 100,
+                        "status": "completed",
+                        "message": "Campaign plan generation complete!",
+                        "logs": ["Files available for download"],
+                        "has_pdf": True,
+                        "has_json": True,
+                        "download_links": {
+                            "pdf": f"/download-pdf/{session_id}",
+                            "json": f"/download-json/{session_id}"
+                        },
+                        "files_ready": {
+                            "pdf": True,
+                            "json": True,
+                            "total": 2
+                        }
+                    }
+                    yield f"data: {json.dumps(final_data)}\n\n"
+                    break
+                else:
+                    # Session not found
+                    error_data = {"error": "Session not found"}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    break
             
             await asyncio.sleep(0.5)  # Check every 500ms
     
@@ -520,44 +588,22 @@ async def progress_stream(session_id: str):
 @app.get("/download-pdf/{session_id}")
 async def download_pdf(session_id: str):
     """Download the generated PDF."""
-    logger.info(f"Download requested for session: {session_id}")
-    logger.info(f"Available sessions: {list(progress_store.keys())}")
+    logger.info(f"PDF download requested for session: {session_id}")
     
-    if session_id not in progress_store:
-        logger.error(f"Session {session_id} not found in progress_store")
-        logger.error(f"Available sessions: {list(progress_store.keys())}")
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session_data = progress_store[session_id]
-    logger.info(f"Session data keys: {list(session_data.keys())}")
-    logger.info(f"Session status: {session_data.get('status', 'unknown')}")
-    
-    if session_data.get("status") != "completed":
-        current_status = session_data.get("status", "unknown")
-        logger.error(f"Generation not completed, status: {current_status}")
-        
-        # Provide more helpful error messages based on status
-        if current_status == "error":
-            error_msg = session_data.get("message", "Unknown error occurred")
-            raise HTTPException(status_code=500, detail=f"Generation failed: {error_msg}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Generation not completed (status: {current_status})")
-    
-    # Get PDF path from storage
+    # Check if PDF file exists directly
     pdf_path = pdf_storage.get_pdf_path(session_id)
     if not pdf_path or not pdf_path.exists():
         logger.error(f"PDF file not found for session {session_id}")
         raise HTTPException(status_code=404, detail="PDF file not found")
     
-    # Get filename from PDF storage metadata
+    # Get filename from metadata
     metadata = pdf_storage.get_metadata(session_id)
-    if metadata and metadata.get("files"):
-        filename = metadata["files"][0]["filename"]  # Get first PDF file
+    if metadata and metadata.get("original_filename"):
+        filename = metadata["original_filename"]
     else:
         filename = "campaign_plan.pdf"
     
     logger.info(f"Serving PDF: {filename}, path: {pdf_path}")
-    
     
     # Stream file from disk
     def file_streamer():
@@ -576,44 +622,27 @@ async def download_json(session_id: str):
     """Download the generated JSON."""
     logger.info(f"JSON download requested for session: {session_id}")
     
-    if session_id not in progress_store:
-        logger.error(f"Session {session_id} not found in progress_store")
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session_data = progress_store[session_id]
-    
-    if session_data.get("status") != "completed":
-        current_status = session_data.get("status", "unknown")
-        logger.error(f"Generation not completed, status: {current_status}")
-        
-        if current_status == "error":
-            error_msg = session_data.get("message", "Unknown error occurred")
-            raise HTTPException(status_code=500, detail=f"Generation failed: {error_msg}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Generation not completed (status: {current_status})")
-    
-    # Load JSON data from filesystem
+    # Load JSON data from filesystem directly
     json_data = json_storage.load_json(session_id)
-    if json_data:
-        metadata = json_storage.get_metadata(session_id)
-        # Get filename from metadata, or default
-        filename = (metadata.get("filename") if metadata else "campaign_plan.json")
-        
-        logger.info(f"Serving JSON from filesystem: {filename}")
-        
-        
-        # Create JSON string for download
-        json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
-        json_bytes = json_str.encode('utf-8')
-        
-        return StreamingResponse(
-            io.BytesIO(json_bytes),
-            media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
+    if not json_data:
+        logger.error(f"JSON file not found for session {session_id}")
+        raise HTTPException(status_code=404, detail="JSON file not found")
     
-    logger.error(f"JSON file not found for session {session_id}")
-    raise HTTPException(status_code=404, detail="JSON file not found")
+    # Get filename from metadata
+    metadata = json_storage.get_metadata(session_id)
+    filename = (metadata.get("original_filename") if metadata else "campaign_plan.json")
+    
+    logger.info(f"Serving JSON: {filename}")
+    
+    # Create JSON string for download
+    json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
+    
+    return StreamingResponse(
+        io.BytesIO(json_bytes),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 @app.post("/generate-campaign-plan-form")
