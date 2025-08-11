@@ -1,7 +1,15 @@
 from datetime import date
+
 from dotenv import load_dotenv
 
-from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, AdditionalCampaignInfo, ContactOptimization
+from ai_generated_campaign_plan.schema.models import (
+    AdditionalCampaignInfo,
+    CampaignInfo,
+    CleanedCampaignInfo,
+    ContactOptimization,
+    IncumbentStatus,
+    RaceType,
+)
 from shared.llm import LLMClient
 from shared.logger import get_logger
 
@@ -11,7 +19,7 @@ class CampaignUtils:
     """
     A unified utility class for campaign information processing and optimization.
     """
-    
+
     def __init__(self, llm_client: LLMClient = None):
         """
         Initialize the campaign utilities.
@@ -21,7 +29,7 @@ class CampaignUtils:
         """
         self.llm_client = llm_client or LLMClient()
         self.logger = get_logger(__name__)
-    
+
     def clean_campaign_info(self, campaign_info: CampaignInfo) -> CleanedCampaignInfo:
         """
         Convert CampaignInfo to CleanedCampaignInfo using LLM to extract and format additional fields.
@@ -58,16 +66,16 @@ extract the following fields as a JSON object:
                 "content": extraction_prompt,
             },
         ]
-        
+
         try:
             self.logger.info("Extracting campaign info using LLM")
             extracted_fields = self.llm_client.create_structured_completion(
                 messages=messages,
                 response_schema=AdditionalCampaignInfo,
             )
-            
+
             self.logger.debug(f"Extracted fields: {extracted_fields}")
-            
+
             cleaned_info = CleanedCampaignInfo(
                 candidate_name=campaign_info.candidate_name,
                 primary_date=campaign_info.primary_date,
@@ -89,13 +97,13 @@ extract the following fields as a JSON object:
                 has_primary=extracted_fields.has_primary,
                 primary_date_formatted=extracted_fields.primary_date_formatted
             )
-            
+
             self.logger.info("Successfully extracted and cleaned campaign info")
             return cleaned_info
-            
+
         except Exception as e:
-            self.logger.error(f"Failed to clean campaign info: {str(e)}")
-            raise RuntimeError(f"Failed to clean campaign info: {str(e)}")
+            self.logger.error(f"Failed to clean campaign info: {e!s}")
+            raise RuntimeError(f"Failed to clean campaign info: {e!s}")
 
     def optimize_contact_strategy(self, start_date: date, end_date: date) -> ContactOptimization:
         """
@@ -109,10 +117,10 @@ extract the following fields as a JSON object:
             ContactOptimization: Optimized contact strategy with reasoning
         """
         days_available = (end_date - start_date).days
-        
-        self.logger.info(f"Optimizing contact strategy")
+
+        self.logger.info("Optimizing contact strategy")
         self.logger.debug(f"Days available: {days_available}")
-        
+
         if days_available <= 21:
             optimization = ContactOptimization(
                 p2p_texts=2,
@@ -128,11 +136,11 @@ extract the following fields as a JSON object:
                 p2p_texts=4,
                 robocalls=3,
             )
-        
+
         self.logger.info(f"Contact optimization complete: {optimization.p2p_texts} texts, {optimization.robocalls} robocalls")
-        
+
         return optimization
-    
+
 
 
 
