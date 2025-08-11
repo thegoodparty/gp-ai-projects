@@ -1,25 +1,29 @@
 import asyncio
-from datetime import date, timedelta
-from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo, ContactOptimization, IncumbentStatus
-from shared.logger import get_logger
-from shared.llm import LLMClient
+from datetime import date
 
+from ai_generated_campaign_plan.schema.models import (
+    CleanedCampaignInfo,
+    ContactOptimization,
+    IncumbentStatus,
+)
+from shared.llm import LLMClient
+from shared.logger import get_logger
 
 
 class VoterContactPlanGenerator:
-    
+
     def __init__(self):
         self.llm_client = LLMClient()
         self.logger = get_logger(__name__)
-    
 
-    
+
+
     async def generate_section(self, campaign_info: CleanedCampaignInfo, primary_contact_strategy: ContactOptimization = None, general_contact_strategy: ContactOptimization = None) -> str:
         self.logger.info(f"Generating voter contact plan for {campaign_info.candidate_name}")
-        
+
         has_primary = campaign_info.has_primary
-        
-        if has_primary:            
+
+        if has_primary:
             prompt = f"""
 today's date: {date.today()}
 primary date: {campaign_info.primary_date}
@@ -65,7 +69,7 @@ Example format:
 - [FULL MONTH DD] – P2P Text #[N]: [Message theme for general]
 - [Election Date] – General Election Day
 """
-        else:            
+        else:
             prompt = f"""
 today's date: {date.today()}
 general election date: {campaign_info.election_date}
@@ -104,7 +108,7 @@ Example format:
                 temperature=0.1,
                 max_tokens=10000
             )
-            
+
             voter_contact_plan = response.choices[0].message.content
 
             self.logger.info(f"Generated voter contact plan: {voter_contact_plan}")
@@ -115,9 +119,9 @@ Example format:
 
             ])
         except Exception as e:
-            self.logger.error(f"Error generating voter contact plan: {str(e)}")
+            self.logger.error(f"Error generating voter contact plan: {e!s}")
             return "## 6. VOTER CONTACT PLAN\n\n[Error generating voter contact plan]"
-            
+
 
 
 if __name__ == "__main__":
@@ -148,9 +152,9 @@ if __name__ == "__main__":
     general_campaign_plan = campaign_utils.optimize_contact_strategy(cleaned_campaign_info_with_primary.primary_date, cleaned_campaign_info_with_primary.election_date)
     result_with_primary = asyncio.run(generator.generate_section(cleaned_campaign_info_with_primary, primary_campaign_plan, general_campaign_plan))
     print(result_with_primary)
-    
+
     print("\n" + "="*60 + "\n")
-    
+
     print("=== TEST CASE 2: CAMPAIGN WITHOUT PRIMARY ===")
     campaign_info_no_primary = CampaignInfo(
         candidate_name="Jane Smith",

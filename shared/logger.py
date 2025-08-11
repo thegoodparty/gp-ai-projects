@@ -3,9 +3,9 @@ import logging.handlers
 import os
 import sys
 import uuid
-from pathlib import Path
-from typing import Optional, Dict, Any
 from enum import Enum
+from pathlib import Path
+from typing import Optional
 
 
 class Colors:
@@ -20,7 +20,7 @@ class Colors:
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log levels"""
-    
+
     LEVEL_COLORS = {
         logging.DEBUG: Colors.GREEN,
         logging.INFO: Colors.GREEN,
@@ -28,18 +28,18 @@ class ColoredFormatter(logging.Formatter):
         logging.ERROR: Colors.RED,
         logging.CRITICAL: Colors.DARK_RED + Colors.BOLD,
     }
-    
+
     def format(self, record):
         original_levelname = record.levelname
-        
+
         if record.levelno in self.LEVEL_COLORS:
             colored_levelname = f"{self.LEVEL_COLORS[record.levelno]}{record.levelname}{Colors.RESET}"
             record.levelname = colored_levelname
-        
+
         formatted = super().format(record)
-        
+
         record.levelname = original_levelname
-        
+
         return formatted
 
 
@@ -63,37 +63,49 @@ class Logger:
     - Structured formatting
     - Context-aware logging
     """
-    
+
     _instance: Optional['Logger'] = None
-    _loggers: Dict[str, logging.Logger] = {}
-    
+    _loggers: dict[str, logging.Logger] = {}
+
     def __new__(cls) -> 'Logger':
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
-    
+
     def __init__(self):
         if hasattr(self, '_initialized'):
             return
-        
+
         self._initialized = True
-        self.log_dir = Path("logs")
-        self.log_dir.mkdir(exist_ok=True)
         
+        # Use /tmp for serverless environments, logs/ for local development
+        if os.getenv('VERCEL') or os.getenv('AWS_LAMBDA_FUNCTION_NAME'):
+            # Serverless environment - use /tmp or disable file logging
+            self.log_dir = Path("/tmp/logs")
+            self.serverless_mode = True
+        else:
+            # Local development
+            self.log_dir = Path("logs")
+            self.serverless_mode = False
+            
+        # Only create directory if not in serverless mode
+        if not self.serverless_mode:
+            self.log_dir.mkdir(exist_ok=True)
+
         self.session_id = str(uuid.uuid4())[:8]
-        
+
         self.environment = os.getenv('ENVIRONMENT', '').lower()
         self.is_production = self.environment == 'production'
         self.is_development = self.environment == 'development'
-        
+
         if self.is_production:
             self.default_level = LogLevel.INFO
         elif self.is_development:
             self.default_level = LogLevel.DEBUG
         else:
             self.default_level = LogLevel.WARNING
-    
-    def get_logger(self, name: str, level: Optional[LogLevel] = None) -> logging.Logger:
+
+    def get_logger(self, name: str, level: LogLevel | None = None) -> logging.Logger:
         """
         Get or create a logger with the specified name and configuration.
         
@@ -106,34 +118,34 @@ class Logger:
         """
         if name in self._loggers:
             return self._loggers[name]
-        
+
         logger = logging.getLogger(name)
-        
+
         logger.handlers.clear()
-        
+
         log_level = level.value if level else self.default_level.value
         logger.setLevel(log_level)
-        
+
         detailed_formatter = logging.Formatter(
             fmt=f'%(asctime)s | {self.session_id} | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        
+
         simple_formatter = logging.Formatter(
             fmt=f'%(asctime)s | {self.session_id} | %(levelname)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        
+
         colored_detailed_formatter = ColoredFormatter(
             fmt=f'%(asctime)s | {self.session_id} | %(name)s | %(levelname)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        
+
         colored_simple_formatter = ColoredFormatter(
             fmt=f'%(asctime)s | {self.session_id} | %(levelname)s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
-        
+
         console_handler = logging.StreamHandler(sys.stdout)
         if self.is_production:
             console_handler.setFormatter(colored_simple_formatter)
@@ -144,19 +156,21 @@ class Logger:
         else:
             console_handler.setFormatter(colored_simple_formatter)
             console_handler.setLevel(logging.WARNING)
-        
+
         logger.addHandler(console_handler)
-        
-        self._add_file_handlers(logger, name, detailed_formatter)
-        
+
+        # Only add file handlers in non-serverless environments
+        if not self.serverless_mode:
+            self._add_file_handlers(logger, name, detailed_formatter)
+
         logger.propagate = False
-        
+
         self._loggers[name] = logger
         return logger
-    
+
     def _add_file_handlers(self, logger: logging.Logger, name: str, formatter: logging.Formatter):
         """Add rotating file handlers for different log levels"""
-        
+
         general_handler = logging.handlers.RotatingFileHandler(
             filename=self.log_dir / f"{name.replace('.', '_')}.log",
             maxBytes=10 * 1024 * 1024,
@@ -165,7 +179,7 @@ class Logger:
         general_handler.setFormatter(formatter)
         general_handler.setLevel(self.default_level.value)
         logger.addHandler(general_handler)
-        
+
         error_handler = logging.handlers.RotatingFileHandler(
             filename=self.log_dir / f"{name.replace('.', '_')}_errors.log",
             maxBytes=10 * 1024 * 1024,
@@ -174,26 +188,26 @@ class Logger:
         error_handler.setFormatter(formatter)
         error_handler.setLevel(logging.WARNING)
         logger.addHandler(error_handler)
-        
+
         if self.is_development:
             debug_handler = logging.handlers.RotatingFileHandler(
                 filename=self.log_dir / f"{name.replace('.', '_')}_debug.log",
-                maxBytes=5 * 1024 * 1024, 
+                maxBytes=5 * 1024 * 1024,
                 backupCount=3
             )
             debug_handler.setFormatter(formatter)
             debug_handler.setLevel(logging.DEBUG)
             logger.addHandler(debug_handler)
-    
+
     def set_level(self, name: str, level: LogLevel):
         """Set log level for a specific logger"""
         if name in self._loggers:
             self._loggers[name].setLevel(level.value)
-    
+
     def get_session_id(self) -> str:
         """Get the current session ID"""
         return self.session_id
-    
+
     def set_session_id(self, session_id: str):
         """
         Set a custom session ID for all future loggers.
@@ -202,7 +216,7 @@ class Logger:
         Existing loggers will keep their original session ID format.
         """
         self.session_id = session_id
-    
+
     def generate_new_session_id(self) -> str:
         """
         Generate a new session ID and return it.
@@ -212,24 +226,24 @@ class Logger:
         """
         self.session_id = str(uuid.uuid4())[:8]
         return self.session_id
-    
+
     def configure_for_production(self):
         """Configure all loggers for production environment"""
         self.is_production = True
         self.default_level = LogLevel.INFO
-        
+
         for logger in self._loggers.values():
             logger.setLevel(logging.INFO)
             for handler in logger.handlers:
                 if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
                     handler.setLevel(logging.INFO)
-    
+
     def configure_for_debug(self):
         """Configure all loggers for debug environment"""
         self.is_production = False
         self.is_development = True
         self.default_level = LogLevel.DEBUG
-        
+
         for logger in self._loggers.values():
             logger.setLevel(logging.DEBUG)
             for handler in logger.handlers:
@@ -240,7 +254,7 @@ class Logger:
 logger_manager = Logger()
 
 
-def get_logger(name: str, level: Optional[LogLevel] = None) -> logging.Logger:
+def get_logger(name: str, level: LogLevel | None = None) -> logging.Logger:
     """
     Convenience function to get a logger instance.
     
@@ -288,19 +302,19 @@ def generate_new_session_id() -> str:
 
 class LogLevelContext:
     """Context manager for temporarily changing log levels"""
-    
+
     def __init__(self, logger_name: str, level: LogLevel):
         self.logger_name = logger_name
         self.new_level = level
         self.original_level = None
-    
+
     def __enter__(self):
         if self.logger_name in logger_manager._loggers:
             logger = logger_manager._loggers[self.logger_name]
             self.original_level = logger.level
             logger.setLevel(self.new_level.value)
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.original_level is not None and self.logger_name in logger_manager._loggers:
             logger_manager._loggers[self.logger_name].setLevel(self.original_level)

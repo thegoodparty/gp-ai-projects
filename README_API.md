@@ -1,11 +1,14 @@
 # Campaign Plan Generator API
 
-A FastAPI-based web service that wraps the campaign plan orchestrator to generate comprehensive campaign plans as downloadable PDFs.
+A FastAPI-based web service that wraps the campaign plan orchestrator to generate comprehensive campaign plans as downloadable PDFs or structured JSON.
 
 ## Features
 
 - ✅ **Web Form Interface**: User-friendly HTML form for non-technical users
 - ✅ **REST API**: JSON API endpoint for programmatic access
+- ✅ **Multiple Output Formats**: PDF download and structured JSON response
+- ✅ **Task Extraction**: Automatic parsing of campaign tasks for todo lists
+- ✅ **React Integration**: JSON endpoints optimized for web app integration
 - ✅ **PDF Generation**: Automatic conversion to professionally formatted PDF
 - ✅ **Slack Integration**: Webhook support for Slack slash commands
 - ✅ **AWS Lambda Ready**: Containerized deployment for AWS Lambda
@@ -19,30 +22,47 @@ A FastAPI-based web service that wraps the campaign plan orchestrator to generat
 - **Description**: Serves an HTML form for easy campaign plan generation
 - **Usage**: Open in browser, fill form, submit to get PDF download
 
-### 2. JSON API
+### 2. JSON API (Flexible Format)
 
 - **URL**: `POST /generate-campaign-plan`
 - **Content-Type**: `application/json`
+- **Query Parameter**: `format` (optional: "pdf" or "json", default: "pdf")
 - **Body**: CampaignInfo JSON object
-- **Response**: PDF file download
+- **Response**: PDF file download or JSON response
 
-### 3. Form Submission
+### 3. JSON API (JSON Only)
+
+- **URL**: `POST /generate-campaign-plan-json`
+- **Content-Type**: `application/json`
+- **Body**: CampaignInfo JSON object
+- **Response**: Structured JSON with campaign plan and extracted tasks
+
+### 4. Form Submission
 
 - **URL**: `POST /generate-campaign-plan-form`
 - **Content-Type**: `application/x-www-form-urlencoded`
 - **Usage**: Internal endpoint for web form submissions
 
-### 4. Slack Webhook
+### 5. Background Generation with Progress Tracking
+
+- **Start**: `POST /start-campaign-plan-generation`
+- **Progress**: `GET /progress/{session_id}`
+- **Download PDF**: `GET /download/{session_id}` or `GET /download-pdf/{session_id}`
+- **Download JSON**: `GET /download/{session_id}?format=json` or `GET /download-json/{session_id}`
+
+### 6. Slack Webhook
 
 - **URL**: `POST /slack-webhook`
 - **Description**: Handles Slack slash commands for campaign plan generation
 
-### 5. Health Check
+### 7. Health Check
 
 - **URL**: `GET /health`
 - **Response**: `{"status": "healthy", "timestamp": "2024-01-01"}`
 
-## JSON API Example
+## JSON API Examples
+
+### Generate PDF (Default)
 
 ```bash
 curl -X POST "https://your-api-url/generate-campaign-plan" \
@@ -65,6 +85,72 @@ curl -X POST "https://your-api-url/generate-campaign-plan" \
   --output campaign_plan.pdf
 ```
 
+### Generate JSON
+
+```bash
+curl -X POST "https://your-api-url/generate-campaign-plan?format=json" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "candidate_name": "Sarah Johnson",
+    "election_date": "2025-11-05",
+    "office_and_jurisdiction": "School Board, At-Large, Chicopee, MA",
+    "incumbent_status": "N/A",
+    "race_type": "Nonpartisan",
+    "seats_available": 3,
+    "number_of_opponents": 7,
+    "win_number": 2500,
+    "total_likely_voters": 8500,
+    "available_cell_phones": 1200,
+    "available_landlines": 300
+  }'
+```
+
+### JSON Response Structure
+
+The JSON response includes extracted tasks for easy integration with todo lists:
+
+```json
+{
+  "campaign_info": {
+    "candidate_name": "Sarah Johnson",
+    "office_and_jurisdiction": "School Board, At-Large, Chicopee, MA",
+    "election_date": "2025-11-05",
+    "primary_date": "2025-09-15",
+    "generated_date": "2025-01-10"
+  },
+  "sections": {
+    "overview": "## 1. OVERVIEW\n\n[Markdown content...]",
+    "campaign_timeline": "## 3. CAMPAIGN TIMELINE\n\n[Markdown content...]",
+    "voter_contact_plan": "## 6. VOTER CONTACT PLAN\n\n[Markdown content...]"
+  },
+  "tasks": {
+    "timeline": [
+      {
+        "date": "July 15",
+        "parsed_date": "2025-07-15",
+        "title": "Campaign Launch Event",
+        "description": "Official campaign announcement",
+        "type": "timeline"
+      }
+    ],
+    "voter_contact": [
+      {
+        "date": "JULY 15",
+        "parsed_date": "2025-07-15",
+        "title": "P2P Text #1",
+        "description": "Candidate intro and vote-by-mail awareness",
+        "type": "voter_contact"
+      }
+    ],
+    "all_tasks": [
+      // Combined timeline and voter_contact tasks, sorted by date
+    ]
+  }
+}
+```
+
+For detailed JSON API documentation, see [API_JSON_ENDPOINTS.md](API_JSON_ENDPOINTS.md).
+
 ## Local Development
 
 ### Prerequisites
@@ -75,13 +161,19 @@ curl -X POST "https://your-api-url/generate-campaign-plan" \
 ### Setup
 
 ```bash
-# Install dependencies
-pip install -r requirements_api.txt
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-# Set environment variables
-export GEMINI_API_KEY="your_gemini_api_key"
-export TOGETHER_API_KEY="your_together_api_key"
-export TAVILY_API_KEY="your_tavily_api_key"
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up environment variables
+cp .env.example .env
+# Edit .env file and add your API keys:
+# TAVILY_API_KEY=your_tavily_api_key
+# GEMINI_API_KEY=your_gemini_api_key
+# TOGETHER_API_KEY=your_together_api_key (optional)
 
 # Run development server
 python api_wrapper.py
