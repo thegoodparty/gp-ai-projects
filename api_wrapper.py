@@ -6,6 +6,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Dict, List, Union
 
+import aiohttp
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -275,6 +276,45 @@ async def generate_campaign_plan_json_only(campaign_info: CampaignInfo):
         logger.error(f"Error generating JSON campaign plan: {e!s}")
         raise HTTPException(status_code=500, detail=f"Error generating campaign plan: {e!s}")
 
+@app.post("/generate-campaign-plan-async")
+async def generate_campaign_plan_async(
+    request: Request
+):
+    """Start async campaign plan generation with optional webhook callback."""
+    try:
+        # Parse the JSON body manually to get both campaign_info and webhook_url
+        body = await request.json()
+        
+        # Extract webhook_url if present
+        webhook_url = body.pop("webhook_url", None)
+        
+        # Create CampaignInfo from remaining body
+        campaign_info = CampaignInfo(**body)
+        
+        logger.info(f"Starting async generation for {campaign_info.candidate_name}")
+
+        # Generate unique session ID
+        session_id = str(uuid.uuid4())
+
+        # Initialize progress tracker
+        progress_tracker = ProgressTracker(session_id)
+
+        # Start background task for generation
+        asyncio.create_task(generate_campaign_plan_background(campaign_info, progress_tracker, webhook_url))
+
+        return {
+            "session_id": session_id,
+            "status": "processing",
+            "progress_url": f"/progress/{session_id}",
+            "download_url": f"/download/{session_id}",
+            "download_json_url": f"/download/{session_id}?format=json",
+            "webhook_url": webhook_url
+        }
+
+    except Exception as e:
+        logger.error(f"Error starting async campaign plan generation: {e!s}")
+        raise HTTPException(status_code=500, detail=f"Error starting generation: {e!s}")
+
 # Add convenient aliases for download endpoints
 @app.get("/download-pdf/{session_id}")
 async def download_pdf_alias(session_id: str):
@@ -301,7 +341,8 @@ async def start_campaign_plan_generation(
     available_cell_phones: int = Form(...),
     available_landlines: int = Form(...),
     primary_date: str | None = Form(None),
-    additional_race_context: str | None = Form(None)
+    additional_race_context: str | None = Form(None),
+    webhook_url: str | None = Form(None)
 ):
     """Start campaign plan generation and return session ID for progress tracking."""
     try:
@@ -333,7 +374,7 @@ async def start_campaign_plan_generation(
         progress_tracker = ProgressTracker(session_id)
 
         # Start background task for generation
-        asyncio.create_task(generate_campaign_plan_background(campaign_info, progress_tracker))
+        asyncio.create_task(generate_campaign_plan_background(campaign_info, progress_tracker, webhook_url))
 
         return {"session_id": session_id}
 
@@ -344,7 +385,7 @@ async def start_campaign_plan_generation(
         logger.error(f"Error starting campaign plan generation: {e!s}")
         raise HTTPException(status_code=500, detail=f"Error starting generation: {e!s}")
 
-async def generate_campaign_plan_background(campaign_info: CampaignInfo, progress_tracker: ProgressTracker):
+async def generate_campaign_plan_background(campaign_info: CampaignInfo, progress_tracker: ProgressTracker, webhook_url: str = None):
     """Background task to generate campaign plan with progress tracking."""
     try:
         progress_tracker.update(10, "processing", "Cleaning and validating campaign data...",
@@ -553,12 +594,20 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
         progress_tracker.update(100, "completed", "Campaign plan generation complete!",
                               "PDF ready for download")
 
+        # Call webhook if provided
+        if webhook_url:
+            await call_webhook(webhook_url, progress_tracker.session_id, "completed", json_data)
+
     except Exception as e:
         logger.error(f"Error in background generation: {e!s}")
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         progress_tracker.update(0, "error", f"Error: {e!s}",
                               f"Generation failed: {e!s}")
+        
+        # Call webhook on error if provided
+        if webhook_url:
+            await call_webhook(webhook_url, progress_tracker.session_id, "error", {"error": str(e)})
 
 @app.get("/progress/{session_id}")
 async def get_progress(session_id: str):
@@ -566,7 +615,19 @@ async def get_progress(session_id: str):
     if session_id not in progress_store:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return progress_store[session_id]
+    # Filter out non-serializable data like PDF bytes
+    session_data = progress_store[session_id]
+    filtered_data = {
+        "progress": session_data.get("progress", 0),
+        "status": session_data.get("status", "unknown"),
+        "message": session_data.get("message", ""),
+        "logs": session_data.get("logs", []),
+        "timestamp": session_data.get("timestamp", ""),
+        "has_pdf": "pdf_data" in session_data,
+        "has_json": "json_data" in session_data
+    }
+    
+    return filtered_data
 
 @app.get("/progress-stream/{session_id}")
 async def progress_stream(session_id: str):
@@ -688,6 +749,31 @@ async def download_pdf(session_id: str, format: str = Query("pdf", pattern="^(pd
             media_type="application/pdf",
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
+
+async def call_webhook(webhook_url: str, session_id: str, status: str, data: Dict[str, Any]):
+    """Call webhook URL with completion status and data."""
+    try:
+        webhook_payload = {
+            "session_id": session_id,
+            "status": status,
+            "timestamp": datetime.utcnow().isoformat(),
+            "data": data
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_url,
+                json=webhook_payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    logger.info(f"Successfully called webhook for session {session_id}")
+                else:
+                    logger.warning(f"Webhook returned status {response.status} for session {session_id}")
+                    
+    except Exception as e:
+        logger.error(f"Failed to call webhook for session {session_id}: {e!s}")
+        # Don't re-raise - webhook failure shouldn't fail the generation
 
 async def cleanup_session(session_id: str):
     """Clean up session data after 15 minutes."""

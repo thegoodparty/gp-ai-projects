@@ -77,8 +77,20 @@ class Logger:
             return
 
         self._initialized = True
-        self.log_dir = Path("logs")
-        self.log_dir.mkdir(exist_ok=True)
+        
+        # Use /tmp for serverless environments, logs/ for local development
+        if os.getenv('VERCEL') or os.getenv('AWS_LAMBDA_FUNCTION_NAME'):
+            # Serverless environment - use /tmp or disable file logging
+            self.log_dir = Path("/tmp/logs")
+            self.serverless_mode = True
+        else:
+            # Local development
+            self.log_dir = Path("logs")
+            self.serverless_mode = False
+            
+        # Only create directory if not in serverless mode
+        if not self.serverless_mode:
+            self.log_dir.mkdir(exist_ok=True)
 
         self.session_id = str(uuid.uuid4())[:8]
 
@@ -147,7 +159,9 @@ class Logger:
 
         logger.addHandler(console_handler)
 
-        self._add_file_handlers(logger, name, detailed_formatter)
+        # Only add file handlers in non-serverless environments
+        if not self.serverless_mode:
+            self._add_file_handlers(logger, name, detailed_formatter)
 
         logger.propagate = False
 

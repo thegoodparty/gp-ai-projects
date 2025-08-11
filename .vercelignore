@@ -1,0 +1,41 @@
+# Development files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+log.txt
+
+# Tests
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+README.md
+README_*.md
+*.md
+
+# Development scripts
+setup-dev.sh
+
+# Large data files
+research/results/
