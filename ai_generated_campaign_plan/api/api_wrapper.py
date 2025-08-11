@@ -1,29 +1,61 @@
 import io
-import re
 import json
 import asyncio
 import uuid
-import os
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Form
+from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 import uvicorn
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.enums import TA_LEFT, TA_CENTER
-from reportlab.lib.colors import black, blue
 
 from ai_generated_campaign_plan.orchestrator import CampaignPlanOrchestrator
 from ai_generated_campaign_plan.schema.models import CampaignInfo, RaceType, IncumbentStatus
+from ai_generated_campaign_plan.api.pdf_storage import PDFStorage
+from ai_generated_campaign_plan.api.json_storage import JSONStorage
+from ai_generated_campaign_plan.api.pdf_generator import CampaignPlanPDFGenerator
+from ai_generated_campaign_plan.api.json_extractor import CampaignPlanJSONExtractor
 from shared.logger import get_logger
 
-app = FastAPI(title="Campaign Plan Generator API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application lifecycle events."""
+    # Startup
+    logger.info("Starting Campaign Plan Generator API...")
+    
+    # Start background cleanup tasks for files and sessions
+    pdf_cleanup_task = asyncio.create_task(
+        pdf_storage.start_cleanup_task(cleanup_interval_hours=1, max_age_hours=24)
+    )
+    json_cleanup_task = asyncio.create_task(
+        json_storage.start_cleanup_task(cleanup_interval_hours=1, max_age_hours=24)
+    )
+    session_cleanup_task_handle = asyncio.create_task(session_cleanup_task())
+    logger.info("Background cleanup tasks started (PDF, JSON, sessions)")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Campaign Plan Generator API...")
+    pdf_cleanup_task.cancel()
+    json_cleanup_task.cancel()
+    session_cleanup_task_handle.cancel()
+    try:
+        await pdf_cleanup_task
+        await json_cleanup_task
+        await session_cleanup_task_handle
+    except asyncio.CancelledError:
+        logger.info("Background cleanup tasks cancelled")
+
+app = FastAPI(
+    title="Campaign Plan Generator API", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 logger = get_logger(__name__)
 
 # Get the directory where this script is located
@@ -32,7 +64,11 @@ templates_dir = current_dir / "templates"
 
 templates = Jinja2Templates(directory=str(templates_dir))
 
-# Store for progress tracking
+# Initialize storage and extraction utilities
+pdf_storage = PDFStorage()
+json_storage = JSONStorage()
+json_extractor = CampaignPlanJSONExtractor()
+pdf_generator = CampaignPlanPDFGenerator()
 progress_store: Dict[str, Dict[str, Any]] = {}
 
 class ProgressTracker:
@@ -63,6 +99,38 @@ class ProgressTracker:
             "timestamp": date.today().isoformat()
         }
 
+def cleanup_expired_sessions():
+    """Remove sessions older than 24 hours from progress_store"""
+    now = datetime.now()
+    expired_sessions = []
+    
+    for session_id, data in list(progress_store.items()):
+        if "expires_at" in data:
+            try:
+                expires_at = datetime.fromisoformat(data["expires_at"])
+                if now > expires_at:
+                    expired_sessions.append(session_id)
+            except (ValueError, TypeError):
+                # Invalid expiration date, clean it up
+                expired_sessions.append(session_id)
+    
+    # Remove expired sessions
+    for session_id in expired_sessions:
+        del progress_store[session_id]
+    
+    return len(expired_sessions)
+
+async def session_cleanup_task():
+    """Background task to periodically clean up expired sessions"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Run every hour
+            cleaned_count = cleanup_expired_sessions()
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} expired sessions from memory")
+        except Exception as e:
+            logger.error(f"Error in session cleanup task: {str(e)}")
+
 @app.get("/", response_class=HTMLResponse)
 async def form_page(request: Request):
     """Serve the HTML form for non-technical users."""
@@ -79,7 +147,7 @@ async def generate_campaign_plan_json(campaign_info: CampaignInfo):
         campaign_plan_text = await orchestrator.generate_complete_campaign_plan(campaign_info)
         
         # Convert to PDF
-        pdf_buffer = create_pdf_from_text(campaign_plan_text, campaign_info)
+        pdf_buffer = pdf_generator.create_pdf_from_text(campaign_plan_text, campaign_info)
         
         # Create filename
         safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
@@ -308,7 +376,7 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
                               "Creating PDF document")
         
         try:
-            pdf_buffer = create_pdf_from_text(final_plan, campaign_info)
+            pdf_buffer = pdf_generator.create_pdf_from_text(final_plan, campaign_info)
             logger.info(f"Successfully created PDF ({len(pdf_buffer.getvalue())} bytes)")
         except Exception as e:
             logger.error(f"Failed to create PDF: {str(e)}")
@@ -316,37 +384,59 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
         
         # Store final result
         safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        # Fallback to generic name if candidate name becomes empty after sanitization
+        if not safe_candidate_name:
+            safe_candidate_name = "candidate"
         filename = f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf"
+        
+        logger.info(f"Generated filename: {filename} from candidate name: '{campaign_info.candidate_name}'")
         
         # Ensure session exists in progress_store
         if progress_tracker.session_id not in progress_store:
             progress_store[progress_tracker.session_id] = {}
         
         try:
-            # Store the PDF data
+            # Save PDF to filesystem
             pdf_data = pdf_buffer.getvalue()
-            progress_store[progress_tracker.session_id]["pdf_data"] = pdf_data
-            progress_store[progress_tracker.session_id]["filename"] = filename
+            pdf_path = pdf_storage.save_pdf(progress_tracker.session_id, pdf_data, filename)
+            
+            # Generate JSON data using the extractor
+            progress_tracker.update(99, "processing", "Generating JSON format...", 
+                                  "Creating structured JSON data")
+            json_data = json_extractor.extract_json(final_plan, campaign_info)
+            
+            # Save JSON to filesystem using dedicated JSON storage
+            json_filename = filename.replace('.pdf', '.json')
+            json_path = json_storage.save_json(progress_tracker.session_id, json_data, json_filename)
+            
+            # Calculate expiration time (24 hours from now)
+            expiration_time = datetime.now() + timedelta(hours=24)
+            
+            # Store expiration time in progress_store
+            progress_store[progress_tracker.session_id]["expires_at"] = expiration_time.isoformat()
+            progress_store[progress_tracker.session_id]["expires_at_formatted"] = expiration_time.strftime("%B %d, %Y at %I:%M %p")
             
             # Debug logging
-            logger.info(f"PDF stored for session {progress_tracker.session_id}, filename: {filename}")
-            logger.info(f"PDF data size: {len(pdf_data)} bytes")
-            logger.info(f"Current progress_store keys: {list(progress_store.keys())}")
-            logger.info(f"Session data keys: {list(progress_store[progress_tracker.session_id].keys())}")
+            logger.info(f"Campaign plan generation completed for session {progress_tracker.session_id}")
+            logger.info(f"PDF saved: {filename} ({len(pdf_data)} bytes)")
+            logger.info(f"JSON saved: {json_filename}")
+            logger.info(f"Files expire at: {expiration_time.strftime('%B %d, %Y at %I:%M %p')}")
             
-            # Verify the data was stored
-            if "pdf_data" in progress_store[progress_tracker.session_id]:
-                logger.info("✓ PDF data successfully stored and verified")
+            # Verify files were saved
+            pdf_file_path = Path(pdf_path)
+            json_file_path = Path(json_path)
+            if pdf_file_path.exists() and json_file_path.exists():
+                logger.info("✓ Both PDF and JSON files successfully saved and verified")
             else:
-                logger.error("✗ PDF data not found after storage attempt")
-                raise Exception("PDF data storage failed")
+                logger.error(f"✗ File verification failed - PDF exists: {pdf_file_path.exists()}, JSON exists: {json_file_path.exists()}")
+                raise Exception("File save verification failed")
             
         except Exception as e:
-            logger.error(f"Failed to store PDF data: {str(e)}")
+            logger.error(f"Failed to save files: {str(e)}")
             raise
         
         progress_tracker.update(100, "completed", "Campaign plan generation complete!", 
-                              "PDF ready for download")
+                              "PDF and JSON formats ready for download")
         
     except Exception as e:
         logger.error(f"Error in background generation: {str(e)}")
@@ -358,10 +448,47 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
 @app.get("/progress/{session_id}")
 async def get_progress(session_id: str):
     """Get progress for a specific session."""
-    if session_id not in progress_store:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # First check if session is in memory (active generation)
+    if session_id in progress_store:
+        return progress_store[session_id]
     
-    return progress_store[session_id]
+    # Check if completed files exist on disk
+    has_pdf = pdf_storage.get_pdf_path(session_id) is not None
+    has_json = json_storage.get_json_path(session_id) is not None
+    
+    if has_pdf and has_json:
+        # Session completed, build response from file metadata
+        pdf_metadata = pdf_storage.get_metadata(session_id)
+        if pdf_metadata:
+            created_at = datetime.fromisoformat(pdf_metadata["created_at"])
+            expiration_time = created_at + timedelta(hours=24)
+            
+            # Check if expired
+            if datetime.now() > expiration_time:
+                raise HTTPException(status_code=404, detail="Session expired")
+            
+            return {
+                "progress": 100,
+                "status": "completed",
+                "message": "Campaign plan generation complete!",
+                "logs": ["Files available for download"],
+                "timestamp": created_at.date().isoformat(),
+                "has_pdf": True,
+                "has_json": True,
+                "expires_at": expiration_time.isoformat(),
+                "expires_at_formatted": expiration_time.strftime("%B %d, %Y at %I:%M %p"),
+                "download_links": {
+                    "pdf": f"/download-pdf/{session_id}",
+                    "json": f"/download-json/{session_id}"
+                },
+                "files_ready": {
+                    "pdf": True,
+                    "json": True,
+                    "total": 2
+                }
+            }
+    
+    raise HTTPException(status_code=404, detail="Session not found")
 
 @app.get("/progress-stream/{session_id}")
 async def progress_stream(session_id: str):
@@ -371,19 +498,40 @@ async def progress_stream(session_id: str):
         last_progress = -1
         while True:
             if session_id in progress_store:
+                # Active generation - stream progress updates
                 current_data = progress_store[session_id]
                 current_progress = current_data.get("progress", 0)
                 
                 # Only send update if progress changed
                 if current_progress != last_progress:
-                    # Filter out non-serializable data like PDF bytes
+                    # Check if files exist using storage systems
+                    has_pdf = pdf_storage.get_pdf_path(session_id) is not None
+                    has_json = json_storage.get_json_path(session_id) is not None
+                    
+                    # Build download links if generation is complete
+                    download_links = {}
+                    if current_data.get("status") == "completed":
+                        if has_pdf:
+                            download_links["pdf"] = f"/download-pdf/{session_id}"
+                        if has_json:
+                            download_links["json"] = f"/download-json/{session_id}"
+                    
                     filtered_data = {
                         "progress": current_data.get("progress", 0),
                         "status": current_data.get("status", "unknown"),
                         "message": current_data.get("message", ""),
                         "logs": current_data.get("logs", []),
                         "timestamp": current_data.get("timestamp", ""),
-                        "has_pdf": "pdf_data" in current_data  # Just indicate if PDF exists
+                        "has_pdf": has_pdf,
+                        "has_json": has_json,
+                        "download_links": download_links,
+                        "expires_at": current_data.get("expires_at"),
+                        "expires_at_formatted": current_data.get("expires_at_formatted"),
+                        "files_ready": {
+                            "pdf": has_pdf,
+                            "json": has_json,
+                            "total": sum([has_pdf, has_json])
+                        }
                     }
                     
                     yield f"data: {json.dumps(filtered_data)}\n\n"
@@ -391,6 +539,37 @@ async def progress_stream(session_id: str):
                 
                 # Stop streaming if completed or error
                 if current_data.get("status") in ["completed", "error"]:
+                    break
+            else:
+                # Check if completed files exist on disk
+                has_pdf = pdf_storage.get_pdf_path(session_id) is not None
+                has_json = json_storage.get_json_path(session_id) is not None
+                
+                if has_pdf and has_json:
+                    # Session completed, send final status
+                    final_data = {
+                        "progress": 100,
+                        "status": "completed",
+                        "message": "Campaign plan generation complete!",
+                        "logs": ["Files available for download"],
+                        "has_pdf": True,
+                        "has_json": True,
+                        "download_links": {
+                            "pdf": f"/download-pdf/{session_id}",
+                            "json": f"/download-json/{session_id}"
+                        },
+                        "files_ready": {
+                            "pdf": True,
+                            "json": True,
+                            "total": 2
+                        }
+                    }
+                    yield f"data: {json.dumps(final_data)}\n\n"
+                    break
+                else:
+                    # Session not found
+                    error_data = {"error": "Session not found"}
+                    yield f"data: {json.dumps(error_data)}\n\n"
                     break
             
             await asyncio.sleep(0.5)  # Check every 500ms
@@ -406,66 +585,65 @@ async def progress_stream(session_id: str):
         }
     )
 
-@app.get("/download/{session_id}")
+@app.get("/download-pdf/{session_id}")
 async def download_pdf(session_id: str):
     """Download the generated PDF."""
-    logger.info(f"Download requested for session: {session_id}")
-    logger.info(f"Available sessions: {list(progress_store.keys())}")
+    logger.info(f"PDF download requested for session: {session_id}")
     
-    if session_id not in progress_store:
-        logger.error(f"Session {session_id} not found in progress_store")
-        logger.error(f"Available sessions: {list(progress_store.keys())}")
-        raise HTTPException(status_code=404, detail="Session not found")
+    # Check if PDF file exists directly
+    pdf_path = pdf_storage.get_pdf_path(session_id)
+    if not pdf_path or not pdf_path.exists():
+        logger.error(f"PDF file not found for session {session_id}")
+        raise HTTPException(status_code=404, detail="PDF file not found")
     
-    session_data = progress_store[session_id]
-    logger.info(f"Session data keys: {list(session_data.keys())}")
-    logger.info(f"Session status: {session_data.get('status', 'unknown')}")
+    # Get filename from metadata
+    metadata = pdf_storage.get_metadata(session_id)
+    if metadata and metadata.get("original_filename"):
+        filename = metadata["original_filename"]
+    else:
+        filename = "campaign_plan.pdf"
     
-    if session_data.get("status") != "completed":
-        current_status = session_data.get("status", "unknown")
-        logger.error(f"Generation not completed, status: {current_status}")
-        
-        # Provide more helpful error messages based on status
-        if current_status == "error":
-            error_msg = session_data.get("message", "Unknown error occurred")
-            raise HTTPException(status_code=500, detail=f"Generation failed: {error_msg}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Generation not completed (status: {current_status})")
+    logger.info(f"Serving PDF: {filename}, path: {pdf_path}")
     
-    if "pdf_data" not in session_data:
-        logger.error(f"PDF data not found in session {session_id}")
-        logger.error(f"Session data contents: {list(session_data.keys())}")
-        
-        # Check if we have detailed error information
-        if "logs" in session_data:
-            logger.error(f"Session logs: {session_data['logs']}")
-        
-        raise HTTPException(status_code=404, detail="PDF not found - generation may have failed")
-    
-    # Additional validation
-    pdf_data = session_data["pdf_data"]
-    if not pdf_data or len(pdf_data) == 0:
-        logger.error(f"PDF data is empty for session {session_id}")
-        raise HTTPException(status_code=500, detail="PDF data is empty")
-    
-    filename = session_data.get("filename", "campaign_plan.pdf")
-    logger.info(f"Serving PDF: {filename}, size: {len(pdf_data)} bytes")
-    
-    # Clean up session data after download
-    asyncio.create_task(cleanup_session(session_id))
+    # Stream file from disk
+    def file_streamer():
+        with open(pdf_path, "rb") as f:
+            while chunk := f.read(8192):
+                yield chunk
     
     return StreamingResponse(
-        io.BytesIO(pdf_data),
+        file_streamer(),
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-async def cleanup_session(session_id: str):
-    """Clean up session data after 15 minutes."""
-    await asyncio.sleep(900)  # Wait 15 minutes (300 seconds)
-    if session_id in progress_store:
-        logger.info(f"Cleaning up session {session_id}")
-        del progress_store[session_id]
+@app.get("/download-json/{session_id}")
+async def download_json(session_id: str):
+    """Download the generated JSON."""
+    logger.info(f"JSON download requested for session: {session_id}")
+    
+    # Load JSON data from filesystem directly
+    json_data = json_storage.load_json(session_id)
+    if not json_data:
+        logger.error(f"JSON file not found for session {session_id}")
+        raise HTTPException(status_code=404, detail="JSON file not found")
+    
+    # Get filename from metadata
+    metadata = json_storage.get_metadata(session_id)
+    filename = (metadata.get("original_filename") if metadata else "campaign_plan.json")
+    
+    logger.info(f"Serving JSON: {filename}")
+    
+    # Create JSON string for download
+    json_str = json.dumps(json_data, indent=2, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
+    
+    return StreamingResponse(
+        io.BytesIO(json_bytes),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 
 @app.post("/generate-campaign-plan-form")
 async def generate_campaign_plan_form(
@@ -516,6 +694,7 @@ async def generate_campaign_plan_form(
         logger.error(f"Error processing form: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing form: {str(e)}")
 
+
 @app.post("/slack-webhook")
 async def slack_webhook(request: Request):
     """Handle Slack webhook for campaign plan generation."""
@@ -555,155 +734,6 @@ async def slack_webhook(request: Request):
         logger.error(f"Error processing Slack webhook: {str(e)}")
         return {"response_type": "ephemeral", "text": f"Error: {str(e)}"}
 
-def create_pdf_from_text(text: str, campaign_info: CampaignInfo) -> io.BytesIO:
-    """Convert campaign plan text to PDF with proper markdown formatting."""
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
-    
-    styles = getSampleStyleSheet()
-    
-    # Create custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=20,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        textColor=black
-    )
-    
-    h1_style = ParagraphStyle(
-        'CustomH1',
-        parent=styles['Heading1'],
-        fontSize=16,
-        spaceAfter=15,
-        spaceBefore=20,
-        textColor=black
-    )
-    
-    h2_style = ParagraphStyle(
-        'CustomH2',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=12,
-        spaceBefore=18,
-        textColor=black
-    )
-    
-    h3_style = ParagraphStyle(
-        'CustomH3',
-        parent=styles['Heading3'],
-        fontSize=12,
-        spaceAfter=10,
-        spaceBefore=15,
-        textColor=black
-    )
-    
-    normal_style = ParagraphStyle(
-        'CustomNormal',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=6,
-        alignment=TA_LEFT
-    )
-    
-    bullet_style = ParagraphStyle(
-        'CustomBullet',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=4,
-        leftIndent=20,
-        alignment=TA_LEFT
-    )
-    
-    def process_markdown_formatting(text):
-        """Process basic markdown formatting in text."""
-        # Handle bold text **text**
-        text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-        
-        # Handle italic text *text*
-        text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
-        
-        # Handle inline code `code`
-        text = re.sub(r'`(.*?)`', r'<font name="Courier">\1</font>', text)
-        
-        # Escape any remaining special characters for reportlab
-        text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        
-        # Restore our formatting tags
-        text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-        text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
-        text = text.replace('&lt;font name="Courier"&gt;', '<font name="Courier">').replace('&lt;/font&gt;', '</font>')
-        
-        return text
-    
-    # Build the document
-    story = []
-    
-    # Split text into lines and process
-    lines = text.split('\n')
-    
-    for line in lines:
-        original_line = line
-        line = line.strip()
-        
-        if not line:
-            story.append(Spacer(1, 6))
-            continue
-        
-        # Handle markdown headers
-        if line.startswith('# '):
-            # H1 header
-            header_text = line[2:].strip()
-            story.append(Paragraph(process_markdown_formatting(header_text), h1_style))
-        elif line.startswith('## '):
-            # H2 header
-            header_text = line[3:].strip()
-            story.append(Paragraph(process_markdown_formatting(header_text), h2_style))
-        elif line.startswith('### '):
-            # H3 header
-            header_text = line[4:].strip()
-            story.append(Paragraph(process_markdown_formatting(header_text), h3_style))
-        elif line.startswith('#### '):
-            # H4 header (treat as H3)
-            header_text = line[5:].strip()
-            story.append(Paragraph(process_markdown_formatting(header_text), h3_style))
-        # Handle bullet points
-        elif line.startswith('- ') or line.startswith('* '):
-            bullet_text = line[2:].strip()
-            story.append(Paragraph(f"• {process_markdown_formatting(bullet_text)}", bullet_style))
-        # Handle numbered lists
-        elif re.match(r'^\d+\.\s', line):
-            story.append(Paragraph(process_markdown_formatting(line), bullet_style))
-        # Title (first line)
-        elif line.startswith('CAMPAIGN PLAN'):
-            story.append(Paragraph(line, title_style))
-        # Section headers (lines with numbers followed by periods - fallback for non-markdown)
-        elif line.startswith(('1.', '2.', '3.', '4.', '5.', '6.')) and line.count('.') == 1:
-            story.append(Paragraph(process_markdown_formatting(line), h1_style))
-        # Subsection headers (lines with letters or multiple numbers - fallback)
-        elif line.startswith(('A.', 'B.', 'C.', 'D.', 'E.')) or ('.' in line[:10] and re.match(r'^[A-Z0-9]+\.', line)):
-            story.append(Paragraph(process_markdown_formatting(line), h2_style))
-        # Separator lines
-        elif line.startswith('═'):
-            story.append(Spacer(1, 12))
-        # Handle code blocks (simple detection)
-        elif line.startswith('```'):
-            story.append(Spacer(1, 6))
-            continue
-        # Regular content
-        else:
-            # Check if line has significant indentation (preserve it)
-            if original_line.startswith('    ') or original_line.startswith('\t'):
-                # Treat as code or indented content
-                story.append(Paragraph(f'<font name="Courier">{process_markdown_formatting(line)}</font>', normal_style))
-            else:
-                story.append(Paragraph(process_markdown_formatting(line), normal_style))
-    
-    # Build PDF
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
 
 @app.get("/health")
 async def health_check():

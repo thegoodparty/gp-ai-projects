@@ -155,20 +155,54 @@
       .log-entry:last-child {
         border-bottom: none;
       }
+      .download-container {
+        display: none;
+        margin-top: 20px;
+        padding: 20px;
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        border: 2px solid #27ae60;
+      }
+      .download-title {
+        text-align: center;
+        font-size: 18px;
+        font-weight: bold;
+        color: #27ae60;
+        margin-bottom: 15px;
+      }
+      .download-buttons {
+        display: flex;
+        gap: 15px;
+        margin-bottom: 15px;
+      }
       .download-btn {
         background-color: #27ae60;
         color: white;
-        padding: 15px 30px;
+        padding: 15px 25px;
         border: none;
         border-radius: 5px;
-        font-size: 18px;
+        font-size: 16px;
         cursor: pointer;
-        width: 100%;
-        margin-top: 15px;
-        display: none;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
       }
       .download-btn:hover {
         background-color: #219a52;
+      }
+      .download-btn-json {
+        background-color: #3498db;
+      }
+      .download-btn-json:hover {
+        background-color: #2980b9;
+      }
+      .download-info {
+        text-align: center;
+        font-size: 14px;
+        color: #7f8c8d;
+        margin-top: 10px;
       }
       .error-message {
         background-color: #e74c3c;
@@ -238,8 +272,8 @@
       <h1>Campaign Plan Generator</h1>
       <p style="text-align: center; color: #7f8c8d; margin-bottom: 30px">
         Generate a comprehensive campaign plan by filling out the form below.
-        The system will create a detailed PDF document with strategic
-        recommendations.
+        The system will create both PDF and JSON formats with strategic
+        recommendations, available for download for 24 hours.
       </p>
 
       <form id="campaignForm">
@@ -410,7 +444,7 @@
         </div>
 
         <button type="submit" class="submit-btn" id="submitBtn">
-          Generate Campaign Plan PDF
+          Generate Campaign Plan (PDF + JSON)
         </button>
       </form>
 
@@ -436,9 +470,21 @@
             System initialized. Waiting for generation to start...
           </div>
         </div>
-        <button class="download-btn" id="downloadBtn">
-          Download PDF (good for 15 minutes)
-        </button>
+        <div class="download-container" id="downloadContainer">
+          <div class="download-title">✅ Campaign Plan Ready!</div>
+          <div class="download-buttons">
+            <button class="download-btn" id="downloadPdfBtn">
+              📄 Download PDF
+            </button>
+            <button class="download-btn download-btn-json" id="downloadJsonBtn">
+              📊 Download JSON
+            </button>
+          </div>
+          <div class="download-info" id="downloadInfo">
+            Files are available for download until <span id="expirationTime">calculating...</span>
+            <br><small id="timeRemaining" style="color: #95a5a6;"></small>
+          </div>
+        </div>
         <div class="error-message" id="errorMessage"></div>
       </div>
     </div>
@@ -446,6 +492,8 @@
     <script>
       let currentSessionId = null;
       let eventSource = null;
+      let expirationDate = null;
+      let countdownInterval = null;
 
       function showError(message) {
         const errorDiv = document.getElementById("errorMessage");
@@ -473,7 +521,7 @@
         document.getElementById("progressContainer").style.display = "none";
         document.getElementById("submitBtn").disabled = false;
         document.getElementById("submitBtn").textContent =
-          "Generate Campaign Plan PDF";
+          "Generate Campaign Plan (PDF + JSON)";
 
         // Close event source if open
         if (eventSource) {
@@ -482,6 +530,48 @@
         }
 
         currentSessionId = null;
+        
+        // Clear countdown timer
+        if (countdownInterval) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+        }
+        expirationDate = null;
+      }
+      
+      function updateCountdown() {
+        const timeRemainingEl = document.getElementById("timeRemaining");
+        if (!expirationDate || !timeRemainingEl) return;
+        
+        const now = new Date();
+        const timeLeft = expirationDate - now;
+        
+        if (timeLeft <= 0) {
+          timeRemainingEl.textContent = "Files have expired";
+          timeRemainingEl.style.color = "#e74c3c";
+          if (countdownInterval) {
+            clearInterval(countdownInterval);
+            countdownInterval = null;
+          }
+          return;
+        }
+        
+        const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+        const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+        
+        if (hours > 0) {
+          timeRemainingEl.textContent = `(${hours} hours ${minutes} minutes remaining)`;
+        } else {
+          timeRemainingEl.textContent = `(${minutes} minutes remaining)`;
+        }
+        
+        // Change color as time gets low
+        if (hours < 1) {
+          timeRemainingEl.style.color = "#f39c12"; // Orange for < 1 hour
+        }
+        if (minutes < 30 && hours === 0) {
+          timeRemainingEl.style.color = "#e74c3c"; // Red for < 30 minutes
+        }
       }
 
       function updateProgress(data) {
@@ -490,7 +580,10 @@
           document.getElementById("progressPercentage");
         const progressMessage = document.getElementById("progressMessage");
         const logContainer = document.getElementById("logContainer");
-        const downloadBtn = document.getElementById("downloadBtn");
+        const downloadContainer = document.getElementById("downloadContainer");
+        const downloadPdfBtn = document.getElementById("downloadPdfBtn");
+        const downloadJsonBtn = document.getElementById("downloadJsonBtn");
+        const expirationTime = document.getElementById("expirationTime");
         const errorDiv = document.getElementById("errorMessage");
 
         // Update progress bar
@@ -521,8 +614,50 @@
         if (data.status === "completed") {
           progressMessage.innerHTML =
             '<span class="status-completed">✓ ' + data.message + "</span>";
-          downloadBtn.style.display = "block";
-          downloadBtn.onclick = () => downloadPDF();
+          
+          // Show download container with appropriate buttons
+          downloadContainer.style.display = "block";
+          
+          // Update expiration time
+          if (data.expires_at_formatted) {
+            expirationTime.textContent = data.expires_at_formatted;
+          } else if (data.expires_at) {
+            // Fallback: format the ISO timestamp
+            const expDate = new Date(data.expires_at);
+            expirationTime.textContent = expDate.toLocaleString('en-US', {
+              weekday: 'long',
+              year: 'numeric', 
+              month: 'long', 
+              day: 'numeric',
+              hour: 'numeric', 
+              minute: '2-digit',
+              hour12: true
+            });
+          } else {
+            expirationTime.textContent = "24 hours from completion";
+          }
+          
+          // Start countdown timer if we have expiration data
+          if (data.expires_at) {
+            expirationDate = new Date(data.expires_at);
+            updateCountdown(); // Initial update
+            countdownInterval = setInterval(updateCountdown, 60000); // Update every minute
+          }
+          
+          // Setup download buttons based on available files
+          if (data.download_links && data.download_links.pdf) {
+            downloadPdfBtn.onclick = () => downloadFile("pdf");
+            downloadPdfBtn.style.display = "flex";
+          } else {
+            downloadPdfBtn.style.display = "none";
+          }
+          
+          if (data.download_links && data.download_links.json) {
+            downloadJsonBtn.onclick = () => downloadFile("json");
+            downloadJsonBtn.style.display = "flex";
+          } else {
+            downloadJsonBtn.style.display = "none";
+          }
 
           // Close event source
           if (eventSource) {
@@ -561,38 +696,58 @@
         };
       }
 
-      async function downloadPDF() {
+      async function downloadFile(format) {
         if (!currentSessionId) {
           showError("No session found for download");
           return;
         }
 
         try {
-          const response = await fetch(`/download/${currentSessionId}`);
+          const url = format === "pdf" 
+            ? `/download-pdf/${currentSessionId}` 
+            : `/download-json/${currentSessionId}`;
+          
+          const response = await fetch(url);
 
           if (response.ok) {
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
+            let filename = `campaign_plan.${format}`;
+            
+            if (format === "pdf") {
+              // Handle PDF download (binary)
+              const blob = await response.blob();
+              const blobUrl = window.URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = blobUrl;
 
-            // Get filename from response headers
-            const contentDisposition = response.headers.get(
-              "Content-Disposition"
-            );
-            let filename = "campaign_plan.pdf";
-            if (contentDisposition) {
-              const matches = contentDisposition.match(/filename=([^;]+)/);
-              if (matches && matches[1]) {
-                filename = matches[1].replace(/['"]/g, "");
+              // Get filename from response headers
+              const contentDisposition = response.headers.get("Content-Disposition");
+              if (contentDisposition) {
+                const matches = contentDisposition.match(/filename=([^;]+)/);
+                if (matches && matches[1]) {
+                  filename = matches[1].replace(/['"]/g, "");
+                }
               }
-            }
 
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
+              a.download = filename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              window.URL.revokeObjectURL(blobUrl);
+            } else {
+              // Handle JSON download
+              const jsonData = await response.json();
+              const jsonBlob = new Blob([JSON.stringify(jsonData, null, 2)], {
+                type: "application/json"
+              });
+              const blobUrl = window.URL.createObjectURL(jsonBlob);
+              const a = document.createElement("a");
+              a.href = blobUrl;
+              a.download = filename;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              window.URL.revokeObjectURL(blobUrl);
+            }
 
             // Show success message
             const successMsg = document.createElement("div");
@@ -608,7 +763,7 @@
               z-index: 1000;
               font-weight: bold;
             `;
-            successMsg.textContent = "✓ PDF downloaded successfully!";
+            successMsg.textContent = `✓ ${format.toUpperCase()} downloaded successfully!`;
             document.body.appendChild(successMsg);
 
             setTimeout(() => {
@@ -618,11 +773,11 @@
             }, 3000);
           } else {
             const errorData = await response.json();
-            showError(errorData.detail || "Failed to download PDF");
+            showError(errorData.detail || `Failed to download ${format.toUpperCase()}`);
           }
         } catch (error) {
           console.error("Download error:", error);
-          showError("Network error during download. Please try again.");
+          showError(`Network error during ${format.toUpperCase()} download. Please try again.`);
         }
       }
 
@@ -690,10 +845,13 @@
       document.getElementById("election_date").min = today;
       document.getElementById("primary_date").min = today;
 
-      // Cleanup event source on page unload
+      // Cleanup event source and countdown on page unload
       window.addEventListener("beforeunload", function () {
         if (eventSource) {
           eventSource.close();
+        }
+        if (countdownInterval) {
+          clearInterval(countdownInterval);
         }
       });
     </script>
