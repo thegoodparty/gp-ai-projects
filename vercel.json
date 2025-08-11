@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/*.py": {
-      "maxDuration": 898
+      "maxDuration": 899
     }
   },
   "rewrites": [
