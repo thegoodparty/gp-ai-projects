@@ -43,7 +43,7 @@ class KnowYourCommunityGenerator:
     ```
     """
 
-    _api_semaphore = asyncio.Semaphore(10) # this is set to call tavily in parallel but not overload the system
+    _api_semaphore = asyncio.Semaphore(3) # Reduced from 10 to 3 to prevent timeouts
 
     def __init__(self):
         """Initialize the generator with necessary clients and logger."""
@@ -64,10 +64,14 @@ class KnowYourCommunityGenerator:
         Returns:
             str: Generated media outreach section
         """
+        import time
+        start_time = time.time()
         self.logger.info(f"Generating media outreach section for candidate: {cleaned_campaign_info.candidate_name}")
 
         try:
             media_info = await self._fetch_media_press_outreach_for_campaign(cleaned_campaign_info)
+            elapsed_time = time.time() - start_time
+            self.logger.info(f"Media outreach section data fetched in {elapsed_time:.2f} seconds")
 
             media_prompt = f"""
 You are an expert campaign strategist. Generate a media outreach section for this campaign.
@@ -149,9 +153,12 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
 
         try:
             async with self._api_semaphore:
-                media_context = await self.tavily_client.get_search_context(
-                    query=f"local media outlets newspapers radio TV stations {location}",
-                    max_results=10
+                media_context = await asyncio.wait_for(
+                    self.tavily_client.get_search_context(
+                        query=f"local media outlets newspapers radio TV stations {location}",
+                        max_results=10
+                    ),
+                    timeout=30.0  # 30 second timeout for each Tavily call
                 )
 
             self.logger.debug(f"Media context: {media_context}")
@@ -165,6 +172,8 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
         """
         Fetch community events for the campaign using Gemini search.
         """
+        import time
+        start_time = time.time()
         self.logger.info(f"Fetching community events for candidate with gemini search: {cleaned_campaign_info.candidate_name}")
         self.logger.debug(f"Campaign info details: {cleaned_campaign_info}")
         prompt = f"""
@@ -176,9 +185,19 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
         - Today's Date: {date.today()}
         """
         self.logger.debug(f"Prompt: {prompt}")
-        response = self.gemini_client.generate_with_search(prompt)
-        self.logger.debug(f"Response: {response}")
-        return response
+        
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(self.gemini_client.generate_with_search, prompt),
+                timeout=120.0  # 2 minute timeout for Gemini search
+            )
+            elapsed_time = time.time() - start_time
+            self.logger.info(f"Gemini search completed in {elapsed_time:.2f} seconds")
+            self.logger.debug(f"Response: {response}")
+            return response.get('text', '') if isinstance(response, dict) else str(response)
+        except asyncio.TimeoutError:
+            self.logger.error("Gemini search timed out after 120 seconds")
+            raise Exception("Gemini search request timed out")
 
 
     async def _generate_community_events_section(self, cleaned_campaign_info: CleanedCampaignInfo) -> str:
@@ -199,7 +218,11 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
                 community_events = await self._fetch_community_events_with_gemini_search(cleaned_campaign_info)
             except Exception as e:
                 self.logger.error(f"Failed to fetch community events with gemini search: {e!s}")
-                community_events = await self._fetch_community_events_for_campaign(cleaned_campaign_info)
+                try:
+                    community_events = await self._fetch_community_events_for_campaign(cleaned_campaign_info)
+                except Exception as e2:
+                    self.logger.error(f"Failed to fetch community events with Tavily search: {e2!s}")
+                    community_events = f"Unable to fetch community events. Error: {e2!s}"
 
             self.logger.info("Filtering events for best voter reach potential")
             filtered_formatted_list = await self._filter_best_events(community_events, cleaned_campaign_info)
@@ -215,13 +238,13 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
 
     async def _generate_search_terms(self, cleaned_campaign_info: CleanedCampaignInfo) -> list[str]:
         """
-        Generate 3 targeted search terms based on campaign information.
+        Generate 2 targeted search terms based on campaign information.
         
         Args:
             cleaned_campaign_info: Cleaned campaign information
             
         Returns:
-            list[str]: 3 targeted search terms
+            list[str]: 2 targeted search terms
         """
         now = date.today()
         self.logger.info(f"Generating search terms for candidate: {cleaned_campaign_info.candidate_name}")
@@ -230,7 +253,7 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
 
         try:
             search_terms_prompt = f"""
-Generate 3 web search terms to find community events where a political candidate can connect with voters.
+Generate 2 web search terms to find community events where a political candidate can connect with voters.
 
 today's date: {now}
 
@@ -249,37 +272,40 @@ EXAMPLES:
 -"Chicopee MA local events school meetings Fall 2025"
 -"Chicopee MA school district town hall meetings Fall 2025"
 
-Return exactly 3 search terms, one per line, with no bullets or formatting.
+Return exactly 2 search terms, one per line, with no bullets or formatting.
 """
 
             self.logger.debug("Generating targeted search terms")
 
-            search_terms_response = self.llm_client.create_structured_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. Generate exactly 3 search terms for finding community events where political candidates can connect with voters."
-                    },
-                    {
-                        "role": "user",
-                        "content": search_terms_prompt
-                    }
-                ],
-                response_schema=SearchTermsList,
-                max_tokens=10000,
+            search_terms_response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.llm_client.create_structured_completion,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert campaign strategist. Generate exactly 2 search terms for finding community events where political candidates can connect with voters."
+                        },
+                        {
+                            "role": "user",
+                            "content": search_terms_prompt
+                        }
+                    ],
+                    response_schema=SearchTermsList,
+                    max_tokens=10000,
+                ),
+                timeout=30.0  # 30 second timeout for search term generation
             )
 
             search_terms = search_terms_response.search_terms
 
-            if len(search_terms) < 3:
+            if len(search_terms) < 2:
                 self.logger.warning(f"Generated only {len(search_terms)} search terms, filling with defaults")
                 search_terms.extend([
                     f"community events {location} with dates from {now.month} {now.year}",
-                    f"town meetings {location} with dates from {now.month} {now.year}",
-                    f"civic events {location} with dates from {now.month} {now.year}"
+                    f"town meetings {location} with dates from {now.month} {now.year}"
                 ])
 
-            search_terms = search_terms[:3]
+            search_terms = search_terms[:2]
 
             self.logger.info(f"Generated search terms: {search_terms}")
             return search_terms
@@ -316,10 +342,13 @@ Return exactly 3 search terms, one per line, with no bullets or formatting.
             for search_term in search_terms:
                 async def search_task(query=search_term):
                     async with self._api_semaphore:
-                        return await self.tavily_client.get_search_context(
-                            query=query,
-                            search_depth="basic",
-                            max_results=5
+                        return await asyncio.wait_for(
+                            self.tavily_client.get_search_context(
+                                query=query,
+                                search_depth="basic",
+                                max_results=5
+                            ),
+                            timeout=30.0  # 30 second timeout for each search
                         )
                 search_tasks.append(search_task())
 
@@ -442,15 +471,21 @@ CRITICAL: Return ONLY the bullet points sorted by date (earliest first). Clean u
         self.logger.debug(f"Campaign info details: {cleaned_campaign_info}")
 
         try:
-            self.logger.debug("Generating community events and media outreach sections in parallel")
+            import time
+            start_time = time.time()
+            self.logger.info("Generating community events and media outreach sections in parallel")
 
             community_events_task = self._generate_community_events_section(cleaned_campaign_info)
             media_outreach_task = self._generate_media_outreach_section(cleaned_campaign_info)
 
+            self.logger.info("Starting parallel execution of community events and media outreach tasks")
             community_events_section, media_outreach_section = await asyncio.gather(
                 community_events_task,
                 media_outreach_task
             )
+            
+            elapsed_time = time.time() - start_time
+            self.logger.info(f"Parallel tasks completed in {elapsed_time:.2f} seconds")
 
             complete_section ="\n".join([
                 "## 5. KNOW YOUR COMMUNITY",
