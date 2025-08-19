@@ -23,11 +23,10 @@ local_testing.py
 offline_data/
 
 #ai tooling
-CLAUDE.md
+CLAUDE*.md
 
 #output files
 output*/
 
 #vector store files
 vector_store/
-
