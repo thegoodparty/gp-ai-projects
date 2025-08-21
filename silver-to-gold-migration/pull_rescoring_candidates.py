@@ -25,7 +25,7 @@ class RescoringCandidatesPuller:
         self.table_path = f"{self.catalog}.{self.schema}.{self.table}"
         
         # Output directory
-        self.output_dir = Path(__file__).parent / "data"
+        self.output_dir = Path(__file__).parent / "offline_data"
         self.output_dir.mkdir(exist_ok=True)
         
     def check_table_exists(self) -> bool:
