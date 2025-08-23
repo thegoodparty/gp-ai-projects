@@ -7,6 +7,7 @@ from shared.logger import get_logger
 from shared.llm import LLMClient
 from shared.llm_gemini import GeminiClient
 from shared.tavily_client import SharedTavilyClient
+from shared.ai_template_client import ai_template_client
 
 # Structured task models for timeline generation
 class TimelineTask(BaseModel):
@@ -16,9 +17,12 @@ class TimelineTask(BaseModel):
     description: str = Field(description="Task description/purpose")
     cta: str = Field(description="Call to action: Schedule, develop strategy, Visit in person, Write post, Learn More, etc.")
     type: str = Field(description="Task type: outreach, externalLink, event, general, compliance")
-    category: str = Field(description="Task category: text, robocall, doorKnocking, phoneBanking, socialMedia, link, general")
+    category: str = Field(description="Task category: text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, compliance, general")
     deadline: str = Field(description="Last effective date for this task (e.g., 'Aug 25, 2025')")
     link: str = Field(default="", description="External link for events (real URLs only)")
+    week: int = Field(description="Campaign week number (1-9, where 1 = election week)")
+    defaultAiTemplateId: str = Field(default="", description="AI template ID for text/robocall/doorKnocking/phoneBanking/socialMedia tasks")
+    proRequired: bool = Field(description="Whether task requires pro subscription")
 
 class TimelineResponse(BaseModel):
     """Timeline generation response with structured tasks"""
@@ -110,10 +114,24 @@ class CampaignTimelineGenerator:
                     "cta": task.cta,
                     "type": task.type,
                     "category": task.category,
-                    "deadline": task.deadline
+                    "deadline": task.deadline,
+                    "week": task.week,
+                    "proRequired": task.proRequired
                 }
                 if task.link:
                     task_dict["link"] = task.link
+                
+                # Get template ID dynamically from AI template service
+                if task.category in ["text", "robocall", "doorKnocking", "phoneBanking", "socialMedia"]:
+                    template_id = ai_template_client.get_template_id_for_task(
+                        task.category, task.week, task.description
+                    )
+                    if template_id:
+                        task_dict["defaultAiTemplateId"] = template_id
+                    elif task.defaultAiTemplateId:
+                        # Fallback to AI-generated template ID if available
+                        task_dict["defaultAiTemplateId"] = task.defaultAiTemplateId
+                
                 structured_tasks.append(task_dict)
             
             self.logger.info("Successfully generated campaign timeline section with structured tasks")
@@ -166,21 +184,54 @@ VOTER CONTACT SECTION:
 BALLOT DATES INFORMATION:
 {ballot_dates}
 
-TASK TYPES (use exact values):
-- "outreach" - Direct voter contact milestones
-- "externalLink" - External community events and activities
-- "event" - Campaign events, meetings, forums
+CAMPAIGN TASK GENERATION GUIDELINES:
+The campaign timeline runs from Week 9 (campaign start) to Week 1 (election week). Generate tasks following these week-specific priorities:
+
+WEEK 1 (Election Week - Final GOTV Push):
+- Focus: Get Out The Vote (GOTV)
+- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
+- Messaging Theme: "reminding people to vote", "election day reminders"
+- Events: Going to polls, celebrating campaign efforts
+
+WEEK 2 (1 Week Before Election):
+- Focus: GOTV + Final Persuasion
+- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
+- Messaging Theme: Mix of persuasive content and vote reminders, "answering common questions"
+
+WEEKS 3-6 (Persuasion Phase - 2-5 Weeks Before Election):
+- Focus: Voter Persuasion & Trust Building
+- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education (week 4+)
+- Special: Week 4 reintroduces text/robocalls with "1 month to election" messaging
+- Messaging Theme: "persuade voters", "build trust", discussing "top voter issues"
+
+WEEKS 7-8 (Voter Identification Phase - 6-7 Weeks Before Election):
+- Focus: Getting to Know Voters
+- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education
+- Messaging Theme: "get to know your voters", "learn about their top issues"
+
+WEEK 9 (Campaign Foundation):
+- Focus: Education & Platform Building
+- Required Task Types: education only
+- Content: Profile completion, community joining, campaign education
+
+TASK CATEGORIES (use exact values):
+- "text" - Text messaging campaigns (requires AI template ID)
+- "robocall" - Robocall campaigns (requires AI template ID)
+- "doorKnocking" - Door-to-door canvassing (requires AI template ID)
+- "phoneBanking" - Phone banking campaigns (requires AI template ID)
+- "socialMedia" - Social media campaigns (requires AI template ID)
+- "events" - Campaign events, community activities (use link instead)
+- "education" - Educational content, platform building (use link instead)
 - "compliance" - Filing deadlines, ballot dates, administrative tasks
 - "general" - General campaign activities, planning, fundraising
 
-TASK CATEGORIES (use exact values):
-- "text" - Text messaging campaign milestones
-- "robocall" - Robocall campaign milestones
-- "doorKnocking" - Canvassing milestones
-- "phoneBanking" - Phone banking milestones
-- "socialMedia" - Social media campaign milestones
-- "link" - External links and community events
-- "general" - General activities
+ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS:
+Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
+Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
+Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
+Week 4: "6Adu3kct9uvZ0YNCXLPUvd" (1-month text), "452l4TPYpWdQZYxHHJsdUb" (1-month robocall), "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
+Week 5-6: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue social media), "3nr6D5fpYfIfywijoE1ITH" (event calendar social media - week 6)
+Week 7-8: "5jrvZCd28PMH4ipYl9DzTB" (voter ID door knocking), "2QCSobc5r6R7gO5hb0i8Ho" (voter ID phone banking), "NogRPt7eIxTU3ZEIw87LA" (community social media)
 
 CALL TO ACTION EXAMPLES:
 - "Schedule" - Schedule the activity/event
@@ -214,16 +265,19 @@ CRITICAL RULES:
 - DO NOT include actual voter contact activities (those are separate)
 
 Generate both:
-1. markdown_content: Formatted bullet points (- Full-Month DD | Event | Purpose)
+1. markdown_content: Formatted bullet points (- Full-Month DD | Event | Purpose) - DO NOT include template IDs in markdown
 2. tasks: Array of structured task objects with ALL required fields:
    - date: Task date in format "Aug 19, 2025" (abbreviated month, day, year)
    - title: Task/event title
    - description: Task description/purpose
    - cta: Call to action from examples above
    - type: Task type from list above
-   - category: Task category from list above
+   - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, compliance, general)
    - deadline: Last effective date in format "Aug 25, 2025" (usually same day for events, few days for milestones)
    - link: External link if applicable (real URLs only, empty string if none)
+   - week: Campaign week number (1-9, where 1 = election week)
+   - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
+   - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
 
 Ensure each task has a realistic deadline that makes sense for the activity type.
 """
@@ -269,6 +323,36 @@ Ensure each task has a realistic deadline that makes sense for the activity type
                 
             except Exception as fallback_error:
                 self.logger.error(f"Fallback timeline generation also failed: {str(fallback_error)}")
+                
+                # Try to extract tasks from any JSON content in the fallback response
+                try:
+                    import json
+                    import re
+                    
+                    # Look for JSON content in the response
+                    json_match = re.search(r'\{.*"tasks":\s*\[(.*?)\]\s*.*\}', fallback_response.choices[0].message.content, re.DOTALL)
+                    if json_match:
+                        # Try to parse the JSON and extract tasks
+                        json_content = json_match.group(0)
+                        parsed_json = json.loads(json_content)
+                        if 'tasks' in parsed_json and parsed_json['tasks']:
+                            self.logger.info(f"Extracted {len(parsed_json['tasks'])} tasks from fallback JSON content")
+                            # Convert to TimelineTask objects
+                            timeline_tasks = []
+                            for task_data in parsed_json['tasks']:
+                                try:
+                                    timeline_task = TimelineTask(**task_data)
+                                    timeline_tasks.append(timeline_task)
+                                except Exception as task_error:
+                                    self.logger.warning(f"Failed to parse task: {str(task_error)}")
+                            
+                            return TimelineResponse(
+                                markdown_content=parsed_json.get('markdown_content', fallback_response.choices[0].message.content),
+                                tasks=timeline_tasks
+                            )
+                except Exception as extract_error:
+                    self.logger.warning(f"Failed to extract tasks from fallback content: {str(extract_error)}")
+                
                 return TimelineResponse(
                     markdown_content="Error generating timeline content",
                     tasks=[]
@@ -312,22 +396,22 @@ if __name__ == "__main__":
  - Chicopee School Committee Budget Hearing (2025 date TBD): discuss fiscal priorities for schools.
  """
         voter_contact_section = """
-[JULY 15] – P2P Text #1: Candidate intro and vote-by-mail awareness if applicable  
-- [JULY 25] – Robocall #1: Ballot arrival and early voting prompt  
-- [AUGUST 10] – P2P Text #2: Experience and contrast message  
-- [AUGUST 25] – Robocall #2: Vote return and community message  
-- [SEPTEMBER 5] – P2P Text #3: Persuasion and vote planning  
-- [SEPTEMBER 10] – Robocall #3: Final GOTV push and polling info  
-- [SEPTEMBER 12] – P2P Text #4: Final GOTV reminder  
-- [SEPTEMBER 15] – Primary Election Day  
-- [OCTOBER 1] – P2P Text #1: Reintroduction and contrast message  
-- [OCTOBER 10] – Robocall #1: Early voting alert  
-- [OCTOBER 20] – P2P Text #2: Key issues and voter education  
-- [OCTOBER 25] – Robocall #2: Final persuasion  
-- [NOVEMBER 1] – P2P Text #3: Vote-by-mail deadline and GOTV push  
-- [NOVEMBER 3] – Robocall #3: Election Day GOTV  
-- [NOVEMBER 4] – P2P Text #4: Final reminder and polling location link  
-- [NOVEMBER 5] – General Election Day
+[JULY 15]  - text: Candidate intro and vote-by-mail awareness if applicable  
+[JULY 25]  - robocall: Ballot arrival and early voting prompt  
+[AUGUST 10]  - text: Experience and contrast message  
+[AUGUST 25]  - robocall: Vote return and community message  
+[SEPTEMBER 5]  - text: Persuasion and vote planning  
+[SEPTEMBER 10]  - robocall: Final GOTV push and polling info  
+[SEPTEMBER 12]  - text: Final GOTV reminder  
+[SEPTEMBER 15]  - Primary Election Day  
+[OCTOBER 1]  - text: Reintroduction and contrast message  
+[OCTOBER 10]  - robocall: Early voting alert  
+[OCTOBER 20]  - text: Key issues and voter education  
+[OCTOBER 25]  - robocall: Final persuasion  
+[NOVEMBER 1]  - text: Vote-by-mail deadline and GOTV push  
+[NOVEMBER 3]  - robocall: Election Day GOTV  
+[NOVEMBER 4]  - text: Final reminder and polling location link  
+[NOVEMBER 5]  - General Election Day
 """
         
         timeline_generator = CampaignTimelineGenerator()

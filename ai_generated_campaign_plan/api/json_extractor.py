@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from ai_generated_campaign_plan.schema.models import CampaignInfo
 from shared.logger import get_logger
 from shared.llm_gemini import GeminiClient
+from ai_generated_campaign_plan.utils.task_extractor import extract_tasks_from_campaign_sections, clean_and_validate_task
 
 logger = get_logger(__name__)
 
@@ -76,13 +77,35 @@ class CampaignPlanJSONExtractor:
             sections = self._parse_sections(campaign_plan_text)
             logger.info(f"Parsed {len(sections)} sections from campaign plan")
             
-            # Use provided structured tasks or fallback to empty lists
+            # Use provided structured tasks or try to extract from section content
             if timeline_tasks is None:
                 timeline_tasks = []
             if voter_contact_tasks is None:
                 voter_contact_tasks = []
             
-            # Tasks now come with all required fields from the generators
+            # If no structured tasks were provided, try to extract from section content
+            if (not timeline_tasks and not voter_contact_tasks) or (len(timeline_tasks) == 0 and len(voter_contact_tasks) == 0):
+                logger.info("No structured tasks provided, attempting to extract from section content")
+                extracted_timeline, extracted_voter_contact = extract_tasks_from_campaign_sections(sections)
+                
+                # Clean and validate extracted tasks
+                if extracted_timeline:
+                    timeline_tasks = []
+                    for task in extracted_timeline:
+                        cleaned_task = clean_and_validate_task(task)
+                        if cleaned_task:
+                            timeline_tasks.append(cleaned_task)
+                    logger.info(f"Successfully extracted and cleaned {len(timeline_tasks)} timeline tasks")
+                
+                if extracted_voter_contact:
+                    voter_contact_tasks = []
+                    for task in extracted_voter_contact:
+                        cleaned_task = clean_and_validate_task(task)
+                        if cleaned_task:
+                            voter_contact_tasks.append(cleaned_task)
+                    logger.info(f"Successfully extracted and cleaned {len(voter_contact_tasks)} voter contact tasks")
+            
+            # Tasks now come with all required fields from the generators or extraction
             
             logger.info(f"Extracted {len(timeline_tasks)} timeline tasks and {len(voter_contact_tasks)} voter contact tasks")
             

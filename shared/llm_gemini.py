@@ -337,34 +337,74 @@ class GeminiClient:
     def _clean_json_response(self, response_text: str) -> str:
         """Clean common JSON issues in AI-generated responses."""
         import re
+        import json
         
         # Remove any text before the first {
         start_idx = response_text.find('{')
         if start_idx > 0:
             response_text = response_text[start_idx:]
         
-        # Remove any text after the last }
-        end_idx = response_text.rfind('}')
-        if end_idx > 0 and end_idx < len(response_text) - 1:
-            response_text = response_text[:end_idx + 1]
+        # Try to parse as-is first
+        try:
+            json.loads(response_text)
+            return response_text
+        except json.JSONDecodeError:
+            pass
         
-        # Fix common issues with unescaped quotes in strings
-        # This is a simple approach - replace unescaped quotes in string values
-        def fix_quotes(match):
-            content = match.group(1)
-            # Escape unescaped quotes within the string content
-            fixed_content = content.replace('"', '\\"')
-            return f'"{fixed_content}"'
+        # Handle severely truncated JSON
+        lines = response_text.split('\n')
+        cleaned_lines = []
+        brace_depth = 0
+        in_string = False
         
-        # Pattern to match string values (simplified)
-        # This catches strings that might have unescaped quotes
-        response_text = re.sub(r':\s*"([^"]*(?:[^"\\][^"])*)"(?=\s*[,}])', 
-                              lambda m: f': "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', 
-                              response_text)
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            
+            # Track brace depth
+            for char in stripped:
+                if char == '"' and (i == 0 or stripped[max(0, stripped.find(char)-1)] != '\\'):
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        brace_depth += 1
+                    elif char == '}':
+                        brace_depth -= 1
+            
+            # Handle unterminated strings
+            if stripped.count('"') % 2 == 1 and ':' in stripped:
+                # Likely an unterminated string value
+                if not stripped.endswith('",') and not stripped.endswith('"'):
+                    line = line.rstrip() + '"'
+                    if i < len(lines) - 1:
+                        line += ','
+            
+            cleaned_lines.append(line)
+            
+            # If this looks like the last meaningful line and we have unclosed braces
+            if (i == len(lines) - 1 or 
+                (i < len(lines) - 1 and not lines[i+1].strip())):
+                
+                # Close any open structures
+                if '"tasks":' in response_text and not ']' in line:
+                    # We're in a tasks array that needs closing
+                    cleaned_lines.append('  ]')
+                
+                # Close remaining braces
+                while brace_depth > 0:
+                    cleaned_lines.append('}')
+                    brace_depth -= 1
+                break
+        
+        response_text = '\n'.join(cleaned_lines)
         
         # Fix trailing commas
         response_text = re.sub(r',\s*}', '}', response_text)
         response_text = re.sub(r',\s*]', ']', response_text)
+        
+        # Remove any text after the last complete }
+        end_idx = response_text.rfind('}')
+        if end_idx > 0 and end_idx < len(response_text) - 1:
+            response_text = response_text[:end_idx + 1]
         
         return response_text
     
