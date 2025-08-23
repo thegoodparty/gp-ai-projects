@@ -316,12 +316,57 @@ class GeminiClient:
             try:
                 return json.loads(response_text)
             except json.JSONDecodeError as json_error:
+                self.logger.warning(f"Initial JSON parse failed, attempting to clean response: {json_error}")
+                
+                # Try to clean common JSON issues
+                cleaned_response = self._clean_json_response(response_text)
+                if cleaned_response != response_text:
+                    try:
+                        self.logger.info("Successfully cleaned JSON response, attempting parse again")
+                        return json.loads(cleaned_response)
+                    except json.JSONDecodeError as second_error:
+                        self.logger.error(f"JSON cleaning failed: {second_error}")
+                
                 self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
                 raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
             
         except Exception as e:
             self.logger.error(f"Structured content generation failed: {str(e)}")
             raise
+    
+    def _clean_json_response(self, response_text: str) -> str:
+        """Clean common JSON issues in AI-generated responses."""
+        import re
+        
+        # Remove any text before the first {
+        start_idx = response_text.find('{')
+        if start_idx > 0:
+            response_text = response_text[start_idx:]
+        
+        # Remove any text after the last }
+        end_idx = response_text.rfind('}')
+        if end_idx > 0 and end_idx < len(response_text) - 1:
+            response_text = response_text[:end_idx + 1]
+        
+        # Fix common issues with unescaped quotes in strings
+        # This is a simple approach - replace unescaped quotes in string values
+        def fix_quotes(match):
+            content = match.group(1)
+            # Escape unescaped quotes within the string content
+            fixed_content = content.replace('"', '\\"')
+            return f'"{fixed_content}"'
+        
+        # Pattern to match string values (simplified)
+        # This catches strings that might have unescaped quotes
+        response_text = re.sub(r':\s*"([^"]*(?:[^"\\][^"])*)"(?=\s*[,}])', 
+                              lambda m: f': "{m.group(1).replace(chr(34), chr(92) + chr(34))}"', 
+                              response_text)
+        
+        # Fix trailing commas
+        response_text = re.sub(r',\s*}', '}', response_text)
+        response_text = re.sub(r',\s*]', ']', response_text)
+        
+        return response_text
     
     def generate_with_search(
         self,

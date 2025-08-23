@@ -230,6 +230,8 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
         
         # Create orchestrator with progress tracking
         orchestrator = CampaignPlanOrchestrator()
+        timeline_tasks = []
+        voter_contact_tasks = []
         
         # Step 1: Clean campaign data
         progress_tracker.update(20, "processing", "Extracting location and date information...", 
@@ -339,11 +341,20 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             contact_generator = VoterContactPlanGenerator()
             if hasattr(contact_generator, 'llm_client'):
                 contact_generator.llm_client = orchestrator.llm_client
-            sections[6] = await contact_generator.generate_section(cleaned_campaign_info, primary_contact_strategy, general_contact_strategy)
+            contact_result = await contact_generator.generate_section(cleaned_campaign_info, primary_contact_strategy, general_contact_strategy)
+            
+            # Handle tuple return (content, tasks)
+            if isinstance(contact_result, tuple):
+                sections[6], voter_contact_tasks = contact_result
+            else:
+                sections[6] = contact_result
+                voter_contact_tasks = []
+                
             logger.info("Successfully generated section 6: Voter Contact Plan")
         except Exception as e:
             logger.error(f"Failed to generate section 6: {str(e)}")
             sections[6] = "6. VOTER CONTACT PLAN\n\nSection could not be generated due to an error."
+            voter_contact_tasks = []
         
         # Section 3: Campaign Timeline (depends on sections 5 and 6)
         progress_tracker.update(85, "processing", "Creating campaign timeline...", 
@@ -354,11 +365,20 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             timeline_generator = CampaignTimelineGenerator()
             if hasattr(timeline_generator, 'llm_client'):
                 timeline_generator.llm_client = orchestrator.llm_client
-            sections[3] = await timeline_generator.generate_section(cleaned_campaign_info, sections[5], sections[6])
+            timeline_result = await timeline_generator.generate_section(cleaned_campaign_info, sections[5], sections[6])
+            
+            # Handle tuple return (content, tasks)
+            if isinstance(timeline_result, tuple):
+                sections[3], timeline_tasks = timeline_result
+            else:
+                sections[3] = timeline_result
+                timeline_tasks = []
+                
             logger.info("Successfully generated section 3: Campaign Timeline")
         except Exception as e:
             logger.error(f"Failed to generate section 3: {str(e)}")
             sections[3] = "3. CAMPAIGN TIMELINE\n\nSection could not be generated due to an error."
+            timeline_tasks = []
         
         # Assemble final document
         progress_tracker.update(95, "processing", "Assembling final campaign plan document...", 
@@ -403,7 +423,7 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             # Generate JSON data using the extractor
             progress_tracker.update(99, "processing", "Generating JSON format...", 
                                   "Creating structured JSON data")
-            json_data = json_extractor.extract_json(final_plan, campaign_info)
+            json_data = json_extractor.extract_json(final_plan, campaign_info, timeline_tasks, voter_contact_tasks)
             
             # Save JSON to filesystem using dedicated JSON storage
             json_filename = filename.replace('.pdf', '.json')

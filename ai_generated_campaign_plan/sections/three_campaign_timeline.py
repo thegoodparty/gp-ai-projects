@@ -1,10 +1,29 @@
 import asyncio
 from datetime import date, timedelta
+from typing import Dict, Any, List, Tuple
+from pydantic import BaseModel, Field
 from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo
 from shared.logger import get_logger
 from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 from shared.tavily_client import SharedTavilyClient
 
+# Structured task models for timeline generation
+class TimelineTask(BaseModel):
+    """Single timeline task with proper categorization"""
+    date: str = Field(description="Date string (e.g., 'Aug 19, 2025')")
+    title: str = Field(description="Task/event title")
+    description: str = Field(description="Task description/purpose")
+    cta: str = Field(description="Call to action: Schedule, develop strategy, Visit in person, Write post, Learn More, etc.")
+    type: str = Field(description="Task type: outreach, externalLink, event, general, compliance")
+    category: str = Field(description="Task category: text, robocall, doorKnocking, phoneBanking, socialMedia, link, general")
+    deadline: str = Field(description="Last effective date for this task (e.g., 'Aug 25, 2025')")
+    link: str = Field(default="", description="External link for events (real URLs only)")
+
+class TimelineResponse(BaseModel):
+    """Timeline generation response with structured tasks"""
+    markdown_content: str = Field(description="Formatted markdown timeline content")
+    tasks: List[TimelineTask] = Field(description="List of structured timeline tasks")
 
 class CampaignTimelineGenerator:
     """
@@ -16,6 +35,7 @@ class CampaignTimelineGenerator:
     def __init__(self):
         self.logger = get_logger(__name__)
         self.llm_client = LLMClient()
+        self.gemini_client = GeminiClient()
         self.tavily_client = SharedTavilyClient()
         self.logger.info("CampaignTimelineGenerator initialized")
 
@@ -50,7 +70,7 @@ class CampaignTimelineGenerator:
 
     async def generate_section(self, cleaned_campaign_info: CleanedCampaignInfo, 
                              community_section: str, 
-                             voter_contact_section: str) -> str:
+                             voter_contact_section: str) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Generate the complete 'Campaign Timeline' section.
         
@@ -60,14 +80,14 @@ class CampaignTimelineGenerator:
             voter_contact_section: Generated voter contact section content
             
         Returns:
-            str: Generated complete campaign timeline section
+            Tuple[str, List[Dict[str, Any]]]: (markdown_section, structured_tasks)
         """
         self.logger.info(f"Starting campaign timeline generation for candidate: {cleaned_campaign_info.candidate_name}")
         
         try:            
             ballot_dates = await self._fetch_ballot_dates(cleaned_campaign_info)
             
-            timeline_content = await self._generate_timeline_content(
+            timeline_response = await self._generate_structured_timeline(
                 cleaned_campaign_info, 
                 community_section, 
                 voter_contact_section,
@@ -76,23 +96,39 @@ class CampaignTimelineGenerator:
             
             complete_section = f"""## 3. CAMPAIGN TIMELINE
 
-{timeline_content}
+{timeline_response.markdown_content}
 
 *Note: Verify all dates for accuracy. Community event dates may change.*"""
             
-            self.logger.info("Successfully generated campaign timeline section")
-            return complete_section
+            # Convert tasks to dict format expected by json_extractor
+            structured_tasks = []
+            for task in timeline_response.tasks:
+                task_dict = {
+                    "date": task.date,
+                    "title": task.title,
+                    "description": task.description,
+                    "cta": task.cta,
+                    "type": task.type,
+                    "category": task.category,
+                    "deadline": task.deadline
+                }
+                if task.link:
+                    task_dict["link"] = task.link
+                structured_tasks.append(task_dict)
+            
+            self.logger.info("Successfully generated campaign timeline section with structured tasks")
+            return complete_section, structured_tasks
             
         except Exception as e:
             self.logger.error(f"Failed to generate campaign timeline: {str(e)}")
-            return "## 3. CAMPAIGN TIMELINE\n\n[Error generating campaign timeline]"
+            return "## 3. CAMPAIGN TIMELINE\n\n[Error generating campaign timeline]", []
 
-    async def _generate_timeline_content(self, cleaned_campaign_info: CleanedCampaignInfo,
-                                       community_events: str, 
-                                       voter_contact_section: str,
-                                       ballot_dates: str) -> str:
+    async def _generate_structured_timeline(self, cleaned_campaign_info: CleanedCampaignInfo,
+                                          community_events: str, 
+                                          voter_contact_section: str,
+                                          ballot_dates: str) -> TimelineResponse:
         """
-        Generate the main timeline content using AI.
+        Generate structured timeline content with proper categorization and links using AI.
         
         Args:
             cleaned_campaign_info: Cleaned campaign information
@@ -101,19 +137,21 @@ class CampaignTimelineGenerator:
             ballot_dates: Ballot mail and return dates
             
         Returns:
-            str: Generated timeline content
+            TimelineResponse: Structured timeline with markdown and tasks
         """
-        self.logger.info("Generating timeline content with AI")
+        self.logger.info("Generating structured timeline content with AI")
         
         has_primary = cleaned_campaign_info.has_primary
         today = date.today()
+        location = f"{cleaned_campaign_info.city}, {cleaned_campaign_info.state_full}"
         
         timeline_prompt = f"""
-You are an expert campaign strategist. Generate a chronological campaign timeline focusing on planning events, milestones, and key election dates ONLY.
+Generate a chronological campaign timeline with both markdown content and structured task data.
 
 CAMPAIGN CONTEXT:
 - Candidate: {cleaned_campaign_info.candidate_name}
 - Office: {cleaned_campaign_info.office_and_jurisdiction}
+- Location: {location}
 - Today's Date: {today}
 - Election Date: {cleaned_campaign_info.election_date}
 - Primary Date: {cleaned_campaign_info.primary_date if has_primary else "No Primary"}
@@ -128,57 +166,113 @@ VOTER CONTACT SECTION:
 BALLOT DATES INFORMATION:
 {ballot_dates}
 
+TASK TYPES (use exact values):
+- "outreach" - Direct voter contact milestones
+- "externalLink" - External community events and activities
+- "event" - Campaign events, meetings, forums
+- "compliance" - Filing deadlines, ballot dates, administrative tasks
+- "general" - General campaign activities, planning, fundraising
+
+TASK CATEGORIES (use exact values):
+- "text" - Text messaging campaign milestones
+- "robocall" - Robocall campaign milestones
+- "doorKnocking" - Canvassing milestones
+- "phoneBanking" - Phone banking milestones
+- "socialMedia" - Social media campaign milestones
+- "link" - External links and community events
+- "general" - General activities
+
+CALL TO ACTION EXAMPLES:
+- "Schedule" - Schedule the activity/event
+- "develop strategy" - Plan and strategize
+- "Visit in person" - Attend event or activity
+- "Write post" - Create content or materials
+- "Learn More" - Research or gather information
+- "File paperwork" - Complete compliance tasks
+- "Register" - Sign up or register for events
+
+EXTERNAL LINK REQUIREMENTS (for externalLink category):
+- Research and provide REAL, specific URLs when possible
+- For state fairs: use official state fair websites
+- For farmers markets: use local harvest or official market websites
+- For community events: find local government or organization websites
+- For festivals: find official event websites
+- If you can't find a real URL, leave the link field empty
+
+JSON FORMAT REQUIREMENTS:
+- Use only standard ASCII characters in JSON
+- Escape all quotes and special characters properly
+- Avoid apostrophes and smart quotes in text fields
+- Use simple punctuation only
+
 CRITICAL RULES:
-- DO NOT include voter contact tactics (texts, robocalls, etc.)
-- Include dates where 25%, 50% and 75% of the TXT campaign will be completed. to do this, count the number of lines that have the word "TEXT" in the VOTER CONTACT SECTION and find the 25%, 50% and 75% of the total number of lines. the date should correspond to the date of the text.
-- Include dates where 25%, 50% and 75% of the ROBOCALL campaign will be completed. to do this, count the number of lines that have the word "ROBOCALL" in the VOTER CONTACT SECTIONand find the 25%, 50% and 75% of the total number of lines. the date should correspond to the date of the robocall.
-- ONLY include planning events, milestones, and key election dates
-- Include ballot mail and return dates
-- Include community events where candidate can appear
-- Include campaign milestones (launch, fundraising deadlines, etc.)
-- Include filing deadlines and other administrative dates
+- Include text/robocall campaign milestones (25%, 50%, 75% completion dates)
+- Include ballot mail and return dates from the ballot information
+- Include community events from the community section
+- Include campaign milestones and administrative deadlines
 - Sort everything chronologically from today through election day
+- DO NOT include actual voter contact activities (those are separate)
 
-REQUIRED FORMAT:
-md bullet points with the following format:
- - Full-Month DD | Event | Purpose
- - Full-Month DD | Event | Purpose
- - Full-Month DD | Event | Purpose
+Generate both:
+1. markdown_content: Formatted bullet points (- Full-Month DD | Event | Purpose)
+2. tasks: Array of structured task objects with ALL required fields:
+   - date: Task date in format "Aug 19, 2025" (abbreviated month, day, year)
+   - title: Task/event title
+   - description: Task description/purpose
+   - cta: Call to action from examples above
+   - type: Task type from list above
+   - category: Task category from list above
+   - deadline: Last effective date in format "Aug 25, 2025" (usually same day for events, few days for milestones)
+   - link: External link if applicable (real URLs only, empty string if none)
 
-EXAMPLES:
- - July 15 | Campaign Launch Event | Official campaign announcement
- - August 1 | Ballot Request Deadline | Last day to request absentee ballot
- - August 10 | Town Hall Meeting | Community engagement and visibility
- - September 15 | Ballot Return Deadline | Last day to return mail-in ballots
- - October 1 | Candidate Forum | Voter education and comparison
- - November 5 | Election Day | Final day of voting
-
-Generate the timeline in the exact format shown above. Start each line with the date, then |, then event, then |, then purpose.
+Ensure each task has a realistic deadline that makes sense for the activity type.
 """
         
         try:
-            response = self.llm_client.create_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. Generate a chronological campaign timeline focusing ONLY on planning events, milestones, and key election dates. Do NOT include voter contact tactics."
-                    },
-                    {
-                        "role": "user",
-                        "content": timeline_prompt
-                    }
-                ],
-                max_tokens=20000,
+            response = self.gemini_client.generate_structured_content(
+                prompt=timeline_prompt,
+                response_schema=TimelineResponse,
                 temperature=0.1
             )
             
-            timeline_content = response.choices[0].message.content
-            self.logger.info("Successfully generated timeline content")
-            return timeline_content
+            self.logger.info("Successfully generated structured timeline content")
+            return response
             
         except Exception as e:
-            self.logger.error(f"Failed to generate timeline content: {str(e)}")
-            return "Error generating timeline content"
+            self.logger.error(f"Failed to generate structured timeline content: {str(e)}")
+            
+            # Try fallback with regular LLM client for markdown content only
+            try:
+                self.logger.info("Attempting fallback with regular LLM client")
+                fallback_response = self.llm_client.create_completion(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert campaign strategist. Generate a chronological campaign timeline focusing ONLY on planning events, milestones, and key election dates. Do NOT include voter contact tactics."
+                        },
+                        {
+                            "role": "user",
+                            "content": timeline_prompt.replace("Generate both:", "Generate timeline content in markdown format:")
+                        }
+                    ],
+                    max_tokens=20000,
+                    temperature=0.1
+                )
+                
+                markdown_content = fallback_response.choices[0].message.content
+                self.logger.info("Successfully generated fallback timeline content")
+                
+                return TimelineResponse(
+                    markdown_content=markdown_content,
+                    tasks=[]  # No structured tasks from fallback
+                )
+                
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback timeline generation also failed: {str(fallback_error)}")
+                return TimelineResponse(
+                    markdown_content="Error generating timeline content",
+                    tasks=[]
+                )
 
 
 if __name__ == "__main__":

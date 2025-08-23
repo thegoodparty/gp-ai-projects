@@ -1,6 +1,6 @@
 import asyncio
 from datetime import date
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo
 from ai_generated_campaign_plan.utils.utils import CampaignUtils
@@ -475,6 +475,148 @@ Generated on: {date.today().strftime('%B %d, %Y')}
         """
         self.logger.info("Running campaign plan generation with cost tracking in synchronous mode")
         return asyncio.run(self.generate_campaign_plan_with_costs(campaign_info))
+    
+    async def generate_campaign_plan_with_tasks(self, campaign_info: CampaignInfo) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Generate campaign plan and return both the plan and structured tasks.
+        
+        Args:
+            campaign_info: Raw campaign information input
+            
+        Returns:
+            tuple: (campaign_plan, timeline_tasks, voter_contact_tasks)
+        """
+        self.logger.info("Generating campaign plan with structured tasks")
+        
+        # Initialize cost tracking
+        self.cost_tracker = CostTracker()
+        
+        # Step 1: Process campaign data
+        self.logger.info("Step 1: Processing campaign data")
+        cleaned_campaign_info = self.campaign_utils.clean_campaign_info(campaign_info)
+        
+        # Optimize contact strategy
+        if cleaned_campaign_info.has_primary:
+            primary_contact_strategy = self.campaign_utils.optimize_contact_strategy(
+                date.today(), cleaned_campaign_info.primary_date
+            )
+            general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
+                cleaned_campaign_info.primary_date, cleaned_campaign_info.election_date
+            )
+        else:
+            primary_contact_strategy = None
+            general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
+                date.today(), cleaned_campaign_info.election_date
+            )
+        
+        # Step 2: Generate sections
+        self.logger.info("Step 2: Generating campaign plan sections")
+        sections = {}
+        timeline_tasks = []
+        voter_contact_tasks = []
+        
+        # Generate independent sections (1, 2, 4, 5)
+        async def generate_section_1():
+            try:
+                self.logger.debug("Generating Section 1: Overview")
+                result = generate_campaign_overview(cleaned_campaign_info)
+                self._track_llm_usage("Section 1")
+                self.logger.info("✓ Section 1: Overview complete")
+                return result
+            except Exception as e:
+                self.logger.error(f"Failed to generate Section 1: {str(e)}")
+                return "1. CAMPAIGN STRATEGY OVERVIEW\n\nSection could not be generated due to an error."
+        
+        async def generate_section_2():
+            try:
+                self.logger.debug("Generating Section 2: Strategic Landscape & Electoral Goals")
+                result = await self.strategic_generator.generate_section(cleaned_campaign_info)
+                self._track_llm_usage("Section 2")
+                self.logger.info("✓ Section 2: Strategic Landscape & Electoral Goals complete")
+                return result
+            except Exception as e:
+                self.logger.error(f"Failed to generate Section 2: {str(e)}")
+                return "2. STRATEGIC LANDSCAPE & ELECTORAL GOALS\n\nSection could not be generated due to an error."
+        
+        async def generate_section_4():
+            try:
+                self.logger.debug("Generating Section 4: Recommended Total Budget")
+                result = generate_recommended_total_budget(cleaned_campaign_info)
+                self._track_llm_usage("Section 4")
+                self.logger.info("✓ Section 4: Recommended Total Budget complete")
+                return result
+            except Exception as e:
+                self.logger.error(f"Failed to generate Section 4: {str(e)}")
+                return "4. RECOMMENDED TOTAL BUDGET\n\nSection could not be generated due to an error."
+        
+        async def generate_section_5():
+            try:
+                self.logger.debug("Generating Section 5: Know Your Community")
+                result = await self.community_generator.generate_section(cleaned_campaign_info)
+                self._track_llm_usage("Section 5")
+                self.logger.info("✓ Section 5: Know Your Community complete")
+                return result
+            except Exception as e:
+                self.logger.error(f"Failed to generate Section 5: {str(e)}")
+                return "5. KNOW YOUR COMMUNITY\n\nSection could not be generated due to an error."
+        
+        async def generate_section_6():
+            try:
+                self.logger.debug("Generating Section 6: Voter Contact Plan")
+                result = await self.voter_contact_plan_generator.generate_section(cleaned_campaign_info, primary_contact_strategy, general_contact_strategy)
+                self._track_llm_usage("Section 6")
+                self.logger.info("✓ Section 6: Voter Contact Plan complete")
+                return result
+            except Exception as e:
+                self.logger.error(f"Failed to generate Section 6: {str(e)}")
+                return "6. VOTER CONTACT PLAN\n\nSection could not be generated due to an error.", []
+        
+        # Execute sections in parallel
+        section_results = await asyncio.gather(
+            generate_section_1(),
+            generate_section_2(),
+            generate_section_4(),
+            generate_section_5(),
+            generate_section_6()
+        )
+        
+        # Assign results
+        sections[1] = section_results[0]
+        sections[2] = section_results[1]
+        sections[4] = section_results[2]
+        sections[5] = section_results[3]
+        
+        # Handle section 6 which returns tuple (content, tasks)
+        if isinstance(section_results[4], tuple):
+            sections[6], voter_contact_tasks = section_results[4]
+        else:
+            sections[6] = section_results[4]
+            voter_contact_tasks = []
+        
+        # Generate Section 3: Campaign Timeline (depends on sections 5 and 6)
+        try:
+            self.logger.debug("Generating Section 3: Campaign Timeline")
+            timeline_result = await self.timeline_generator.generate_section(cleaned_campaign_info, sections[5], sections[6])
+            self._track_llm_usage("Section 3")
+            self._track_tavily_usage("Section 3", 2)
+            
+            if isinstance(timeline_result, tuple):
+                sections[3], timeline_tasks = timeline_result
+            else:
+                sections[3] = timeline_result
+                timeline_tasks = []
+                
+            self.logger.info("✓ Section 3: Campaign Timeline complete")
+        except Exception as e:
+            self.logger.error(f"Failed to generate Section 3: {str(e)}")
+            sections[3] = "3. CAMPAIGN TIMELINE\n\nSection could not be generated due to an error."
+            timeline_tasks = []
+        
+        # Assemble final document
+        final_plan = self._assemble_final_document(campaign_info, sections)
+        
+        self.logger.info(f"Successfully generated campaign plan with {len(timeline_tasks)} timeline tasks and {len(voter_contact_tasks)} voter contact tasks")
+        return final_plan, timeline_tasks, voter_contact_tasks
 
 
 if __name__ == "__main__":

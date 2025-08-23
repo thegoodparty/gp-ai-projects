@@ -1,11 +1,40 @@
-import re
 import json
 from datetime import date, datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel, Field
 from ai_generated_campaign_plan.schema.models import CampaignInfo
 from shared.logger import get_logger
+from shared.llm_gemini import GeminiClient
 
 logger = get_logger(__name__)
+
+# Pydantic schemas for structured task generation
+class TaskCategory:
+    """Constants for task categories"""
+    TEXT = "text"
+    ROBOCALL = "robocall"
+    DOOR_KNOCKING = "doorKnocking"
+    PHONE_BANKING = "phoneBanking"
+    SOCIAL_MEDIA = "socialMedia"
+    EXTERNAL_LINK = "externalLink"
+    GENERAL = "general"
+    WEBSITE = "website"
+    COMPLIANCE = "compliance"
+    UPGRADE_TO_PRO = "upgradeToPro"
+    PROFILE = "profile"
+
+class TaskItem(BaseModel):
+    """Single task item with proper categorization"""
+    date: str = Field(description="Date string (e.g., 'August 19, 2025')")
+    title: str = Field(description="Task title")
+    description: str = Field(description="Task description/purpose")
+    category: str = Field(description="Task category from the enum: text, robocall, doorKnocking, phoneBanking, socialMedia, externalLink, general, website, compliance, upgradeToPro, profile")
+    link: Optional[str] = Field(default=None, description="External link for events/activities (real URLs, not generic searches)")
+    contact_method: Optional[str] = Field(default=None, description="For voter contact tasks: text_message, phone_call, direct_mail, door_to_door, digital_outreach, event")
+
+class TaskList(BaseModel):
+    """List of structured tasks"""
+    tasks: List[TaskItem] = Field(description="List of campaign tasks")
 
 class CampaignPlanJSONExtractor:
     """
@@ -23,14 +52,19 @@ class CampaignPlanJSONExtractor:
             5: "know_your_community",
             6: "voter_contact_plan"
         }
+        self.gemini_client = GeminiClient()
     
-    def extract_json(self, campaign_plan_text: str, campaign_info: CampaignInfo) -> Dict[str, Any]:
+    def extract_json(self, campaign_plan_text: str, campaign_info: CampaignInfo, 
+                     timeline_tasks: List[Dict[str, Any]] = None,
+                     voter_contact_tasks: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Convert campaign plan text to structured JSON format.
         
         Args:
             campaign_plan_text: The full campaign plan text
             campaign_info: Campaign information object
+            timeline_tasks: Pre-generated structured timeline tasks
+            voter_contact_tasks: Pre-generated structured voter contact tasks
             
         Returns:
             Dict containing structured campaign plan data
@@ -42,9 +76,13 @@ class CampaignPlanJSONExtractor:
             sections = self._parse_sections(campaign_plan_text)
             logger.info(f"Parsed {len(sections)} sections from campaign plan")
             
-            # Extract tasks from relevant sections
-            timeline_tasks = self._parse_timeline_tasks(sections.get(3, ""))
-            voter_contact_tasks = self._parse_voter_contact_tasks(sections.get(6, ""))
+            # Use provided structured tasks or fallback to empty lists
+            if timeline_tasks is None:
+                timeline_tasks = []
+            if voter_contact_tasks is None:
+                voter_contact_tasks = []
+            
+            # Tasks now come with all required fields from the generators
             
             logger.info(f"Extracted {len(timeline_tasks)} timeline tasks and {len(voter_contact_tasks)} voter contact tasks")
             
@@ -103,7 +141,28 @@ class CampaignPlanJSONExtractor:
         
         for line in lines:
             # Check if this is a section header (## N. SECTION NAME or # N. SECTION NAME)
-            section_match = re.match(r'^#+\s*(\d+)\.\s*(.+)', line.strip())
+            line_stripped = line.strip()
+            if line_stripped.startswith('#') and '.' in line_stripped:
+                # Extract section number from pattern like "## 1. SECTION NAME"
+                try:
+                    hash_end = 0
+                    while hash_end < len(line_stripped) and line_stripped[hash_end] == '#':
+                        hash_end += 1
+                    
+                    content = line_stripped[hash_end:].strip()
+                    if content and content[0].isdigit():
+                        dot_pos = content.find('.')
+                        if dot_pos > 0:
+                            section_num = int(content[:dot_pos])
+                            section_match = True
+                        else:
+                            section_match = False
+                    else:
+                        section_match = False
+                except (ValueError, IndexError):
+                    section_match = False
+            else:
+                section_match = False
             
             if section_match:
                 # Save previous section if exists
@@ -111,7 +170,6 @@ class CampaignPlanJSONExtractor:
                     sections[current_section] = '\n'.join(current_content)
                 
                 # Start new section
-                section_num = int(section_match.group(1))
                 current_section = section_num
                 current_content = [line]
             else:
@@ -124,87 +182,6 @@ class CampaignPlanJSONExtractor:
             sections[current_section] = '\n'.join(current_content)
         
         return sections
-    
-    def _parse_timeline_tasks(self, timeline_content: str) -> List[Dict[str, Any]]:
-        """Parse timeline tasks from section 3 content into structured format."""
-        tasks = []
-        lines = timeline_content.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            # Look for lines matching: - Month DD | Event | Purpose
-            if line.startswith('- ') and ' | ' in line:
-                try:
-                    parts = line[2:].split(' | ')  # Remove '- ' prefix
-                    if len(parts) >= 3:
-                        date_str = parts[0].strip()
-                        event = parts[1].strip()
-                        purpose = parts[2].strip()
-                        
-                        # Try to parse the date
-                        parsed_date = self._parse_date_string(date_str)
-                        
-                        tasks.append({
-                            "date": date_str,
-                            "parsed_date": parsed_date.isoformat() if parsed_date else None,
-                            "title": event,
-                            "description": purpose,
-                            "type": "timeline",
-                            "category": "campaign_timeline"
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to parse timeline task: {line}. Error: {str(e)}")
-                    continue
-        
-        return tasks
-    
-    def _parse_voter_contact_tasks(self, contact_content: str) -> List[Dict[str, Any]]:
-        """Parse voter contact tasks from section 6 content into structured format."""
-        tasks = []
-        lines = contact_content.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            # Look for lines matching: - [MONTH DD] – Contact Type: Message
-            if line.startswith('- [') and '] –' in line:
-                try:
-                    # Extract date from brackets
-                    date_start = line.find('[') + 1
-                    date_end = line.find(']')
-                    
-                    if date_end > date_start:
-                        date_str = line[date_start:date_end].strip()
-                        
-                        # Extract the rest after ] –
-                        rest_start = line.find('] –') + 3
-                        rest_content = line[rest_start:].strip()
-                        
-                        # Split on first colon to separate contact type and message
-                        if ':' in rest_content:
-                            contact_type, message = rest_content.split(':', 1)
-                            contact_type = contact_type.strip()
-                            message = message.strip()
-                        else:
-                            contact_type = rest_content
-                            message = ""
-                        
-                        # Try to parse the date
-                        parsed_date = self._parse_date_string(date_str)
-                        
-                        tasks.append({
-                            "date": date_str,
-                            "parsed_date": parsed_date.isoformat() if parsed_date else None,
-                            "title": contact_type,
-                            "description": message,
-                            "type": "voter_contact",
-                            "category": "voter_outreach",
-                            "contact_method": self._categorize_contact_method(contact_type)
-                        })
-                except Exception as e:
-                    logger.warning(f"Failed to parse voter contact task: {line}. Error: {str(e)}")
-                    continue
-        
-        return tasks
     
     def _parse_date_string(self, date_str: str) -> date:
         """
@@ -223,25 +200,6 @@ class CampaignPlanJSONExtractor:
             except:
                 logger.warning(f"Could not parse date: {date_str}")
                 return None
-    
-    def _categorize_contact_method(self, contact_type: str) -> str:
-        """Categorize contact method based on contact type string."""
-        contact_type_lower = contact_type.lower()
-        
-        if any(word in contact_type_lower for word in ['text', 'sms', 'p2p']):
-            return "text_message"
-        elif any(word in contact_type_lower for word in ['call', 'phone', 'robocall']):
-            return "phone_call"
-        elif any(word in contact_type_lower for word in ['mail', 'postcard', 'letter']):
-            return "direct_mail"
-        elif any(word in contact_type_lower for word in ['door', 'canvass', 'knock']):
-            return "door_to_door"
-        elif any(word in contact_type_lower for word in ['digital', 'online', 'social', 'facebook', 'instagram']):
-            return "digital_outreach"
-        elif any(word in contact_type_lower for word in ['event', 'rally', 'meet']):
-            return "event"
-        else:
-            return "other"
     
     def save_json_to_file(self, json_data: Dict[str, Any], file_path: str) -> None:
         """Save JSON data to file with pretty formatting."""
