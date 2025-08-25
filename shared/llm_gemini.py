@@ -361,8 +361,8 @@ class GeminiClient:
             stripped = line.strip()
             
             # Track brace depth
-            for char in stripped:
-                if char == '"' and (i == 0 or stripped[max(0, stripped.find(char)-1)] != '\\'):
+            for char_idx, char in enumerate(stripped):
+                if char == '"' and (char_idx == 0 or stripped[char_idx - 1] != '\\'):
                     in_string = not in_string
                 elif not in_string:
                     if char == '{':
