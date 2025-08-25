@@ -12,13 +12,13 @@ from shared.ai_template_client import ai_template_client
 # Structured task models for timeline generation
 class TimelineTask(BaseModel):
     """Single timeline task with proper categorization"""
-    date: str = Field(description="Date string (e.g., 'Aug 19, 2025')")
+    date: str = Field(description="Exact date string (e.g., 'Aug 19, 2025')")
     title: str = Field(description="Task/event title")
     description: str = Field(description="Task description/purpose")
     cta: str = Field(description="Call to action: Schedule, develop strategy, Visit in person, Write post, Learn More, etc.")
     type: str = Field(description="Task type: outreach, externalLink, event, general, compliance")
     category: str = Field(description="Task category: text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, compliance, general")
-    deadline: str = Field(description="Last effective date for this task (e.g., 'Aug 25, 2025')")
+    deadline: int = Field(description="Weeks from election date when this task becomes ineffective (e.g., 2 = 2 weeks before election)")
     link: str = Field(default="", description="External link for events (real URLs only)")
     week: int = Field(description="Campaign week number (1-9, where 1 = election week)")
     defaultAiTemplateId: str = Field(default="", description="AI template ID for text/robocall/doorKnocking/phoneBanking/socialMedia tasks")
@@ -121,16 +121,18 @@ class CampaignTimelineGenerator:
                 if task.link:
                     task_dict["link"] = task.link
                 
-                # Get template ID dynamically from AI template service
+                # Prioritize AI-generated template ID, fallback to template service
                 if task.category in ["text", "robocall", "doorKnocking", "phoneBanking", "socialMedia"]:
-                    template_id = ai_template_client.get_template_id_for_task(
-                        task.category, task.week, task.description
-                    )
-                    if template_id:
-                        task_dict["defaultAiTemplateId"] = template_id
-                    elif task.defaultAiTemplateId:
-                        # Fallback to AI-generated template ID if available
+                    if task.defaultAiTemplateId:
+                        # Use AI-generated template ID if available (prioritized)
                         task_dict["defaultAiTemplateId"] = task.defaultAiTemplateId
+                    else:
+                        # Fallback to template service
+                        template_id = ai_template_client.get_template_id_for_task(
+                            task.category, task.week, task.description
+                        )
+                        if template_id:
+                            task_dict["defaultAiTemplateId"] = template_id
                 
                 structured_tasks.append(task_dict)
             
@@ -225,7 +227,7 @@ TASK CATEGORIES (use exact values):
 - "compliance" - Filing deadlines, ballot dates, administrative tasks
 - "general" - General campaign activities, planning, fundraising
 
-ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS:
+ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS (THESE ARE REQUIRED FOR EACH TASK GENERATION):
 Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
 Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
 Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
@@ -267,19 +269,19 @@ CRITICAL RULES:
 Generate both:
 1. markdown_content: Formatted bullet points (- Full-Month DD | Event | Purpose) - DO NOT include template IDs in markdown
 2. tasks: Array of structured task objects with ALL required fields:
-   - date: Task date in format "Aug 19, 2025" (abbreviated month, day, year)
+   - date: Exact task date in format "Aug 19, 2025" (abbreviated month, day, year)
    - title: Task/event title
    - description: Task description/purpose
    - cta: Call to action from examples above
    - type: Task type from list above
    - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, compliance, general)
-   - deadline: Last effective date in format "Aug 25, 2025" (usually same day for events, few days for milestones)
+   - deadline: Weeks from election date when task becomes ineffective (integer, e.g., 2 = 2 weeks before election)
    - link: External link if applicable (real URLs only, empty string if none)
    - week: Campaign week number (1-9, where 1 = election week)
    - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
    - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
 
-Ensure each task has a realistic deadline that makes sense for the activity type.
+Ensure each task has a realistic deadline in weeks that makes sense for the activity type (e.g., events = same week, milestones = 1-2 weeks buffer).
 """
         
         try:

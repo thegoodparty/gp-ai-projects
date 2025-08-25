@@ -11,13 +11,13 @@ from shared.ai_template_client import ai_template_client
 # Structured task models for voter contact generation
 class VoterContactTask(BaseModel):
     """Single voter contact task with proper categorization"""
-    date: str = Field(description="Date string (e.g., 'Aug 19, 2025')")
+    date: str = Field(description="Exact date string (e.g., 'Aug 19, 2025')")
     title: str = Field(description="Contact method/type title")
     description: str = Field(description="Message theme or purpose")
     cta: str = Field(description="Call to action: Schedule, develop strategy, Visit in person, Write post, Learn More, etc.")
     type: str = Field(description="Task type: outreach, externalLink, event, general")
     category: str = Field(description="Task category: text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, compliance, general")
-    deadline: str = Field(description="Last effective date for this task (e.g., 'Aug 25, 2025')")
+    deadline: int = Field(description="Weeks from election date when this task becomes ineffective (e.g., 2 = 2 weeks before election)")
     link: str = Field(default="", description="External link if applicable")
     week: int = Field(description="Campaign week number (1-9, where 1 = election week)")
     defaultAiTemplateId: str = Field(default="", description="AI template ID for text/robocall/doorKnocking/phoneBanking/socialMedia tasks")
@@ -43,7 +43,7 @@ class VoterContactPlanGenerator:
         has_primary = campaign_info.has_primary
         
         try:
-            if has_primary:
+            if has_primary:            
                 contact_response = await self._generate_structured_contact_with_primary(
                     campaign_info, primary_contact_strategy, general_contact_strategy
                 )
@@ -74,16 +74,18 @@ class VoterContactPlanGenerator:
                 if task.link:
                     task_dict["link"] = task.link
                 
-                # Get template ID dynamically from AI template service
+                # Prioritize AI-generated template ID, fallback to template service
                 if task.category in ["text", "robocall", "doorKnocking", "phoneBanking", "socialMedia"]:
-                    template_id = ai_template_client.get_template_id_for_task(
-                        task.category, task.week, task.description
-                    )
-                    if template_id:
-                        task_dict["defaultAiTemplateId"] = template_id
-                    elif task.defaultAiTemplateId:
-                        # Fallback to AI-generated template ID if available
+                    if task.defaultAiTemplateId:
+                        # Use AI-generated template ID if available (prioritized)
                         task_dict["defaultAiTemplateId"] = task.defaultAiTemplateId
+                    else:
+                        # Fallback to template service
+                        template_id = ai_template_client.get_template_id_for_task(
+                            task.category, task.week, task.description
+                        )
+                        if template_id:
+                            task_dict["defaultAiTemplateId"] = template_id
                 
                 structured_tasks.append(task_dict)
             
@@ -151,7 +153,7 @@ TASK CATEGORIES (use exact values):
 - "education" - Educational content, platform building (use link instead)
 - "general" - General voter contact activities
 
-ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS:
+ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS (THESE ARE REQUIRED FOR EACH TASK GENERATION):
 Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
 Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
 Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
@@ -198,20 +200,20 @@ General Phase:
 Generate both:
 1. markdown_content: Formatted bullet points (- [FULL MONTH DD] - Contact Type: Message theme) - DO NOT include template IDs in markdown
 2. tasks: Array of structured contact task objects with ALL required fields:
-   - date: Task date in format "Aug 19, 2025" (abbreviated month, day, year)
+   - date: Exact task date in format "Aug 19, 2025" (abbreviated month, day, year)
    - title: Contact method/type title
    - description: Message theme or purpose
    - cta: Call to action from examples above
    - type: Task type from list above
    - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, general)
-   - deadline: Last effective date in format "Aug 25, 2025" (usually 1-3 days after task date)
+   - deadline: Weeks from election date when task becomes ineffective (integer, e.g., 2 = 2 weeks before election)
    - link: External link if applicable (empty string if none)
    - week: Campaign week number (1-9, where 1 = election week)
    - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
    - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
 
 Schedule contacts chronologically from today through election day.
-Ensure each task has a realistic deadline that makes sense for the activity type.
+Ensure each task has a realistic deadline in weeks that makes sense for the activity type (e.g., texts/calls = same week, events = 1 week buffer).
 """
         
         try:
@@ -334,7 +336,7 @@ TASK CATEGORIES (use exact values):
 - "education" - Educational content, platform building (use link instead)
 - "general" - General voter contact activities
 
-ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS:
+ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS (THESE ARE REQUIRED FOR EACH TASK GENERATION):
 Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
 Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
 Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
@@ -366,20 +368,20 @@ VOTER CONTACT STRATEGY EXAMPLES:
 Generate both:
 1. markdown_content: Formatted bullet points (- [FULL MONTH DD] - Contact Type: Message theme) - DO NOT include template IDs in markdown
 2. tasks: Array of structured contact task objects with ALL required fields:
-   - date: Task date in format "Aug 19, 2025" (abbreviated month, day, year)
+   - date: Exact task date in format "Aug 19, 2025" (abbreviated month, day, year)
    - title: Contact method/type title
    - description: Message theme or purpose
    - cta: Call to action from examples above
    - type: Task type from list above
    - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, general)
-   - deadline: Last effective date in format "Aug 25, 2025" (usually 1-3 days after task date)
+   - deadline: Weeks from election date when task becomes ineffective (integer, e.g., 2 = 2 weeks before election)
    - link: External link if applicable (empty string if none)
    - week: Campaign week number (1-9, where 1 = election week)
    - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
    - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
 
 Schedule contacts chronologically from today through election day.
-Ensure each task has a realistic deadline that makes sense for the activity type.
+Ensure each task has a realistic deadline in weeks that makes sense for the activity type (e.g., texts/calls = same week, events = 1 week buffer).
 """
         
         try:
@@ -395,14 +397,14 @@ Ensure each task has a realistic deadline that makes sense for the activity type
             try:
                 self.logger.info("Attempting fallback with regular LLM client for general campaign")
                 fallback_response = self.llm_client.create_completion(
-                    messages=[
-                        {"role": "system", "content": "You are a campaign strategist. Generate the voter contact plan in the exact format shown. Do not add thinking or reasoning."},
+                messages=[
+                    {"role": "system", "content": "You are a campaign strategist. Generate the voter contact plan in the exact format shown. Do not add thinking or reasoning."},
                         {"role": "user", "content": prompt.replace("Generate both:", "Generate voter contact plan in markdown format:")}
-                    ],
-                    temperature=0.1,
-                    max_tokens=10000
-                )
-                
+                ],
+                temperature=0.1,
+                max_tokens=10000
+            )
+            
                 markdown_content = fallback_response.choices[0].message.content
                 self.logger.info("Successfully generated fallback voter contact content for general campaign")
                 

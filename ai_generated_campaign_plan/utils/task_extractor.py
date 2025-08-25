@@ -7,8 +7,61 @@ import re
 from typing import List, Dict, Any, Optional
 from shared.logger import get_logger
 from shared.ai_template_client import ai_template_client
+from datetime import datetime, date
 
 logger = get_logger(__name__)
+
+def convert_date_to_weeks_from_election(date_str: str, election_date: date = None) -> int:
+    """
+    Convert a date string to weeks from election date.
+    
+    Args:
+        date_str: Date string in format like "Aug 25, 2025" or "2025-11-05"
+        election_date: Election date (defaults to Nov 5, 2025 if not provided)
+        
+    Returns:
+        Integer representing weeks from election date
+    """
+    if not election_date:
+        # Default election date for testing
+        election_date = date(2025, 11, 5)
+    
+    try:
+        # Try parsing different date formats
+        task_date = None
+        
+        # Format: "Aug 25, 2025"
+        try:
+            task_date = datetime.strptime(date_str, "%b %d, %Y").date()
+        except ValueError:
+            pass
+        
+        # Format: "2025-11-05"
+        if not task_date:
+            try:
+                task_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        
+        # Format: "August 25, 2025"
+        if not task_date:
+            try:
+                task_date = datetime.strptime(date_str, "%B %d, %Y").date()
+            except ValueError:
+                pass
+        
+        if task_date:
+            # Calculate weeks difference
+            days_diff = (election_date - task_date).days
+            weeks_diff = max(1, round(days_diff / 7))  # Minimum 1 week
+            return weeks_diff
+        else:
+            logger.warning(f"Could not parse date: {date_str}")
+            return 1  # Default to 1 week
+            
+    except Exception as e:
+        logger.warning(f"Error converting date {date_str} to weeks: {str(e)}")
+        return 1  # Default to 1 week
 
 def extract_tasks_from_section_content(section_content: str, section_name: str) -> List[Dict[str, Any]]:
     """
@@ -44,7 +97,7 @@ def extract_tasks_from_section_content(section_content: str, section_name: str) 
                         "cta": "Schedule",
                         "type": "general",
                         "category": "general",
-                        "deadline": date_str.strip(),
+                        "deadline": 1,  # Default to 1 week from election
                         "link": "",
                         "week": 1,  # Default week
                         "defaultAiTemplateId": "",
@@ -223,7 +276,7 @@ def clean_and_validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             'cta': str(task['cta']).strip(),
             'type': str(task['type']).strip(),
             'category': str(task['category']).strip(),
-            'deadline': str(task['deadline']).strip(),
+            'deadline': task['deadline'] if isinstance(task['deadline'], int) else convert_date_to_weeks_from_election(str(task['deadline']).strip()),
         }
         
         # Optional fields
@@ -242,20 +295,22 @@ def clean_and_validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Apply AI template ID and pro requirements based on category and week
         category = cleaned_task['category']
         
-        # Get AI template ID for categories that need it
+        # Handle AI template ID for categories that need it
         if category in ['text', 'robocall', 'doorKnocking', 'phoneBanking', 'socialMedia'] and week:
-            template_id = ai_template_client.get_template_id_for_task(
-                category, week, cleaned_task['description']
-            )
-            if template_id:
-                cleaned_task['defaultAiTemplateId'] = template_id
-                logger.info(f"Applied template ID {template_id} to {category} task in week {week}")
+            # Prioritize existing template ID if provided and valid
+            if 'defaultAiTemplateId' in task and task['defaultAiTemplateId'] and str(task['defaultAiTemplateId']).strip():
+                cleaned_task['defaultAiTemplateId'] = str(task['defaultAiTemplateId']).strip()
+                logger.info(f"Using provided template ID {cleaned_task['defaultAiTemplateId']} for {category} task in week {week}")
             else:
-                logger.warning(f"No template ID found for {category} task in week {week}: {cleaned_task['title']}")
-        
-        # Override with existing template ID if provided and valid
-        if 'defaultAiTemplateId' in task and task['defaultAiTemplateId'] and str(task['defaultAiTemplateId']).strip():
-            cleaned_task['defaultAiTemplateId'] = str(task['defaultAiTemplateId']).strip()
+                # Fallback to template service
+                template_id = ai_template_client.get_template_id_for_task(
+                    category, week, cleaned_task['description']
+                )
+                if template_id:
+                    cleaned_task['defaultAiTemplateId'] = template_id
+                    logger.info(f"Applied template ID {template_id} to {category} task in week {week}")
+                else:
+                    logger.warning(f"No template ID found for {category} task in week {week}: {cleaned_task['title']}")
         
         # Set pro requirements based on category (ALWAYS apply the correct rule)
         if category in ['text', 'robocall', 'doorKnocking', 'phoneBanking']:
