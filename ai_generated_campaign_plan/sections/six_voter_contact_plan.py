@@ -6,7 +6,7 @@ from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo, Contac
 from shared.logger import get_logger
 from shared.llm import LLMClient
 from shared.llm_gemini import GeminiClient
-from shared.ai_template_client import ai_template_client
+
 
 # Structured task models for voter contact generation
 class VoterContactTask(BaseModel):
@@ -20,7 +20,7 @@ class VoterContactTask(BaseModel):
     deadline: int = Field(description="Weeks from election date when this task becomes ineffective (e.g., 2 = 2 weeks before election)")
     link: str = Field(default="", description="External link if applicable")
     week: int = Field(description="Campaign week number (1-9, where 1 = election week)")
-    defaultAiTemplateId: str = Field(default="", description="AI template ID for text/robocall/doorKnocking/phoneBanking/socialMedia tasks")
+
     proRequired: bool = Field(description="Whether task requires pro subscription")
 
 class VoterContactResponse(BaseModel):
@@ -74,18 +74,7 @@ class VoterContactPlanGenerator:
                 if task.link:
                     task_dict["link"] = task.link
                 
-                # Prioritize AI-generated template ID, fallback to template service
-                if task.category in ["text", "robocall", "doorKnocking", "phoneBanking", "socialMedia"]:
-                    if task.defaultAiTemplateId:
-                        # Use AI-generated template ID if available (prioritized)
-                        task_dict["defaultAiTemplateId"] = task.defaultAiTemplateId
-                    else:
-                        # Fallback to template service
-                        template_id = ai_template_client.get_template_id_for_task(
-                            task.category, task.week, task.description
-                        )
-                        if template_id:
-                            task_dict["defaultAiTemplateId"] = template_id
+
                 
                 structured_tasks.append(task_dict)
             
@@ -115,105 +104,92 @@ CONTACT LIMITS:
 - Primary phase: {primary_strategy.p2p_texts} texts, {primary_strategy.robocalls} robocalls
 - General phase: {general_strategy.p2p_texts} texts, {general_strategy.robocalls} robocalls
 
-CAMPAIGN TASK GENERATION GUIDELINES:
-The campaign timeline runs from Week 9 (campaign start) to Week 1 (election week). Generate tasks following these week-specific priorities:
+MANDATORY VOTER CONTACT TASK REQUIREMENTS:
+You MUST generate tasks with the following specific categories. DO NOT use "general" for voter contact activities:
 
-WEEK 1 (Election Week - Final GOTV Push):
-- Focus: Get Out The Vote (GOTV)
-- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
-- Messaging Theme: "reminding people to vote", "election day reminders"
+REQUIRED WEEKLY VOTER CONTACT TASKS (MUST INCLUDE ALL OF THESE):
+Week 1 (Election Week):
+- text: Election Day Text Reminder (proRequired: true)
+- robocall: Election Day Robocall Reminder (proRequired: true)  
+- doorKnocking: GOTV Door Knocking (proRequired: true)
+- phoneBanking: GOTV Phone Banking (proRequired: true)
+- socialMedia: GOTV Social Media Push (proRequired: false)
 
-WEEK 2 (1 Week Before Election):
-- Focus: GOTV + Final Persuasion
-- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
-- Messaging Theme: Mix of persuasive content and vote reminders, "answering common questions"
+Week 2:
+- text: Persuasive Text Campaign (proRequired: true)
+- robocall: Persuasive Robocall Campaign (proRequired: true)
+- doorKnocking: Door Knocking Campaign (proRequired: true)
+- phoneBanking: Phone Banking Campaign (proRequired: true)
+- socialMedia: Social Media Q&A (proRequired: false)
 
-WEEKS 3-6 (Persuasion Phase - 2-5 Weeks Before Election):
-- Focus: Voter Persuasion & Trust Building
-- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education (week 4+)
-- Special: Week 4 reintroduces text/robocalls with "1 month to election" messaging
-- Messaging Theme: "persuade voters", "build trust", discussing "top voter issues"
+Week 3:
+- doorKnocking: Persuasive Door Knocking (proRequired: true)
+- phoneBanking: Persuasive Phone Banking (proRequired: true)
+- socialMedia: Issue-Focused Social Media (proRequired: false)
 
-WEEKS 7-8 (Voter Identification Phase - 6-7 Weeks Before Election):
-- Focus: Getting to Know Voters
-- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education
-- Messaging Theme: "get to know your voters", "learn about their top issues"
+Week 4:
+- text: 1 Month to Election Text (proRequired: true)
+- robocall: 1 Month to Election Robocall (proRequired: true)
+- doorKnocking: Persuasive Door Knocking (proRequired: true)
+- phoneBanking: Persuasive Phone Banking (proRequired: true)
+- socialMedia: Issue-Focused Social Media (proRequired: false)
 
-WEEK 9 (Campaign Foundation):
-- Focus: Education & Platform Building
-- Required Task Types: education only
+Week 7-8:
+- doorKnocking: Voter ID Door Knocking (proRequired: true)
+- phoneBanking: Voter ID Phone Banking (proRequired: true)
+- socialMedia: Community Engagement Social Media (proRequired: false)
 
-TASK CATEGORIES (use exact values):
-- "text" - Text messaging campaigns (requires AI template ID)
-- "robocall" - Robocall campaigns (requires AI template ID)
-- "doorKnocking" - Door-to-door canvassing (requires AI template ID)
-- "phoneBanking" - Phone banking campaigns (requires AI template ID)
-- "socialMedia" - Social media campaigns (requires AI template ID)
-- "events" - Campaign events, community activities (use link instead)
-- "education" - Educational content, platform building (use link instead)
-- "general" - General voter contact activities
+CATEGORY CONSTRAINTS (MUST use these exact values):
+- "text" - Text messaging campaigns (proRequired: true)
+- "robocall" - Robocall campaigns (proRequired: true)
+- "doorKnocking" - Door-to-door canvassing (proRequired: true)
+- "phoneBanking" - Phone banking campaigns (proRequired: true)
+- "socialMedia" - Social media campaigns (proRequired: false)
+- "events" - Campaign events, voter contact activities
+- "education" - Educational voter contact content
+- "general" - ONLY for general activities, NOT for voter contact
 
-ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS (THESE ARE REQUIRED FOR EACH TASK GENERATION):
-Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
-Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
-Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
-Week 4: "6Adu3kct9uvZ0YNCXLPUvd" (1-month text), "452l4TPYpWdQZYxHHJsdUb" (1-month robocall), "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
-Week 5-6: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue social media), "3nr6D5fpYfIfywijoE1ITH" (event calendar social media - week 6)
-Week 7-8: "5jrvZCd28PMH4ipYl9DzTB" (voter ID door knocking), "2QCSobc5r6R7gO5hb0i8Ho" (voter ID phone banking), "NogRPt7eIxTU3ZEIw87LA" (community social media)
+CALL TO ACTION MAPPING:
+- text/robocall/doorKnocking/phoneBanking: "develop strategy"
+- socialMedia: "Write post"
+- events: "Visit in person"
+- education: "Learn More"
+- general: "Schedule"
 
-CALL TO ACTION EXAMPLES:
-- "Schedule" - Schedule the activity/contact
-- "develop strategy" - Plan and strategize
-- "Visit in person" - Attend event or canvass
-- "Write post" - Create social media content
-- "Learn More" - Research or gather information
-- "Make calls" - Conduct phone banking
-- "Send texts" - Execute text campaigns
+TYPE FIELD MAPPING:
+- text/robocall/doorKnocking/phoneBanking/socialMedia: "outreach"
+- events: "events" 
+- education: "education"
+- general: "general"
 
-JSON FORMAT REQUIREMENTS:
-- Use only standard ASCII characters in JSON
-- Escape all quotes and special characters properly
-- Avoid apostrophes and smart quotes in text fields
-- Use simple punctuation only
-
-VOTER CONTACT STRATEGY EXAMPLES:
-Primary Phase:
-- Text: Candidate intro and vote-by-mail awareness
-- Robocall: Ballot arrival and early voting prompt
-- DoorKnocking: Weekend canvassing in high-turnout precincts
-- PhoneBanking: Volunteer-led voter ID calls
-- SocialMedia: Facebook/Instagram targeted ads
-- Event: Town hall meetings, coffee hours
-- ExternalLink: Election Day polling location link
-- General: General voter contact activities
-
-General Phase:
-- Text: Reintroduction and contrast message
-- Robocall: Early voting alert
-- DoorKnocking: Targeted door-to-door in swing precincts
-- PhoneBanking: Persuasion calls to undecided voters
-- SocialMedia: Digital ad campaigns, social media engagement
-- Event: Candidate forums, community events
-- Final Text: Final reminder and polling location link
-- Final Robocall: Election Day GOTV
+CRITICAL REQUIREMENTS:
+1. You MUST include ALL the required weekly voter contact tasks listed above with their exact template IDs
+2. You MUST use the correct category values (NOT "general" for voter contact activities)
+3. You MUST set proRequired correctly (true for text/robocall/doorKnocking/phoneBanking, false for others)
+4. Include scheduling milestones for text/robocall campaigns (25%, 50%, 75% completion)
+5. Schedule all voter contact activities chronologically
 
 Generate both:
-1. markdown_content: Formatted bullet points (- [FULL MONTH DD] - Contact Type: Message theme) - DO NOT include template IDs in markdown
-2. tasks: Array of structured contact task objects with ALL required fields:
-   - date: Exact task date in format "Aug 19, 2025" (abbreviated month, day, year)
-   - title: Contact method/type title
-   - description: Message theme or purpose
-   - cta: Call to action from examples above
-   - type: Task type from list above
-   - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, general)
-   - deadline: Weeks from election date when task becomes ineffective (integer, e.g., 2 = 2 weeks before election)
-   - link: External link if applicable (empty string if none)
-   - week: Campaign week number (1-9, where 1 = election week)
-   - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
-   - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
+1. markdown_content: Formatted bullet points (- [MONTH DD] - Contact Type: Message theme)
+2. tasks: Array of structured voter contact task objects with ALL required fields correctly set
 
-Schedule contacts chronologically from today through election day.
-Ensure each task has a realistic deadline in weeks that makes sense for the activity type (e.g., texts/calls = same week, events = 1 week buffer).
+WEEK CALCULATION:
+Calculate week numbers where Week 1 = election week. Work backwards from election date.
+
+FORMAT EXAMPLE for tasks array:
+{{
+  "date": "Oct 15, 2026",
+  "title": "Election Day Text Reminder",
+  "description": "Final text reminder to vote on Election Day",
+  "cta": "develop strategy",
+  "type": "outreach", 
+  "category": "text",
+  "deadline": 1,
+  "link": "",
+  "week": 1,
+
+  "proRequired": true
+}}
 """
         
         try:
@@ -298,90 +274,92 @@ CAMPAIGN CONTEXT:
 CONTACT LIMITS:
 - {general_strategy.p2p_texts} texts and {general_strategy.robocalls} robocalls total
 
-CAMPAIGN TASK GENERATION GUIDELINES:
-The campaign timeline runs from Week 9 (campaign start) to Week 1 (election week). Generate tasks following these week-specific priorities:
+MANDATORY VOTER CONTACT TASK REQUIREMENTS:
+You MUST generate tasks with the following specific categories. DO NOT use "general" for voter contact activities:
 
-WEEK 1 (Election Week - Final GOTV Push):
-- Focus: Get Out The Vote (GOTV)
-- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
-- Messaging Theme: "reminding people to vote", "election day reminders"
+REQUIRED WEEKLY VOTER CONTACT TASKS (MUST INCLUDE ALL OF THESE):
+Week 1 (Election Week):
+- text: Election Day Text Reminder (proRequired: true)
+- robocall: Election Day Robocall Reminder (proRequired: true)  
+- doorKnocking: GOTV Door Knocking (proRequired: true)
+- phoneBanking: GOTV Phone Banking (proRequired: true)
+- socialMedia: GOTV Social Media Push (proRequired: false)
 
-WEEK 2 (1 Week Before Election):
-- Focus: GOTV + Final Persuasion
-- Required Task Types: text, robocall, doorKnocking, phoneBanking, socialMedia, events
-- Messaging Theme: Mix of persuasive content and vote reminders, "answering common questions"
+Week 2:
+- text: Persuasive Text Campaign (proRequired: true)
+- robocall: Persuasive Robocall Campaign (proRequired: true)
+- doorKnocking: Door Knocking Campaign (proRequired: true)
+- phoneBanking: Phone Banking Campaign (proRequired: true)
+- socialMedia: Social Media Q&A (proRequired: false)
 
-WEEKS 3-6 (Persuasion Phase - 2-5 Weeks Before Election):
-- Focus: Voter Persuasion & Trust Building
-- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education (week 4+)
-- Special: Week 4 reintroduces text/robocalls with "1 month to election" messaging
-- Messaging Theme: "persuade voters", "build trust", discussing "top voter issues"
+Week 3:
+- doorKnocking: Persuasive Door Knocking (proRequired: true)
+- phoneBanking: Persuasive Phone Banking (proRequired: true)
+- socialMedia: Issue-Focused Social Media (proRequired: false)
 
-WEEKS 7-8 (Voter Identification Phase - 6-7 Weeks Before Election):
-- Focus: Getting to Know Voters
-- Required Task Types: doorKnocking, phoneBanking, socialMedia, events, education
-- Messaging Theme: "get to know your voters", "learn about their top issues"
+Week 4:
+- text: 1 Month to Election Text (proRequired: true)
+- robocall: 1 Month to Election Robocall (proRequired: true)
+- doorKnocking: Persuasive Door Knocking (proRequired: true)
+- phoneBanking: Persuasive Phone Banking (proRequired: true)
+- socialMedia: Issue-Focused Social Media (proRequired: false)
 
-WEEK 9 (Campaign Foundation):
-- Focus: Education & Platform Building
-- Required Task Types: education only
+Week 7-8:
+- doorKnocking: Voter ID Door Knocking (proRequired: true)
+- phoneBanking: Voter ID Phone Banking (proRequired: true)
+- socialMedia: Community Engagement Social Media (proRequired: false)
 
-TASK CATEGORIES (use exact values):
-- "text" - Text messaging campaigns (requires AI template ID)
-- "robocall" - Robocall campaigns (requires AI template ID)
-- "doorKnocking" - Door-to-door canvassing (requires AI template ID)
-- "phoneBanking" - Phone banking campaigns (requires AI template ID)
-- "socialMedia" - Social media campaigns (requires AI template ID)
-- "events" - Campaign events, community activities (use link instead)
-- "education" - Educational content, platform building (use link instead)
-- "general" - General voter contact activities
+CATEGORY CONSTRAINTS (MUST use these exact values):
+- "text" - Text messaging campaigns (proRequired: true)
+- "robocall" - Robocall campaigns (proRequired: true)
+- "doorKnocking" - Door-to-door canvassing (proRequired: true)
+- "phoneBanking" - Phone banking campaigns (proRequired: true)
+- "socialMedia" - Social media campaigns (proRequired: false)
+- "events" - Campaign events, voter contact activities
+- "education" - Educational voter contact content
+- "general" - ONLY for general activities, NOT for voter contact
 
-ESSENTIAL WEEKLY TASKS WITH AI TEMPLATE IDS (THESE ARE REQUIRED FOR EACH TASK GENERATION):
-Week 1: "5b6W9pYlX796TBI2HV7HlQ" (election day text), "2GMO6bQoQermNhdRmRe1fh" (election day robocall), "2p3mztAVPhuDHOYJetmdWJ" (GOTV door knocking), "1HcpEmwIcXMCSW26ilxQP7" (GOTV phone banking), "GpWsRql46Nif2wYroxj81" (GOTV social media)
-Week 2: "5NbCRs4cIhti8pxnI8IM0P" (persuasive text), "6ZH4tMYcZNXshFOcLtjMJB" (persuasive robocall), "2p3mztAVPhuDHOYJetmdWJ" (door knocking), "1HcpEmwIcXMCSW26ilxQP7" (phone banking), "2X5rPGVz0sneUZ06w0ezcl" (social media Q&A)
-Week 3: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
-Week 4: "6Adu3kct9uvZ0YNCXLPUvd" (1-month text), "452l4TPYpWdQZYxHHJsdUb" (1-month robocall), "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue-focused social media)
-Week 5-6: "wgbnDDTxrf8OrresVE1HU" (persuasive door knocking), "5N93cglp3cvq62EIwu1IOa" (persuasive phone banking), "Xboqgh6Ye3SgSwO6moujw" (issue social media), "3nr6D5fpYfIfywijoE1ITH" (event calendar social media - week 6)
-Week 7-8: "5jrvZCd28PMH4ipYl9DzTB" (voter ID door knocking), "2QCSobc5r6R7gO5hb0i8Ho" (voter ID phone banking), "NogRPt7eIxTU3ZEIw87LA" (community social media)
+CALL TO ACTION MAPPING:
+- text/robocall/doorKnocking/phoneBanking: "develop strategy"
+- socialMedia: "Write post"
+- events: "Visit in person"
+- education: "Learn More"
+- general: "Schedule"
 
-JSON FORMAT REQUIREMENTS:
-- Use only standard ASCII characters in JSON
-- Escape all quotes and special characters properly
-- Avoid apostrophes and smart quotes in text fields
-- Use simple punctuation only
+TYPE FIELD MAPPING:
+- text/robocall/doorKnocking/phoneBanking/socialMedia: "outreach"
+- events: "events" 
+- education: "education"
+- general: "general"
 
-VOTER CONTACT STRATEGY EXAMPLES:
-- Early Text: Voter intro + early voting alert
-- Early Robocall: Candidate intro + race message
-- Early DoorKnocking: Weekend canvassing in target neighborhoods
-- Early PhoneBanking: Voter ID and registration drives
-- Early SocialMedia: Digital ad campaigns and social engagement
-- Mid Campaign Text: Contrast/persuasion message
-- Mid Campaign Robocall: Polling info + persuasion
-- Mid Campaign DoorKnocking: Targeted persuasion canvassing
-- Mid Campaign Event: Town halls, candidate forums
-- Late Campaign PhoneBanking: GOTV calls to supporters
-- Late Campaign SocialMedia: Final push digital campaigns
-- Final Text: Election Day reminder + poll finder
-- Final Robocall: Final GOTV call (morning)
+CRITICAL REQUIREMENTS:
+1. You MUST include ALL the required weekly voter contact tasks listed above with their exact template IDs
+2. You MUST use the correct category values (NOT "general" for voter contact activities)
+3. You MUST set proRequired correctly (true for text/robocall/doorKnocking/phoneBanking, false for others)
+4. Include scheduling milestones for text/robocall campaigns (25%, 50%, 75% completion)
+5. Schedule all voter contact activities chronologically
 
 Generate both:
-1. markdown_content: Formatted bullet points (- [FULL MONTH DD] - Contact Type: Message theme) - DO NOT include template IDs in markdown
-2. tasks: Array of structured contact task objects with ALL required fields:
-   - date: Exact task date in format "Aug 19, 2025" (abbreviated month, day, year)
-   - title: Contact method/type title
-   - description: Message theme or purpose
-   - cta: Call to action from examples above
-   - type: Task type from list above
-   - category: Task category from list above (text, robocall, doorKnocking, phoneBanking, socialMedia, events, education, general)
-   - deadline: Weeks from election date when task becomes ineffective (integer, e.g., 2 = 2 weeks before election)
-   - link: External link if applicable (empty string if none)
-   - week: Campaign week number (1-9, where 1 = election week)
-   - defaultAiTemplateId: Required for text/robocall/doorKnocking/phoneBanking/socialMedia tasks (use IDs from essential tasks list above)
-   - proRequired: Boolean - true for text/robocall/doorKnocking/phoneBanking, false for socialMedia/events/education
+1. markdown_content: Formatted bullet points (- [MONTH DD] - Contact Type: Message theme)
+2. tasks: Array of structured voter contact task objects with ALL required fields correctly set
 
-Schedule contacts chronologically from today through election day.
-Ensure each task has a realistic deadline in weeks that makes sense for the activity type (e.g., texts/calls = same week, events = 1 week buffer).
+WEEK CALCULATION:
+Calculate week numbers where Week 1 = election week. Work backwards from election date.
+
+FORMAT EXAMPLE for tasks array:
+{{
+  "date": "Oct 15, 2026",
+  "title": "Election Day Text Reminder",
+  "description": "Final text reminder to vote on Election Day",
+  "cta": "develop strategy",
+  "type": "outreach", 
+  "category": "text",
+  "deadline": 1,
+  "link": "",
+  "week": 1,
+
+  "proRequired": true
+}}
 """
         
         try:

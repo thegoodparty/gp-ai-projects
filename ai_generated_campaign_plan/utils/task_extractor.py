@@ -6,7 +6,7 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 from shared.logger import get_logger
-from shared.ai_template_client import ai_template_client
+
 from datetime import datetime, date
 
 logger = get_logger(__name__)
@@ -100,7 +100,7 @@ def extract_tasks_from_section_content(section_content: str, section_name: str) 
                         "deadline": 1,  # Default to 1 week from election
                         "link": "",
                         "week": 1,  # Default week
-                        "defaultAiTemplateId": "",
+
                         "proRequired": False
                     }
                     tasks.append(task)
@@ -292,25 +292,45 @@ def clean_and_validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             except (ValueError, TypeError):
                 logger.warning(f"Invalid week value for task '{task['title']}': {task['week']}")
         
-        # Apply AI template ID and pro requirements based on category and week
         category = cleaned_task['category']
         
-        # Handle AI template ID for categories that need it
-        if category in ['text', 'robocall', 'doorKnocking', 'phoneBanking', 'socialMedia'] and week:
-            # Prioritize existing template ID if provided and valid
-            if 'defaultAiTemplateId' in task and task['defaultAiTemplateId'] and str(task['defaultAiTemplateId']).strip():
-                cleaned_task['defaultAiTemplateId'] = str(task['defaultAiTemplateId']).strip()
-                logger.info(f"Using provided template ID {cleaned_task['defaultAiTemplateId']} for {category} task in week {week}")
-            else:
-                # Fallback to template service
-                template_id = ai_template_client.get_template_id_for_task(
-                    category, week, cleaned_task['description']
-                )
-                if template_id:
-                    cleaned_task['defaultAiTemplateId'] = template_id
-                    logger.info(f"Applied template ID {template_id} to {category} task in week {week}")
-                else:
-                    logger.warning(f"No template ID found for {category} task in week {week}: {cleaned_task['title']}")
+        # ENFORCE CORRECT CATEGORIZATION RULES
+        # If the task appears to be a voter contact activity but is misclassified as "general", fix it
+        title_lower = cleaned_task['title'].lower()
+        desc_lower = cleaned_task['description'].lower()
+        
+        # Detect and fix misclassified voter contact tasks
+        if category == 'general':
+            if any(keyword in title_lower for keyword in ['text', 'sms', 'message']):
+                cleaned_task['category'] = 'text'
+                category = 'text'
+                logger.info(f"Fixed misclassified task: {cleaned_task['title']} -> text")
+            elif any(keyword in title_lower for keyword in ['robocall', 'robo call', 'call']):
+                cleaned_task['category'] = 'robocall'
+                category = 'robocall'
+                logger.info(f"Fixed misclassified task: {cleaned_task['title']} -> robocall")
+            elif any(keyword in title_lower for keyword in ['door', 'knocking', 'canvas']):
+                cleaned_task['category'] = 'doorKnocking'
+                category = 'doorKnocking'
+                logger.info(f"Fixed misclassified task: {cleaned_task['title']} -> doorKnocking")
+            elif any(keyword in title_lower for keyword in ['phone', 'banking', 'phone bank']):
+                cleaned_task['category'] = 'phoneBanking'
+                category = 'phoneBanking'
+                logger.info(f"Fixed misclassified task: {cleaned_task['title']} -> phoneBanking")
+            elif any(keyword in title_lower for keyword in ['social media', 'facebook', 'instagram', 'twitter']):
+                cleaned_task['category'] = 'socialMedia'
+                category = 'socialMedia'
+                logger.info(f"Fixed misclassified task: {cleaned_task['title']} -> socialMedia")
+        
+        # Auto-assign event links for known events (after category fixing)
+        if category == 'events' or 'event' in title_lower:
+            if 'link' not in cleaned_task or not cleaned_task['link']:
+                event_link = get_event_link(cleaned_task['title'])
+                if event_link:
+                    cleaned_task['link'] = event_link
+                    logger.info(f"Auto-assigned event link for {cleaned_task['title']}: {event_link}")
+        
+
         
         # Set pro requirements based on category (ALWAYS apply the correct rule)
         if category in ['text', 'robocall', 'doorKnocking', 'phoneBanking']:
@@ -323,3 +343,40 @@ def clean_and_validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error cleaning task: {str(e)}")
         return None
+
+
+
+
+
+def get_event_link(title: str) -> Optional[str]:
+    """
+    Get the appropriate link for generic event types based on the title.
+    Returns None for most events since specific URLs depend on location and year.
+    Only provides links for generic voting/civic resources.
+    
+    Args:
+        title: Event title
+        
+    Returns:
+        Event URL if it's a generic civic resource, None otherwise
+    """
+    title_lower = title.lower()
+    
+    # Only include generic civic/voting resources that apply broadly
+    generic_civic_links = {
+        'voter registration': 'https://www.vote.gov/register/',
+        'register to vote': 'https://www.vote.gov/register/',
+        'voting information': 'https://www.vote.gov/',
+        'election information': 'https://www.vote.gov/',
+        'absentee ballot': 'https://www.vote.gov/absentee-voting/',
+        'early voting': 'https://www.vote.gov/early-voting/'
+    }
+    
+    for event_key, link in generic_civic_links.items():
+        if event_key in title_lower:
+            return link
+    
+    # For all other events (festivals, fairs, community events), return None
+    # These should be researched and added by the AI generation process
+    # based on the specific campaign location
+    return None
