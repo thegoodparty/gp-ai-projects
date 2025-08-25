@@ -32,7 +32,7 @@ from shared.llm_gemini import GeminiClient, GeminiModelType
 from shared.logger import get_logger
 
 class ParallelProductionMatcher:
-    def __init__(self, batch_size: int = 50, max_records: Optional[int] = None, max_workers: int = 150):
+    def __init__(self, batch_size: int = 1000, max_records: Optional[int] = None, max_workers: int = 1500):
         self.logger = get_logger(__name__)
         self.batch_size = batch_size
         self.max_records = max_records
@@ -58,6 +58,10 @@ class ParallelProductionMatcher:
         records_to_process = min(len(self.hubspot_df), max_records) if max_records else len(self.hubspot_df)
         print(f"\n✅ Ready to process {records_to_process:,} temporally-aligned HubSpot records")
     
+    def _get_candidate_name(self, hubspot_record: Dict) -> str:
+        """Helper method to construct candidate name from HubSpot record"""
+        return f"{hubspot_record.get('first_name', '')} {hubspot_record.get('last_name', '')}".strip()
+    
     def _load_data(self):
         print("📥 Loading offline data...")
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -70,58 +74,123 @@ class ParallelProductionMatcher:
         self.hubspot_df = pd.read_parquet(hubspot_file)
         self.ddhq_df = pd.read_parquet(ddhq_file)
         
+        # Sort HubSpot data by election date for optimal cache performance
+        print("🔄 Sorting HubSpot data by election date for cache optimization...")
+        self.hubspot_df = self.hubspot_df.sort_values('election_date', na_position='last')
+        
         print(f"   HubSpot (filtered by DDHQ dates): {len(self.hubspot_df):,} records")
         print(f"   DDHQ (full dataset): {len(self.ddhq_df):,} records")
     
     def _build_faiss_index(self):
-        print("🔍 Building FAISS index from DDHQ embeddings...")
+        print("🔍 Pre-building ALL FAISS indices for maximum speed...")
         
-        ddhq_embeddings = np.array(self.ddhq_df['embedding_name_race'].tolist(), dtype=np.float32)
+        # SPEED OPTIMIZATION: Pre-build all indices (no lazy loading)
+        self.faiss_indices = {}  # date -> FAISS index
+        self.date_records = {}   # date -> DataFrame slice
         
-        embedding_dim = ddhq_embeddings.shape[1]
-        self.faiss_index = faiss.IndexFlatIP(embedding_dim)
+        # Pre-compute date partitions AND build all FAISS indices
+        print("📊 Building all date partitions and FAISS indices...")
+        unique_dates = sorted(self.ddhq_df['date'].unique())
         
-        faiss.normalize_L2(ddhq_embeddings)
-        self.faiss_index.add(ddhq_embeddings)
+        for date in unique_dates:
+            date_records = self.ddhq_df[self.ddhq_df['date'] == date].copy()
+            self.date_records[date] = date_records
+            
+            # Build FAISS index immediately
+            embeddings = np.array(date_records['embedding_name_race'].tolist(), dtype=np.float32)
+            embedding_dim = embeddings.shape[1]
+            index = faiss.IndexFlatIP(embedding_dim)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+            self.faiss_indices[date] = index
         
-        print(f"   FAISS index built: {self.faiss_index.ntotal:,} embeddings, {embedding_dim} dimensions")
+        print(f"   ALL {len(unique_dates)} FAISS indices pre-built")
+        print(f"   Largest partition: {max(len(df) for df in self.date_records.values()):,} records")
+        print("   🚀 Zero lazy-loading delays - maximum concurrency ready!")
     
     def _init_llm(self):
         print("🤖 Initializing Gemini LLM...")
+        # Configure for MAXIMUM THROUGHPUT - push to theoretical limits for 10k/min
+        target_concurrency = 1200  # Maximum concurrent connections for true 10k/min target
         self.llm_client = GeminiClient(
             default_model=GeminiModelType.FLASH,
-            default_temperature=0.0
+            default_temperature=0.0,
+            max_connections=target_concurrency,
+            max_keepalive_connections=target_concurrency // 4  # 300 keepalive
             # Removed thinking_budget to avoid token limit issues that cause JSON truncation
         )
-        print("   Gemini Flash initialized (no token limits)")
+        print(f"   Gemini Flash initialized with {target_concurrency} max connections (MAXIMUM THROUGHPUT - 10k/min target)")
     
-    def _search_similar_candidates(self, hubspot_embedding: np.ndarray, k: int = 10) -> List[Dict[str, Any]]:
-        """Search for k most similar DDHQ candidates using FAISS"""
+    def _get_date_index(self, date):
+        """Get FAISS index for specific date - INSTANT ACCESS (pre-built)"""
+        return self.faiss_indices.get(date, None)
+    
+    def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> List[Dict[str, Any]]:
+        """Search for k most similar DDHQ candidates using date-partitioned FAISS"""
         
-        query_embedding = np.array(hubspot_embedding, dtype=np.float32).reshape(1, -1)
+        search_start_time = time.time()
+        
+        # Get target date from HubSpot record (unified election_date field)
+        target_dates = []
+        if pd.notna(hubspot_record.get('election_date')):
+            target_dates.append(hubspot_record['election_date'])
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        target_dates = [d for d in target_dates if not (d in seen or seen.add(d))]
+        
+        if not target_dates:
+            return []  # No valid dates
+        
+        # Search each relevant date partition
+        all_candidates = []
+        hubspot_embedding = np.array(hubspot_record['embedding_name_race'])
+        query_embedding = hubspot_embedding.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(query_embedding)
         
-        similarities, indices = self.faiss_index.search(query_embedding, k)
+        for date in target_dates:
+            # SPEED OPTIMIZATION: Instant index access (pre-built)
+            index_get_start = time.time()
+            faiss_index = self._get_date_index(date)
+            index_get_duration = time.time() - index_get_start
+            
+            if faiss_index is None:
+                continue
+                
+            date_records = self.date_records[date]
+            
+            # Search this date partition
+            search_actual_start = time.time()
+            similarities, indices = faiss_index.search(query_embedding, min(k, len(date_records)))
+            search_actual_duration = time.time() - search_actual_start
+            
+            # Convert results
+            for similarity, idx in zip(similarities[0], indices[0]):
+                if idx >= len(date_records):  # Safety check
+                    continue
+                    
+                ddhq_record = date_records.iloc[idx]
+                all_candidates.append({
+                    'rank': len(all_candidates) + 1,
+                    'similarity': float(similarity),
+                    'ddhq_index': ddhq_record.name,  # Original DataFrame index
+                    'candidate': ddhq_record['candidate'],
+                    'race_name': ddhq_record['race_name'],
+                    'candidate_party': ddhq_record.get('candidate_party', 'N/A'),
+                    'is_winner': ddhq_record.get('is_winner', 'N/A'),
+                    'embedding_text': ddhq_record.get('embedding_name_race_text', 'N/A'),
+                    'ddhq_race_id': ddhq_record.get('race_id', 'N/A'),
+                    'ddhq_candidate_id': ddhq_record.get('candidate_id', 'N/A'),
+                    'election_type': ddhq_record.get('election_type', 'N/A'),
+                    'date': ddhq_record.get('date', 'N/A')
+                })
         
-        results = []
-        for i, (similarity, idx) in enumerate(zip(similarities[0], indices[0])):
-            ddhq_record = self.ddhq_df.iloc[idx]
-            results.append({
-                'rank': i + 1,
-                'similarity': float(similarity),
-                'ddhq_index': int(idx),
-                'candidate': ddhq_record['candidate'],
-                'race_name': ddhq_record['race_name'],
-                'candidate_party': ddhq_record.get('candidate_party', 'N/A'),
-                'is_winner': ddhq_record.get('is_winner', 'N/A'),
-                'embedding_text': ddhq_record.get('embedding_name_race_text', 'N/A'),
-                'ddhq_race_id': ddhq_record.get('race_id', 'N/A'),
-                'ddhq_candidate_id': ddhq_record.get('candidate_id', 'N/A'),
-                'election_type': ddhq_record.get('election_type', 'N/A'),
-                'date': ddhq_record.get('date', 'N/A')
-            })
+        # Sort by similarity and return top k
+        all_candidates.sort(key=lambda x: x['similarity'], reverse=True)
         
-        return results
+        search_total_duration = time.time() - search_start_time
+        
+        return all_candidates[:k]
     
     def _calibrate_confidence(self, llm_result: Dict, hubspot_record: Dict, matched_candidate: Dict) -> Dict:
         """Adjust confidence based on match quality indicators"""
@@ -176,7 +245,7 @@ class ParallelProductionMatcher:
         """Use LLM to validate and select the best match with enhanced retry logic"""
         
         hubspot_info = {
-            'name': f"{hubspot_record.get('first_name', '')} {hubspot_record.get('last_name', '')}".strip(),
+            'name': self._get_candidate_name(hubspot_record),
             'full_name': hubspot_record.get('full_name', 'N/A'),
             'state': hubspot_record.get('state', 'N/A'),
             'city': hubspot_record.get('city', 'N/A'),
@@ -266,13 +335,17 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         max_retries = 9
         base_delay = 1.0
         
+        llm_validation_start = time.time()
+        
         for attempt in range(max_retries):
             try:
                 # Use dedicated thread pool for maximum LLM concurrency
+                llm_call_start = time.time()
                 response = await asyncio.get_event_loop().run_in_executor(
                     self.thread_pool, 
                     lambda: self.llm_client.generate_content(prompt)
                 )
+                llm_call_duration = time.time() - llm_call_start
                 
                 response_text = response.strip()
                 
@@ -309,12 +382,16 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 stats = self.llm_client.get_usage_stats()
                 self.total_cost = stats.get('total_cost', 0.0)
                 
+                llm_validation_total = time.time() - llm_validation_start
+                candidate_name = self._get_candidate_name(hubspot_record)
+                self.logger.debug(f"🤖 LLM validation for {candidate_name}: Total={llm_validation_total:.3f}s | Call={llm_call_duration:.3f}s | Attempts={attempt+1}")
+                
                 return result
                 
             except Exception as e:
                 # Enhanced error logging with more context
                 error_context = {
-                    'candidate_name': f"{hubspot_record.get('first_name', '')} {hubspot_record.get('last_name', '')}".strip(),
+                    'candidate_name': self._get_candidate_name(hubspot_record),
                     'candidate_state': hubspot_record.get('state', 'N/A'),
                     'candidate_office': hubspot_record.get('candidate_office', 'N/A'),
                     'error_type': type(e).__name__,
@@ -377,14 +454,18 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
     async def _process_hubspot_record(self, hubspot_record: pd.Series, record_index: int) -> Dict[str, Any]:
         """Process a single HubSpot record through the matching pipeline"""
         
-        hubspot_embedding = np.array(hubspot_record['embedding_name_race'])
+        record_start_time = time.time()
         
         try:
-            # Step 1: FAISS similarity search
-            similar_candidates = self._search_similar_candidates(hubspot_embedding, k=10)
+            # Step 1: Date-partitioned FAISS similarity search
+            faiss_start_time = time.time()
+            similar_candidates = self._search_similar_candidates(hubspot_record.to_dict(), k=10)
+            faiss_duration = time.time() - faiss_start_time
             
             # Step 2: LLM validation
+            llm_start_time = time.time()
             llm_result = await self._validate_with_llm(hubspot_record.to_dict(), similar_candidates)
+            llm_duration = time.time() - llm_start_time
             
             # Prepare match result
             match_result = {
@@ -401,8 +482,8 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 'hubspot_official_office_name': hubspot_record.get('official_office_name', 'N/A'),
                 'hubspot_party_affiliation': hubspot_record.get('party_affiliation', 'N/A'),
                 'hubspot_embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A'),
-                'hubspot_primary_election_date': hubspot_record.get('primary_election_date', 'N/A'),
-                'hubspot_general_election_date': hubspot_record.get('general_election_date', 'N/A'),
+                'hubspot_election_date': hubspot_record.get('election_date', 'N/A'),
+                'hubspot_election_type': hubspot_record.get('election_type', 'N/A'),
                 
                 # LLM validation results
                 'llm_best_match': llm_result.get('best_match'),
@@ -456,6 +537,12 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 self.matched_count += 1
             
             self.processed_count += 1
+            
+            # Log detailed timing for performance analysis
+            total_duration = time.time() - record_start_time
+            candidate_name = self._get_candidate_name(hubspot_record.to_dict())
+            self.logger.info(f"⏱️  Record {record_index} ({candidate_name}): TOTAL={total_duration:.3f}s | FAISS={faiss_duration:.3f}s | LLM={llm_duration:.3f}s | Match={llm_result.get('best_match') is not None}")
+            
             return match_result
             
         except Exception as e:
@@ -489,8 +576,8 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         # Execute all tasks in parallel with error handling
         start_time = time.time()
         
-        # Process in smaller groups to enable faster quota exhaustion detection
-        group_size = min(self.max_workers, 100)  # Optimized for throughput
+        # Process in maximum groups for instant launching
+        group_size = min(self.max_workers, 200)  # Maximum group size for instant launch
         results = []
         
         for i in range(0, len(tasks), group_size):
@@ -530,73 +617,184 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
             batch_matches = sum(1 for row in processed_rows if row.get('has_match', False))
             batch_match_rate = (batch_matches / len(processed_rows) * 100) if processed_rows else 0
             
+            # Calculate throughput metrics
+            records_per_minute = records_per_second * 60
+            projected_10k_time = 10000 / records_per_second / 60 if records_per_second > 0 else float('inf')
+            
             self.logger.info(f"✅ Batch {batch_num}/{total_batches} completed ({progress_pct:.1f}%)")
             self.logger.info(f"   📊 {batch_size} records in {duration:.1f}s ({records_per_second:.1f} rec/sec)")
+            self.logger.info(f"   🚀 Throughput: {records_per_minute:.0f} rec/min | 10K would take: {projected_10k_time:.1f} min")
             self.logger.info(f"   🎯 Batch matches: {batch_matches}/{len(processed_rows)} ({batch_match_rate:.1f}%)")
             self.logger.info(f"   💰 Running cost: ${self.total_cost:.6f}")
         
         return pd.DataFrame(processed_rows)
     
     async def process_all_records(self) -> pd.DataFrame:
-        """Process all HubSpot records with parallel batch processing"""
+        """Process all HubSpot records with MASSIVE CONCURRENCY for 10k/min target"""
         
         if self.max_records:
-            # Use random sampling instead of just taking the first records
             records_to_process = self.hubspot_df.sample(n=min(self.max_records, len(self.hubspot_df)), random_state=123)
             print(f"   🎲 Using random sample of {len(records_to_process):,} records (seed=123 for reproducibility)")
         else:
             records_to_process = self.hubspot_df
         
-        print(f"\n🔄 Processing {len(records_to_process):,} HubSpot records with parallel batching...")
+        print(f"\n🚀 Processing {len(records_to_process):,} HubSpot records with HIGH THROUGHPUT CONCURRENCY...")
+        print(f"   Target: 10,000 records/minute = 140 records/second (MATCHED SPAWN RATE)")
+        print(f"   Workers: {self.max_workers} (designed for EXTREME 10k/min throughput)")
         
-        all_result_dfs = []
-        total_batches = (len(records_to_process) + self.batch_size - 1) // self.batch_size
+        # SPEED OPTIMIZATION: Process ALL records concurrently (not in sequential batches)
+        print(f"   🔥 Creating {len(records_to_process):,} concurrent tasks...")
+        
+        # Create ALL tasks at once - maximum concurrency
+        all_tasks = []
+        for idx, (_, row) in enumerate(records_to_process.iterrows()):
+            task = self._process_hubspot_record(row, idx)
+            all_tasks.append(task)
+        
+        print(f"   ⚡ Launching {len(all_tasks):,} concurrent LLM calls...")
         
         # Use tqdm for progress tracking
-        pbar = tqdm(total=total_batches, desc="Processing batches", unit="batch")
+        pbar = tqdm(total=len(all_tasks), desc="Processing records", unit="record")
         
-        try:
-            for batch_start in range(0, len(records_to_process), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(records_to_process))
-                batch_df = records_to_process.iloc[batch_start:batch_end]
-                batch_num = (batch_start // self.batch_size) + 1
+        # BATCH LAUNCHING: Overcome sub-millisecond timing precision limits
+        start_time = time.time()
+        results = [None] * len(all_tasks)  # Pre-allocate results array
+        
+        calls_per_second = 140  # 10k records/minute = 140 records/second spawn rate
+        batch_size = 140  # Launch 140 calls per batch
+        batch_interval = 1.0  # 1 second between batches for 10k/min
+        actual_rate = batch_size / batch_interval  # 140 / 1.0 = 140/sec = 10k/min
+        
+        print(f"   🎯 Target rate: {calls_per_second} calls/second ({calls_per_second * 60}/min) - 10K/MIN SPAWN RATE")
+        print(f"   📦 Batch strategy: {batch_size} calls every {batch_interval*1000:.0f}ms (10k/min pacing)")
+        print(f"   ⚡ Actual rate: {actual_rate:.0f} calls/second")
+        
+        # Track running tasks
+        running_tasks = {}
+        completed_count = 0
+        total_launched = 0
+        
+        # Launch tasks in batches with precise timing
+        batch_count = 0
+        for batch_start in range(0, len(all_tasks), batch_size):
+            batch_tasks = all_tasks[batch_start:batch_start + batch_size]
+            batch_count += 1
+            
+            # Launch entire batch simultaneously
+            batch_launch_start = time.time()
+            for i, task in enumerate(batch_tasks):
+                task_index = batch_start + i
+                actual_task = asyncio.create_task(task)
+                running_tasks[task_index] = actual_task
+                total_launched += 1
+            
+            batch_launch_time = time.time() - batch_launch_start
+            elapsed_total = time.time() - start_time
+            current_rate = total_launched / elapsed_total if elapsed_total > 0 else 0
+            
+            # Log batch timing
+            print(f"   📦 Batch {batch_count:2d}: Launched {len(batch_tasks):2d} tasks in {batch_launch_time*1000:.1f}ms | Total: {total_launched:4d} | Rate: {current_rate:.0f}/sec")
+            
+            # Wait for next batch (only if more batches remain)
+            if batch_start + batch_size < len(all_tasks):
+                await asyncio.sleep(batch_interval)
+            
+            # Check for completed tasks every 5 starts to maintain awareness
+            if batch_count % 5 == 0:
+                # Check for completed tasks
+                completed_indices = []
+                for task_idx, running_task in list(running_tasks.items()):
+                    if running_task.done():
+                        try:
+                            results[task_idx] = await running_task
+                        except Exception as e:
+                            results[task_idx] = e
+                        completed_indices.append(task_idx)
+                        completed_count += 1
                 
-                try:
-                    batch_result_df = await self.process_batch(batch_df, batch_num, total_batches)
-                    all_result_dfs.append(batch_result_df)
-                    
-                    # Update progress
-                    match_rate = f"{self.matched_count/self.processed_count*100:.1f}%" if self.processed_count > 0 else "0.0%"
-                    pbar.set_postfix({
-                        'matches': self.matched_count,
-                        'match_rate': match_rate,
-                        'cost': f"${self.total_cost:.2f}"
-                    })
-                    pbar.update(1)
-                    
-                    # Save intermediate results every 10 batches
-                    if batch_num % 10 == 0:
-                        self._save_intermediate_results(all_result_dfs, batch_num)
-                        
-                except Exception as e:
-                    self.logger.error(f"Failed to process batch {batch_num}: {str(e)}")
-                    pbar.update(1)
-                    continue
-        finally:
-            pbar.close()
+                # Remove completed tasks
+                for idx in completed_indices:
+                    del running_tasks[idx]
+                
+                # Update progress
+                elapsed = time.time() - start_time
+                actual_rate = total_launched / elapsed if elapsed > 0 else 0
+                pbar.update(len(completed_indices))
+                pbar.set_postfix({
+                    'started': i + 1,
+                    'completed': completed_count,
+                    'rate': f"{actual_rate:.1f}/sec",
+                    'running': len(running_tasks)
+                })
         
-        # Combine all results into final DataFrame
-        if all_result_dfs:
-            final_results_df = pd.concat(all_result_dfs, ignore_index=True)
-        else:
-            final_results_df = pd.DataFrame()
+        print(f"   ✅ All {len(all_tasks)} tasks started")
+        print(f"   ⏳ Waiting for remaining {len(running_tasks)} tasks to complete...")
         
-        print(f"\n✅ Processing complete!")
-        print(f"   Processed: {self.processed_count:,} records")
+        # Wait for all remaining tasks to complete
+        while running_tasks:
+            completed_indices = []
+            for task_idx, running_task in list(running_tasks.items()):
+                if running_task.done():
+                    try:
+                        results[task_idx] = await running_task
+                    except Exception as e:
+                        results[task_idx] = e
+                    completed_indices.append(task_idx)
+                    completed_count += 1
+            
+            # Remove completed tasks
+            for idx in completed_indices:
+                del running_tasks[idx]
+            
+            # Update progress
+            pbar.update(len(completed_indices))
+            pbar.set_postfix({
+                'completed': completed_count,
+                'remaining': len(running_tasks)
+            })
+            
+            # Small delay to avoid busy waiting
+            if running_tasks:
+                await asyncio.sleep(0.1)
+        
+        pbar.close()
+        total_duration = time.time() - start_time
+        
+        # Process results
+        processed_rows = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Handle exceptions
+                row = records_to_process.iloc[i].copy()
+                error_result = {
+                    'hubspot_row_index': i,
+                    'hubspot_first_name': row.get('first_name', 'N/A'),
+                    'hubspot_last_name': row.get('last_name', 'N/A'),
+                    'llm_best_match': None,
+                    'llm_confidence': 0,
+                    'llm_reasoning': f'Concurrent processing error: {str(result)}',
+                    'has_match': False,
+                    'top_10_candidates': 'CONCURRENT_ERROR'
+                }
+                processed_rows.append(error_result)
+            else:
+                processed_rows.append(result)
+        
+        # Calculate final performance metrics
+        total_records = len(processed_rows)
+        records_per_second = total_records / max(0.1, total_duration)
+        records_per_minute = records_per_second * 60
+        target_achievement = (records_per_minute / 10000) * 100  # 10k/min target
+        
+        print(f"\n🎯 PERFORMANCE RESULTS:")
+        print(f"   Total time: {total_duration:.1f}s")
+        print(f"   Records processed: {total_records:,}")
+        print(f"   Speed: {records_per_second:.1f} rec/sec = {records_per_minute:.0f} rec/min")
+        print(f"   Target achievement: {target_achievement:.1f}% of 10k/min goal")
         print(f"   Matches found: {self.matched_count:,} ({self.matched_count/self.processed_count*100:.1f}%)")
         print(f"   Total LLM cost: ${self.total_cost:.2f}")
         
-        return final_results_df
+        return pd.DataFrame(processed_rows)
     
     def _save_intermediate_results(self, result_dfs: List[pd.DataFrame], batch_count: int):
         """Save intermediate results to output folder"""
@@ -668,10 +866,10 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
             self.thread_pool.shutdown(wait=True)
 
 async def main():
-    # Configuration
-    BATCH_SIZE = 150  # Larger batches for more aggressive parallelization
-    MAX_RECORDS = None  # Process all records
-    MAX_WORKERS = 150  # More workers for maximum concurrency
+    # Configuration - OPTIMIZED FOR 10K/MINUTE THROUGHPUT
+    BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))  # Process 1000 records concurrently
+    MAX_RECORDS = int(os.getenv('MAX_RECORDS')) if os.getenv('MAX_RECORDS') else None
+    MAX_WORKERS = int(os.getenv('MAX_WORKERS', 1500))  # Maximum workers for true 10k/min target
     
     matcher = ParallelProductionMatcher(
         batch_size=BATCH_SIZE, 

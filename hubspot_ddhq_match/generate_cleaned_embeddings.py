@@ -66,71 +66,6 @@ class EmbeddingGenerator:
         self.embedding_client = GeminiEmbeddingClient()
         self.logger.info("Gemini Embedding client initialized")
         
-    def create_embedding_text_hubspot(self, row: pd.Series) -> str:
-        """Create embedding text for HubSpot candidate"""
-        parts = []
-        
-        # Name (always available after cleaning)
-        if pd.notna(row.get('first_name')) and pd.notna(row.get('last_name')):
-            parts.append(f"{row['first_name']} {row['last_name']}")
-        
-        # Add full name if different and available
-        if pd.notna(row.get('full_name')) and row.get('full_name') != '':
-            full_name = str(row['full_name']).strip()
-            current_name = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
-            if full_name.lower() != current_name.lower():
-                parts.append(full_name)
-        
-        # State
-        if pd.notna(row.get('state')):
-            parts.append(f"State: {row['state']}")
-        
-        # City
-        if pd.notna(row.get('city')):
-            parts.append(f"City: {row['city']}")
-        
-        # Office information
-        if pd.notna(row.get('candidate_office')):
-            parts.append(f"Office: {row['candidate_office']}")
-        elif pd.notna(row.get('official_office_name')):
-            parts.append(f"Office: {row['official_office_name']}")
-        
-        # Party affiliation
-        if pd.notna(row.get('party_affiliation')):
-            parts.append(f"Party: {row['party_affiliation']}")
-        
-        return " | ".join(parts)
-    
-    def create_embedding_text_ddhq(self, row: pd.Series) -> str:
-        """Create embedding text for DDHQ candidate"""
-        parts = []
-        
-        # Candidate name
-        if pd.notna(row.get('candidate')):
-            parts.append(row['candidate'])
-        
-        # State (extracted)
-        if pd.notna(row.get('extracted_state')):
-            parts.append(f"State: {row['extracted_state']}")
-        
-        # Race name
-        if pd.notna(row.get('race_name')):
-            parts.append(f"Race: {row['race_name']}")
-        
-        # Party
-        if pd.notna(row.get('candidate_party')):
-            parts.append(f"Party: {row['candidate_party']}")
-        
-        # Election type
-        if pd.notna(row.get('election_type')):
-            parts.append(f"Election: {row['election_type']}")
-        
-        # Winner status
-        if pd.notna(row.get('is_winner')):
-            parts.append(f"Winner: {row['is_winner']}")
-        
-        return " | ".join(parts)
-    
     def create_name_race_embedding_text_hubspot(self, row: pd.Series) -> str:
         """Create name+race focused embedding text for HubSpot"""
         # Name
@@ -151,13 +86,8 @@ class EmbeddingGenerator:
         
         state_office = f"{state} {office}".strip()
         
-        # Election type (primary/general)
-        election_type = ""
-        if pd.notna(row.get('election_type')):
-            election_type = row['election_type']
-        
-        # Format: name: Name | race: State Office | election: Type (labeled format for better discrimination)
-        return f"name: {name} | race: {state_office} | election: {election_type}"
+        # Format: name: Name | race: State Office 
+        return f"name: {name} | race: {state_office}"
     
     def create_name_race_embedding_text_ddhq(self, row: pd.Series) -> str:
         """Create name+race focused embedding text for DDHQ"""
@@ -171,13 +101,9 @@ class EmbeddingGenerator:
         if pd.notna(row.get('race_name')):
             race = row['race_name']
         
-        # Election type
-        election_type = ""
-        if pd.notna(row.get('election_type')):
-            election_type = row['election_type']
         
-        # Format: name: Name | race: Race | election: Type (labeled format for better discrimination)
-        return f"name: {name} | race: {race} | election: {election_type}"
+        # Format: name: Name | race: Race
+        return f"name: {name} | race: {race}"
     
     def generate_all_embeddings(self, texts: List[str]) -> List[np.ndarray]:
         """Generate embeddings for all texts using parallel processing"""

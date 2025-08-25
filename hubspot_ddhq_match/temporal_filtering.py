@@ -118,6 +118,7 @@ def main():
         output_file = filter_obj.save_filtered_data(hubspot_filtered)
         
         print(f"\n✅ Temporal filtering complete!")
+        print(f"   Filtered records: {len(hubspot_filtered):,}")
         print(f"   Output: {output_file}")
         print(f"   Ready for embedding generation")
         

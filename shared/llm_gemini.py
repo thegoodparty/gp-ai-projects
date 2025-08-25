@@ -67,13 +67,39 @@ class GeminiClient:
         default_temperature: float = 0.7,
         default_max_tokens: int = 10000,
         thinking_budget: Optional[int] = None,
-        include_thoughts: bool = False
+        include_thoughts: bool = False,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Google API key is required")
         
-        self.client = genai.Client(api_key=self.api_key)
+        # Configure custom HTTP limits for high concurrency
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        
+        # Create HTTP options with custom connection limits
+        from google.genai.types import HttpOptions
+        
+        # Use minimal HTTP options - only connection limits
+        http_options = HttpOptions(
+            clientArgs={
+                "limits": httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections
+                )
+            },
+            asyncClientArgs={
+                "limits": httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections
+                )
+            }
+        )
+        
+        # Initialize Gemini client with custom HTTP options
+        self.client = genai.Client(api_key=self.api_key, http_options=http_options)
         self.default_model = default_model
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
@@ -92,7 +118,7 @@ class GeminiClient:
         self.total_completion_tokens = 0
         self.total_cost = 0.0
         
-        self.logger.info(f"Gemini client initialized with model: {default_model.value}")
+        self.logger.info(f"Gemini client initialized with model: {default_model.value}, max_connections: {max_connections}, max_keepalive: {max_keepalive_connections}")
     
     def _get_base_config(
         self,

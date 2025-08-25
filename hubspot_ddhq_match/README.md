@@ -85,7 +85,7 @@ uv run hubspot_ddhq_match/temporal_filtering.py
 ### 4. Embedding Generation (`generate_cleaned_embeddings.py`)
 **Purpose**: Create semantic embeddings for improved matching
 - Uses Google Gemini to generate embeddings for candidate names + race information
-- Creates labeled format: `"name: John Smith | race: CA Governor | election: primary"`
+- Creates labeled format: `"name: John Smith | race: CA Governor"`
 - Enables semantic similarity search with FAISS
 
 **Run Command**:
@@ -109,11 +109,13 @@ uv run hubspot_ddhq_match/generate_cleaned_embeddings.py --test-rows 100
 ---
 
 ### 5. Production Matching (`parallel_production_matcher.py`)
-**Purpose**: Perform high-performance candidate matching
-- FAISS similarity search to find top 10 most similar candidates
+**Purpose**: Perform high-performance candidate matching with **date-partitioned FAISS optimization**
+- **🚀 Date-Partitioned FAISS**: Only searches candidates from relevant election dates
+- **Pre-built Indices**: All FAISS indices built upfront for maximum concurrency
+- **Data Sorting**: HubSpot data sorted by election date for optimal processing
 - LLM validation with strict matching rules to prevent false positives
-- Advanced parallelization with ThreadPoolExecutor (150+ workers)
-- 88% confidence threshold for match acceptance
+- Advanced parallelization with ThreadPoolExecutor (up to 2000 workers)
+- 70% minimum confidence threshold for match acceptance
 
 **Run Command**:
 ```bash
@@ -125,12 +127,20 @@ ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/
 ```
 
 **Matching Logic**:
-1. Semantic similarity search (FAISS)
-2. LLM validation with strict rules:
+1. **Date-Partitioned Search**: Only search DDHQ candidates from same election dates
+2. **Lazy-Load FAISS Index**: Build/cache indices on-demand per election date
+3. **Semantic Similarity**: Find top 5 most similar candidates (reduced from 10)
+4. **LLM Validation** with strict rules:
    - Name matching (exact or clear variants)
    - Geographic validation (same state)
    - Gender mismatch detection
    - Confidence calibration
+
+**Performance Optimizations**:
+- **Targeted Search**: Search only relevant election date partitions instead of full dataset
+- **Pre-built Indices**: All date-specific FAISS indices built upfront
+- **Parallel Processing**: Up to 2000 concurrent workers for maximum throughput
+- **Memory Optimization**: Separate smaller indices per election date
 
 **Output Files**:
 - `output/parallel_hubspot_ddhq_matches_latest.parquet`
@@ -169,10 +179,10 @@ DATABRICKS_HTTP_PATH=your_http_path
 
 ### Performance Configuration
 ```bash
-# Recommended settings for optimal performance
+# Recommended settings for date-partitioned FAISS optimization
 ENVIRONMENT=development          # or 'production'
-BATCH_SIZE=150                  # Records per batch
-MAX_WORKERS=400                 # Concurrent workers
+BATCH_SIZE=1000                 # Records per batch (increased for better performance)
+MAX_WORKERS=2000                # Concurrent workers (increased for date partitioning)
 LOG_LEVEL=DEBUG                 # or 'INFO'
 ```
 
@@ -194,18 +204,14 @@ uv run hubspot_ddhq_match/temporal_filtering.py
 # Step 4: Generate semantic embeddings
 ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/generate_cleaned_embeddings.py
 
-# Step 5: Run production matching
-ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/parallel_production_matcher.py
+# Step 5: Run production matching (with date-partitioned FAISS)
+ENVIRONMENT=development BATCH_SIZE=1000 MAX_WORKERS=2000 uv run hubspot_ddhq_match/parallel_production_matcher.py
 ```
 
 ### 🧪 **Testing Commands**
 ```bash
 # Test embeddings with limited records
 uv run hubspot_ddhq_match/generate_cleaned_embeddings.py --test-rows 100
-
-# Test various embedding formats
-uv run hubspot_ddhq_match/test_embedding_formats.py
-uv run hubspot_ddhq_match/test_real_data_embedding_formats.py
 ```
 
 ### 🏭 **Production Commands (Full Dataset)**
@@ -218,8 +224,8 @@ uv run hubspot_ddhq_match/temporal_filtering.py
 # Step 4: Full dataset embeddings
 ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/generate_cleaned_embeddings.py
 
-# Step 5: Full dataset matching
-ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/parallel_production_matcher.py
+# Step 5: Full dataset matching (with date-partitioned FAISS)
+ENVIRONMENT=production BATCH_SIZE=1000 MAX_WORKERS=2000 uv run hubspot_ddhq_match/parallel_production_matcher.py
 ```
 
 ### 📋 **Individual Script Commands**
@@ -244,9 +250,9 @@ uv run hubspot_ddhq_match/temporal_filtering.py
 ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/generate_cleaned_embeddings.py
 ```
 
-**Step 5: Production Matching**
+**Step 5: Production Matching (Date-Partitioned FAISS)**
 ```bash
-ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match/parallel_production_matcher.py
+ENVIRONMENT=development BATCH_SIZE=1000 MAX_WORKERS=2000 uv run hubspot_ddhq_match/parallel_production_matcher.py
 ```
 
 **Complete Pipeline (Optional)**
@@ -256,7 +262,8 @@ ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=400 uv run hubspot_ddhq_match
 
 ### ⚠️ **Important Notes**
 - Steps 1-3 don't need environment variables (no LLM/parallel processing)
-- Steps 4-5 use performance settings: `BATCH_SIZE=150 MAX_WORKERS=400`
+- Step 4 (embeddings): `BATCH_SIZE=150 MAX_WORKERS=400`
+- **Step 5 (matching): `BATCH_SIZE=1000 MAX_WORKERS=2000`** ← **Date-partitioned optimization**
 - `ENVIRONMENT=development` processes 200 test records
 - `ENVIRONMENT=production` processes the full dataset
 
@@ -290,34 +297,33 @@ hubspot_ddhq_match/
     └── parallel_hubspot_ddhq_matches_latest.tsv
 ```
 
-## Testing Scripts
-
-Additional test scripts for format and embedding optimization:
-```bash
-uv run hubspot_ddhq_match/test_discrimination_formats.py
-uv run hubspot_ddhq_match/test_embedding_formats.py
-uv run hubspot_ddhq_match/test_focused_discrimination.py
-uv run hubspot_ddhq_match/test_format_comparison.py
-uv run hubspot_ddhq_match/test_label_variations.py
-uv run hubspot_ddhq_match/test_nickname_variations.py
-uv run hubspot_ddhq_match/test_real_data_embedding_formats.py
-```
 
 ## Performance Notes
 
+### 🚀 **Date-Partitioned FAISS Optimization**
+- **Smart Search**: Only searches candidates from relevant election dates
+- **Pre-built Indices**: All FAISS indices built upfront for maximum speed
+- **Memory Efficiency**: Separate indices per election date
+- **Speed Gains**: Faster for small elections by avoiding full dataset search
+
+### Processing Modes
 - **Development Mode**: Processes 200 test records for quick iteration
 - **Production Mode**: Processes full dataset (potentially 50K+ records)
-- **Batch Size 150**: Optimal balance of throughput and API limits
-- **Max Workers 400**: Aggressive parallelization for maximum speed
+
+### Configuration
+- **Embeddings (Step 4)**: `BATCH_SIZE=150 MAX_WORKERS=400`
+- **Matching (Step 5)**: `BATCH_SIZE=1000 MAX_WORKERS=2000` ← Optimized for date partitioning
 - **Cost Tracking**: Built-in LLM cost monitoring throughout pipeline
 
 ## Key Features
 
 ✅ **Election Type Awareness**: Separate primary/general matching  
 ✅ **Temporal Alignment**: Only match candidates from same election dates  
+✅ **🚀 Date-Partitioned FAISS**: Smart search only in relevant date partitions  
+✅ **Pre-built Indices**: All FAISS indices built upfront for maximum speed  
 ✅ **Semantic Similarity**: AI-powered candidate name/race matching  
 ✅ **Quality Controls**: Strict validation to prevent false positives  
-✅ **High Performance**: 400+ concurrent workers with batch processing  
+✅ **Ultra-High Performance**: 2000+ concurrent workers with optimized batch processing  
 ✅ **Cost Monitoring**: Real-time LLM usage and cost tracking  
 ✅ **Environment Flexibility**: Development vs production modes  
 
@@ -338,5 +344,5 @@ uv run hubspot_ddhq_match/temporal_filtering.py
 # Step 4: Generate semantic embeddings
 ENVIRONMENT=development BATCH_SIZE=100 MAX_WORKERS=80 uv run hubspot_ddhq_match/generate_cleaned_embeddings.py
 
-# Step 5: Run production matching
-ENVIRONMENT=development BATCH_SIZE=150 MAX_WORKERS=800 uv run hubspot_ddhq_match/parallel_production_matcher.py
+# Step 5: Run production matching (Date-Partitioned FAISS Optimization)
+ENVIRONMENT=development BATCH_SIZE=1000 MAX_WORKERS=2000 uv run hubspot_ddhq_match/parallel_production_matcher.py
