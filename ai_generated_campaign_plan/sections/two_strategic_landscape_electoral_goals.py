@@ -1,6 +1,6 @@
 from datetime import date
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus
-from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 from shared.logger import get_logger
 
 class StrategicLandscapeElectoralGoalsGenerator:
@@ -14,7 +14,7 @@ class StrategicLandscapeElectoralGoalsGenerator:
     def __init__(self):
         """Initialize the generator with necessary clients and logger."""
         self.logger = get_logger(__name__)
-        self.llm_client = LLMClient()
+        self.llm_client = GeminiClient()
         
         self.logger.info("StrategicLandscapeElectoralGoalsGenerator initialized")
 
@@ -104,22 +104,13 @@ Challenges:
         self.logger.debug("Sending strategic landscape generation request to LLM")
         
         try:
-            response = self.llm_client.create_completion(
-                max_tokens=10000,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. Generate strategic analysis that is logically consistent and specific to the candidate's situation.",
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
+            response = self.llm_client.generate_content(
+                prompt=prompt,
+                system_instruction="You are an expert campaign strategist. Generate strategic analysis that is logically consistent and specific to the candidate's situation.",
                 temperature=0.1,
             )
             
-            result = response.choices[0].message.content.strip()
+            result = response.strip()
             
             self.logger.info(f"Successfully generated strategic landscape for {campaign_info.candidate_name}")
             self.logger.debug(f"Strategic landscape length: {len(result)} characters")

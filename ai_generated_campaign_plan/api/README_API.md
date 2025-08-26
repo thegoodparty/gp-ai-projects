@@ -268,7 +268,7 @@ uv sync
 
 # Set environment variables
 export GEMINI_API_KEY="your_gemini_api_key"
-export TOGETHER_API_KEY="your_together_api_key"  
+  
 export TAVILY_API_KEY="your_tavily_api_key"
 
 # Run development server
@@ -282,7 +282,6 @@ The API will be available at `http://localhost:8000`
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `GEMINI_API_KEY` | Google Gemini API key (primary LLM) | ✓ |
-| `TOGETHER_API_KEY` | Together AI API key (fallback LLM) | ✓ |
 | `TAVILY_API_KEY` | Tavily search API key | ✓ |
 | `ENVIRONMENT` | Set to "development" for debug logging | |
 
@@ -389,7 +388,7 @@ The API includes built-in cost tracking:
    - Verify storage cleanup hasn't removed files early
 
 5. **Generation Timeouts or Failures**
-   - Check API key validity (GEMINI_API_KEY, TOGETHER_API_KEY, TAVILY_API_KEY)
+   - Check API key validity (GEMINI_API_KEY, TAVILY_API_KEY)
    - Monitor logs for LLM provider failures
    - Review individual section generation errors
 

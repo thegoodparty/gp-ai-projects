@@ -17,7 +17,7 @@ from ai_generated_campaign_plan.schema.models import CampaignInfo, RaceType, Inc
 from ai_generated_campaign_plan.api.pdf_storage import PDFStorage
 from ai_generated_campaign_plan.api.json_storage import JSONStorage
 from ai_generated_campaign_plan.api.pdf_generator import CampaignPlanPDFGenerator
-from ai_generated_campaign_plan.api.json_extractor import CampaignPlanJSONExtractor
+from ai_generated_campaign_plan.task_system.task_orchestrator import AITaskOrchestrator
 from shared.logger import get_logger
 
 
@@ -67,7 +67,6 @@ templates = Jinja2Templates(directory=str(templates_dir))
 # Initialize storage and extraction utilities
 pdf_storage = PDFStorage()
 json_storage = JSONStorage()
-json_extractor = CampaignPlanJSONExtractor()
 pdf_generator = CampaignPlanPDFGenerator()
 progress_store: Dict[str, Dict[str, Any]] = {}
 
@@ -137,28 +136,103 @@ async def form_page(request: Request):
     return templates.TemplateResponse("campaign_form.html", {"request": request})
 
 @app.post("/generate-campaign-plan")
-async def generate_campaign_plan_json(campaign_info: CampaignInfo):
-    """Generate campaign plan from JSON input and return as downloadable PDF."""
+async def generate_campaign_plan_json(request: Request):
+    """Generate campaign plan from JSON input and optionally return with AI tasks."""
     try:
-        logger.info(f"Generating campaign plan for {campaign_info.candidate_name}")
+        # Parse request body
+        body = await request.json()
+        campaign_info = CampaignInfo(**body.get("campaign_info", body))
         
-        # Generate campaign plan using async method
+        # Check if tasks are requested
+        include_tasks = body.get("include_tasks", False)
+        return_format = body.get("format", "pdf")  # "pdf", "json", or "both"
+        
+        logger.info(f"Generating campaign plan for {campaign_info.candidate_name} (include_tasks={include_tasks}, format={return_format})")
+        
+        # Generate campaign plan with structured sections
         orchestrator = CampaignPlanOrchestrator()
-        campaign_plan_text = await orchestrator.generate_complete_campaign_plan(campaign_info)
+        campaign_data = await orchestrator.generate_campaign_plan_with_sections(campaign_info)
         
-        # Convert to PDF
-        pdf_buffer = pdf_generator.create_pdf_from_text(campaign_plan_text, campaign_info)
+        campaign_plan_text = campaign_data['full_text']
+        sections = campaign_data['sections']
+        metadata = campaign_data['metadata']
         
-        # Create filename
-        safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
-        filename = f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf"
+        # Extract AI tasks if requested
+        ai_tasks = []
+        task_stats = {}
+        if include_tasks:
+            try:
+                # Use structured sections directly (much more efficient than text parsing)
+                timeline_section = sections.get(3, "")
+                voter_contact_section = sections.get(6, "")
+                
+                if timeline_section and voter_contact_section:
+                    # Initialize AI task orchestrator  
+                    task_orchestrator = AITaskOrchestrator()
+                    
+                    # Generate tasks from sections
+                    ai_tasks = await task_orchestrator.generate_tasks_from_sections(
+                        timeline_section=timeline_section,
+                        voter_contact_section=voter_contact_section,
+                        campaign_info=campaign_info,
+                        enable_template_mapping=True
+                    )
+                    
+                    task_stats = task_orchestrator.get_task_statistics(ai_tasks)
+                    logger.info(f"Successfully generated {len(ai_tasks)} AI tasks")
+                else:
+                    logger.warning("Timeline or voter contact sections not available for task extraction")
+                    
+            except Exception as e:
+                logger.error(f"AI task generation failed: {str(e)}")
+                # Continue without tasks
         
-        # Return as downloadable PDF
-        return StreamingResponse(
-            io.BytesIO(pdf_buffer.getvalue()),
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
+        # Generate JSON data structure
+        json_data = {
+            "campaign_plan": campaign_plan_text,
+            "candidate_name": campaign_info.candidate_name,
+            "election_date": str(campaign_info.election_date),
+            "office_and_jurisdiction": campaign_info.office_and_jurisdiction,
+            "generation_timestamp": datetime.now().isoformat()
+        }
+        
+        # Add tasks to JSON if generated
+        if ai_tasks:
+            json_data["ai_tasks"] = [task.model_dump(exclude_none=True) for task in ai_tasks]
+            json_data["task_metadata"] = {
+                "generation_timestamp": datetime.now().isoformat(),
+                "statistics": task_stats
+            }
+        
+        # Return based on requested format
+        if return_format == "json":
+            return JSONResponse(json_data)
+        elif return_format == "both":
+            # Convert to PDF
+            pdf_buffer = pdf_generator.create_pdf_from_text(campaign_plan_text, campaign_info)
+            
+            # Create filename
+            safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            
+            return JSONResponse({
+                "campaign_plan_text": campaign_plan_text,
+                "json_data": json_data,
+                "pdf_filename": f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf",
+                "pdf_size_bytes": len(pdf_buffer.getvalue())
+            })
+        else:
+            # Default: Return PDF
+            pdf_buffer = pdf_generator.create_pdf_from_text(campaign_plan_text, campaign_info)
+            
+            # Create filename
+            safe_candidate_name = "".join(c for c in campaign_info.candidate_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            filename = f"campaign_plan_{safe_candidate_name.replace(' ', '_')}.pdf"
+            
+            return StreamingResponse(
+                io.BytesIO(pdf_buffer.getvalue()),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
         
     except Exception as e:
         logger.error(f"Error generating campaign plan: {str(e)}")
@@ -400,10 +474,60 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             pdf_data = pdf_buffer.getvalue()
             pdf_path = pdf_storage.save_pdf(progress_tracker.session_id, pdf_data, filename)
             
-            # Generate JSON data using the extractor
-            progress_tracker.update(99, "processing", "Generating JSON format...", 
-                                  "Creating structured JSON data")
-            json_data = json_extractor.extract_json(final_plan, campaign_info)
+            # Generate AI tasks from sections
+            progress_tracker.update(96, "processing", "Extracting personalized campaign tasks...", 
+                                  "Analyzing timeline and voter contact plan for actionable tasks")
+            
+            ai_tasks = []
+            task_stats = {}
+            try:
+                # Initialize AI task orchestrator
+                task_orchestrator = AITaskOrchestrator()
+                
+                # Extract sections 3 and 6 from the generated content
+                timeline_section = sections.get(3, "")
+                voter_contact_section = sections.get(6, "")
+                
+                if timeline_section and voter_contact_section:
+                    # Generate tasks from sections
+                    ai_tasks = await task_orchestrator.generate_tasks_from_sections(
+                        timeline_section=timeline_section,
+                        voter_contact_section=voter_contact_section,
+                        campaign_info=campaign_info,
+                        enable_template_mapping=True
+                    )
+                    
+                    task_stats = task_orchestrator.get_task_statistics(ai_tasks)
+                    logger.info(f"Successfully generated {len(ai_tasks)} AI tasks for campaign")
+                else:
+                    logger.warning("Timeline or voter contact sections not available for task extraction")
+                    
+            except Exception as e:
+                logger.error(f"AI task generation failed, continuing without: {str(e)}")
+            
+            # Generate JSON data structure
+            progress_tracker.update(98, "processing", "Generating JSON format...", 
+                                  "Creating structured JSON data with AI tasks")
+            
+            json_data = {
+                "campaign_plan": final_plan,
+                "candidate_name": campaign_info.candidate_name,
+                "election_date": str(campaign_info.election_date),
+                "office_and_jurisdiction": campaign_info.office_and_jurisdiction,
+                "generation_timestamp": datetime.now().isoformat()
+            }
+            
+            # Add tasks to JSON data
+            if ai_tasks:
+                json_data["ai_tasks"] = [task.model_dump(exclude_none=True) for task in ai_tasks]
+                json_data["task_metadata"] = {
+                    "generation_timestamp": datetime.now().isoformat(),
+                    "statistics": task_stats
+                }
+            else:
+                json_data["ai_tasks"] = []
+                if "AI task generation failed" in str(locals().get('e', '')):
+                    json_data["task_generation_error"] = str(e)
             
             # Save JSON to filesystem using dedicated JSON storage
             json_filename = filename.replace('.pdf', '.json')
@@ -436,7 +560,7 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             raise
         
         progress_tracker.update(100, "completed", "Campaign plan generation complete!", 
-                              "PDF and JSON formats ready for download")
+                              f"Generated campaign plan with {len(ai_tasks)} personalized tasks - PDF and JSON ready for download")
         
     except Exception as e:
         logger.error(f"Error in background generation: {str(e)}")
@@ -645,94 +769,8 @@ async def download_json(session_id: str):
     )
 
 
-@app.post("/generate-campaign-plan-form")
-async def generate_campaign_plan_form(
-    request: Request,
-    candidate_name: str = Form(...),
-    election_date: str = Form(...),
-    office_and_jurisdiction: str = Form(...),
-    race_type: str = Form(...),
-    incumbent_status: str = Form(...),
-    seats_available: int = Form(...),
-    number_of_opponents: int = Form(...),
-    win_number: int = Form(...),
-    total_likely_voters: int = Form(...),
-    available_cell_phones: int = Form(...),
-    available_landlines: int = Form(...),
-    primary_date: Optional[str] = Form(None),
-    additional_race_context: Optional[str] = Form(None)
-):
-    """Generate campaign plan from form submission."""
-    try:
-        # Parse dates
-        election_date_parsed = date.fromisoformat(election_date)
-        primary_date_parsed = date.fromisoformat(primary_date) if primary_date else None
-        
-        # Create CampaignInfo object
-        campaign_info = CampaignInfo(
-            candidate_name=candidate_name,
-            primary_date=primary_date_parsed,
-            election_date=election_date_parsed,
-            office_and_jurisdiction=office_and_jurisdiction,
-            incumbent_status=IncumbentStatus(incumbent_status),
-            race_type=RaceType(race_type),
-            seats_available=seats_available,
-            number_of_opponents=number_of_opponents,
-            win_number=win_number,
-            total_likely_voters=total_likely_voters,
-            available_cell_phones=available_cell_phones,
-            available_landlines=available_landlines,
-            additional_race_context=additional_race_context
-        )
-        
-        return await generate_campaign_plan_json(campaign_info)
-        
-    except ValidationError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Validation error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error processing form: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing form: {str(e)}")
 
 
-@app.post("/slack-webhook")
-async def slack_webhook(request: Request):
-    """Handle Slack webhook for campaign plan generation."""
-    try:
-        body = await request.json()
-        
-        # Extract campaign info from Slack message
-        # This is a simplified example - you'd need to parse the actual Slack payload
-        if "text" in body:
-            # Parse text for campaign info or use slash command parameters
-            # For now, return instructions
-            return {
-                "response_type": "ephemeral",
-                "text": "Please provide campaign information in JSON format or use the web form at /",
-                "attachments": [
-                    {
-                        "color": "good",
-                        "fields": [
-                            {
-                                "title": "Web Form",
-                                "value": "Visit the web form to fill out campaign details",
-                                "short": True
-                            },
-                            {
-                                "title": "API Endpoint",
-                                "value": "POST /generate-campaign-plan with JSON payload",
-                                "short": True
-                            }
-                        ]
-                    }
-                ]
-            }
-        
-        return {"response_type": "ephemeral", "text": "Invalid request format"}
-        
-    except Exception as e:
-        logger.error(f"Error processing Slack webhook: {str(e)}")
-        return {"response_type": "ephemeral", "text": f"Error: {str(e)}"}
 
 
 @app.get("/health")

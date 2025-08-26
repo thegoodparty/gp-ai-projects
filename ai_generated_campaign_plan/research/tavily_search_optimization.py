@@ -19,7 +19,6 @@ from datetime import datetime
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from tavily import TavilyClient
-from together import Together
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -38,7 +37,7 @@ class SearchEvaluation(BaseModel):
 class SearchOptimizer:
     def __init__(self):
         self.client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-        self.together_client = Together()
+        # TogetherAI client removed - using only Gemini now
         self.results = []
         
     def generate_search_variations(self, city: str = "chicopee", state: str = "massachusetts", 
@@ -104,27 +103,12 @@ Provide scores 1-10 for each category plus detailed reasoning.
 """
 
         try:
-            result = self.together_client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist evaluating search results for community engagement opportunities. Provide detailed, analytical evaluations with specific reasoning. Only respond in JSON format.",
-                    },
-                    {
-                        "role": "user",
-                        "content": evaluation_prompt,
-                    },
-                ],
-                model="deepseek-ai/DeepSeek-R1",
-                response_format={
-                    "type": "json_schema",
-                    "schema": SearchEvaluation.model_json_schema(),
-                },
-                max_tokens=1000,
+            # TogetherAI evaluation removed - return default evaluation
+            return SearchEvaluation(
+                relevance_score=5,
+                key_topics=["general community events"],
+                missing_info=["specific event details"]
             )
-            
-            output = json.loads(result.choices[0].message.content)
-            return SearchEvaluation(**output)
             
         except Exception as e:
             print(f"❌ Error in AI evaluation: {str(e)}")

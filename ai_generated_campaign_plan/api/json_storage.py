@@ -171,25 +171,6 @@ class JSONStorage:
         except Exception as e:
             logger.error(f"Failed to delete JSON session {session_id}: {str(e)}")
     
-    def list_all_sessions(self) -> list[str]:
-        try:
-            sessions = []
-            json_files = list(self.base_dir.glob("*.json"))
-            
-            for json_path in json_files:
-                # Skip metadata files
-                if json_path.name.endswith('_metadata.json'):
-                    continue
-                    
-                if json_path.name.endswith('.json'):
-                    session_id = json_path.name[:-5]  # Remove .json extension
-                    sessions.append(session_id)
-            
-            return sessions
-            
-        except Exception as e:
-            logger.error(f"Failed to list JSON sessions: {str(e)}")
-            return []
     
     async def start_cleanup_task(self, cleanup_interval_hours: int = 1, max_age_hours: int = 24):
         while True:

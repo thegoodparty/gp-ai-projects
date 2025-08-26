@@ -1,6 +1,6 @@
 import asyncio
 from datetime import date
-from typing import Optional, Dict, Any
+from typing import Optional
 from dataclasses import dataclass
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo
 from ai_generated_campaign_plan.utils.utils import CampaignUtils
@@ -10,7 +10,7 @@ from ai_generated_campaign_plan.sections.three_campaign_timeline import Campaign
 from ai_generated_campaign_plan.sections.four_recommended_total_budget import generate_recommended_total_budget
 from ai_generated_campaign_plan.sections.five_know_your_community import KnowYourCommunityGenerator
 from ai_generated_campaign_plan.sections.six_voter_contact_plan import VoterContactPlanGenerator
-from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 from shared.logger import get_logger
 
 
@@ -20,7 +20,6 @@ class CostBreakdown:
     
     # LLM costs by provider
     gemini_cost: float = 0.0
-    together_cost: float = 0.0
     total_llm_cost: float = 0.0
     
     # Token usage
@@ -37,7 +36,7 @@ class CostBreakdown:
     
     def __post_init__(self):
         """Calculate total costs after initialization."""
-        self.total_llm_cost = self.gemini_cost + self.together_cost
+        self.total_llm_cost = self.gemini_cost
         self.total_cost = self.total_llm_cost + self.tavily_cost
 
 
@@ -47,7 +46,6 @@ class CostTracker:
     # Pricing per 1M tokens (as of 2024)
     PRICING = {
         'gemini-2.5-flash': {'input': 0.3, 'output': 2.50},  # $0.075 input, $0.30 output per 1M tokens
-        'deepseek-ai/DeepSeek-V3': {'input': 1.25, 'output': 1.25},  # TogetherAI pricing
         'tavily_search': 0.008  # $0.001 per search
     }
     
@@ -94,8 +92,6 @@ class CostTracker:
             
             if 'gemini' in provider.lower():
                 breakdown.gemini_cost += data['cost']
-            elif 'together' in provider.lower():
-                breakdown.together_cost += data['cost']
         
         breakdown.total_tokens = breakdown.total_prompt_tokens + breakdown.total_completion_tokens
         
@@ -115,15 +111,15 @@ class CampaignPlanOrchestrator:
     data processing and section generation across all modules.
     """
     
-    def __init__(self, llm_client: Optional[LLMClient] = None):
+    def __init__(self, llm_client: Optional[GeminiClient] = None):
         """
         Initialize the orchestrator with necessary utilities and generators.
         
         Args:
-            llm_client: Optional LLM client to share across components
+            llm_client: Optional Gemini client to share across components
         """
         self.logger = get_logger(__name__)
-        self.llm_client = llm_client or LLMClient()
+        self.llm_client = llm_client or GeminiClient()
         self.cost_tracker = CostTracker()
         
         # Initialize utilities and generators with shared LLM client
@@ -147,7 +143,7 @@ class CampaignPlanOrchestrator:
     
     def _track_llm_usage(self, section_name: str):
         """Track LLM usage for a specific section."""
-        stats = self.llm_client.get_usage_since_last_reset()
+        stats = self.llm_client.get_usage_stats()
         
         # Get the actual provider and model used
         provider_name = stats.get('last_provider_used', 'unknown')
@@ -165,7 +161,7 @@ class CampaignPlanOrchestrator:
             self.logger.debug(f"Section {section_name}: No LLM usage detected")
         
         # Reset for next section
-        self.llm_client.reset_token_usage_stats()
+        self.llm_client.reset_usage_stats()
     
     def _track_tavily_usage(self, section_name: str, num_searches: int):
         """Track Tavily search usage for a specific section."""
@@ -182,7 +178,6 @@ CAMPAIGN PLAN GENERATION COST REPORT
 
 LLM COSTS:
   Gemini (Primary):     ${breakdown.gemini_cost:.6f}
-  TogetherAI (Fallback): ${breakdown.together_cost:.6f}
   Total LLM Cost:       ${breakdown.total_llm_cost:.6f}
 
 TOKEN USAGE:
@@ -201,57 +196,39 @@ Actual costs may vary based on provider pricing changes.
 """
         return report
     
-    async def generate_complete_campaign_plan(self, campaign_info: CampaignInfo) -> str:
+    async def generate_campaign_plan_with_sections(self, campaign_info: CampaignInfo) -> dict:
         """
-        Generate a complete campaign plan from raw campaign information.
+        Generate a complete campaign plan and return both structured sections and full text.
         
         Args:
             campaign_info: Raw campaign information input
             
         Returns:
-            str: Complete formatted campaign plan document
+            dict: Dictionary containing 'full_text', 'sections', and 'metadata'
             
         Raises:
             Exception: If plan generation fails at any stage
         """
-        self.logger.info(f"Starting complete campaign plan generation for {campaign_info.candidate_name}")
-        self.logger.debug(f"Campaign info: {campaign_info}")
+        self.logger.info(f"Starting campaign plan generation with sections for {campaign_info.candidate_name}")
         
         try:
             # Step 1: Clean and enhance campaign data
-            self.logger.info("Step 1: Cleaning and enhancing campaign data")
             cleaned_campaign_info = self.campaign_utils.clean_campaign_info(campaign_info)
-            self.logger.info(f"Successfully cleaned data")
-            self.logger.debug(f"cleaned_campaign_info: {cleaned_campaign_info}")
-            
-            self.logger.info("generating contact strategies")
             
             if cleaned_campaign_info.has_primary:
-                self.logger.info("Generating contact strategies for primary and general elections")
                 primary_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    date.today(), 
-                    cleaned_campaign_info.primary_date
+                    date.today(), cleaned_campaign_info.primary_date
                 )
                 general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    cleaned_campaign_info.primary_date, 
-                    cleaned_campaign_info.election_date
+                    cleaned_campaign_info.primary_date, cleaned_campaign_info.election_date
                 )
-                self.logger.info("Successfully generated both primary and general contact strategies")
-                self.logger.debug(f"primary_contact_strategy: {primary_contact_strategy}")
-                self.logger.debug(f"general_contact_strategy: {general_contact_strategy}")
             else:
-                self.logger.info("Generating contact strategy for general election only")
-                general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    date.today(), 
-                    cleaned_campaign_info.election_date
-                )
                 primary_contact_strategy = None
-                self.logger.info("Successfully generated general contact strategy")
-                self.logger.debug(f"general_contact_strategy: {general_contact_strategy}")
+                general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
+                    date.today(), cleaned_campaign_info.election_date
+                )
             
-            # Step 2: Generate individual sections
-            self.logger.info("Step 2: Generating campaign plan sections")
-            
+            # Step 2: Generate individual sections  
             sections = {}
             
             # Generate sections 1, 2, 4, 5, and 6 in parallel
@@ -269,8 +246,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 1: {str(e)}")
-                    self.logger.debug(f"Section 1 error details: {type(e).__name__}: {e}", exc_info=True)
-                    return "1. OVERVIEW\n\nSection could not be generated due to an error."
+                    return "1. OVERVIEW\\n\\nSection could not be generated due to an error."
             
             async def generate_section_2():
                 try:
@@ -281,8 +257,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 2: {str(e)}")
-                    self.logger.debug(f"Section 2 error details: {type(e).__name__}: {e}", exc_info=True)
-                    return "2. STRATEGIC LANDSCAPE & ELECTORAL GOALS\n\nSection could not be generated due to an error."
+                    return "2. STRATEGIC LANDSCAPE & ELECTORAL GOALS\\n\\nSection could not be generated due to an error."
             
             async def generate_section_4():
                 try:
@@ -293,22 +268,19 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 4: {str(e)}")
-                    self.logger.debug(f"Section 4 error details: {type(e).__name__}: {e}", exc_info=True)
-                    return "4. RECOMMENDED TOTAL BUDGET\n\nSection could not be generated due to an error."
+                    return "4. RECOMMENDED TOTAL BUDGET\\n\\nSection could not be generated due to an error."
             
             async def generate_section_5():
                 try:
                     self.logger.debug("Generating Section 5: Know Your Community")
                     result = await self.community_generator.generate_section(cleaned_campaign_info)
                     self._track_llm_usage("Section 5")
-                    # Estimate Tavily searches for community section (typically 4-5 searches)
                     self._track_tavily_usage("Section 5", 4)
                     self.logger.info("✓ Section 5: Know Your Community complete")
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 5: {str(e)}")
-                    self.logger.debug(f"Section 5 error details: {type(e).__name__}: {e}", exc_info=True)
-                    return "5. KNOW YOUR COMMUNITY\n\nSection could not be generated due to an error."
+                    return "5. KNOW YOUR COMMUNITY\\n\\nSection could not be generated due to an error."
             
             async def generate_section_6():
                 try:
@@ -319,8 +291,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 6: {str(e)}")
-                    self.logger.debug(f"Section 6 error details: {type(e).__name__}: {e}", exc_info=True)
-                    return "6. VOTER CONTACT PLAN\n\nSection could not be generated due to an error."
+                    return "6. VOTER CONTACT PLAN\\n\\nSection could not be generated due to an error."
             
             # Execute all independent sections in parallel
             section_results = await asyncio.gather(
@@ -338,59 +309,39 @@ Actual costs may vary based on provider pricing changes.
             sections[5] = section_results[3]
             sections[6] = section_results[4]
             
-            # Log summary of section generation results
-            failed_sections = []
-            successful_sections = []
-            for section_num, content in [(1, sections[1]), (2, sections[2]), (4, sections[4]), (5, sections[5]), (6, sections[6])]:
-                if "Section could not be generated due to an error." in content:
-                    failed_sections.append(section_num)
-                else:
-                    successful_sections.append(section_num)
-            
-            if successful_sections:
-                self.logger.info(f"✓ Successfully generated sections: {', '.join(map(str, successful_sections))}")
-            if failed_sections:
-                self.logger.warning(f"✗ Failed to generate sections: {', '.join(map(str, failed_sections))}")
-            
-            self.logger.info("✓ All independent sections (1, 2, 4, 5, 6) completed in parallel")
-            
             # Section 3: Campaign Timeline (depends on sections 5 and 6)
             self.logger.debug("Generating Section 3: Campaign Timeline")
             try:
                 sections[3] = await self.timeline_generator.generate_section(cleaned_campaign_info, sections[5], sections[6])
                 self._track_llm_usage("Section 3")
-                # Estimate Tavily searches for timeline section (typically 1-2 searches for ballot dates)
                 self._track_tavily_usage("Section 3", 2)
                 self.logger.info("✓ Section 3: Campaign Timeline complete")
             except Exception as e:
-                self.logger.error(f"Failed to generate Section 3: {str(e)}")
-                self.logger.debug(f"Section 3 error details: {type(e).__name__}: {e}", exc_info=True)
-                sections[3] = "3. CAMPAIGN TIMELINE\n\nSection could not be generated due to an error."
-
-
-
-            # Step 3: Assemble final document
-            self.logger.info("Step 3: Assembling final campaign plan document")
-            final_plan = self._assemble_final_document(campaign_info, sections)
+                self.logger.error(f"Failed to generate timeline content: {str(e)}")
+                sections[3] = "Error generating timeline content"
             
-            # Generate and log cost report
-            cost_report = self.get_generation_cost_report()
-            self.logger.info("Campaign plan generation completed - Cost Summary:")
-            self.logger.info(cost_report)
+            # Assemble full text
+            full_text = self._assemble_final_document(campaign_info, sections)
             
-            # Get final cost breakdown for return
+            # Get cost breakdown
             cost_breakdown = self.cost_tracker.get_cost_breakdown()
             
-            self.logger.info(f"Successfully generated complete campaign plan for {campaign_info.candidate_name}")
-            self.logger.info(f"Total generation cost: ${cost_breakdown.total_cost:.6f}")
-            self.logger.debug(f"Final document length: {len(final_plan)} characters")
+            self.logger.info(f"Successfully generated campaign plan with sections for {campaign_info.candidate_name}")
             
-
-            return final_plan
+            return {
+                'full_text': full_text,
+                'sections': sections,
+                'metadata': {
+                    'candidate_name': campaign_info.candidate_name,
+                    'election_date': str(campaign_info.election_date),
+                    'office_and_jurisdiction': campaign_info.office_and_jurisdiction,
+                    'cost_breakdown': cost_breakdown.__dict__,
+                    'cleaned_campaign_info': cleaned_campaign_info
+                }
+            }
             
         except Exception as e:
-            self.logger.error(f"Failed to generate campaign plan: {str(e)}")
-            self.logger.debug(f"Exception details: {type(e).__name__}: {e}", exc_info=True)
+            self.logger.error(f"Failed to generate campaign plan with sections: {str(e)}")
             raise
     
     def _assemble_final_document(self, campaign_info: CampaignInfo, sections: dict) -> str:
@@ -444,7 +395,8 @@ Generated on: {date.today().strftime('%B %d, %Y')}
             str: Complete formatted campaign plan document
         """
         self.logger.info("Running campaign plan generation in synchronous mode")
-        return asyncio.run(self.generate_complete_campaign_plan(campaign_info))
+        result = asyncio.run(self.generate_campaign_plan_with_sections(campaign_info))
+        return result['full_text']
     
     async def generate_campaign_plan_with_costs(self, campaign_info: CampaignInfo) -> tuple[str, CostBreakdown]:
         """
@@ -458,7 +410,8 @@ Generated on: {date.today().strftime('%B %d, %Y')}
         """
         self.logger.info("Generating campaign plan with detailed cost tracking")
         
-        campaign_plan = await self.generate_complete_campaign_plan(campaign_info)
+        result = await self.generate_campaign_plan_with_sections(campaign_info)
+        campaign_plan = result['full_text']
         cost_breakdown = self.cost_tracker.get_cost_breakdown()
         
         return campaign_plan, cost_breakdown
@@ -519,7 +472,6 @@ if __name__ == "__main__":
         print(f"Total Cost: ${cost_breakdown.total_cost:.6f}")
         print(f"LLM Cost: ${cost_breakdown.total_llm_cost:.6f}")
         print(f"  - Gemini: ${cost_breakdown.gemini_cost:.6f}")
-        print(f"  - TogetherAI: ${cost_breakdown.together_cost:.6f}")
         print(f"Tavily Searches: {cost_breakdown.tavily_searches} (${cost_breakdown.tavily_cost:.6f})")
         print(f"Total Tokens: {cost_breakdown.total_tokens:,}")
         print(f"  - Prompt: {cost_breakdown.total_prompt_tokens:,}")
