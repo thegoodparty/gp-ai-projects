@@ -480,6 +480,7 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             
             ai_tasks = []
             task_stats = {}
+            task_generation_error = None
             try:
                 # Initialize AI task orchestrator
                 task_orchestrator = AITaskOrchestrator()
@@ -504,6 +505,7 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
                     
             except Exception as e:
                 logger.error(f"AI task generation failed, continuing without: {str(e)}")
+                task_generation_error = str(e)
             
             # Generate JSON data structure
             progress_tracker.update(98, "processing", "Generating JSON format...", 
@@ -526,8 +528,8 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
                 }
             else:
                 json_data["ai_tasks"] = []
-                if "AI task generation failed" in str(locals().get('e', '')):
-                    json_data["task_generation_error"] = str(e)
+                if task_generation_error:
+                    json_data["task_generation_error"] = task_generation_error
             
             # Save JSON to filesystem using dedicated JSON storage
             json_filename = filename.replace('.pdf', '.json')

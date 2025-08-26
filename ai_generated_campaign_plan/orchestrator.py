@@ -246,7 +246,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 1: {str(e)}")
-                    return "1. OVERVIEW\\n\\nSection could not be generated due to an error."
+                    return "1. OVERVIEW\n\nSection could not be generated due to an error."
             
             async def generate_section_2():
                 try:
@@ -257,7 +257,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 2: {str(e)}")
-                    return "2. STRATEGIC LANDSCAPE & ELECTORAL GOALS\\n\\nSection could not be generated due to an error."
+                    return "2. STRATEGIC LANDSCAPE & ELECTORAL GOALS\n\nSection could not be generated due to an error."
             
             async def generate_section_4():
                 try:
@@ -268,7 +268,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 4: {str(e)}")
-                    return "4. RECOMMENDED TOTAL BUDGET\\n\\nSection could not be generated due to an error."
+                    return "4. RECOMMENDED TOTAL BUDGET\n\nSection could not be generated due to an error."
             
             async def generate_section_5():
                 try:
@@ -280,7 +280,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 5: {str(e)}")
-                    return "5. KNOW YOUR COMMUNITY\\n\\nSection could not be generated due to an error."
+                    return "5. KNOW YOUR COMMUNITY\n\nSection could not be generated due to an error."
             
             async def generate_section_6():
                 try:
@@ -291,7 +291,7 @@ Actual costs may vary based on provider pricing changes.
                     return result
                 except Exception as e:
                     self.logger.error(f"Failed to generate Section 6: {str(e)}")
-                    return "6. VOTER CONTACT PLAN\\n\\nSection could not be generated due to an error."
+                    return "6. VOTER CONTACT PLAN\n\nSection could not be generated due to an error."
             
             # Execute all independent sections in parallel
             section_results = await asyncio.gather(
