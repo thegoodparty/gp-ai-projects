@@ -145,9 +145,9 @@ class CampaignPlanOrchestrator:
         """Track LLM usage for a specific section."""
         stats = self.llm_client.get_usage_stats()
         
-        # Get the actual provider and model used
-        provider_name = stats.get('last_provider_used', 'unknown')
-        model_name = stats.get('last_model_used', 'unknown')
+        # GeminiClient always uses Gemini provider
+        provider_name = 'gemini'
+        model_name = self.llm_client.default_model.value  # Get model from GeminiClient
         
         prompt_tokens = stats.get('total_prompt_tokens', 0)
         completion_tokens = stats.get('total_completion_tokens', 0)
@@ -156,7 +156,7 @@ class CampaignPlanOrchestrator:
             cost = self.cost_tracker.calculate_llm_cost(
                 provider_name, model_name, prompt_tokens, completion_tokens
             )
-            self.logger.info(f"Section {section_name} cost: ${cost:.6f} ({provider_name}, {prompt_tokens + completion_tokens:,} tokens)")
+            self.logger.info(f"Section {section_name} cost: ${cost:.6f} ({provider_name}/{model_name}, {prompt_tokens + completion_tokens:,} tokens)")
         else:
             self.logger.debug(f"Section {section_name}: No LLM usage detected")
         
