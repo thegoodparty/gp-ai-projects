@@ -20,14 +20,13 @@ logs/
 local_testing.py
 
 #offline files
-offline_data/
+offline_data*/
 
 #ai tooling
-CLAUDE.md
+CLAUDE*.md
 
 #output files
 output*/
 
 #vector store files
 vector_store/
-
