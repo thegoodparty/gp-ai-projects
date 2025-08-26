@@ -20,7 +20,7 @@ logs/
 local_testing.py
 
 #offline files
-offline_data/
+offline_data*/
 
 #ai tooling
 CLAUDE*.md

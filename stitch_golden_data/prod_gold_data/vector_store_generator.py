@@ -151,8 +151,10 @@ class VectorStoreGenerator:
             self.logger.info(f"🔄 Generating embeddings (batch_size={batch_size})...")
             initial_cost = self.embedding_client.get_cost_stats()['total_cost']
             
-            embeddings = await self.embedding_client.create_embeddings_parallel(
+            embeddings = await asyncio.to_thread(
+                self.embedding_client.create_embeddings,
                 texts,
+                parallel=True,
                 batch_size=batch_size,
                 max_concurrent_batches=2,
                 rate_limit_delay=2.0

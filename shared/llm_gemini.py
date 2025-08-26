@@ -67,13 +67,39 @@ class GeminiClient:
         default_temperature: float = 0.7,
         default_max_tokens: int = 10000,
         thinking_budget: Optional[int] = None,
-        include_thoughts: bool = False
+        include_thoughts: bool = False,
+        max_connections: int = 100,
+        max_keepalive_connections: int = 20
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Google API key is required")
         
-        self.client = genai.Client(api_key=self.api_key)
+        # Configure custom HTTP limits for high concurrency
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        
+        # Create HTTP options with custom connection limits
+        from google.genai.types import HttpOptions
+        
+        # Use minimal HTTP options - only connection limits
+        http_options = HttpOptions(
+            clientArgs={
+                "limits": httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections
+                )
+            },
+            asyncClientArgs={
+                "limits": httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections
+                )
+            }
+        )
+        
+        # Initialize Gemini client with custom HTTP options
+        self.client = genai.Client(api_key=self.api_key, http_options=http_options)
         self.default_model = default_model
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
@@ -92,7 +118,7 @@ class GeminiClient:
         self.total_completion_tokens = 0
         self.total_cost = 0.0
         
-        self.logger.info(f"Gemini client initialized with model: {default_model.value}")
+        self.logger.info(f"Gemini client initialized with model: {default_model.value}, max_connections: {max_connections}, max_keepalive: {max_keepalive_connections}")
     
     def _get_base_config(
         self,
@@ -542,7 +568,7 @@ class GeminiEmbeddingClient:
         self.total_cost = 0.0
         return previous_stats
     
-    def create_single_embedding(
+    def _create_single_embedding(
         self,
         text: str,
         model: str = "gemini-embedding-001"
@@ -579,80 +605,16 @@ class GeminiEmbeddingClient:
                 else:
                     raise RuntimeError(f"Failed to create single embedding after {self.max_retries} attempts: {str(e)}")
     
-    def create_embeddings_sync(
-        self,
-        texts: List[str],
-        model: str = "gemini-embedding-001",
-        batch_size: int = 100
-    ) -> np.ndarray:
-        """
-        Create embeddings synchronously with progress tracking.
-        
-        Args:
-            texts: List of texts to embed
-            model: Embedding model to use
-            batch_size: Number of texts to process per batch
-            
-        Returns:
-            numpy array of embeddings
-        """
-        self.logger.info(f"Creating embeddings for {len(texts)} texts using {model} (sync)")
-        
-        embeddings = []
-        total_batches = (len(texts) + batch_size - 1) // batch_size
-        
-        with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                batch_num = i // batch_size + 1
-                
-                self.logger.debug(f"Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
-                
-                last_exception = None
-                
-                for attempt in range(self.max_retries):
-                    try:
-                        batch_embeddings = []
-                        for text in batch:
-                            result = self.genai_client.models.embed_content(
-                                model=model,
-                                contents=text
-                            )
-                            batch_embeddings.append(result.embeddings[0].values)
-                        
-                        embeddings.extend(batch_embeddings)
-                        
-                        # Track cost for this batch
-                        self._track_embedding_cost(batch, model)
-                        
-                        self.logger.debug(f"Batch {batch_num} completed successfully")
-                        pbar.update(1)
-                        break
-                        
-                    except Exception as e:
-                        last_exception = e
-                        self.logger.warning(f"Batch {batch_num} attempt {attempt + 1}/{self.max_retries} failed: {str(e)}")
-                        
-                        if attempt < self.max_retries - 1:
-                            delay = self.base_delay * (2 ** attempt)
-                            self.logger.debug(f"Retrying batch {batch_num} in {delay} seconds...")
-                            time.sleep(delay)
-                        else:
-                            self.logger.error(f"Batch {batch_num} failed after {self.max_retries} attempts")
-                            pbar.update(1)
-                            raise RuntimeError(f"Failed to create embeddings for batch {batch_num} after {self.max_retries} attempts. Last error: {str(last_exception)}")
-        
-        self.logger.info(f"Successfully created {len(embeddings)} embeddings")
-        return np.array(embeddings)
     
-    async def create_embeddings_parallel(
+    async def _create_embeddings_parallel(
         self,
         texts: List[str],
         model: str = "gemini-embedding-001",
         batch_size: int = 100,
         max_concurrent_batches: int = 2,
         rate_limit_delay: float = 2.0,
-        adaptive_rate_limiting: bool = True
+        adaptive_rate_limiting: bool = True,
+        stagger_delay: float = 0.1
     ) -> np.ndarray:
         """
         Create embeddings using parallel batch processing with adaptive rate limiting.
@@ -664,6 +626,7 @@ class GeminiEmbeddingClient:
             max_concurrent_batches: Maximum number of concurrent batches
             rate_limit_delay: Base delay between batches (seconds)
             adaptive_rate_limiting: Whether to adapt delays based on 429 errors
+            stagger_delay: Delay to stagger batch start times (seconds)
             
         Returns:
             numpy array of embeddings
@@ -693,6 +656,11 @@ class GeminiEmbeddingClient:
             
             async with semaphore:
                 last_exception = None
+                
+                # Add staggered start delay for each batch
+                stagger_wait = batch_num * stagger_delay
+                if stagger_wait > 0:
+                    await asyncio.sleep(stagger_wait)
                 
                 # Add rate limiting delay before processing
                 if batch_num > 0:  # Don't delay the first batch
@@ -799,6 +767,7 @@ class GeminiEmbeddingClient:
         batch_size: int = 100,
         max_concurrent_batches: int = 2,
         rate_limit_delay: float = 2.0,
+        stagger_delay: float = 0.1,
         **kwargs
     ) -> np.ndarray:
         """
@@ -810,30 +779,25 @@ class GeminiEmbeddingClient:
             batch_size: Number of texts per batch
             max_concurrent_batches: Max concurrent batches (lower = fewer 429s)
             rate_limit_delay: Base delay between batches in seconds
+            stagger_delay: Delay to stagger batch start times (seconds)
             **kwargs: Additional arguments
             
         Returns:
             numpy array of embeddings
         """
-        # For single texts, always use sync
+        # For single texts, always use single embedding
         if len(texts) == 1:
-            return self.create_single_embedding(texts[0], **kwargs).reshape(1, -1)
+            return self._create_single_embedding(texts[0], **kwargs).reshape(1, -1)
         
-        # Use parallel for larger datasets
-        if parallel and len(texts) > 100:
-            return asyncio.run(self.create_embeddings_parallel(
-                texts,
-                batch_size=batch_size,
-                max_concurrent_batches=max_concurrent_batches,
-                rate_limit_delay=rate_limit_delay,
-                **kwargs
-            ))
-        else:
-            return self.create_embeddings_sync(
-                texts,
-                batch_size=batch_size,
-                **kwargs
-            )
+        # For multiple texts, always use parallel processing (more efficient)
+        return asyncio.run(self._create_embeddings_parallel(
+            texts,
+            batch_size=batch_size,
+            max_concurrent_batches=max_concurrent_batches,
+            rate_limit_delay=rate_limit_delay,
+            stagger_delay=stagger_delay,
+            **kwargs
+        ))
 
 def example_usage():
     client = GeminiClient(
