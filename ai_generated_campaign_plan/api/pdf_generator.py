@@ -102,33 +102,6 @@ class CampaignPlanPDFGenerator:
         logger.info(f"PDF generated successfully ({len(buffer.getvalue())} bytes)")
         return buffer
     
-    def _create_title_page(self, campaign_info: CampaignInfo) -> List:
-        """Create the title page elements."""
-        elements = []
-        
-        # Main title
-        title_text = f"Campaign Plan for {campaign_info.candidate_name}"
-        elements.append(Paragraph(title_text, self.title_style))
-        elements.append(Spacer(1, 0.3 * inch))
-        
-        # Candidate details
-        office_text = f"{campaign_info.office_and_jurisdiction}"
-        elements.append(Paragraph(office_text, self.h2_style))
-        elements.append(Spacer(1, 0.2 * inch))
-        
-        election_text = f"Election Date: {campaign_info.election_date}"
-        elements.append(Paragraph(election_text, self.normal_style))
-        elements.append(Spacer(1, 0.1 * inch))
-        
-        race_text = f"Race Type: {campaign_info.race_type}"
-        elements.append(Paragraph(race_text, self.normal_style))
-        elements.append(Spacer(1, 0.1 * inch))
-        
-        status_text = f"Status: {campaign_info.incumbent_status}"
-        elements.append(Paragraph(status_text, self.normal_style))
-        
-        elements.append(PageBreak())
-        return elements
     
     def _parse_markdown_content(self, text: str) -> List:
         """Parse markdown content and convert to PDF elements."""

@@ -2,7 +2,6 @@ import asyncio
 from datetime import date
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, SearchTermsList
 from ai_generated_campaign_plan.utils.utils import CampaignUtils
-from shared.llm import LLMClient
 from shared.logger import get_logger
 from shared.tavily_client import SharedTavilyClient
 from shared.llm_gemini import GeminiClient
@@ -41,8 +40,7 @@ class KnowYourCommunityGenerator:
         """Initialize the generator with necessary clients and logger."""
         self.logger = get_logger(__name__)
         self.tavily_client = SharedTavilyClient()
-        self.llm_client = LLMClient()
-        self.gemini_client = GeminiClient()
+        self.llm_client = GeminiClient()
         
         self.logger.info("KnowYourCommunityGenerator initialized")
 
@@ -98,22 +96,13 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
             
             self.logger.debug("Generating media outreach content")
             
-            media_response = self.llm_client.create_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. CRITICAL: Every line must start with exactly ' - ' (space-dash-space). Return ONLY clean bullet points with no explanations, corrections, or thinking process."
-                    },
-                    {
-                        "role": "user",
-                        "content": media_prompt
-                    }
-                ],
-                max_tokens=10000,
+            media_response = self.llm_client.generate_content(
+                prompt=media_prompt,
+                system_instruction="You are an expert campaign strategist. CRITICAL: Every line must start with exactly ' - ' (space-dash-space). Return ONLY clean bullet points with no explanations, corrections, or thinking process.",
                 temperature=0.0
             )
             
-            media_content = media_response.choices[0].message.content
+            media_content = media_response
             
             return f"""
 ### Earned Media & Press Outreach
@@ -168,7 +157,7 @@ FINAL REMINDER: Start EVERY line with the exact character sequence: [space][dash
         - Today's Date: {date.today()}
         """
         self.logger.debug(f"Prompt: {prompt}")
-        response = self.gemini_client.generate_with_search(prompt)
+        response = self.llm_client.generate_with_search(prompt)
         self.logger.debug(f"Response: {response}")
         return response
         
@@ -246,19 +235,10 @@ Return exactly 3 search terms, one per line, with no bullets or formatting.
             
             self.logger.debug("Generating targeted search terms")
             
-            search_terms_response = self.llm_client.create_structured_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. Generate exactly 3 search terms for finding community events where political candidates can connect with voters."
-                    },
-                    {
-                        "role": "user",
-                        "content": search_terms_prompt
-                    }
-                ],
+            search_terms_response = self.llm_client.generate_structured_content(
+                prompt=search_terms_prompt,
+                system_instruction="You are an expert campaign strategist. Generate exactly 3 search terms for finding community events where political candidates can connect with voters.",
                 response_schema=SearchTermsList,
-                max_tokens=10000,
             )
             
             search_terms = search_terms_response.search_terms
@@ -391,22 +371,13 @@ CRITICAL: Return ONLY the bullet points sorted by date (earliest first). Clean u
             
             self.logger.debug("Sending events for AI filtering")
             
-            filter_response = self.llm_client.create_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. CRITICAL: Every line must start with exactly ' - ' (space-dash-space). Return ONLY clean bullet points with no explanations, corrections, or thinking process."
-                    },
-                    {
-                        "role": "user",
-                        "content": filter_prompt
-                    }
-                ],
-                max_tokens=20000,
+            filter_response = self.llm_client.generate_content(
+                prompt=filter_prompt,
+                system_instruction="You are an expert campaign strategist. CRITICAL: Every line must start with exactly ' - ' (space-dash-space). Return ONLY clean bullet points with no explanations, corrections, or thinking process.",
                 temperature=0.0
             )
             
-            filtered_events_text = filter_response.choices[0].message.content
+            filtered_events_text = filter_response
             self.logger.info(f"AI filtering completed.")
             self.logger.debug(f"Filtered events text length: {len(filtered_events_text)} characters")
             

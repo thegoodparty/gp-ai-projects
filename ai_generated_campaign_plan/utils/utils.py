@@ -2,7 +2,7 @@ from datetime import date
 from dotenv import load_dotenv
 
 from ai_generated_campaign_plan.schema.models import CampaignInfo, CleanedCampaignInfo, IncumbentStatus, RaceType, AdditionalCampaignInfo, ContactOptimization
-from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 from shared.logger import get_logger
 
 load_dotenv()
@@ -12,14 +12,14 @@ class CampaignUtils:
     A unified utility class for campaign information processing and optimization.
     """
     
-    def __init__(self, llm_client: LLMClient = None):
+    def __init__(self, llm_client: GeminiClient = None):
         """
         Initialize the campaign utilities.
         
         Args:
-            llm_client: LLMClient instance. If None, creates a default one.
+            llm_client: GeminiClient instance. If None, creates a default one.
         """
-        self.llm_client = llm_client or LLMClient()
+        self.llm_client = llm_client or GeminiClient()
         self.logger = get_logger(__name__)
     
     def clean_campaign_info(self, campaign_info: CampaignInfo) -> CleanedCampaignInfo:
@@ -61,9 +61,10 @@ extract the following fields as a JSON object:
         
         try:
             self.logger.info("Extracting campaign info using LLM")
-            extracted_fields = self.llm_client.create_structured_completion(
-                messages=messages,
+            extracted_fields = self.llm_client.generate_structured_content(
+                prompt=extraction_prompt,
                 response_schema=AdditionalCampaignInfo,
+                system_instruction="You are an expert at parsing location and date information from campaign data. Extract the required fields accurately and format dates consistently."
             )
             
             self.logger.debug(f"Extracted fields: {extracted_fields}")

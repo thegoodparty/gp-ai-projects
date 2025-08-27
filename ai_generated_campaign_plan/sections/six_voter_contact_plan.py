@@ -2,14 +2,14 @@ import asyncio
 from datetime import date, timedelta
 from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo, ContactOptimization, IncumbentStatus
 from shared.logger import get_logger
-from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 
 
 
 class VoterContactPlanGenerator:
     
     def __init__(self):
-        self.llm_client = LLMClient()
+        self.llm_client = GeminiClient()
         self.logger = get_logger(__name__)
     
 
@@ -96,16 +96,13 @@ Example format:
 - [Election Date] – General Election Day
 """
         try:
-            response = self.llm_client.create_completion(
-                messages=[
-                    {"role": "system", "content": "You are a campaign strategist. Generate the voter contact plan in the exact format shown. Do not add thinking or reasoning."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=10000
+            response = self.llm_client.generate_content(
+                prompt=prompt,
+                system_instruction="You are a campaign strategist. Generate the voter contact plan in the exact format shown. Do not add thinking or reasoning.",
+                temperature=0.1
             )
             
-            voter_contact_plan = response.choices[0].message.content
+            voter_contact_plan = response
 
             self.logger.info(f"Generated voter contact plan: {voter_contact_plan}")
             return "\n".join([

@@ -5,11 +5,10 @@ This repository contains AI-powered tools for political campaign planning, data 
 ## Projects Overview
 
 ### 1. AI Generated Campaign Plan (`ai_generated_campaign_plan/`)
-Generates comprehensive political campaign plans using LLM providers (Gemini → TogetherAI fallback) with automatic cost tracking, web search integration, and parallel section generation.
+Generates comprehensive political campaign plans using Gemini LLM with automatic cost tracking, web search integration, and parallel section generation.
 
 **Key Features:**
 - Complete campaign plan orchestration with 6 sections
-- Automatic LLM provider fallback (Gemini primary, TogetherAI secondary)
 - Web search integration via Tavily API
 - Parallel processing with cost tracking
 - PDF generation and structured data models
@@ -50,7 +49,6 @@ GEMINI_API_KEY=your_gemini_api_key
 
 # Secondary LLM Provider (Optional - fallback)
 GEMINI_API_KEY2=your_second_gemini_key_optional
-TOGETHER_API_KEY=your_together_api_key
 
 # Web Search (Required for campaign planning)
 TAVILY_API_KEY=your_tavily_api_key
@@ -168,5 +166,4 @@ Cost summaries are automatically logged and included in output files.
 
 - **Databricks Access**: All database operations are READ-ONLY (SELECT queries only)
 - **API Key Rotation**: Supports multiple Gemini API keys for rate limit management
-- **Fallback Systems**: Automatic provider fallback (Gemini → TogetherAI)
 - **Batch Processing**: Optimized for large-scale data processing with parallel execution

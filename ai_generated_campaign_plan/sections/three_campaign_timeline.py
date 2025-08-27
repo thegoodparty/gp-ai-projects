@@ -2,7 +2,7 @@ import asyncio
 from datetime import date, timedelta
 from ai_generated_campaign_plan.schema.models import CleanedCampaignInfo
 from shared.logger import get_logger
-from shared.llm import LLMClient
+from shared.llm_gemini import GeminiClient
 from shared.tavily_client import SharedTavilyClient
 
 
@@ -15,7 +15,7 @@ class CampaignTimelineGenerator:
     
     def __init__(self):
         self.logger = get_logger(__name__)
-        self.llm_client = LLMClient()
+        self.llm_client = GeminiClient()
         self.tavily_client = SharedTavilyClient()
         self.logger.info("CampaignTimelineGenerator initialized")
 
@@ -157,22 +157,13 @@ Generate the timeline in the exact format shown above. Start each line with the 
 """
         
         try:
-            response = self.llm_client.create_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert campaign strategist. Generate a chronological campaign timeline focusing ONLY on planning events, milestones, and key election dates. Do NOT include voter contact tactics."
-                    },
-                    {
-                        "role": "user",
-                        "content": timeline_prompt
-                    }
-                ],
-                max_tokens=20000,
+            response = self.llm_client.generate_content(
+                prompt=timeline_prompt,
+                system_instruction="You are an expert campaign strategist. Generate a chronological campaign timeline focusing ONLY on planning events, milestones, and key election dates. Do NOT include voter contact tactics.",
                 temperature=0.1
             )
             
-            timeline_content = response.choices[0].message.content
+            timeline_content = response
             self.logger.info("Successfully generated timeline content")
             return timeline_content
             

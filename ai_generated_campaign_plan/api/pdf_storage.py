@@ -154,21 +154,6 @@ class PDFStorage:
         except Exception as e:
             logger.error(f"Failed to delete PDF session {session_id}: {str(e)}")
     
-    def list_all_sessions(self) -> list[str]:
-        try:
-            sessions = []
-            pdf_files = list(self.base_dir.glob("*.pdf"))
-            
-            for pdf_path in pdf_files:
-                if pdf_path.name.endswith('.pdf'):
-                    session_id = pdf_path.name[:-4]  # Remove .pdf extension
-                    sessions.append(session_id)
-            
-            return sessions
-            
-        except Exception as e:
-            logger.error(f"Failed to list PDF sessions: {str(e)}")
-            return []
     
     async def start_cleanup_task(self, cleanup_interval_hours: int = 1, max_age_hours: int = 24):
         while True:

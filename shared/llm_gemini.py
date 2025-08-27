@@ -65,7 +65,7 @@ class GeminiClient:
         api_key: Optional[str] = None,
         default_model: GeminiModelType = GeminiModelType.FLASH,
         default_temperature: float = 0.7,
-        default_max_tokens: int = 10000,
+        default_max_tokens: Optional[int] = None,
         thinking_budget: Optional[int] = None,
         include_thoughts: bool = False,
         max_connections: int = 100,
@@ -128,9 +128,13 @@ class GeminiClient:
         include_thoughts: Optional[bool] = None
     ) -> types.GenerateContentConfig:
         config_params = {
-            "temperature": temperature or self.default_temperature,
-            "max_output_tokens": max_tokens or self.default_max_tokens
+            "temperature": temperature or self.default_temperature
         }
+        
+        # Only set max_output_tokens if a limit is specified
+        max_tokens_limit = max_tokens or self.default_max_tokens
+        if max_tokens_limit:
+            config_params["max_output_tokens"] = max_tokens_limit
         
         thinking_config_params = {}
         
