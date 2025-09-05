@@ -1,0 +1,13 @@
+# SAM build artifacts
+.aws-sam/
+
+# Copied shared modules (auto-generated during deployment)
+shared/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env

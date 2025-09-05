@@ -156,8 +156,8 @@ class VectorStoreGenerator:
                 texts,
                 parallel=True,
                 batch_size=batch_size,
-                max_concurrent_batches=2,
-                rate_limit_delay=2.0
+                max_concurrent_batches=800,  # ULTRA FAST MODE: Increased to 800
+                rate_limit_delay=0.01  # ULTRA FAST MODE: Minimal delay
             )
             
             final_cost = self.embedding_client.get_cost_stats()['total_cost']
@@ -321,9 +321,9 @@ async def main():
     # List existing vector stores
     generator.list_vector_stores()
     
-    # Generate vector stores for all states (skip existing ones)
+    # Generate vector stores for all states (skip existing ones) - FAST MODE
     results = await generator.generate_all_states(
-        batch_size=100,
+        batch_size=200,  # Increased from 100
         force_regenerate=False  # Set to True to regenerate all
     )
 

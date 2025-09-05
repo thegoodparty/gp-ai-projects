@@ -1,0 +1,14 @@
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "llm-matching"
+s3_bucket = ""
+s3_prefix = "llm-matching"
+region = "us-west-2"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = false
+parameter_overrides = "S3BucketName=llm-matching-embeddings"
+image_repositories = []

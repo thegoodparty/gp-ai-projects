@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: LLM Matching Service - Political District Matching via Embeddings + LLM
+
+Parameters:
+  ApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: API key for authentication (minimum 32 characters)
+  
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+    Description: Gemini API key for LLM and embedding services
+  
+  S3BucketName:
+    Type: String
+    Default: llm-matching-embeddings
+    Description: S3 bucket name for storing embeddings (will be created if doesn't exist)
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 300
+    MemorySize: 1024
+    Environment:
+      Variables:
+        API_KEY: !Ref ApiKey
+        S3_BUCKET_NAME: !Sub "${S3BucketName}-${AWS::Region}"
+        GEMINI_API_KEY: !Ref GeminiApiKey
+
+Resources:
+  EmbeddingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  LLMMatchingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: llm-matching-service
+      CodeUri: .
+      Handler: lambda_function.lambda_handler
+      EphemeralStorage:
+        Size: 5120
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: ["*"]
+          AllowMethods: ["POST"]
+          AllowHeaders: ["Content-Type", "x-api-key"]
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref EmbeddingsBucket
+
+Outputs:
+  LLMMatchingFunctionUrl:
+    Description: Lambda Function URL for LLM Matching Service
+    Value: !GetAtt LLMMatchingFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-function-url"
+  
+  S3BucketName:
+    Description: S3 Bucket for embeddings storage
+    Value: !Ref EmbeddingsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-s3-bucket"
+  
+  ApiKey:
+    Description: API Key for authentication (keep secure!)
+    Value: !Ref ApiKey
+    Export:
+      Name: !Sub "${AWS::StackName}-api-key"

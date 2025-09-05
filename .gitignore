@@ -30,3 +30,6 @@ output*/
 
 #vector store files
 vector_store/
+
+#macOS files
+.DS_Store
