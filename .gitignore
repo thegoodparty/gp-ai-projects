@@ -33,3 +33,6 @@ vector_store/
 
 #macOS files
 .DS_Store
+
+# may be sensitive
+data
