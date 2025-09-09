@@ -67,7 +67,7 @@ class ParallelProductionMatcher:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         offline_data_dir = os.path.join(current_dir, "offline_data")
         
-        # Use test embeddings (valid embeddings for 100 records each)
+        # Use full embeddings dataset
         hubspot_file = os.path.join(offline_data_dir, 'hubspot_filtered_with_embeddings_latest.parquet')
         ddhq_file = os.path.join(offline_data_dir, 'ddhq_with_embeddings_cleaned_latest.parquet')
         
@@ -82,30 +82,43 @@ class ParallelProductionMatcher:
         print(f"   DDHQ (full dataset): {len(self.ddhq_df):,} records")
     
     def _build_faiss_index(self):
-        print("🔍 Pre-building ALL FAISS indices for maximum speed...")
+        print("🔍 Pre-building ALL FAISS indices (Date + Election Type) for maximum speed...")
         
         # SPEED OPTIMIZATION: Pre-build all indices (no lazy loading)
-        self.faiss_indices = {}  # date -> FAISS index
-        self.date_records = {}   # date -> DataFrame slice
+        self.faiss_indices = {}  # "{date}_{election_type}" -> FAISS index
+        self.partition_records = {}   # "{date}_{election_type}" -> DataFrame slice
         
-        # Pre-compute date partitions AND build all FAISS indices
-        print("📊 Building all date partitions and FAISS indices...")
-        unique_dates = sorted(self.ddhq_df['date'].unique())
+        # Pre-compute date + election type partitions AND build all FAISS indices
+        print("📊 Building all date + election type partitions and FAISS indices...")
+        unique_combinations = self.ddhq_df[['date', 'election_type']].drop_duplicates()
         
-        for date in unique_dates:
-            date_records = self.ddhq_df[self.ddhq_df['date'] == date].copy()
-            self.date_records[date] = date_records
+        partition_sizes = []
+        for _, row in unique_combinations.iterrows():
+            date = row['date']
+            election_type = row['election_type']
+            partition_key = f"{date}_{election_type}"
             
-            # Build FAISS index immediately
-            embeddings = np.array(date_records['embedding_name_race'].tolist(), dtype=np.float32)
-            embedding_dim = embeddings.shape[1]
-            index = faiss.IndexFlatIP(embedding_dim)
-            faiss.normalize_L2(embeddings)
-            index.add(embeddings)
-            self.faiss_indices[date] = index
+            # Filter to this specific date + election type combination
+            partition_records = self.ddhq_df[
+                (self.ddhq_df['date'] == date) & 
+                (self.ddhq_df['election_type'] == election_type)
+            ].copy()
+            
+            if len(partition_records) > 0:
+                self.partition_records[partition_key] = partition_records
+                partition_sizes.append(len(partition_records))
+                
+                # Build FAISS index immediately
+                embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
+                embedding_dim = embeddings.shape[1]
+                index = faiss.IndexFlatIP(embedding_dim)
+                faiss.normalize_L2(embeddings)
+                index.add(embeddings)
+                self.faiss_indices[partition_key] = index
         
-        print(f"   ALL {len(unique_dates)} FAISS indices pre-built")
-        print(f"   Largest partition: {max(len(df) for df in self.date_records.values()):,} records")
+        print(f"   ALL {len(self.faiss_indices)} date+election_type FAISS indices pre-built")
+        if partition_sizes:
+            print(f"   Partition sizes: min={min(partition_sizes)}, max={max(partition_sizes):,}, avg={sum(partition_sizes)/len(partition_sizes):.0f}")
         print("   🚀 Zero lazy-loading delays - maximum concurrency ready!")
     
     def _init_llm(self):
@@ -121,69 +134,78 @@ class ParallelProductionMatcher:
         )
         print(f"   Gemini Flash initialized with {target_concurrency} max connections (MAXIMUM THROUGHPUT - 10k/min target)")
     
-    def _get_date_index(self, date):
-        """Get FAISS index for specific date - INSTANT ACCESS (pre-built)"""
-        return self.faiss_indices.get(date, None)
+    def _get_partition_index(self, date, election_type):
+        """Get FAISS index for specific date + election type - INSTANT ACCESS (pre-built)"""
+        partition_key = f"{date}_{election_type}"
+        return self.faiss_indices.get(partition_key, None)
+    
+    def _get_partition_records(self, date, election_type):
+        """Get DataFrame records for specific date + election type partition"""
+        partition_key = f"{date}_{election_type}"
+        return self.partition_records.get(partition_key, None)
     
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for k most similar DDHQ candidates using date-partitioned FAISS"""
+        """Search for k most similar DDHQ candidates using date + election type partitioned FAISS"""
         
         search_start_time = time.time()
         
-        # Get target date from HubSpot record (unified election_date field)
-        target_dates = []
-        if pd.notna(hubspot_record.get('election_date')):
-            target_dates.append(hubspot_record['election_date'])
+        # Get target date and election type from HubSpot record
+        target_date = hubspot_record.get('election_date')
+        target_election_type = hubspot_record.get('election_type')
         
-        # Remove duplicates while preserving order
-        seen = set()
-        target_dates = [d for d in target_dates if not (d in seen or seen.add(d))]
+        if pd.isna(target_date) or pd.isna(target_election_type):
+            self.logger.warning(f"Missing date or election_type for candidate: {self._get_candidate_name(hubspot_record)}")
+            return []  # Cannot search without both date and election type
         
-        if not target_dates:
-            return []  # No valid dates
+        # Get the specific partition index and records
+        faiss_index = self._get_partition_index(target_date, target_election_type)
+        partition_records = self._get_partition_records(target_date, target_election_type)
         
-        # Search each relevant date partition
-        all_candidates = []
+        if faiss_index is None or partition_records is None:
+            partition_key = f"{target_date}_{target_election_type}"
+            self.logger.warning(f"No partition found for {partition_key}")
+            return []
+        
+        # Prepare embedding for search
         hubspot_embedding = np.array(hubspot_record['embedding_name_race'])
         query_embedding = hubspot_embedding.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(query_embedding)
         
-        for date in target_dates:
-            # SPEED OPTIMIZATION: Instant index access (pre-built)
-            index_get_start = time.time()
-            faiss_index = self._get_date_index(date)
-            index_get_duration = time.time() - index_get_start
-            
-            if faiss_index is None:
+        # Search within the specific date + election type partition
+        search_actual_start = time.time()
+        similarities, indices = faiss_index.search(query_embedding, min(k, len(partition_records)))
+        search_actual_duration = time.time() - search_actual_start
+        
+        # Check if FAISS returned any valid results
+        if len(similarities[0]) == 0 or len(indices[0]) == 0:
+            self.logger.debug(f"FAISS returned empty results for partition {partition_key}")
+            return []
+        
+        # Convert results with comprehensive bounds checking
+        all_candidates = []
+        for similarity, idx in zip(similarities[0], indices[0]):
+            # Comprehensive safety checks
+            if idx < 0 or idx >= len(partition_records):  
+                self.logger.warning(f"FAISS returned invalid index {idx} for partition {partition_key} with {len(partition_records)} records")
+                continue
+            if similarity <= 0:  # Skip non-matches
                 continue
                 
-            date_records = self.date_records[date]
-            
-            # Search this date partition
-            search_actual_start = time.time()
-            similarities, indices = faiss_index.search(query_embedding, min(k, len(date_records)))
-            search_actual_duration = time.time() - search_actual_start
-            
-            # Convert results
-            for similarity, idx in zip(similarities[0], indices[0]):
-                if idx >= len(date_records):  # Safety check
-                    continue
-                    
-                ddhq_record = date_records.iloc[idx]
-                all_candidates.append({
-                    'rank': len(all_candidates) + 1,
-                    'similarity': float(similarity),
-                    'ddhq_index': ddhq_record.name,  # Original DataFrame index
-                    'candidate': ddhq_record['candidate'],
-                    'race_name': ddhq_record['race_name'],
-                    'candidate_party': ddhq_record.get('candidate_party', 'N/A'),
-                    'is_winner': ddhq_record.get('is_winner', 'N/A'),
-                    'embedding_text': ddhq_record.get('embedding_name_race_text', 'N/A'),
-                    'ddhq_race_id': ddhq_record.get('race_id', 'N/A'),
-                    'ddhq_candidate_id': ddhq_record.get('candidate_id', 'N/A'),
-                    'election_type': ddhq_record.get('election_type', 'N/A'),
-                    'date': ddhq_record.get('date', 'N/A')
-                })
+            ddhq_record = partition_records.iloc[idx]
+            all_candidates.append({
+                'rank': len(all_candidates) + 1,
+                'similarity': float(similarity),
+                'ddhq_index': ddhq_record.name,  # Original DataFrame index
+                'candidate': ddhq_record['candidate'],
+                'race_name': ddhq_record['race_name'],
+                'candidate_party': ddhq_record.get('candidate_party', 'N/A'),
+                'is_winner': ddhq_record.get('is_winner', 'N/A'),
+                'embedding_text': ddhq_record.get('embedding_name_race_text', 'N/A'),
+                'ddhq_race_id': ddhq_record.get('race_id', 'N/A'),
+                'ddhq_candidate_id': ddhq_record.get('candidate_id', 'N/A'),
+                'election_type': ddhq_record.get('election_type', 'N/A'),  # Will always match HubSpot
+                'date': ddhq_record.get('date', 'N/A')  # Will always match HubSpot
+            })
         
         # Sort by similarity and return top k
         all_candidates.sort(key=lambda x: x['similarity'], reverse=True)
@@ -347,6 +369,10 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 )
                 llm_call_duration = time.time() - llm_call_start
                 
+                # Handle None response from API failures
+                if response is None:
+                    raise ValueError("LLM returned None response - likely API failure")
+                
                 response_text = response.strip()
                 
                 # Simple cleaning - remove markdown blocks but don't over-process
@@ -377,6 +403,12 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                     if 0 <= best_match_idx < len(similar_candidates):
                         matched_candidate = similar_candidates[best_match_idx]
                         result = self._calibrate_confidence(result, hubspot_record, matched_candidate)
+                    else:
+                        # Handle invalid match index
+                        self.logger.warning(f"LLM returned invalid best_match index {result['best_match']} for {len(similar_candidates)} candidates")
+                        result['best_match'] = None
+                        result['confidence'] = 0
+                        result['reasoning'] = f"Invalid match index {result['best_match']} for {len(similar_candidates)} candidates"
                 
                 # Track LLM cost
                 stats = self.llm_client.get_usage_stats()
@@ -518,23 +550,31 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
             # Fill matched DDHQ record details if there's a match
             if llm_result.get('best_match'):
                 best_match_idx = llm_result['best_match'] - 1
-                best_candidate = similar_candidates[best_match_idx]
+                if 0 <= best_match_idx < len(similar_candidates):
+                    best_candidate = similar_candidates[best_match_idx]
+                else:
+                    # Handle invalid match index - treat as no match
+                    self.logger.warning(f"Invalid best_match index {llm_result['best_match']} for {len(similar_candidates)} candidates in record {record_index}")
+                    llm_result['best_match'] = None
+                    llm_result['confidence'] = 0
+                    best_candidate = None
                 
-                match_result.update({
-                    'ddhq_matched_index': best_candidate['ddhq_index'],
-                    'ddhq_candidate': best_candidate['candidate'],
-                    'ddhq_race_name': best_candidate['race_name'],
-                    'ddhq_candidate_party': best_candidate['candidate_party'],
-                    'ddhq_is_winner': best_candidate['is_winner'],
-                    'ddhq_race_id': best_candidate['ddhq_race_id'],
-                    'ddhq_candidate_id': best_candidate['ddhq_candidate_id'],
-                    'ddhq_election_type': best_candidate['election_type'],
-                    'ddhq_date': best_candidate['date'],
-                    'ddhq_embedding_text': best_candidate['embedding_text'],
-                    'match_similarity': best_candidate['similarity']
-                })
-                
-                self.matched_count += 1
+                if best_candidate is not None:
+                    match_result.update({
+                        'ddhq_matched_index': best_candidate['ddhq_index'],
+                        'ddhq_candidate': best_candidate['candidate'],
+                        'ddhq_race_name': best_candidate['race_name'],
+                        'ddhq_candidate_party': best_candidate['candidate_party'],
+                        'ddhq_is_winner': best_candidate['is_winner'],
+                        'ddhq_race_id': best_candidate['ddhq_race_id'],
+                        'ddhq_candidate_id': best_candidate['ddhq_candidate_id'],
+                        'ddhq_election_type': best_candidate['election_type'],
+                        'ddhq_date': best_candidate['date'],
+                        'ddhq_embedding_text': best_candidate['embedding_text'],
+                        'match_similarity': best_candidate['similarity']
+                    })
+                    
+                    self.matched_count += 1
             
             self.processed_count += 1
             

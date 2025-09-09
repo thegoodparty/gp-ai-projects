@@ -157,8 +157,9 @@ class DataCleaner:
                 primary_row = row.copy()
                 primary_row['election_type'] = 'primary'
                 primary_row['election_date'] = primary_row['primary_election_date']
-                # Clear the other election date to avoid confusion
+                # Clear the other election dates to avoid confusion
                 primary_row['general_election_date'] = pd.NaT
+                primary_row['runoff_election_date'] = pd.NaT
                 expanded_records.append(primary_row)
             
             # General election record  
@@ -168,7 +169,18 @@ class DataCleaner:
                 general_row['election_date'] = general_row['general_election_date']
                 # Clear the other election date to avoid confusion
                 general_row['primary_election_date'] = pd.NaT
+                general_row['runoff_election_date'] = pd.NaT
                 expanded_records.append(general_row)
+            
+            # Runoff election record
+            if pd.notna(row.get('runoff_election_date')):
+                runoff_row = row.copy()
+                runoff_row['election_type'] = 'runoff'
+                runoff_row['election_date'] = runoff_row['runoff_election_date']
+                # Clear the other election dates to avoid confusion
+                runoff_row['primary_election_date'] = pd.NaT
+                runoff_row['general_election_date'] = pd.NaT
+                expanded_records.append(runoff_row)
         
         expanded_df = pd.DataFrame(expanded_records)
         final_count = len(expanded_df)
@@ -283,12 +295,70 @@ class DataCleaner:
             df['candidate_party'] = df['candidate_party'].replace(['nan', 'None'], '')
             df['candidate_party'] = df['candidate_party'].replace('', np.nan)
         
+        # Normalize election types to match HubSpot format
+        df = self._normalize_ddhq_election_types(df)
+        
         final_count = len(df)
         removed_count = original_count - final_count
         self.stats['ddhq_cleaned'] = final_count
         self.stats['ddhq_removed'] = removed_count
         
         self.logger.info(f"✅ DDHQ cleaning complete: {original_count:,} → {final_count:,} records ({removed_count:,} removed)")
+        
+        return df
+    
+    def _normalize_ddhq_election_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize DDHQ election types to match HubSpot format using pattern matching"""
+        if 'election_type' not in df.columns:
+            self.logger.warning("No election_type column found in DDHQ data")
+            return df
+        
+        # Store original for debugging/reference
+        df['election_type_original'] = df['election_type'].copy()
+        
+        # Apply flexible pattern matching in order (like your original pipeline)
+        # Order matters: primary first, then runoff, then general (most specific to least specific)
+        def normalize_election_type(election_type_str):
+            if pd.isna(election_type_str):
+                return election_type_str
+            
+            election_type_lower = str(election_type_str).lower()
+            
+            # Check in order: primary -> runoff -> general
+            if 'primary' in election_type_lower:
+                return 'primary'
+            elif 'runoff' in election_type_lower:
+                return 'runoff' 
+            elif 'general' in election_type_lower:
+                return 'general'
+            else:
+                # Fallback for unmatched types
+                return election_type_str
+        
+        # Apply normalization
+        df['election_type_normalized'] = df['election_type'].apply(normalize_election_type)
+        
+        # Count normalizations
+        normalized_count = (df['election_type_normalized'] != df['election_type']).sum()
+        unmapped_types = df[df['election_type_normalized'] == df['election_type']]['election_type'].unique()
+        # Filter out NaN from unmapped_types
+        unmapped_types = [t for t in unmapped_types if pd.notna(t)]
+        
+        # Replace original with normalized
+        df['election_type'] = df['election_type_normalized']
+        
+        # Clean up temporary column
+        df = df.drop('election_type_normalized', axis=1)
+        
+        self.logger.info(f"✅ Election type normalization: {normalized_count:,} types normalized")
+        
+        if len(unmapped_types) > 0:
+            self.logger.warning(f"⚠️ Unmapped election types found: {list(unmapped_types)}")
+        
+        # Log the normalization results
+        type_counts = df['election_type'].value_counts()
+        for election_type, count in type_counts.items():
+            self.logger.debug(f"   {election_type}: {count:,} records")
         
         return df
     
