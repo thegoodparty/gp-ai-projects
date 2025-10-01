@@ -1,0 +1,165 @@
+# World-Class Civic Message Classification Pipeline Configuration
+
+# Data Loading Configuration
+data:
+  directory: "./data"         # Path to data directory
+  source: "josh"                   # Default data source: "josh", "cara", "berkley", "heather", "japjeet", "joanna", "jonathan", "all"
+  inbound_only: true               # Only process INBOUND messages (citizen responses)
+  supported_formats: ["csv"]      # Supported file formats
+
+# Data Cleaning Configuration
+cleaning:
+  min_length: 10                   # Minimum message length to be considered substantive
+  remove_duplicates: true          # Remove duplicate messages from same phone number
+  remove_stop_messages: true       # Remove STOP/opt-out messages
+  preserve_meaningful_short: true  # Keep short messages with civic keywords
+
+  # Text normalization options
+  normalize_text: true             # Apply text normalization
+  remove_phone_artifacts: true    # Remove SMS-specific artifacts
+  preserve_line_breaks: true      # Keep line breaks for compound messages
+
+# LLM Processing Configuration
+processing:
+  # Model settings
+  model: "gemini-2.5-flash"       # LLM model to use
+  temperature: 0.0                # Temperature for deterministic results
+  thinking_budget: 0              # Disable thinking for cost efficiency
+
+  # Batch processing
+  batch_size: 50                  # Messages per batch
+  max_parallel: 10                # Maximum parallel batches
+  max_connections: 100            # Maximum LLM connections
+
+  # Retry configuration
+  max_retries: 2                  # Maximum retries per failed batch
+  retry_delay: 1.0               # Delay between retries (seconds)
+
+  # Checkpointing
+  checkpoint_interval: 100        # Save checkpoint every N messages
+  resume_from_checkpoint: true    # Resume from checkpoint if exists
+
+# Classification Configuration
+classification:
+  # Multi-pass classification
+  enable_multi_pass: true         # Enable multi-pass classification system
+
+  # Validation settings
+  enable_validation: true         # Enable classification quality validation
+  strict_validation: false       # Strict validation mode
+  confidence_threshold: 0.7      # Minimum confidence for valid classification
+
+  # Rule application
+  apply_learned_rules: true       # Apply patterns from manual review
+  enforce_required_categories: true  # Ensure required categories are included
+  avoid_blacklisted_categories: true # Avoid categories marked for avoidance
+
+  # Issue-specific settings
+  capture_issue_stances: true     # Capture stance toward each specific issue
+  identify_root_causes: true      # Identify root cause relationships
+  detect_compound_patterns: true  # Detect patterns of co-occurring issues
+
+# Insights Generation Configuration
+insights:
+  # Analysis depth
+  generate_insights: true         # Generate comprehensive insights
+  max_top_issues: 10             # Maximum top issues to highlight
+  max_compound_patterns: 10      # Maximum compound patterns to identify
+  min_pattern_frequency: 2       # Minimum frequency for compound patterns
+
+  # Respondent-based aggregation settings
+  aggregation_mode: "respondent"  # "respondent" (unique people) or "message" (all messages)
+  normalize_phone_numbers: true   # Clean phone numbers for consistent matching
+
+  # Priority calculation
+  urgency_threshold: 5           # Minimum mentions for priority issues
+  negative_ratio_threshold: 0.7  # Minimum negative ratio for priority
+
+  # Sample size limits
+  max_sample_messages: 5         # Maximum sample messages per issue
+  max_key_concerns: 5            # Maximum key concerns per issue
+
+# Output Configuration
+output:
+  directory: "./serve/classify/output"  # Output directory (relative to project root)
+
+  # Export formats
+  formats:
+    - "csv"                      # Classified messages in CSV format
+    - "json"                     # Full results in JSON format
+    - "markdown"                 # Human-readable reports
+
+  # Report generation
+  include_reports: true          # Generate analysis reports
+  include_data_lineage: true     # Include CSV row tracking
+  include_validation_results: true  # Include validation metrics
+
+  # File naming
+  timestamp_files: true          # Add timestamps to output files
+  preserve_original_names: true  # Keep original CSV filenames in metadata
+
+# Performance Configuration
+performance:
+  # Memory management
+  streaming_mode: false          # Process in streaming mode for large datasets
+  max_memory_usage: "2GB"       # Maximum memory usage
+
+  # Concurrency limits
+  max_concurrent_classifications: 100  # Maximum concurrent LLM calls
+  connection_pool_size: 25       # HTTP connection pool size
+
+  # Caching
+  enable_caching: true           # Enable response caching
+  cache_directory: "./.cache"    # Cache directory
+  cache_ttl: 86400              # Cache time-to-live (seconds)
+
+# Logging Configuration
+logging:
+  level: "INFO"                  # Logging level: DEBUG, INFO, WARNING, ERROR
+  enable_progress: true          # Show progress bars/indicators
+  detailed_timing: true         # Log detailed timing information
+  log_validation_issues: true    # Log classification validation issues
+
+  # Output settings
+  console_output: true           # Enable console logging
+  file_output: false             # Enable file logging
+  log_directory: "./logs"        # Log file directory
+
+# Quality Assurance Configuration
+quality:
+  # Validation thresholds
+  min_success_rate: 0.90         # Minimum classification success rate
+  max_error_rate: 0.10          # Maximum acceptable error rate
+  max_validation_errors: 50      # Maximum validation errors before warning
+
+  # Monitoring
+  track_performance_metrics: true  # Track detailed performance metrics
+  generate_quality_report: true   # Generate quality assessment report
+  alert_on_quality_issues: false  # Alert on quality threshold breaches
+
+# Advanced Configuration
+advanced:
+  # Experimental features
+  enable_experimental: false     # Enable experimental features
+
+  # Custom rules
+  custom_classification_rules: [] # Custom classification rules (file paths)
+  custom_taxonomy_extensions: [] # Custom taxonomy extensions
+
+  # Integration settings
+  webhook_url: null              # Webhook for pipeline completion
+  external_validation: false     # External validation service
+
+  # Development settings
+  debug_mode: false              # Enable debug mode
+  save_intermediate_results: false  # Save results at each pipeline stage
+  profile_performance: false     # Enable performance profiling
+
+# Quick Test Mode (overrides for fast testing)
+quick_test:
+  enabled: false                 # Enable quick test mode
+  max_messages: 50               # Limit messages for testing
+  batch_size: 5                  # Very small batch size for testing
+  max_parallel: 2                # Reduced parallelism
+  skip_validation: false         # Skip validation for speed
+  minimal_insights: true         # Generate minimal insights only

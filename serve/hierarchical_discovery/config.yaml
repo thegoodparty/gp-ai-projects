@@ -1,0 +1,122 @@
+# Hierarchical Clustering Discovery Pipeline Configuration
+
+# Data source configuration
+data_source: "cara"  # Options: "josh", "cara", "berkeley", "heather", "japjeet", "joanna", "jonathan", "all"
+
+# Content filtering configuration (inherited from discovery)
+filtering:
+  enabled: true
+  remove_profanity: true
+  remove_non_substantive: true
+  min_length: 0
+  require_civic_relevance: false
+  max_message_length: 5000
+
+# AI message processing configuration (unified preprocessing/splitting/anonymization)
+ai_processing:
+  enabled: true
+  llm_batch_size: 50
+
+# Embedding generation configuration
+embeddings:
+  model: "gemini"
+  dimensions_3072: true  # Hierarchical clustering uses full 3072d embeddings
+  pca_dimensions: 100
+  umap_dimensions: 15
+  cache_embeddings: false
+  cache_file: ""
+  batch_size: 100
+
+# Hierarchical clustering configuration
+hierarchical:
+  # Core parameters (deterministic hierarchical clustering)
+  linkage: "ward"                    # Options: "ward", "complete", "average", "single"
+  affinity: "euclidean"              # Options: "euclidean", "manhattan", "cosine"
+  n_clusters: 15                     # Fixed number of clusters
+  distance_threshold: null           # Alternative to n_clusters (set one or the other)
+  compute_distances: true            # Required for dendrogram generation
+
+  # Multi-clustering configuration
+  multi_cluster_analysis: true       # Enable multi-cluster runs
+  cluster_ranges: "auto"             # "auto" for adaptive, or list like [10, 20, 30, 40]
+
+  # Dimensionality reduction (enabled for large datasets)
+  use_reduced_embeddings: true       # Enable PCA for datasets > 500 messages
+  reduced_dimensions: 50             # Aggressive reduction for large datasets
+  reduction_method: "pca"            # Principal Component Analysis
+
+# Dendrogram visualization configuration
+dendrogram:
+  enabled: true
+  max_display_clusters: 30          # Limit for readability
+  figsize: [15, 10]                 # Figure dimensions
+  orientation: "top"                # "top", "bottom", "left", "right"
+  leaf_rotation: 90                 # Leaf label rotation
+  leaf_font_size: 10                # Font size for leaf labels
+  truncate_mode: "level"            # "level" or "lastp"
+  p: 30                             # Truncation parameter
+  show_leaf_counts: true            # Show cluster sizes
+  color_threshold: null             # Auto-determine color threshold
+  distance_sort: "descending"       # Sort clusters by distance
+
+# Cluster analysis configuration (inherited from discovery)
+analysis:
+  enabled: true
+  parallel_analysis: true
+  max_workers: 50
+  max_example_messages: 50
+  save_example_messages: 5
+
+  # LLM configuration for analysis
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_connections: 100
+    max_keepalive_connections: 25
+
+# Performance configuration
+performance:
+  max_connections: 100
+  max_keepalive_connections: 25
+  enable_parallel_processing: true
+
+# Output configuration
+output:
+  save_intermediates: true
+  export_formats: ["json", "csv", "markdown"]
+
+  # Directory structure
+  base_dir: "output"
+  subdirs:
+    reports: "reports"
+    visualizations: "visualizations"
+    dendrograms: "dendrograms"       # Hierarchical-specific
+    checkpoints: "checkpoints"
+    exports: "exports"
+
+  # File naming
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+  # Visualization (handled by visualization_generator stage)
+
+# Error handling configuration
+error_handling:
+  continue_on_error: false
+
+# Checkpointing configuration
+checkpoints:
+  enabled: true
+  auto_save: true
+  save_frequency: "stage"
+  max_checkpoints: 10
+  compression: true
+
+# Accountability tracking configuration
+accountability:
+  enabled: true
+  include_filtered: true
+  include_embeddings: false
+  append_to_original: true
+  export_format: "csv"
+  detailed_tracking: true

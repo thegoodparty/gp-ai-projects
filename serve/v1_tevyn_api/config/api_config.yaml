@@ -1,0 +1,101 @@
+# V1 Tevyn API Configuration
+
+# Development environment
+development:
+  api:
+    base_url: "https://ai-dev.goodparty.org"
+    serve_messages_endpoint: "/serve/messages"
+    api_key: "${SERVE_API_KEY}"
+
+  upload:
+    batch_size: 25
+    retry_attempts: 3
+    timeout: 30
+
+  rate_limiting:
+    requests_per_second: 10
+    burst_size: 50
+
+# Production environment
+production:
+  api:
+    base_url: "https://ai.goodparty.org"
+    serve_messages_endpoint: "/serve/messages"
+    api_key: "${PROD_API_KEY}"  # Environment variable
+
+  upload:
+    batch_size: 25
+    retry_attempts: 5
+    timeout: 60
+
+  rate_limiting:
+    requests_per_second: 20
+    burst_size: 100
+
+# Testing environment (mock uploads)
+testing:
+  api:
+    base_url: "http://localhost:3000"
+    serve_messages_endpoint: "/serve/messages"
+    api_key: "test-key"
+
+  upload:
+    mock_uploads: true
+    batch_size: 10
+    retry_attempts: 1
+    timeout: 10
+
+# Default configuration
+default_environment: "development"
+
+# Campaign ID format configuration
+campaign_id:
+  # Format: {location}_{round}_{date}
+  format: "{location}_{round}_{date}"
+
+  # Date format for campaign IDs
+  date_format: "%Y%m%d"
+
+  # Valid round values
+  valid_rounds: ["R1", "R2", "R3"]
+
+# Data validation rules
+validation:
+  required_fields:
+    - "campaign_id"
+    - "phone_number"
+    - "message_text"
+    - "sent_at"
+
+  phone_number:
+    # Normalize phone numbers (remove non-digits)
+    normalize: true
+
+    # Minimum length for valid phone number
+    min_length: 10
+
+    # Maximum length for valid phone number
+    max_length: 15
+
+  message_text:
+    # Minimum message length
+    min_length: 1
+
+    # Maximum message length
+    max_length: 1600
+
+    # Filter out common opt-out messages
+    filter_opt_outs: true
+    opt_out_patterns: ["STOP", "UNSUBSCRIBE", "OPT OUT"]
+
+# Error handling configuration
+error_handling:
+  # Continue processing on individual record failures
+  continue_on_record_failure: true
+
+  # Maximum error rate before stopping pipeline
+  max_error_rate: 0.1  # 10%
+
+  # Save failed records for retry
+  save_failed_records: true
+  failed_records_file: "./logs/failed_records.json"

@@ -1,0 +1,113 @@
+# V1 Tevyn API Pipeline Configuration
+
+pipeline:
+  # Pipeline mode: 'integrated' (all stages) or 'standalone' (individual stages)
+  mode: "integrated"
+
+  # Enable checkpointing for resumable pipelines
+  checkpoint_enabled: true
+
+  # Skip upload stage (useful for testing)
+  skip_upload: false
+
+# Data consolidation stage configuration
+consolidation:
+  # Input directory containing R1/R2/R3 files
+  input_dir: "../../input"
+
+  # Output directory for consolidated data
+  output_dir: "../output/consolidated"
+
+# Message classification stage configuration
+classification:
+  # Enable/disable classification stage
+  enabled: true
+
+  # Batch size for classification processing
+  batch_size: 100
+
+  # Skip classification on errors (continue pipeline)
+  skip_on_error: true
+
+  # Classification pipeline configuration
+  model: "FLASH"
+  temperature: 0.0
+
+  # Use existing classify pipeline
+  use_existing_pipeline: true
+  return_raw: true
+  skip_exports: true
+
+# Message clustering stage configuration
+clustering:
+  # Enable/disable clustering stage
+  enabled: true
+
+  # Batch size for clustering processing (larger for better clusters)
+  batch_size: 500
+
+  # Minimum messages required for clustering
+  min_messages_for_clustering: 5
+
+  # Skip clustering on errors (continue pipeline)
+  skip_on_error: true
+
+  # Clustering configuration
+  optimal_clusters: 15
+
+  # Use existing hierarchical discovery pipeline
+  use_existing_pipeline: true
+  return_raw: true
+  skip_visualizations: true
+
+  # Anonymization configuration
+  anonymize_keywords: []  # List of keywords to anonymize during AI summarization
+  # Example: ["Berkeley", "Kendall County", "Mayor Smith"]
+
+# Data merging configuration
+merging:
+  # Field to match records on
+  match_on: "phone_number"
+
+  # How to handle missing analysis data
+  handle_missing: "use_defaults"
+
+# DynamoDB upload configuration
+upload:
+  # Enable/disable upload stage
+  enabled: true
+
+  # Lambda API configuration
+  api_url: "https://ai-dev.goodparty.org/serve/messages"
+  api_key: "${SERVE_API_KEY}"
+
+  # Upload batch size (25 is optimal for DynamoDB batch writes)
+  batch_size: 25
+
+  # Retry configuration
+  retry_attempts: 3
+  retry_delay: 1.0
+
+  # Request timeout in seconds
+  timeout: 30
+
+  # Skip upload on errors (log but continue)
+  skip_on_error: false
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+
+  # Log to file as well as console
+  log_to_file: true
+  log_file: "./logs/pipeline.log"
+
+# Performance configuration
+performance:
+  # Maximum concurrent operations
+  max_concurrency: 50
+
+  # Memory management
+  stream_large_datasets: true
+  max_records_in_memory: 10000

@@ -60,8 +60,10 @@ infrastructure/.env.*
 
 # Terraform variable files with secrets (allow .example files)
 infrastructure/**/environments/*.tfvars
+infrastructure/**/environments/**/*.tfvars
 infrastructure/shared/environments/*.tfvars
 !infrastructure/**/environments/*.tfvars.example
+!infrastructure/**/environments/**/*.tfvars.example
 !infrastructure/shared/environments/*.tfvars.example
 
 # Node.js

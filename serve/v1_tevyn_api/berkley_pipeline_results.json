@@ -1,0 +1,81 @@
+{
+  "campaign_id": "berkley",
+  "summary": {
+    "campaign_id": "berkley",
+    "total_messages": 175,
+    "successful_records": 175,
+    "failed_records": 0,
+    "success_rate": "100.0%",
+    "processing_time": "125.46s",
+    "errors_count": 0,
+    "warnings_count": 0
+  },
+  "consolidation": {
+    "summary": {
+      "total_messages": 175,
+      "unique_respondents": 158,
+      "messages_per_respondent": 1.11,
+      "demographic_match_rate": 100.0
+    },
+    "by_round": {},
+    "demographics": {
+      "age_groups": {
+        "respondent_counts": {
+          "18-29": 4,
+          "30-44": 42,
+          "45-64": 60,
+          "65+": 52
+        },
+        "message_counts": {
+          "18-29": 4,
+          "30-44": 48,
+          "45-64": 63,
+          "65+": 60
+        }
+      },
+      "gender": {
+        "respondent_counts": {
+          "F": 65,
+          "M": 93
+        },
+        "message_counts": {
+          "F": 73,
+          "M": 102
+        }
+      },
+      "voting_performance": {
+        "respondent_counts": {
+          "High Turnout": 110,
+          "Low Turnout": 9,
+          "Moderate Turnout": 39
+        },
+        "message_counts": {
+          "High Turnout": 121,
+          "Low Turnout": 10,
+          "Moderate Turnout": 44
+        }
+      },
+      "ward": {
+        "respondent_counts": {
+          "Unknown": 158
+        },
+        "message_counts": {
+          "Unknown": 175
+        }
+      }
+    }
+  },
+  "classification": {
+    "processed_messages": 0,
+    "processing_time": 10.413257122039795,
+    "success": true
+  },
+  "clustering": {
+    "processed_messages": 73,
+    "processing_time": 114.92834401130676,
+    "success": true
+  },
+  "upload": {},
+  "errors": [],
+  "warnings": []
+}
