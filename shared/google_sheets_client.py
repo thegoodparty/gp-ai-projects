@@ -202,7 +202,6 @@ class GoogleSheetsClient:
     def close(self):
         """Close the Google Sheets service connection."""
         if self.service:
-            self.service.close()
             self.service = None
             self.logger.info("Google Sheets service connection closed")
 
