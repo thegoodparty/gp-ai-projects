@@ -155,6 +155,7 @@ class ProductionMatcher:
         candidate_races: pd.DataFrame
     ) -> MatchResult:
         """Validate match using LLM with race/office name matching"""
+        races_considered = ""
 
         if candidate_races is None or len(candidate_races) == 0:
             return MatchResult(
@@ -243,8 +244,7 @@ OR if exact match found:
                 self.thread_pool,
                 lambda: self.llm_client.generate_structured_content(
                     prompt=prompt,
-                    response_schema=LLMMatchResponse,
-                    max_tokens=500
+                    response_schema=LLMMatchResponse
                 )
             )
 
@@ -317,7 +317,7 @@ OR if exact match found:
                     hubspot_record['state'],
                     hubspot_record['election_type']
                 ),
-                candidate_races_considered=races_considered if 'races_considered' in locals() else ""
+                candidate_races_considered=races_considered
             )
 
     async def match_single_record(self, hubspot_record: pd.Series) -> MatchResult:
