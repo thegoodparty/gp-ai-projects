@@ -441,12 +441,3 @@ print(no_matches['match_reasoning'].value_counts())
 print(matches['candidate_races_considered'].head())
 ```
 
-### Future Enhancements
-
-Potential next steps for this pipeline:
-
-1. **Write matches back to Google Sheets** - Update `race_id` column with matched values
-2. **Add confidence-based filtering** - Allow users to review matches below certain confidence thresholds
-3. **Improve match rate** - Continue refining LLM prompt based on false positive/negative analysis
-4. **Add manual review workflow** - Flag edge cases for human verification
-5. **Performance optimization** - Further tune concurrency settings for faster matching
