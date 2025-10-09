@@ -179,7 +179,7 @@ class ProductionMatcher:
                 candidate_races_considered=""
             )
 
-        prompt = f"""Match this HubSpot candidate to the correct election race.
+        prompt = f"""Analyze this HubSpot candidate and determine if it's a federal/state race or if it matches a local race.
 
 HubSpot Candidate:
 - Office: {hubspot_record['office_name']}
@@ -188,6 +188,30 @@ HubSpot Candidate:
 - District: {hubspot_record.get('district', 'N/A')}
 - Election Date: {hubspot_record['election_date']}
 - Election Type: {hubspot_record['election_type']}
+
+STEP 1: CHECK IF FEDERAL OR STATE LEVEL RACE
+First, determine if this is a federal or state level office:
+
+FEDERAL OFFICES (return "FEDERAL_RACE"):
+- President/President of the United States
+- U.S. Senate/US Senate/United States Senate
+- U.S. House of Representatives/US House/Congressional District
+
+STATE OFFICES (return "STATE_RACE"):
+- Governor/Lieutenant Governor (unless it's a school board like "Governor Mifflin School Board")
+- State Senate/State House/State Assembly/State Legislature
+- State Representative/State Senator
+- Attorney General/Secretary of State/State Treasurer/State Auditor/State Comptroller
+- State Supreme Court/State Appeals Court
+
+If this is a FEDERAL or STATE office, return:
+{{
+  "match_index": null,
+  "confidence": 95,
+  "reasoning": "Federal race: [office name]" OR "State race: [office name]"
+}}
+
+STEP 2: IF LOCAL/MUNICIPAL RACE, MATCH AGAINST GOOGLE SHEETS
 
 Google Sheets Races (top {len(candidate_races)} semantic matches):
 """
@@ -200,41 +224,45 @@ Google Sheets Races (top {len(candidate_races)} semantic matches):
         races_considered = " | ".join(races_list)
 
         prompt += """
-Does this candidate's office have an EXACT MATCH in the race list below?
+If this is a LOCAL/MUNICIPAL race, does it match a race in the list above?
 
-CRITICAL MATCHING RULES - EVERY COMPONENT MUST MATCH EXACTLY:
+CRITICAL MATCHING RULES:
 1. Municipality/jurisdiction names MUST be identical (city, town, borough, county, school district name)
-2. ALL numeric identifiers MUST match exactly (district #, USD #, ward #, position #)
-3. Directional qualifiers MUST match exactly (North, South, East, West, etc.)
-4. Office type must match exactly (council, mayor, board, commission, etc.)
-5. If there are MULTIPLE identifiers (e.g., Ward 6 + Position 11), ALL must match
-6. If ANY single component is different, return null with confidence 0
+2. Office type must match exactly (council, mayor, board, commission, etc.)
+3. Directional qualifiers (North, South, East, West) MUST match if both specify them
+4. School district numbers (USD #, District #) MUST match exactly if both specify them
 
-Examples of NO MATCH (return null):
-- "Aberdeen City Council Ward 6 Position 11" vs "Aberdeen City Council Ward 2 Position 4" (Ward 6≠2, Position 11≠4)
-- "Bainbridge Island City Council District 7 North Ward" vs "Bainbridge Island City Council South Ward 3" (North≠South, 7≠3)
-- "Bethel School District 52 Position 5" vs "Cascade School District 5 Position 5" (Bethel≠Cascade, 52≠5)
-- "Winfield City Commission" vs "Arkansas City Commission" (Winfield≠Arkansas City)
-- "Frontenac USD 249 School Board" vs "USD 315 Board of Education" (249≠315)
+IMPORTANT: GROUP-LEVEL MATCHING FOR DISTRICTS/WARDS/POSITIONS
+- If the Google Sheets race does NOT specify a district/ward/position (e.g., "City Council"), it should MATCH HubSpot candidates that DO specify one (e.g., "City Council - District 3")
+- Rationale: DDHQ will collect all districts under the group race
+- Examples of VALID MATCHES:
+  * HubSpot: "Fredericksburg City Council - District 1" → Google Sheets: "Fredericksburg City City Council" ✓ MATCH (group-level)
+  * HubSpot: "City Council Ward 3" → Google Sheets: "City Council" ✓ MATCH (group-level)
+  * HubSpot: "School Board Position 5" → Google Sheets: "School Board" ✓ MATCH (group-level)
 
-CRITICAL:
-- Do NOT return "closest match" or "best semantic match"
-- ONLY return a match if EVERY component is identical
-- When in doubt, return null
-- Most candidates will have NO MATCH - that's expected and correct
+SPECIFIC-LEVEL MATCHING (both have identifiers)
+- If BOTH specify districts/wards/positions, they MUST match exactly
+- Examples of NO MATCH (different identifiers):
+  * "Aberdeen City Council Ward 6" vs "Aberdeen City Council Ward 2" (Ward 6≠2) ✗ NO MATCH
+  * "School District 52 Position 5" vs "School District 52 Position 3" (Position 5≠3) ✗ NO MATCH
 
-Return JSON with null if no exact match:
+MISMATCHED COMPONENTS (always fail)
+- Different municipalities: "Winfield City" vs "Arkansas City" ✗ NO MATCH
+- Different school district numbers: "USD 249" vs "USD 315" ✗ NO MATCH
+- Different directional qualifiers: "North Ward" vs "South Ward" ✗ NO MATCH
+
+Return JSON with null if no match:
 {
   "match_index": null,
   "confidence": 0,
   "reasoning": "<brief explanation why no match>"
 }
 
-OR if exact match found:
+OR if match found (exact or group-level):
 {
   "match_index": <1-based index>,
-  "confidence": <70-100>,
-  "reasoning": "<brief explanation>"
+  "confidence": <70-100 for exact, 60-75 for group-level>,
+  "reasoning": "<brief explanation, specify if group-level match>"
 }
 """
 
@@ -252,7 +280,34 @@ OR if exact match found:
             confidence = result.confidence
             reasoning = result.reasoning
 
-            if match_index is not None and confidence >= 70:
+            reasoning_lower = reasoning.lower()
+            is_federal = reasoning_lower.startswith('federal race:')
+            is_state = reasoning_lower.startswith('state race:')
+
+            if is_federal or is_state:
+                race_type = "FEDERAL_RACE" if is_federal else "STATE_RACE"
+                return MatchResult(
+                    hubspot_company_id=hubspot_record['company_id'],
+                    candidate_name=hubspot_record.get('candidate_name', ''),
+                    candidate_office=hubspot_record['office_name'],
+                    state=hubspot_record['state'],
+                    city=hubspot_record.get('city', ''),
+                    district=hubspot_record.get('district', ''),
+                    election_date=str(hubspot_record['election_date']),
+                    election_type=hubspot_record['election_type'],
+                    matched_race_id=None,
+                    matched_race_name=race_type,
+                    match_confidence=confidence,
+                    match_reasoning=reasoning,
+                    partition_key=self.build_partition_key(
+                        hubspot_record['election_date'],
+                        hubspot_record['state'],
+                        hubspot_record['election_type']
+                    ),
+                    candidate_races_considered=races_considered
+                )
+
+            if match_index is not None and confidence >= 60:
                 matched_race = candidate_races.iloc[match_index - 1]
 
                 return MatchResult(
@@ -371,17 +426,21 @@ OR if exact match found:
         self.logger.info(f"   - {parquet_file}")
         self.logger.info(f"   - {tsv_file}")
 
-        matched_count = matches_df['matched_race_id'].notna().sum()
-        match_rate = (matched_count / len(matches_df) * 100) if len(matches_df) > 0 else 0
+        local_matched_count = matches_df['matched_race_id'].notna().sum()
+        federal_count = (matches_df['matched_race_name'] == 'FEDERAL_RACE').sum()
+        state_count = (matches_df['matched_race_name'] == 'STATE_RACE').sum()
+        no_match_count = len(matches_df) - local_matched_count - federal_count - state_count
 
         self.logger.info(f"\n📊 MATCH STATISTICS:")
         self.logger.info(f"   - Total records: {len(matches_df):,}")
-        self.logger.info(f"   - Successful matches: {matched_count:,} ({match_rate:.1f}%)")
-        self.logger.info(f"   - No match: {len(matches_df) - matched_count:,}")
+        self.logger.info(f"   - Local/municipal matches: {local_matched_count:,} ({local_matched_count/len(matches_df)*100:.1f}%)")
+        self.logger.info(f"   - Federal races: {federal_count:,} ({federal_count/len(matches_df)*100:.1f}%)")
+        self.logger.info(f"   - State races: {state_count:,} ({state_count/len(matches_df)*100:.1f}%)")
+        self.logger.info(f"   - No match: {no_match_count:,} ({no_match_count/len(matches_df)*100:.1f}%)")
 
-        if matched_count > 0:
+        if local_matched_count > 0:
             avg_confidence = matches_df[matches_df['matched_race_id'].notna()]['match_confidence'].mean()
-            self.logger.info(f"   - Average confidence: {avg_confidence:.1f}%")
+            self.logger.info(f"   - Average confidence (local matches): {avg_confidence:.1f}%")
 
     async def run(self, test_mode: bool = False):
         """Execute complete matching pipeline"""

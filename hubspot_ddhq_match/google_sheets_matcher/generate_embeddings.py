@@ -41,17 +41,22 @@ class EmbeddingGenerator:
         self.embedding_client = GeminiEmbeddingClient()
 
     def create_hubspot_embedding_text(self, row: pd.Series) -> str:
-        """Create embedding text for HubSpot office name"""
+        """Create embedding text for HubSpot office name with city context"""
         office = row.get('office_name', '')
         if pd.isna(office) or office.strip() == '':
             office = row.get('official_office_name', '')
 
-        return str(office).strip()
+        city = row.get('city', '')
+
+        if pd.notna(city) and city.strip() != '':
+            return f"city:{city.strip()} | race:{str(office).strip()}"
+        else:
+            return str(office).strip()
 
     def create_google_sheets_embedding_text(self, row: pd.Series) -> str:
-        """Create embedding text for Google Sheets race name"""
+        """Create embedding text for Google Sheets race name with consistent format"""
         race = row.get('race_name', '')
-        return str(race).strip()
+        return f"race:{str(race).strip()}"
 
     def generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Generate embeddings for a batch of texts"""
