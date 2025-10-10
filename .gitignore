@@ -26,7 +26,14 @@ offline_data*/
 CLAUDE*.md
 
 #output files
-output*/
+*output*/
+*output.txt
+*results*/
+*cache*/
+*smac3_output*/
+input*
+*.zip
+enhanced_data/
 
 #vector store files
 vector_store/
@@ -34,5 +41,42 @@ vector_store/
 #macOS files
 .DS_Store
 
+# Google API credentials
+token.pickle
+
 # may be sensitive
 data
+
+# AWS Infrastructure
+infrastructure/*/lambdas/*/node_modules/
+infrastructure/*/lambdas/*/dist/
+infrastructure/*/deploy/terraform/.terraform/
+infrastructure/*/deploy/terraform/tfplan
+infrastructure/*/deploy/terraform/modules/lambda/*.zip
+infrastructure/**/.env.*
+infrastructure/.env.*
+**/.terraform/
+**/.terraform.tfstate.lock.info
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/tfplan
+
+# Terraform variable files with secrets (allow .example files)
+infrastructure/**/environments/*.tfvars
+infrastructure/**/environments/**/*.tfvars
+infrastructure/shared/environments/*.tfvars
+!infrastructure/**/environments/*.tfvars.example
+!infrastructure/**/environments/**/*.tfvars.example
+!infrastructure/shared/environments/*.tfvars.example
+
+# Node.js
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# TypeScript build artifacts
+*.d.ts.map
+*.js.map
