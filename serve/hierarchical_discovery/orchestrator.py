@@ -793,62 +793,106 @@ class HierarchicalDiscoveryOrchestrator:
         logger.info("🎨 Multi-cluster dendrograms and visualizations generation complete!")
 
     async def _generate_multi_cluster_report(self, consolidated_result, timestamp):
-        """Generate summary report for multi-cluster analysis"""
+        """Generate detailed report for multi-cluster analysis"""
 
         dataset_name = consolidated_result['dataset_name']
         report_filename = self.output_paths['reports'] / f"multi_cluster_report_{dataset_name}_{timestamp}.md"
 
-        report_content = f"""# Multi-Cluster Hierarchical Analysis Report
+        report_content = f"""# Multi-Cluster Hierarchical Analysis Report - Detailed
 
 **Dataset:** {dataset_name}
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **Total Messages:** {consolidated_result['total_messages']:,}
 **Cluster Ranges Tested:** {', '.join(consolidated_result['cluster_ranges'])}
 
-## Clustering Results Summary
+## Executive Summary
 
-| Cluster Count | Themes Found | Avg People/Cluster | Top Themes |
-|---------------|--------------|---------------------|------------|
+This report provides a comprehensive analysis of civic messages from {dataset_name}'s campaign across multiple clustering configurations. The analysis reveals key themes and concerns across different levels of granularity.
+
+---
+
 """
 
+        # Add detailed sections for each cluster count
         for cluster_count in consolidated_result['cluster_ranges']:
+            n_clusters = int(cluster_count)
             result = consolidated_result['cluster_results'][cluster_count]
-            analyzed_clusters_count = len(result['analyzed_clusters'])
-
-            # Calculate total unique people across all clusters for this configuration
             analyzed_clusters = result['analyzed_clusters']
-            total_unique_people = sum(
-                getattr(cluster, 'unique_respondents', 0) if hasattr(cluster, 'unique_respondents')
-                else cluster.get('unique_respondents', 0)
-                for cluster in analyzed_clusters
+
+            if not analyzed_clusters:
+                continue
+
+            report_content += f"\n## {n_clusters}-Cluster Analysis\n\n"
+
+            # Sort by unique respondents
+            sorted_clusters = sorted(
+                analyzed_clusters,
+                key=lambda x: getattr(x, 'unique_respondents', 0) if hasattr(x, 'unique_respondents') else (x.get('unique_respondents', 0) if isinstance(x, dict) else 0),
+                reverse=True
             )
-            avg_people_per_cluster = total_unique_people / analyzed_clusters_count if analyzed_clusters_count > 0 else 0
 
-            # Get top 3 themes by unique respondent count
-            if analyzed_clusters:
-                top_themes = sorted(
-                    analyzed_clusters,
-                    key=lambda x: getattr(x, 'unique_respondents', 0) if hasattr(x, 'unique_respondents') else (x.get('unique_respondents', 0) if isinstance(x, dict) else 0),
-                    reverse=True
-                )[:3]
-            else:
-                top_themes = []
-
-            # Handle both object and dict formats
-            top_theme_names = []
-            for theme in top_themes:
-                if hasattr(theme, 'theme_analysis'):
-                    name = theme.theme_analysis.theme
-                    people_count = getattr(theme, 'unique_respondents', 0)
-                elif isinstance(theme, dict):
-                    name = theme.get('theme', f"Cluster {theme.get('cluster_id', '?')}")
-                    people_count = theme.get('unique_respondents', 0)
+            # Show top 10 clusters for each configuration
+            for idx, cluster in enumerate(sorted_clusters[:10], 1):
+                # Extract cluster info (handle both object and dict formats)
+                if hasattr(cluster, 'theme_analysis'):
+                    theme = cluster.theme_analysis.theme
+                    sentiment = getattr(cluster.theme_analysis, 'sentiment', '')
+                    category = getattr(cluster.theme_analysis, 'category', '')
+                    summary = getattr(cluster.theme_analysis, 'issues_summary', '')
+                    analysis = getattr(cluster.theme_analysis, 'detailed_analysis', '')
+                    key_topics = getattr(cluster.theme_analysis, 'key_topics', [])
+                    quotes = getattr(cluster.theme_analysis, 'verbatim_quotes', [])
+                    unique_respondents = getattr(cluster, 'unique_respondents', 0)
+                    total_mentions = getattr(cluster, 'total_mentions', 0)
+                elif isinstance(cluster, dict):
+                    theme = cluster.get('theme', f"Cluster {cluster.get('cluster_id', '?')}")
+                    theme_data = cluster.get('theme_analysis', {})
+                    sentiment = theme_data.get('sentiment', '')
+                    category = theme_data.get('category', '')
+                    summary = theme_data.get('issues_summary', '')
+                    analysis = theme_data.get('detailed_analysis', '')
+                    key_topics = theme_data.get('key_topics', [])
+                    quotes = theme_data.get('verbatim_quotes', [])
+                    unique_respondents = cluster.get('unique_respondents', 0)
+                    total_mentions = cluster.get('total_mentions', 0)
                 else:
-                    name = "Unknown"
-                    people_count = 0
-                top_theme_names.append(f"{name} ({people_count} people)")
+                    continue
 
-            report_content += f"| {cluster_count} | {analyzed_clusters_count} | {avg_people_per_cluster:.1f} | {', '.join(top_theme_names)} |\n"
+                if not theme:
+                    continue
+
+                report_content += f"### {idx}. {theme}\n\n"
+
+                if sentiment:
+                    report_content += f"**Sentiment:** {sentiment}  \n"
+
+                report_content += f"**People:** {unique_respondents} unique respondents  \n"
+                report_content += f"**Total Mentions:** {total_mentions}  \n"
+
+                if category:
+                    report_content += f"**Category:** {category}  \n"
+
+                report_content += "\n"
+
+                if summary:
+                    report_content += f"**Summary:**  \n{summary}\n\n"
+
+                if analysis:
+                    report_content += f"**Analysis:**  \n{analysis}\n\n"
+
+                if key_topics:
+                    topics_str = ', '.join(key_topics[:10]) if isinstance(key_topics, list) else str(key_topics)
+                    report_content += f"**Key Topics:** {topics_str}\n\n"
+
+                if quotes:
+                    report_content += "**Representative Quotes:**\n"
+                    quote_list = quotes[:5] if isinstance(quotes, list) else [quotes]
+                    for quote in quote_list:
+                        if quote and str(quote).strip():
+                            report_content += f"- {quote}\n"
+                    report_content += "\n"
+
+                report_content += "---\n\n"
 
         report_content += f"""
 ## Cost Summary
@@ -862,7 +906,7 @@ Generated with Multi-Cluster Hierarchical Discovery Pipeline
         with open(report_filename, 'w') as f:
             f.write(report_content)
 
-        logger.info(f"Multi-cluster report generated: {report_filename}")
+        logger.info(f"Detailed multi-cluster report generated: {report_filename}")
 
     async def run_pipeline(self, anonymize_keywords: Optional[List[str]] = None, disable_optimization: bool = False, return_data: bool = False, in_memory_messages: Optional[List] = None) -> PipelineResult:
         """Run the complete hierarchical discovery pipeline
