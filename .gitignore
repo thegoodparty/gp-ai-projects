@@ -13,6 +13,9 @@ discovery_results
 # Environment variables
 .env
 
+# Google OAuth tokens
+token.pickle
+
 # Logs
 logs/
 
