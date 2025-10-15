@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Data directories
+**/data/
+**/output/
+**/logs/
+**/cache/
+**/offline_data/
+**/vector_store/
+
+# Data files
+*.csv
+*.parquet
+*.tsv
+*.json.gz
+*.pkl
+*.pickle
+*.faiss
+*.index
+
+# Large project directories (not needed for serve-analyze)
+hubspot_ddhq_match/
+playground/
+stitch_l2_BR_DDHQ/
+bronze_data/
+ai_generated_campaign_plan/
+
+# Other serve projects (not needed for serve-analyze)
+serve/messages/
+serve/data/
+serve/input/
+serve/results/
+serve/logs/
+serve/cache/
+serve/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+*.log.*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Node (if any)
+node_modules/
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+**/tests/
+**/*_test.py
+**/test_*.py

@@ -83,3 +83,6 @@ package-lock.json
 # TypeScript build artifacts
 *.d.ts.map
 *.js.map
+
+# Slack notifier secrets
+infrastructure/shared/slack-notifier/terraform.tfvars

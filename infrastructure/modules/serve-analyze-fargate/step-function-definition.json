@@ -1,0 +1,60 @@
+{
+  "Comment": "ECS Fargate task execution with automatic retry",
+  "StartAt": "RunECSTask",
+  "States": {
+    "RunECSTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster.$": "$.cluster",
+        "TaskDefinition.$": "$.taskDefinition",
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "LATEST",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets.$": "$.subnets",
+            "SecurityGroups.$": "$.securityGroups",
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "serve-analyze",
+              "Environment.$": "$.environment"
+            }
+          ]
+        },
+        "Tags.$": "$.tags"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Next": "Success"
+    },
+    "SendFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.snsTopicArn",
+        "Message.$": "States.Format('Pipeline failed after 3 retries\n\nCampaign: {}\nS3 Path: {}\nError: {}', $.campaign, $.s3Path, $.error.Cause)"
+      },
+      "End": true
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

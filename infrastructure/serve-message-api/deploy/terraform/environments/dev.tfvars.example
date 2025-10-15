@@ -1,0 +1,6 @@
+# Development Environment Configuration
+environment  = "dev"
+aws_region   = "us-west-2"
+project_name = "serve-message-platform"
+
+# Note: ALB and Route53 configuration moved to infrastructure/shared/environments/dev.tfvars
