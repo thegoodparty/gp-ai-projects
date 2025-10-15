@@ -428,11 +428,8 @@ resource "aws_cloudwatch_event_rule" "ecs_task_failed" {
     source      = ["aws.ecs"]
     detail-type = ["ECS Task State Change"]
     detail = {
-      clusterArn  = [aws_ecs_cluster.pipeline.arn]
-      lastStatus  = ["STOPPED"]
-      stoppedReason = [{
-        "anything-but" = { "prefix" = "Essential container" }
-      }]
+      clusterArn = [aws_ecs_cluster.pipeline.arn]
+      lastStatus = ["STOPPED"]
       containers = {
         exitCode = [{
           "anything-but" = 0
@@ -484,7 +481,7 @@ resource "aws_sns_topic_policy" "pipeline_failures" {
       {
         Effect = "Allow"
         Principal = {
-          Service = "events.amazonaws.com"
+          Service = ["events.amazonaws.com", "states.amazonaws.com"]
         }
         Action   = "SNS:Publish"
         Resource = aws_sns_topic.pipeline_failures.arn

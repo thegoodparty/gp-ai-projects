@@ -56,6 +56,11 @@ function isALBEvent(event: any): boolean {
   return event.requestContext?.elb !== undefined;
 }
 
+function extractBucketFromS3Path(s3Path: string): string | undefined {
+  const match = s3Path.match(/^s3:\/\/([^\/]+)/);
+  return match ? match[1] : undefined;
+}
+
 function getApiUrlFromBucket(bucketName: string): string {
   if (bucketName.includes('-qa')) {
     return 'https://ai-qa.goodparty.org/serve/messages';
@@ -73,7 +78,13 @@ async function processPipeline(request: PipelineRequest, triggerSource: string, 
 
   const s3InputPath = request.csvS3Path;
 
-  const apiUrl = request.apiUrl || (bucketName ? getApiUrlFromBucket(bucketName) : 'https://ai-dev.goodparty.org');
+  const effectiveBucketName = bucketName || extractBucketFromS3Path(request.csvS3Path);
+
+  if (!request.apiUrl && !effectiveBucketName) {
+    throw new Error(`Unable to determine API URL: csvS3Path "${request.csvS3Path}" is not a valid S3 path`);
+  }
+
+  const apiUrl = request.apiUrl || getApiUrlFromBucket(effectiveBucketName!);
 
   const environmentOverrides = [
     { Name: 'CAMPAIGN_NAME', Value: campaign },
