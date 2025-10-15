@@ -86,3 +86,4 @@ package-lock.json
 
 # Slack notifier secrets
 infrastructure/shared/slack-notifier/terraform.tfvars
+*.js.map
