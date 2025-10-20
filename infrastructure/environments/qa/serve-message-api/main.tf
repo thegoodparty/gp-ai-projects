@@ -11,6 +11,9 @@ terraform {
     bucket = "goodparty-terraform-state-us-west-2"
     key    = "serve-message-api/qa/terraform.tfstate"
     region = "us-west-2"
+
+    use_lockfile = true
+    encrypt      = true
   }
 }
 
