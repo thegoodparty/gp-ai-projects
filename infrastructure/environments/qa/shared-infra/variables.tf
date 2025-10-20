@@ -41,11 +41,6 @@ variable "serve_message_lambda_function_name" {
   type        = string
 }
 
-variable "api_key" {
-  description = "API key for authentication"
-  type        = string
-}
-
 variable "route53_zone_id" {
   description = "Route53 hosted zone ID"
   type        = string

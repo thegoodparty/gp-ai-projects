@@ -21,6 +21,15 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_secretsmanager_secret_version" "ai_secrets" {
+  secret_id = "AI_SECRETS_${upper(var.environment)}"
+}
+
+locals {
+  ai_secrets = jsondecode(data.aws_secretsmanager_secret_version.ai_secrets.secret_string)
+  api_key    = local.ai_secrets["SERVE_API_KEY"]
+}
+
 data "terraform_remote_state" "serve_analyze" {
   backend = "s3"
 
@@ -40,7 +49,7 @@ module "alb" {
   certificate_arn                   = var.certificate_arn
   serve_message_lambda_arn          = var.serve_message_lambda_arn
   serve_message_lambda_function_name = var.serve_message_lambda_function_name
-  api_key                           = var.api_key
+  api_key                           = local.api_key
 }
 
 module "route53" {
@@ -95,7 +104,7 @@ resource "aws_lb_listener_rule" "serve_analyze_valid" {
   condition {
     http_header {
       http_header_name = "x-api-key"
-      values          = [var.api_key]
+      values          = [local.api_key]
     }
   }
 
