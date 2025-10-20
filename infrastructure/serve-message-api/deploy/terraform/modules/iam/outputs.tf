@@ -8,13 +8,12 @@ output "retrieve_lambda_role_arn" {
   value       = aws_iam_role.retrieve_lambda_role.arn
 }
 
-output "set_lambda_user_access_key_id" {
-  description = "Access Key ID for SET Lambda user"
-  value       = aws_iam_access_key.set_lambda_user_key.id
+output "set_lambda_credentials_secret_arn" {
+  description = "ARN of the Secrets Manager secret containing SET Lambda credentials"
+  value       = aws_secretsmanager_secret.set_lambda_credentials.arn
 }
 
-output "set_lambda_user_secret_access_key" {
-  description = "Secret Access Key for SET Lambda user"
-  value       = aws_iam_access_key.set_lambda_user_key.secret
-  sensitive   = true
+output "set_lambda_credentials_secret_name" {
+  description = "Name of the Secrets Manager secret containing SET Lambda credentials"
+  value       = aws_secretsmanager_secret.set_lambda_credentials.name
 }

@@ -50,6 +50,26 @@ resource "aws_s3_bucket" "pipeline_data" {
   }
 }
 
+resource "aws_s3_bucket_server_side_encryption_configuration" "pipeline_data" {
+  bucket = aws_s3_bucket.pipeline_data.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "pipeline_data" {
+  bucket = aws_s3_bucket.pipeline_data.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "pipeline_data_lifecycle" {
   bucket = aws_s3_bucket.pipeline_data.id
 
@@ -319,12 +339,13 @@ resource "aws_iam_role_policy" "lambda_step_functions_trigger" {
 }
 
 resource "aws_lambda_function" "pipeline_trigger" {
-  filename      = "lambda-trigger.zip"
-  function_name = "serve-analyze-trigger-${var.environment}"
-  role          = aws_iam_role.lambda_trigger.arn
-  handler       = "index.handler"
-  runtime       = "nodejs22.x"
-  timeout       = 60
+  filename         = "${path.module}/lambda-trigger/lambda-trigger.zip"
+  source_code_hash = filebase64sha256("${path.module}/lambda-trigger/lambda-trigger.zip")
+  function_name    = "serve-analyze-trigger-${var.environment}"
+  role             = aws_iam_role.lambda_trigger.arn
+  handler          = "index.handler"
+  runtime          = "nodejs22.x"
+  timeout          = 60
 
   environment {
     variables = {
@@ -517,12 +538,37 @@ resource "aws_iam_role_policy" "step_functions_ecs" {
       {
         Effect = "Allow"
         Action = [
-          "ecs:RunTask",
+          "ecs:RunTask"
+        ]
+        Resource = [
+          aws_ecs_task_definition.pipeline.arn,
+          "${aws_ecs_task_definition.pipeline.arn}:*"
+        ]
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = aws_ecs_cluster.pipeline.arn
+          }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "ecs:StopTask",
-          "ecs:DescribeTasks",
+          "ecs:DescribeTasks"
+        ]
+        Resource = "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.pipeline.name}/*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = aws_ecs_cluster.pipeline.arn
+          }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "ecs:TagResource"
         ]
-        Resource = "*"
+        Resource = "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.pipeline.name}/*"
       },
       {
         Effect = "Allow"

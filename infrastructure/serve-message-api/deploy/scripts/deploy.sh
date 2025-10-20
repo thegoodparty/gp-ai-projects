@@ -169,19 +169,28 @@ else
     # Create env configuration file
     ENV_FILE="$SCRIPT_DIR/../../../.env.${ENVIRONMENT}"
 
-    echo "# Serve Message Platform - ${ENVIRONMENT} Environment" > "$ENV_FILE"
-    echo "# Generated on $(date)" >> "$ENV_FILE"
-    echo "" >> "$ENV_FILE"
-
     # Extract outputs
     TABLE_NAME=$(terraform output -raw dynamodb_table_name)
-    SET_ACCESS_KEY=$(terraform output -raw set_lambda_user_access_key_id)
-    SET_SECRET_KEY=$(terraform output -raw set_lambda_user_secret_access_key)
-    API_URL=$(terraform output -raw api_gateway_url)
-    API_KEY=$(terraform output -raw retrieve_api_key_value)
-    CUSTOM_DOMAIN_URL=$(terraform output -raw custom_domain_url)
+    SECRET_NAME=$(terraform output -raw set_lambda_credentials_secret_name)
+    API_URL=$(terraform output -raw api_gateway_url 2>/dev/null || echo "N/A")
+    API_KEY=$(terraform output -raw retrieve_api_key_value 2>/dev/null || echo "N/A")
+    CUSTOM_DOMAIN_URL=$(terraform output -raw custom_domain_url 2>/dev/null || echo "N/A")
+
+    # Retrieve credentials from Secrets Manager
+    echo -e "${BLUE}🔐 Retrieving credentials from Secrets Manager...${NC}"
+    SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text)
+    SET_ACCESS_KEY=$(echo "$SECRET_JSON" | jq -r '.access_key_id')
+    SET_SECRET_KEY=$(echo "$SECRET_JSON" | jq -r '.secret_access_key')
 
     # Write to env file
+    echo "# Serve Message Platform - ${ENVIRONMENT} Environment" > "$ENV_FILE"
+    echo "# Generated on $(date)" >> "$ENV_FILE"
+    echo "#" >> "$ENV_FILE"
+    echo "# SECURITY NOTE: Credentials are stored in AWS Secrets Manager" >> "$ENV_FILE"
+    echo "# Secret Name: $SECRET_NAME" >> "$ENV_FILE"
+    echo "# To retrieve: aws secretsmanager get-secret-value --secret-id $SECRET_NAME" >> "$ENV_FILE"
+    echo "#" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
     echo "# DynamoDB" >> "$ENV_FILE"
     echo "${ENVIRONMENT^^}_TABLE_NAME=$TABLE_NAME" >> "$ENV_FILE"
     echo "" >> "$ENV_FILE"

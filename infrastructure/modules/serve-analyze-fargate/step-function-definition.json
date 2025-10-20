@@ -14,7 +14,7 @@
           "AwsvpcConfiguration": {
             "Subnets.$": "$.subnets",
             "SecurityGroups.$": "$.securityGroups",
-            "AssignPublicIp": "ENABLED"
+            "AssignPublicIp": "DISABLED"
           }
         },
         "Overrides": {

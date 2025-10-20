@@ -22,15 +22,14 @@ output "serve_message_function_url" {
 }
 
 # IAM Outputs
-output "set_lambda_user_access_key_id" {
-  description = "Access Key ID for SET Lambda user"
-  value       = module.iam.set_lambda_user_access_key_id
+output "set_lambda_credentials_secret_arn" {
+  description = "ARN of the Secrets Manager secret containing SET Lambda credentials"
+  value       = module.iam.set_lambda_credentials_secret_arn
 }
 
-output "set_lambda_user_secret_access_key" {
-  description = "Secret Access Key for SET Lambda user"
-  value       = module.iam.set_lambda_user_secret_access_key
-  sensitive   = true
+output "set_lambda_credentials_secret_name" {
+  description = "Name of the Secrets Manager secret containing SET Lambda credentials"
+  value       = module.iam.set_lambda_credentials_secret_name
 }
 
 # API Gateway Outputs (DEPRECATED - replaced with Function URLs)
@@ -54,10 +53,9 @@ output "set_lambda_user_secret_access_key" {
 output "env_configuration" {
   description = "Environment configuration for .env file"
   value = {
-    table_name                 = module.dynamodb.table_name
-    set_access_key_id         = module.iam.set_lambda_user_access_key_id
-    set_secret_access_key     = module.iam.set_lambda_user_secret_access_key
-    serve_message_function_url = module.lambda.serve_message_function_url
+    table_name                     = module.dynamodb.table_name
+    credentials_secret_name        = module.iam.set_lambda_credentials_secret_name
+    serve_message_function_url     = module.lambda.serve_message_function_url
   }
-  sensitive = true
+  sensitive = false
 }

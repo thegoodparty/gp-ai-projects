@@ -192,3 +192,24 @@ resource "aws_iam_user_policy_attachment" "set_user_invoke" {
 resource "aws_iam_access_key" "set_lambda_user_key" {
   user = aws_iam_user.set_lambda_user.name
 }
+
+resource "aws_secretsmanager_secret" "set_lambda_credentials" {
+  name                    = "serve-message-api/set-lambda-credentials-${var.environment}"
+  description             = "IAM Access Keys for Campaign Data SET Lambda user"
+  recovery_window_in_days = 7
+
+  tags = {
+    Name        = "Campaign Data SET Lambda Credentials"
+    Environment = var.environment
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "set_lambda_credentials" {
+  secret_id = aws_secretsmanager_secret.set_lambda_credentials.id
+  secret_string = jsonencode({
+    access_key_id     = aws_iam_access_key.set_lambda_user_key.id
+    secret_access_key = aws_iam_access_key.set_lambda_user_key.secret
+    user_name         = aws_iam_user.set_lambda_user.name
+    user_arn          = aws_iam_user.set_lambda_user.arn
+  })
+}

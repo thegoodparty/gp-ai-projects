@@ -210,19 +210,27 @@ terraform apply
 
 ## Security
 
+> 📖 **For detailed security improvements and fixes, see [SECURITY_IMPROVEMENTS.md](./SECURITY_IMPROVEMENTS.md)**
+
 ### Network Isolation
-- ECS tasks run in private subnets (no direct internet access)
-- NAT Gateway required for outbound connections (S3, DynamoDB, APIs)
+- ECS tasks run in private subnets with no public IPs (AssignPublicIp: DISABLED)
+- NAT Gateway provides outbound-only internet access
 - Security group allows only outbound traffic
 
+### Data Protection
+- S3 bucket encryption enabled (AES256) with S3 Bucket Keys
+- Public access completely blocked on all S3 buckets
+- Secrets encrypted at rest in AWS Secrets Manager
+
 ### Secrets Management
-- API keys stored in AWS Secrets Manager
+- API keys stored in AWS Secrets Manager (never in code/state)
 - Task execution role grants access to specific secrets only
 - Secrets injected as environment variables at runtime
 
 ### IAM Least Privilege
-- Task role: S3 read (input), S3 write (output), DynamoDB write
-- Lambda role: ECS RunTask, S3 write (input only)
+- Task role: S3 read (input), S3 write (output), DynamoDB write (scoped to specific table)
+- Step Functions role: ECS actions scoped to specific cluster and task definitions only
+- Lambda role: Step Functions execution scoped to specific state machine
 - Execution role: Secrets Manager read, CloudWatch Logs write
 
 ## Troubleshooting
