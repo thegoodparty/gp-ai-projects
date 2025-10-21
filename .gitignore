@@ -44,6 +44,9 @@ vector_store/
 #macOS files
 .DS_Store
 
+# Google API credentials
+token.pickle
+
 # may be sensitive
 data
 
@@ -79,4 +82,8 @@ package-lock.json
 
 # TypeScript build artifacts
 *.d.ts.map
+*.js.map
+
+# Slack notifier secrets
+infrastructure/shared/slack-notifier/terraform.tfvars
 *.js.map

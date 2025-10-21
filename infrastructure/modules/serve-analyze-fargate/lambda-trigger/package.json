@@ -1,0 +1,16 @@
+{
+  "name": "v1-pipeline-lambda-trigger",
+  "version": "1.0.0",
+  "description": "Lambda trigger for V1 pipeline ECS tasks",
+  "main": "index.js",
+  "scripts": {
+    "build": "rm -rf dist && tsc && cp -r node_modules dist/ && cd dist && zip -r ../lambda-trigger.zip . && cd .."
+  },
+  "dependencies": {
+    "@aws-sdk/client-sfn": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
