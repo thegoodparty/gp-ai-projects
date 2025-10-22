@@ -69,15 +69,21 @@ class GeminiClient:
         thinking_budget: Optional[int] = None,
         include_thoughts: bool = False,
         max_connections: int = 100,
-        max_keepalive_connections: int = 20
+        max_keepalive_connections: int = 20,
+        max_retries: int = 3,
+        base_delay: float = 1.0
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Google API key is required")
-        
+
         # Configure custom HTTP limits for high concurrency
         self.max_connections = max_connections
         self.max_keepalive_connections = max_keepalive_connections
+
+        # Retry configuration
+        self.max_retries = max_retries
+        self.base_delay = base_delay
         
         # Create HTTP options with custom connection limits
         from google.genai.types import HttpOptions
@@ -257,23 +263,29 @@ class GeminiClient:
     ) -> str:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
-        
+
         if system_instruction:
             config.system_instruction = system_instruction
-        
-        try:
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            
-            self._track_usage(response, model_name)
-            return response.text
-            
-        except Exception as e:
-            self.logger.error(f"Content generation failed: {str(e)}")
-            raise
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config
+                )
+
+                self._track_usage(response, model_name)
+                return response.text
+
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    delay = self.base_delay * (2 ** attempt)
+                    self.logger.warning(f"Content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"Content generation failed after {self.max_retries} attempts: {str(e)}")
+                    raise
     
     def generate_content_stream(
         self,
@@ -318,40 +330,45 @@ class GeminiClient:
     ) -> Union[BaseModel, List[BaseModel], Dict[str, Any]]:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
-        
+
         if system_instruction:
             config.system_instruction = system_instruction
-        
+
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
-        
-        try:
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            
-            self._track_usage(response, model_name)
-            
-            if hasattr(response, 'parsed') and response.parsed:
-                return response.parsed
-            
-            # Handle empty or invalid response text
-            response_text = response.text.strip() if response.text else ""
-            if not response_text:
-                self.logger.error(f"Empty response from {model_name} for structured content generation")
-                raise RuntimeError(f"Empty response from {model_name} - no content generated")
-            
+
+        for attempt in range(self.max_retries):
             try:
-                return json.loads(response_text)
-            except json.JSONDecodeError as json_error:
-                self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
-                raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
-            
-        except Exception as e:
-            self.logger.error(f"Structured content generation failed: {str(e)}")
-            raise
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config
+                )
+
+                self._track_usage(response, model_name)
+
+                if hasattr(response, 'parsed') and response.parsed:
+                    return response.parsed
+
+                response_text = response.text.strip() if response.text else ""
+                if not response_text:
+                    self.logger.error(f"Empty response from {model_name} for structured content generation")
+                    raise RuntimeError(f"Empty response from {model_name} - no content generated")
+
+                try:
+                    return json.loads(response_text)
+                except json.JSONDecodeError as json_error:
+                    self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
+                    raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
+
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    delay = self.base_delay * (2 ** attempt)
+                    self.logger.warning(f"Structured content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"Structured content generation failed after {self.max_retries} attempts: {str(e)}")
+                    raise
     
     def generate_with_search(
         self,
@@ -365,52 +382,58 @@ class GeminiClient:
     ) -> Dict[str, Any]:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
-        
+
         if system_instruction:
             config.system_instruction = system_instruction
-        
+
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config.tools = [grounding_tool]
-        
-        try:
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            
-            self._track_usage(response, model_name)
-            
-            result = {
-                "text": response.text,
-                "grounding_metadata": None,
-                "search_queries": [],
-                "sources": []
-            }
-            
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
-                    metadata = candidate.grounding_metadata
-                    result["grounding_metadata"] = metadata
-                    
-                    if hasattr(metadata, 'web_search_queries'):
-                        result["search_queries"] = metadata.web_search_queries
-                    
-                    if hasattr(metadata, 'grounding_chunks'):
-                        result["sources"] = [
-                            {
-                                "title": chunk.web.title if hasattr(chunk, 'web') else "Unknown",
-                                "uri": chunk.web.uri if hasattr(chunk, 'web') else "Unknown"
-                            }
-                            for chunk in metadata.grounding_chunks
-                        ]
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Search-grounded generation failed: {str(e)}")
-            raise
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config
+                )
+
+                self._track_usage(response, model_name)
+
+                result = {
+                    "text": response.text,
+                    "grounding_metadata": None,
+                    "search_queries": [],
+                    "sources": []
+                }
+
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                        metadata = candidate.grounding_metadata
+                        result["grounding_metadata"] = metadata
+
+                        if hasattr(metadata, 'web_search_queries'):
+                            result["search_queries"] = metadata.web_search_queries
+
+                        if hasattr(metadata, 'grounding_chunks'):
+                            result["sources"] = [
+                                {
+                                    "title": chunk.web.title if hasattr(chunk, 'web') else "Unknown",
+                                    "uri": chunk.web.uri if hasattr(chunk, 'web') else "Unknown"
+                                }
+                                for chunk in metadata.grounding_chunks
+                            ]
+
+                return result
+
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    delay = self.base_delay * (2 ** attempt)
+                    self.logger.warning(f"Search-grounded generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"Search-grounded generation failed after {self.max_retries} attempts: {str(e)}")
+                    raise
     
     def generate_multimodal_content(
         self,
