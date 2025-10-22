@@ -1,0 +1,70 @@
+pipeline:
+  campaign: "berkley"
+
+loader:
+  input_dir: "serve/data"
+
+cleaner:
+  normalize_whitespace: true
+  fix_encoding: true
+
+filter:
+  remove_stop_messages: true
+  remove_emoji_starters: true
+  remove_non_substantive: true
+
+atomizer:
+  enabled: true
+  anonymize: true
+  anonymization_rules:
+    berkley: "the local area"
+    burnsville: "the local area"
+    minooka: "the local area"
+    ghaps: "the local area"
+    livingston: "the local area"
+    missouri-city: "the local area"
+    north-las-vegas: "the local area"
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_connections: 1200
+    max_workers: 400
+
+classifier:
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_connections: 1200
+    max_workers: 400
+
+synthesizer:
+  small_category_threshold: 20
+  clustering:
+    enabled: true
+    min_cluster_size: 5
+    batch_size: 100
+    max_concurrent_batches: 2
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_workers: 50
+
+hierarchical_reanalysis:
+  enabled: true
+  min_messages_for_clustering: 6
+  clustering:
+    distance_threshold: 0.15
+    linkage: "average"
+    batch_size: 100
+    max_concurrent_batches: 2
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_workers: 50
+
+exporter:
+  output_dir: "serve/analyze_texts/output"
