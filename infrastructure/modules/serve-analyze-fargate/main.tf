@@ -24,8 +24,13 @@ variable "docker_image_tag" {
   default     = "dev"
 }
 
-variable "dynamodb_table_name" {
-  description = "DynamoDB table name for storing results"
+variable "sqs_queue_arn" {
+  description = "ARN of SQS queue for poll issue analysis events"
+  type        = string
+}
+
+variable "sqs_queue_url" {
+  description = "URL of SQS queue for poll issue analysis events"
   type        = string
 }
 
@@ -192,15 +197,16 @@ resource "aws_iam_role_policy" "task_s3_access" {
           "s3:PutObject"
         ]
         Resource = [
-          "${aws_s3_bucket.pipeline_data.arn}/output/*"
+          "${aws_s3_bucket.pipeline_data.arn}/output/*",
+          "${aws_s3_bucket.pipeline_data.arn}/events/*"
         ]
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy" "task_dynamodb_access" {
-  name = "dynamodb-access"
+resource "aws_iam_role_policy" "task_sqs_access" {
+  name = "sqs-access"
   role = aws_iam_role.task_role.id
 
   policy = jsonencode({
@@ -209,11 +215,10 @@ resource "aws_iam_role_policy" "task_dynamodb_access" {
       {
         Effect = "Allow"
         Action = [
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:BatchWriteItem"
+          "sqs:SendMessage",
+          "sqs:GetQueueUrl"
         ]
-        Resource = "arn:aws:dynamodb:*:*:table/${var.dynamodb_table_name}"
+        Resource = var.sqs_queue_arn
       }
     ]
   })
@@ -288,6 +293,14 @@ resource "aws_ecs_task_definition" "pipeline" {
         {
           name  = "ENVIRONMENT"
           value = var.environment
+        },
+        {
+          name  = "SQS_QUEUE_URL"
+          value = var.sqs_queue_url
+        },
+        {
+          name  = "S3_OUTPUT_BUCKET"
+          value = aws_s3_bucket.pipeline_data.id
         }
       ]
     }

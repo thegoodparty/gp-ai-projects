@@ -1,6 +1,0 @@
-# Production Environment Configuration
-environment  = "prod"
-aws_region   = "us-west-2"
-project_name = "serve-message-platform"
-
-# Note: ALB and Route53 configuration moved to infrastructure/shared/environments/prod.tfvars

@@ -43,13 +43,11 @@ data "terraform_remote_state" "serve_analyze" {
 module "alb" {
   source = "../../../modules/alb"
 
-  environment                        = var.environment
-  vpc_id                            = var.vpc_id
-  public_subnet_ids                 = var.public_subnet_ids
-  certificate_arn                   = var.certificate_arn
-  serve_message_lambda_arn          = var.serve_message_lambda_arn
-  serve_message_lambda_function_name = var.serve_message_lambda_function_name
-  api_key                           = local.api_key
+  environment       = var.environment
+  vpc_id            = var.vpc_id
+  public_subnet_ids = var.public_subnet_ids
+  certificate_arn   = var.certificate_arn
+  api_key           = local.api_key
 }
 
 module "route53" {

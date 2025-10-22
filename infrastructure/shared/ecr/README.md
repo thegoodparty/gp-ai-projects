@@ -10,7 +10,9 @@ Single ECR repository for all gp-ai-projects Docker images.
 **ARN**: `arn:aws:ecr:us-west-2:333022194791:repository/gp-ai-projects`
 
 **Images stored**:
-- `v1-pipeline:latest` - V1 Pipeline for message consolidation/classification/clustering
+- `serve-analyze-dev` - V1 Pipeline (dev environment)
+- `serve-analyze-qa` - V1 Pipeline (qa environment)
+- `serve-analyze-prod` - V1 Pipeline (prod environment)
 - Future AI project images...
 
 ## Deploy ECR Repository
@@ -25,42 +27,49 @@ terraform apply
 
 ## Build and Push Images
 
-### V1 Pipeline
-
-```bash
-cd serve/v1_pipeline
-
-# Build and push to ECR
-PUSH_TO_ECR=true ./build.sh latest
-
-# Build locally only (no push)
-./build.sh latest
-```
-
-### Manual Push
+### serve-analyze (V1 Pipeline)
 
 ```bash
 # Get ECR repository URL
-ECR_REPO=$(aws ecr describe-repositories \
-  --repository-names gp-ai-projects \
-  --query 'repositories[0].repositoryUri' \
-  --output text)
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
 
-# Build image
+# Build for ARM64 (Fargate ARM64 is cheaper)
 cd serve/v1_pipeline
-./build.sh prod
+docker buildx build --platform linux/arm64 -t serve-analyze-dev -f Dockerfile ../..
 
-# Tag for ECR
-docker tag v1-pipeline:prod ${ECR_REPO}:v1-pipeline-prod
-docker tag v1-pipeline:prod ${ECR_REPO}:v1-pipeline-latest
+# Tag for specific environment
+docker tag serve-analyze-dev:latest ${ECR_REPO}:serve-analyze-dev
 
 # Login to ECR
-aws ecr get-login-password --region us-west-2 | \
+aws ecr get-login-password --region us-west-2 --profile work | \
   docker login --username AWS --password-stdin ${ECR_REPO}
 
 # Push to ECR
-docker push ${ECR_REPO}:v1-pipeline-prod
-docker push ${ECR_REPO}:v1-pipeline-latest
+docker push ${ECR_REPO}:serve-analyze-dev
+```
+
+### Build for All Environments
+
+```bash
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+cd serve/v1_pipeline
+
+# Build once
+docker buildx build --platform linux/arm64 -t serve-analyze -f Dockerfile ../..
+
+# Tag for each environment
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-dev
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-qa
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-prod
+
+# Login
+aws ecr get-login-password --region us-west-2 --profile work | \
+  docker login --username AWS --password-stdin ${ECR_REPO}
+
+# Push all
+docker push ${ECR_REPO}:serve-analyze-dev
+docker push ${ECR_REPO}:serve-analyze-qa
+docker push ${ECR_REPO}:serve-analyze-prod
 ```
 
 ## Lifecycle Policy
@@ -75,8 +84,8 @@ Convention-based retention policy to prevent active projects from evicting stabl
 - Tags: `v1.*`, `v2.*`, `v3.*`, etc.
 - Example: `v1.0.0`, `v2.1.3`, `campaign-planner-v1.5.2`
 
-**Priority 3**: v1-pipeline images - **180 days** (stable project)
-- Tags: `v1-pipeline-*`
+**Priority 3**: serve-analyze images - **180 days** (stable project)
+- Tags: `serve-analyze-*`
 
 **Priority 4**: campaign-planner images - **90 days** (active development)
 - Tags: `campaign-planner-*`
@@ -152,10 +161,10 @@ resource "aws_ecs_task_definition" "example" {
 - `main` ← **Never expires** (environment tag)
 - `dev` ← **Never expires** (environment tag)
 - `prod` ← **Never expires** (environment tag)
-- `v1-pipeline-prod` ← **Never expires** (contains "prod")
+- `serve-analyze-prod` ← **Never expires** (contains "prod")
 - `campaign-planner-release` ← **Never expires** (contains "release")
 - `v1.5.2` ← 365 days (versioned release)
-- `v1-pipeline-latest` ← 180 days (project-specific)
+- `serve-analyze-latest` ← 180 days (project-specific)
 - `campaign-planner-dev` ← 90 days (project-specific, but `dev` alone never expires)
 - `staging` ← 60 days (dev tag)
 
@@ -163,11 +172,11 @@ resource "aws_ecs_task_definition" "example" {
 
 **⚠️ Issue with "latest" Tags:**
 
-When you push a new image with the same tag (e.g., `v1-pipeline-latest`), the tag **moves** to the new image:
+When you push a new image with the same tag (e.g., `serve-analyze-latest`), the tag **moves** to the new image:
 
 ```
-Day 1:  Image A tagged "v1-pipeline-latest"
-Day 10: Push Image B with "v1-pipeline-latest"
+Day 1:  Image A tagged "serve-analyze-latest"
+Day 10: Push Image B with "serve-analyze-latest"
         → Tag moves to Image B
         → Image A becomes UNTAGGED
         → Image A deleted after 90 days (untagged retention)
@@ -182,13 +191,16 @@ Keep every build tagged with a unique timestamp:
 ```bash
 # Build with timestamp
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-PUSH_TO_ECR=true ./build.sh "dev-${TIMESTAMP}"
-# → Tag: v1-pipeline-dev-20251010-143022 (180 days retention)
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+docker buildx build --platform linux/arm64 -t serve-analyze-dev-${TIMESTAMP} ../..
+docker push ${ECR_REPO}:serve-analyze-dev-${TIMESTAMP}
+# → Tag: serve-analyze-dev-20251010-143022 (180 days retention)
 
 # Git commit SHA (best for traceability)
 GIT_SHA=$(git rev-parse --short HEAD)
-PUSH_TO_ECR=true ./build.sh "dev-${GIT_SHA}"
-# → Tag: v1-pipeline-dev-abc1234 (180 days retention)
+docker buildx build --platform linux/arm64 -t serve-analyze-dev-${GIT_SHA} ../..
+docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
+# → Tag: serve-analyze-dev-abc1234 (180 days retention)
 ```
 
 **Benefits:**
@@ -202,20 +214,25 @@ PUSH_TO_ECR=true ./build.sh "dev-${GIT_SHA}"
 Use moving tags for environments, versioned tags for releases:
 
 ```bash
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+
 # Development (tag moves)
-PUSH_TO_ECR=true ./build.sh dev
-# → Tag: v1-pipeline-dev (moves with each push)
+docker buildx build --platform linux/arm64 -t serve-analyze-dev ../..
+docker push ${ECR_REPO}:serve-analyze-dev
+# → Tag: serve-analyze-dev (moves with each push)
 
 # Staging (tag moves)
-PUSH_TO_ECR=true ./build.sh staging
+docker buildx build --platform linux/arm64 -t staging ../..
+docker push ${ECR_REPO}:staging
 # → Tag: staging (moves with each push)
 
 # Production releases (unique tags)
-PUSH_TO_ECR=true ./build.sh v1.2.3
+docker buildx build --platform linux/arm64 -t v1.2.3 ../..
+docker push ${ECR_REPO}:v1.2.3
 # → Tag: v1.2.3 (never moves, 365 days)
 
-PUSH_TO_ECR=true ./build.sh prod
-# → Tag: prod (never expires)
+docker push ${ECR_REPO}:serve-analyze-prod
+# → Tag: serve-analyze-prod (never expires)
 ```
 
 **Benefits:**
@@ -232,29 +249,29 @@ Combine moving environment tags with timestamped tags:
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 GIT_SHA=$(git rev-parse --short HEAD)
 
-# Build once
-docker build -t v1-pipeline:latest .
+# Build and tag strategy
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
 
-# Tag for ECR with multiple tags
-ECR_REPO=$(aws ecr describe-repositories --repository-names gp-ai-projects --query 'repositories[0].repositoryUri' --output text)
+# Build once
+docker buildx build --platform linux/arm64 -t serve-analyze ../..
 
 # Timestamped tag (keeps build tagged for 180 days)
-docker tag v1-pipeline:latest ${ECR_REPO}:v1-pipeline-dev-${GIT_SHA}
-docker push ${ECR_REPO}:v1-pipeline-dev-${GIT_SHA}
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
+docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
 
 # Environment tag (moves with each push)
-docker tag v1-pipeline:latest ${ECR_REPO}:v1-pipeline-dev
-docker push ${ECR_REPO}:v1-pipeline-dev
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-dev
+docker push ${ECR_REPO}:serve-analyze-dev
 
 # Production releases
-docker tag v1-pipeline:latest ${ECR_REPO}:v1.2.3
-docker tag v1-pipeline:latest ${ECR_REPO}:prod
+docker tag serve-analyze:latest ${ECR_REPO}:v1.2.3
+docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-prod
 docker push ${ECR_REPO}:v1.2.3
-docker push ${ECR_REPO}:prod
+docker push ${ECR_REPO}:serve-analyze-prod
 ```
 
 **Benefits:**
-- ✅ Environment tags for easy deployment (Fargate pulls `v1-pipeline-dev`)
+- ✅ Environment tags for easy deployment (Fargate pulls `serve-analyze-dev`)
 - ✅ Timestamped tags for rollback capability
 - ✅ Versioned releases for production
 - ✅ Best of all approaches
@@ -265,7 +282,7 @@ docker push ${ECR_REPO}:prod
 |-------------|-----------|----------|------------|
 | `main`, `master`, `prod`, `dev`, `release` | **Never** | Environment deployments | Yes (but never expires) |
 | `v1.0.0`, `v2.1.3` | **365 days** | Versioned releases | No |
-| `{project}-*` | **180 days** (v1-pipeline)<br>**90 days** (campaign-planner) | Project-specific builds | Depends on strategy |
+| `{project}-*` | **180 days** (serve-analyze)<br>**90 days** (campaign-planner) | Project-specific builds | Depends on strategy |
 | `latest`, `staging` | **60 days** (tagged)<br>**90 days** (untagged) | Development/testing | Yes (becomes untagged) |
 | Untagged images | **90 days** | Previous "latest" builds | N/A |
 | Other tags | **30 days** | Temporary/experimental | Depends |
@@ -285,21 +302,24 @@ PUSH_TO_ECR=true ./build.sh v1.2.3        # 365 days
 
 **2. Development Builds (with history):**
 ```bash
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+
 # Use timestamps to keep all builds tagged
 GIT_SHA=$(git rev-parse --short HEAD)
-PUSH_TO_ECR=true ./build.sh "dev-${GIT_SHA}"   # 180 days, never becomes untagged
+docker buildx build --platform linux/arm64 -t serve-analyze-dev-${GIT_SHA} ../..
+docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}  # 180 days, never becomes untagged
 
 # Or just use "dev" if you only need current deployment
-PUSH_TO_ECR=true ./build.sh dev           # Never expires (tag moves but never deleted)
+docker push ${ECR_REPO}:serve-analyze-dev           # Never expires (tag moves but never deleted)
 ```
 
 **3. Rollback Safety:**
 - Use versioned tags (`v1.2.3`) for releases you may need to rollback to
-- Use timestamped tags (`dev-20251010-143022`) to keep full build history
+- Use timestamped tags (`serve-analyze-dev-20251010-143022`) to keep full build history
 - Avoid relying on untagged image retention (90 days) for critical builds
 
 **4. Tag Naming:**
-- Include project name for multi-project repositories: `v1-pipeline-dev-abc1234`
+- Include project name for multi-project repositories: `serve-analyze-dev-abc1234`
 - Include git commit SHA for traceability: `campaign-planner-v1.2.3-abc1234`
 - Use semantic versioning for releases: `v1.2.3`, `v2.0.0`
 
