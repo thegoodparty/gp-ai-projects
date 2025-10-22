@@ -81,11 +81,13 @@ class Logger:
         self.log_dir.mkdir(exist_ok=True)
         
         self.session_id = str(uuid.uuid4())[:8]
-        
+
         self.environment = os.getenv('ENVIRONMENT', '').lower()
-        self.is_production = self.environment == 'production'
-        self.is_development = self.environment == 'development'
-        
+        self.is_production = self.environment in ['production', 'prod']
+        self.is_development = self.environment in ['development', 'dev', 'debug']
+
+        self.use_colors = sys.stdout.isatty()
+
         if self.is_production:
             self.default_level = LogLevel.INFO
         elif self.is_development:
@@ -136,13 +138,16 @@ class Logger:
         
         console_handler = logging.StreamHandler(sys.stdout)
         if self.is_production:
-            console_handler.setFormatter(colored_simple_formatter)
+            formatter = colored_simple_formatter if self.use_colors else simple_formatter
+            console_handler.setFormatter(formatter)
             console_handler.setLevel(logging.INFO)
         elif self.is_development:
-            console_handler.setFormatter(colored_detailed_formatter)
+            formatter = colored_detailed_formatter if self.use_colors else detailed_formatter
+            console_handler.setFormatter(formatter)
             console_handler.setLevel(logging.DEBUG)
         else:
-            console_handler.setFormatter(colored_simple_formatter)
+            formatter = colored_simple_formatter if self.use_colors else simple_formatter
+            console_handler.setFormatter(formatter)
             console_handler.setLevel(logging.WARNING)
         
         logger.addHandler(console_handler)
