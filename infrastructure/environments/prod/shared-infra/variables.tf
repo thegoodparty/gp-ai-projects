@@ -31,16 +31,6 @@ variable "certificate_arn" {
   type        = string
 }
 
-variable "serve_message_lambda_arn" {
-  description = "Lambda function ARN"
-  type        = string
-}
-
-variable "serve_message_lambda_function_name" {
-  description = "Lambda function name"
-  type        = string
-}
-
 variable "route53_zone_id" {
   description = "Route53 hosted zone ID"
   type        = string

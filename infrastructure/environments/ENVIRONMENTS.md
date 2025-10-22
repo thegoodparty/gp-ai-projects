@@ -15,19 +15,16 @@ Unstable             Stable Testing            Live Production
 ```
 infrastructure/environments/
 ├── dev/
-│   ├── serve-analyze-fargate/    ✅ DEPLOYED
-│   ├── serve-message-api/        ✅ DEPLOYED
-│   └── shared-infra/             ✅ DEPLOYED
+│   ├── serve-analyze-fargate/    ✅ DEPLOYED (V1 Pipeline)
+│   └── shared-infra/             ✅ DEPLOYED (ALB + Route53)
 │
 ├── qa/
-│   ├── serve-analyze-fargate/    🆕 READY TO DEPLOY
-│   ├── serve-message-api/        ⏳ TODO
-│   └── shared-infra/             ⏳ TODO
+│   ├── serve-analyze-fargate/    ✅ DEPLOYED (V1 Pipeline)
+│   └── shared-infra/             ✅ DEPLOYED (ALB + Route53)
 │
 └── prod/
-    ├── serve-analyze-fargate/    🆕 READY TO DEPLOY
-    ├── serve-message-api/        ✅ DEPLOYED
-    └── shared-infra/             ✅ DEPLOYED
+    ├── serve-analyze-fargate/    ✅ DEPLOYED (V1 Pipeline)
+    └── shared-infra/             ✅ DEPLOYED (ALB + Route53)
 ```
 
 ## serve-analyze-fargate: Environment Comparison
@@ -295,30 +292,32 @@ goodparty-terraform-state-us-west-2
 
 ## Deployment Status
 
-| Environment | Status | Infrastructure | Docker Image | Last Tested |
-|-------------|--------|---------------|--------------|-------------|
-| **Dev** | ✅ Live | Deployed | `serve-analyze-dev` | 2025-10-14 |
-| **QA** | ⏳ Ready | Not deployed | Build pending | - |
-| **Prod** | ⏳ Ready | Not deployed | Build pending | - |
+| Environment | Status | Infrastructure | Docker Image | Last Updated |
+|-------------|--------|---------------|--------------|--------------|
+| **Dev** | ✅ Live | Fully deployed | `serve-analyze-dev` | Active |
+| **QA** | ✅ Live | Fully deployed | `serve-analyze-qa` | Oct 21, 2025 |
+| **Prod** | ✅ Live | Fully deployed | `serve-analyze-prod` | Active |
 
-## Next Steps
+## Deployment History
 
-### For QA:
-1. ✅ Terraform config created
-2. ⏳ Update terraform.tfvars (VPC, API keys)
-3. ⏳ Build and push QA Docker image
-4. ⏳ Deploy infrastructure
-5. ⏳ Run integration tests
-6. ⏳ Get QA team sign-off
+### Dev
+- ✅ Infrastructure deployed and active
+- ✅ Docker image: `serve-analyze-dev` (latest)
+- ✅ ALB: `ai-dev.goodparty.org`
+- ✅ S3 bucket: `serve-analyze-data-dev`
 
-### For Prod:
-1. ✅ Terraform config created
-2. ⏳ Update terraform.tfvars (API keys)
-3. ⏳ QA testing complete
-4. ⏳ Tag Docker image as prod
-5. ⏳ Deploy infrastructure
-6. ⏳ Run smoke tests
-7. ⏳ Monitor initial usage
+### QA
+- ✅ Infrastructure deployed and active (Oct 2025)
+- ✅ Docker image: `serve-analyze-qa` (Oct 21, 2025)
+- ✅ ALB: `ai-qa.goodparty.org`
+- ✅ S3 bucket: `serve-analyze-data-qa`
+- ✅ ECS Cluster: `serve-analyze-qa` (ACTIVE, 0 running tasks)
+
+### Prod
+- ✅ Infrastructure deployed and active
+- ✅ Docker image: `serve-analyze-prod` (latest)
+- ✅ ALB: `ai.goodparty.org`
+- ✅ S3 bucket: `serve-analyze-data-prod`
 
 ## Quick Reference Commands
 

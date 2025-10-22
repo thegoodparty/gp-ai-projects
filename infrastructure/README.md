@@ -1,14 +1,15 @@
 # Infrastructure
 
-AWS infrastructure for the GoodParty.org AI platform using a **multi-service Application Load Balancer architecture** with path-based routing.
+AWS infrastructure for the GoodParty.org AI platform using **ECS Fargate** for compute with **Application Load Balancer** for HTTP triggers and **S3 Events** for automated processing.
 
 ## Architecture Philosophy
 
-This infrastructure is designed to support **multiple microservices** under a single ALB:
-- One ALB routes to multiple Lambda/ECS services via path patterns
-- Services are added by creating new target groups and listener rules
-- Shared authentication (API key) across all services
-- Efficient: Single ALB serves unlimited services
+This infrastructure is designed for **scalable AI pipeline processing**:
+- ECS Fargate tasks for message classification, clustering, and analysis
+- Dual trigger modes: HTTP API (via ALB) and S3 file uploads
+- Serverless cost model: Pay only when pipelines run
+- Production-grade monitoring with failure alerts via SNS/Slack
+- Shared infrastructure (ALB, ECR, Route53) across all AI services
 
 ## Shared Resources
 
@@ -34,509 +35,496 @@ This infrastructure is designed to support **multiple microservices** under a si
 
 ```
 infrastructure/
-├── shared/                          # Deploy ONCE per environment
-│   ├── main.tf                     # ALB + Route53 modules
-│   ├── variables.tf                # Shared infrastructure variables
-│   ├── outputs.tf                  # ALB/Route53 outputs
-│   ├── deploy.sh                   # Shared infrastructure deployment script
-│   ├── environments/
-│   │   ├── dev.tfvars              # ai-dev.goodparty.org configuration
-│   │   └── prod.tfvars             # ai.goodparty.org configuration
+├── environments/                    # Environment-specific deployments
+│   ├── dev/
+│   │   ├── serve-analyze-fargate/  # Dev pipeline deployment
+│   │   └── shared-infra/           # Dev ALB + Route53
+│   ├── qa/
+│   │   ├── serve-analyze-fargate/  # QA pipeline deployment
+│   │   └── shared-infra/           # QA ALB + Route53
+│   └── prod/
+│       ├── serve-analyze-fargate/  # Prod pipeline deployment
+│       └── shared-infra/           # Prod ALB + Route53
+│
+├── modules/                        # Reusable Terraform modules
+│   ├── serve-analyze-fargate/      # ECS Fargate pipeline module
+│   │   ├── main.tf                 # ECS cluster, task definition, Lambda trigger
+│   │   ├── lambda-trigger/         # TypeScript Lambda for ALB/S3 triggers
+│   │   └── slack-notifier/         # Lambda for Slack failure alerts
 │   ├── alb/                        # Application Load Balancer module
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   └── outputs.tf
-│   ├── route53/                    # Route53 DNS module
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── ecr/                        # Shared ECR repository
-│       ├── main.tf                 # ECR repository + lifecycle policy
-│       └── README.md               # ECR documentation
+│   └── route53/                    # Route53 DNS module
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
 │
-├── serve-message-api/              # Deploy FREQUENTLY
-│   ├── lambdas/                    # TypeScript Lambda functions
-│   │   ├── set_campaign_data/      # SET operations (write data)
-│   │   └── retrieve_campaign_data/ # RETRIEVE operations (read/filter)
-│   └── deploy/
-│       ├── terraform/              # Service-specific infrastructure
-│       │   ├── main.tf             # DynamoDB + Lambda + API Gateway
-│       │   ├── modules/            # Service modules
-│       │   └── environments/       # Service environment configs
-│       └── scripts/
-│           └── deploy.sh           # Service deployment script
+├── shared/                         # Shared resources (deploy once)
+│   ├── ecr/                        # Docker image repository
+│   │   ├── main.tf                 # ECR repository + lifecycle policy
+│   │   └── README.md               # ECR documentation
+│   └── slack-notifier/             # Shared Slack notifier Lambda
+│       └── main.tf                 # Lambda for failure alerts
 │
+├── deploy.sh                       # Deployment script
 └── README.md                       # This file
 ```
 
 ## Architecture Overview
 
-### Multi-Service ALB Architecture
+### Dual-Trigger ECS Fargate Architecture
 
 ```
-                      Internet
-                         ↓
-                   Route53 DNS
-                         ↓
-            Application Load Balancer
-                         ↓
-        ┌────────────────┼────────────────┐
-        │                │                │
-    /serve/messages/*  /ml/*      /analytics/*
-        ↓                ↓                ↓
-   serve-message    ml-inference    analytics
-      Lambda          Lambda          Lambda
-        ↓                ↓                ↓
-    DynamoDB         Model S3       Analytics DB
+                      Trigger Options
+                           ↓
+        ┌──────────────────┴──────────────────┐
+        │                                      │
+    HTTP POST                              S3 Upload
+  (via ALB)                               (CSV file)
+        │                                      │
+        ↓                                      ↓
+   Route53 DNS                           S3 Event
+        ↓                                      ↓
+Application Load Balancer              S3 Notification
+        ↓                                      ↓
+  x-api-key auth                        Lambda Permission
+        ↓                                      │
+        └──────────────┬───────────────────────┘
+                       ↓
+            Lambda Trigger Function
+           (TypeScript, dual-mode handler)
+                       ↓
+          Starts ECS Fargate Task
+          (4 vCPU, 16 GB RAM)
+                       ↓
+        Pipeline Container Executes:
+        - Message consolidation
+        - AI classification (Gemini)
+        - Multi-cluster analysis
+        - DynamoDB upload (via API)
+                       ↓
+         Results uploaded to S3
+         (output/ directory)
+                       ↓
+          EventBridge monitors task
+                       ↓
+        Failure alerts → SNS → Slack
 ```
 
 **Current Services:**
-- ✅ `/serve/messages/*` - Campaign message API (production)
+- ✅ `/serve/messages/process` - V1 pipeline HTTP trigger (production)
+- ✅ S3 input uploads - Automatic pipeline execution (production)
 - 🔜 `/ml/*` - Machine learning inference (planned)
 - 🔜 `/analytics/*` - Data analytics API (planned)
 
-### Two-Tier Deployment Model
+### Infrastructure Layers
 
-```
-Internet → Route53 → ALB → Lambda Target Groups → Backends
-           ↑        ↑      ↑
-         Shared   Shared  Service (per-service)
-```
+**Shared Resources (Deploy Once):**
+- **ECR Repository**: Docker images for all AI projects (`gp-ai-projects`)
+- **Application Load Balancer**: HTTPS endpoint with x-api-key auth
+- **Route53**: DNS records (ai-dev.goodparty.org, ai.goodparty.org)
+- **Slack Notifier**: Failure alert Lambda (shared across environments)
 
-### Shared Infrastructure (Deploy Once)
-- **Application Load Balancer (ALB)**: Single HTTPS load balancer serving all services
-- **Route53**: DNS records pointing to ALB
-- **Listener Rules**: Path-based routing with API key validation
-
-### Service Infrastructure (Deploy Per Service)
-- **Lambda Functions**: Service-specific Lambda functions
-- **Target Groups**: Each service has its own Lambda target group
-- **Databases**: Service-specific data stores (DynamoDB, RDS, etc.)
-- **IAM**: Service-specific roles and policies
+**Per-Environment Resources:**
+- **ECS Cluster**: Fargate cluster for pipeline tasks
+- **S3 Bucket**: Input/output data storage
+- **Lambda Trigger**: Handles ALB and S3 events
+- **SNS Topic**: Pipeline failure notifications
+- **EventBridge Rules**: Task failure monitoring
+- **IAM Roles**: ECS execution and task roles
+- **Security Groups**: ECS task network access
 
 ## Deployment Workflow
 
 ### Prerequisites
 - AWS CLI configured with `work` profile
 - Terraform 1.0+ installed
+- Docker for building pipeline images
 - Node.js 22+ for Lambda builds
 - Access to `goodparty.org` hosted zone and `*.goodparty.org` certificate
+- AWS Secrets Manager secrets: `AI_SECRETS_DEV`, `AI_SECRETS_PROD`
 
-### Step 1: Deploy Service Infrastructure
+### Complete Deployment (First Time)
+
+#### Step 1: Deploy Shared ECR Repository
 ```bash
-cd infrastructure/serve-message-api/deploy/terraform
-AWS_PROFILE=work terraform apply -var-file=environments/dev.tfvars -auto-approve
+cd infrastructure/shared/ecr
+AWS_PROFILE=work terraform init
+AWS_PROFILE=work terraform apply
 ```
 
 **What this creates:**
-```
-DynamoDB Table: serve-messages-dev
-Lambda Function: serve-message-dev
-Lambda ARN: arn:aws:lambda:us-west-2:333022194791:function:serve-message-dev
-```
+- ECR Repository: `gp-ai-projects` (333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects)
 
-### Step 2: Update Shared Configuration
-Edit `infrastructure/shared/environments/dev.tfvars`:
-```hcl
-# Update Lambda ARN from Step 1
-serve_message_lambda_arn = "arn:aws:lambda:us-west-2:333022194791:function:serve-message-dev"
-serve_message_lambda_function_name = "serve-message-dev"
-```
-
-### Step 3: Deploy Shared Infrastructure (ALB)
+#### Step 2: Build and Push Docker Image
 ```bash
-cd infrastructure/shared
-AWS_PROFILE=work terraform apply -var-file=environments/dev.tfvars -auto-approve
+cd serve/v1_pipeline
+
+# Build for ARM64 (Fargate ARM64 is cheaper)
+docker buildx build --platform linux/arm64 -t serve-analyze-dev -f Dockerfile ../..
+
+# Tag for ECR
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+docker tag serve-analyze-dev:latest ${ECR_REPO}:serve-analyze-dev
+
+# Login and push
+aws ecr get-login-password --region us-west-2 --profile work | \
+  docker login --username AWS --password-stdin ${ECR_REPO}
+docker push ${ECR_REPO}:serve-analyze-dev
 ```
 
-**Output Example:**
-```
-ALB DNS: serve-messages-dev-123456789.us-west-2.elb.amazonaws.com
-Custom Domain: https://ai-dev.goodparty.org
-```
-
-### Step 4: Verify Endpoints
+#### Step 3: Deploy serve-analyze-fargate
 ```bash
-# Test via custom domain (ALB)
-GET  https://ai-dev.goodparty.org/serve/messages/{campaign_id}
-POST https://ai-dev.goodparty.org/serve/messages/{campaign_id}
+cd infrastructure/environments/dev/serve-analyze-fargate
 
-# Both require x-api-key header
-curl -H "x-api-key: YOUR_API_KEY_HERE" \
-    "https://ai-dev.goodparty.org/serve/messages/test-campaign"
+# Create terraform.tfvars
+cat > terraform.tfvars <<EOF
+vpc_id             = "vpc-01fed488c4047eaae"
+private_subnet_ids = ["subnet-xxx", "subnet-yyy"]
+failure_notification_email = "team@example.com"
+EOF
+
+AWS_PROFILE=work terraform init
+AWS_PROFILE=work terraform apply
+```
+
+**What this creates:**
+- ECS Cluster: `serve-analyze-dev`
+- S3 Bucket: `serve-analyze-data-dev`
+- Lambda Function: `serve-analyze-trigger-dev`
+- SNS Topic: `serve-analyze-pipeline-failures-dev`
+- EventBridge Rules: Task failure monitoring
+
+#### Step 4: Deploy Shared Infrastructure (ALB + Route53)
+```bash
+cd infrastructure/environments/dev/shared-infra
+
+# Create terraform.tfvars
+cat > terraform.tfvars <<EOF
+aws_region         = "us-west-2"
+environment        = "dev"
+vpc_id             = "vpc-01fed488c4047eaae"
+public_subnet_ids  = ["subnet-aaa", "subnet-bbb"]
+certificate_arn    = "arn:aws:acm:us-west-2:333022194791:certificate/xxx"
+route53_zone_id    = "Z123456789ABC"
+custom_domain_name = "ai-dev.goodparty.org"
+EOF
+
+AWS_PROFILE=work terraform init
+AWS_PROFILE=work terraform apply
+```
+
+**What this creates:**
+- ALB: `ai-dev` load balancer
+- Target Group: `serve-analyze-dev`
+- Listener Rules: `/serve/messages/process` with x-api-key auth
+- Route53 Record: `ai-dev.goodparty.org` → ALB
+
+#### Step 5: Verify Deployment
+
+**Test HTTP Trigger:**
+```bash
+curl -X POST https://ai-dev.goodparty.org/serve/messages/process \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{
+    "csvS3Path": "s3://serve-analyze-data-dev/input/test.csv"
+  }'
+```
+
+**Test S3 Trigger:**
+```bash
+# Upload CSV file
+aws s3 cp test-data.csv s3://serve-analyze-data-dev/input/test-campaign.csv --profile work
+
+# Watch logs
+aws logs tail /ecs/serve-analyze-dev --follow --profile work
 ```
 
 ## Environment Configuration
 
 ### Development
 - **Domain**: `ai-dev.goodparty.org`
-- **ALB**: `serve-messages-dev` load balancer
-- **Lambda**: `serve-message-dev` function
-- **DynamoDB**: `serve-messages-dev` table
+- **ALB**: `ai-dev` load balancer
+- **ECS Cluster**: `serve-analyze-dev`
+- **Lambda Trigger**: `serve-analyze-trigger-dev`
+- **S3 Bucket**: `serve-analyze-data-dev`
+- **Docker Image**: `serve-analyze-dev`
+- **DynamoDB Table**: `serve-message-v1-dev`
+
+### QA
+- **Domain**: `ai-qa.goodparty.org`
+- **ALB**: `ai-qa` load balancer
+- **ECS Cluster**: `serve-analyze-qa`
+- **Lambda Trigger**: `serve-analyze-trigger-qa`
+- **S3 Bucket**: `serve-analyze-data-qa`
+- **Docker Image**: `serve-analyze-qa`
+- **DynamoDB Table**: `serve-message-v1-qa`
 
 ### Production
 - **Domain**: `ai.goodparty.org`
-- **ALB**: `serve-messages-prod` load balancer
-- **Lambda**: `serve-message-prod` function
-- **DynamoDB**: `serve-messages-prod` table
+- **ALB**: `ai-prod` load balancer
+- **ECS Cluster**: `serve-analyze-prod`
+- **Lambda Trigger**: `serve-analyze-trigger-prod`
+- **S3 Bucket**: `serve-analyze-data-prod`
+- **Docker Image**: `serve-analyze-prod`
+- **DynamoDB Table**: `serve-message-v1-prod`
 
 ## Authentication
 
-### All Operations (GET and POST)
-- **Auth**: API Key in `x-api-key` header
-- **Validation**: ALB listener rules check for valid API key
-- **Rate Limits**: ALB native rate limiting
+### HTTP Trigger (via ALB)
+- **Auth**: API Key in `x-api-key` header (required)
+- **Validation**: ALB listener rules validate key before Lambda invocation
+- **403 Response**: Invalid/missing API key returns 403 Forbidden
 
 ```bash
-# GET requests
-curl -H "x-api-key: YOUR_API_KEY_HERE" \
-  "https://ai-dev.goodparty.org/serve/messages/campaign-123?age_min=25"
-
-# POST requests
-curl -X POST -H "x-api-key: YOUR_API_KEY_HERE" \
+# HTTP POST trigger
+curl -X POST https://ai-dev.goodparty.org/serve/messages/process \
   -H "Content-Type: application/json" \
-  -d '{"campaign_id":"campaign-123","voter_name":"Alice"}' \
-  "https://ai-dev.goodparty.org/serve/messages/campaign-123"
+  -H "x-api-key: YOUR_API_KEY_HERE" \
+  -d '{
+    "csvS3Path": "s3://serve-analyze-data-dev/input/campaign.csv",
+    "environment": "production",
+    "anonymizeKeywords": ["keyword1"]
+  }'
+```
+
+### S3 Trigger (Automatic)
+- **Auth**: Not required (S3 event notifications are internal)
+- **Access Control**: S3 bucket is private, only Lambda can trigger
+- **Upload**: Any CSV file uploaded to `input/` triggers pipeline automatically
+
+```bash
+# S3 upload trigger (no API key needed)
+aws s3 cp campaign-data.csv s3://serve-analyze-data-dev/input/campaign.csv
+# Pipeline starts automatically
 ```
 
 ## ALB Configuration
 
 **Load Balancer Features:**
-- **API Key Validation**: Enforced at ALB listener rule level
-- **Health Checks**: Disabled for Lambda targets (on-demand invocation)
-- **SSL/TLS**: HTTPS with certificate from ACM
-- **Target Groups**: Direct Lambda invocation
+- **API Key Validation**: Enforced at ALB listener rule level before Lambda invocation
+- **Target Type**: Lambda function (triggers ECS Fargate tasks)
+- **SSL/TLS**: HTTPS with certificate from ACM (*.goodparty.org)
+- **Path**: `/serve/messages/process` (fixed path, not wildcard)
+- **Health Checks**: Not applicable (Lambda invokes ECS tasks on-demand)
 
-**Lambda Response Headers:**
-```javascript
-'Cache-Control': 'no-cache, no-store, must-revalidate',
-'Pragma': 'no-cache',
-'Expires': '0'
+**Target Group Configuration:**
+```hcl
+target_type = "lambda"
+target_id   = Lambda ARN (serve-analyze-trigger-dev)
 ```
 
-**Why Multi-Service ALB Architecture:**
-- **Resource Efficient**: Single ALB serves unlimited services
-- **Scalable**: Easy to add new services without infrastructure duplication
-- **Unified Authentication**: Shared API key validation across all services
-- **Direct Integration**: Lambda target groups for serverless execution
-- **Immediate Deployments**: No CDN propagation delays
-- **Path-Based Routing**: `/serve/messages/*`, `/ml/*`, `/analytics/*`, etc.
+**Listener Rules:**
+1. **Priority 10**: Valid requests with x-api-key → Forward to Lambda
+2. **Priority 15**: Invalid requests without key → 403 Forbidden
+
+**Why ALB + Lambda + Fargate:**
+- **Unified Entry Point**: Single HTTPS endpoint for all AI services
+- **Authentication at Edge**: ALB validates API keys before Lambda invocation
+- **Serverless Scaling**: Fargate tasks scale to zero when idle
+- **Cost Efficient**: No idle costs, pay per task execution
+- **Easy Service Addition**: Add new paths without infrastructure duplication
 
 ## Deployment Frequency
 
-### Daily Development (Fast ~1 minute)
+### Docker Image Updates (Most Common ~5-10 minutes)
 ```bash
-cd serve/messages
-./deploy-lambdas.sh -e dev -f serve-message  # Lambda code updates only
+# Build new image
+cd serve/v1_pipeline
+docker buildx build --platform linux/arm64 -t serve-analyze-dev -f Dockerfile ../..
+
+# Push to ECR
+ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
+docker tag serve-analyze-dev:latest ${ECR_REPO}:serve-analyze-dev
+aws ecr get-login-password --region us-west-2 | \
+  docker login --username AWS --password-stdin ${ECR_REPO}
+docker push ${ECR_REPO}:serve-analyze-dev
+
+# ECS will use new image on next task launch
 ```
 
-### Monthly/Quarterly (Moderate ~5 minutes)
+### Lambda Code Updates (Rare ~2 minutes)
 ```bash
-cd infrastructure/shared
-AWS_PROFILE=work terraform apply -var-file=environments/dev.tfvars  # ALB/Route53 updates
+cd infrastructure/modules/serve-analyze-fargate/lambda-trigger
+npm install && npm run build
+zip -r ../lambda-trigger.zip .
+
+cd infrastructure/environments/dev/serve-analyze-fargate
+AWS_PROFILE=work terraform apply  # Updates Lambda function
 ```
 
-### When to Update Shared Infrastructure
-- Adding new Lambda target groups
-- Modifying ALB listener rules
-- Changing API key
-- SSL certificate updates
-- Route53 DNS changes
+### Infrastructure Updates (Occasional ~5-10 minutes)
+```bash
+cd infrastructure/environments/dev/shared-infra
+AWS_PROFILE=work terraform apply  # ALB/Route53/listener rules
 
-## Health Check Architecture
-
-### Current Configuration
-
-Health checks are **disabled** for Lambda target groups. This is the recommended approach for serverless functions because:
-
-- Lambda functions are invoked on-demand by ALB
-- AWS manages Lambda infrastructure health automatically
-- Failed invocations are handled at request time with appropriate error responses
-- Eliminates unnecessary periodic health check invocations
-
-**Current Setup:**
-```
-ALB Target Group (Lambda) → health_check.enabled = false
+cd infrastructure/environments/dev/serve-analyze-fargate
+AWS_PROFILE=work terraform apply  # ECS cluster/S3/SNS/EventBridge
 ```
 
-### Alternative: Enable Health Checks (Not Recommended for Lambda)
-
-If you want to add health checks for monitoring purposes, you have two options:
-
-#### Option 1: ALB-Level Health Endpoint (Recommended)
-
-Create a dedicated health check endpoint that's independent of any service:
-
-```
-ALB Health Check: GET /health (no API key required)
-├── Simple health Lambda returning 200 OK
-└── Used for ALB-level monitoring
-
-Service-Specific Target Groups:
-├── /serve/messages/* → serve-message Lambda
-│   └── Target Group Health: /serve/messages/health
-├── /ml/* → ml-inference Lambda/ECS
-│   └── Target Group Health: /ml/health
-├── /analytics/* → analytics Lambda/ECS
-│   └── Target Group Health: /analytics/health
-└── Future services...
-```
-
-**Implementation Plan:**
-1. Create lightweight health-check Lambda that returns `{"status": "healthy", "timestamp": "..."}`
-2. Add ALB listener rule at priority 1: `/health` → health-check target group (no API key)
-3. Each service keeps its own health endpoint for target group monitoring
-4. ALB overall health becomes independent of any single service
-
-**Benefits:**
-- Cleaner separation: ALB health vs service health
-- Easy to add new services without touching ALB health config
-- Standard microservices pattern
-- Route53 health checks can use `/health` for failover
-
-#### Option 2: Dynamic Target Group Configuration
-
-Refactor the ALB module to accept multiple target configurations:
-
-```hcl
-# infrastructure/shared/alb/variables.tf
-variable "service_targets" {
-  type = list(object({
-    name          = string
-    path_pattern  = string
-    health_path   = string
-    lambda_arn    = string
-    lambda_name   = string
-  }))
-}
-
-# Example configuration
-service_targets = [
-  {
-    name          = "serve-message"
-    path_pattern  = "/serve/messages/*"
-    health_path   = "/serve/messages/health"
-    lambda_arn    = "arn:aws:lambda:..."
-    lambda_name   = "serve-message-dev"
-  },
-  {
-    name          = "ml-inference"
-    path_pattern  = "/ml/*"
-    health_path   = "/ml/health"
-    lambda_arn    = "arn:aws:lambda:..."
-    lambda_name   = "ml-inference-dev"
-  }
-]
-```
-
-**Implementation Plan:**
-1. Refactor `infrastructure/shared/alb/main.tf` to use `for_each` for target groups
-2. Remove hardcoded `serve_message_lambda_arn` variable
-3. Each service defines its own health check path
-4. Dynamically create listener rules based on service list
-
-**Benefits:**
-- More flexible and scalable
-- Each service is self-contained
-- Easy to add/remove services
-
-**Trade-offs:**
-- More complex Terraform code
-- Requires refactoring existing setup
-
-### Recommendation for Multi-Service Architecture
-
-If you add EC2/ECS targets that require health checks, implement **Option 1** for ALB-level monitoring. Lambda targets can keep health checks disabled.
-
-## Multi-Service Architecture Pattern
-
-### How It Works
-
-The ALB uses **path-based routing** with **priority-based listener rules**:
-
-```hcl
-Priority 10: /serve/messages/health    → serve-message (no API key)
-Priority 20: /serve/messages/* + key   → serve-message Lambda
-Priority 30: /serve/messages/* no key  → 403 Forbidden
-
-Priority 40: /ml/* + key               → ml-inference Lambda  (future)
-Priority 50: /ml/* no key              → 403 Forbidden        (future)
-
-Default: /*                            → 404 Not Found
-```
-
-Each service gets:
-1. **Target Group**: Lambda/ECS target group with health checks
-2. **Valid Request Rule**: Path pattern + API key → forward to service
-3. **Invalid Request Rule**: Path pattern without key → 403 Forbidden
-
-### Benefits of Single ALB
-
-- **Single Entry Point**: One domain (`ai-dev.goodparty.org`) for all AI services
-- **Shared Security**: API key validation enforced at ALB level for all services
-- **Resource Optimization**: Single ALB serves multiple services vs dedicated ALB per service
-- **Simplified DNS**: One Route53 record for all services
-- **Unified Monitoring**: Centralized ALB access logs and metrics
-
-## Adding New Services
-
-To add a new service (e.g., ML API):
-
-### If Using Option 1 (Current + Health Endpoint)
-
-1. **Create service Lambda**:
-   ```bash
-   mkdir infrastructure/ml-api
-   # Implement Lambda with /ml/health endpoint
-   ```
-
-2. **Update ALB module** (add new target group):
-   ```hcl
-   # infrastructure/shared/alb/main.tf
-   resource "aws_lb_target_group" "ml_inference" {
-     name        = "ml-inference-${var.environment}"
-     target_type = "lambda"
-
-     health_check {
-       enabled   = true
-       path      = "/ml/health"
-       matcher   = "200"
-       interval  = 30
-     }
-   }
-
-   resource "aws_lb_listener_rule" "ml_inference" {
-     listener_arn = aws_lb_listener.https.arn
-     priority     = 40
-
-     action {
-       type             = "forward"
-       target_group_arn = aws_lb_target_group.ml_inference.arn
-     }
-
-     condition {
-       path_pattern {
-         values = ["/ml/*"]
-       }
-     }
-
-     condition {
-       http_header {
-         http_header_name = "x-api-key"
-         values          = [var.api_key]
-       }
-     }
-   }
-   ```
-
-3. **Deploy in order**:
-   ```bash
-   # 1. Deploy service Lambda
-   cd infrastructure/ml-api
-   AWS_PROFILE=work terraform apply
-
-   # 2. Update ALB with new target group
-   cd infrastructure/shared
-   AWS_PROFILE=work terraform apply -var-file=environments/dev.tfvars
-   ```
-
-### If Using Option 2 (Dynamic Configuration)
-
-1. **Create service Lambda with health endpoint**
-2. **Add to `service_targets` list** in `environments/dev.tfvars`
-3. **Run terraform apply** - target group created automatically
-
+### When to Update Infrastructure
+- **Shared ALB**: Adding new services, changing API keys, SSL certificates
+- **Fargate Module**: Changing task resources (CPU/memory), environment variables, monitoring
+- **Docker Image**: Code changes in pipeline (most frequent)
 
 ## Monitoring & Observability
 
 ### CloudWatch Logs
-- **Lambda functions**: `/aws/lambda/serve-message-*`
-- **API Gateway**: Access logs enabled
-- **Retention**: 7 days
+- **Lambda Trigger**: `/aws/lambda/serve-analyze-trigger-{env}`
+- **ECS Tasks**: `/ecs/serve-analyze-{env}`
+- **Retention**: 30 days (configurable per environment)
+
 
 ### CloudWatch Metrics
-- **Lambda**: Duration, errors, invocations
-- **API Gateway**: Request count, latency, 4xx/5xx errors
-- **DynamoDB**: Read/write capacity, throttles
+- **ALB**: Request count, target response time, 4xx/5xx errors
+- **Lambda Trigger**: Invocations, errors, duration
+- **ECS**: Running tasks, CPU/memory utilization, task failures
+- **S3**: Object uploads to input/
 
-### Alarms (Future)
-- Lambda error rate > 5%
-- API Gateway latency > 2 seconds
-- DynamoDB throttling events
+### Failure Monitoring (Configured)
+- **EventBridge Rule**: Captures ECS task failures (exit code ≠ 0)
+- **SNS Topic**: `serve-analyze-pipeline-failures-{env}`
+- **Slack Notifier**: Optional Lambda for Slack alerts
+- **Email Alerts**: Configurable email notifications
+- **CloudWatch Alarm**: High failure rate (>3 tasks in 5 minutes)
+
+**Monitoring Features:**
+- Real-time failure notifications (<60 seconds)
+- Task tagging (campaign, S3 path, trigger source)
+- Direct links to CloudWatch Logs in alerts
+- Failure rate tracking and aggregation
+
+For detailed monitoring setup, see:
+- `infrastructure/modules/serve-analyze-fargate/FAILURE_MONITORING.md`
+- `infrastructure/modules/serve-analyze-fargate/MONITORING_SUMMARY.md`
+- `infrastructure/modules/serve-analyze-fargate/SLACK_SETUP.md`
 
 ## Security
 
 ### Network Security
-- **HTTPS Everywhere**: SSL/TLS end-to-end
-- **CORS**: Configured for web applications
+- **HTTPS Everywhere**: SSL/TLS via ALB with ACM certificates
+- **VPC Isolation**: ECS tasks run in private subnets with NAT gateway
+- **Security Groups**: ECS tasks have restricted egress (HTTPS only to APIs, S3 via VPC endpoint)
 - **DDoS Protection**: AWS Shield Standard via ALB
+- **S3 Bucket**: Private, block public access enabled
 
 ### Access Control
-- **IAM Roles**: Least privilege for Lambda functions
-- **API Keys**: Rate limiting and usage quotas
-- **Secrets**: No hardcoded credentials
-- **VPC**: Lambda functions in default VPC (can be moved to private)
+- **API Key Authentication**: ALB validates x-api-key header at edge
+- **IAM Roles**: Least privilege for Lambda execution and ECS task roles
+- **Secrets Management**: AWS Secrets Manager for API keys (GEMINI_API_KEY, SERVE_API_KEY)
+- **S3 Access**: ECS tasks only, Lambda trigger only for reads
+- **ECR Access**: ECS task execution role pulls images
 
 ### Compliance
-- **Data Encryption**: At rest (DynamoDB) and in transit (HTTPS)
-- **Audit Logging**: CloudTrail integration
-- **Access Logs**: API Gateway request logging
+- **Data Encryption**:
+  - At rest: S3 (AES-256), DynamoDB (AWS managed)
+  - In transit: HTTPS everywhere, TLS 1.2+
+- **Audit Logging**: CloudTrail enabled for all API calls
+- **Access Logs**: ALB logs, ECS task logs, Lambda logs
+- **Secrets Rotation**: Support for automatic rotation via Secrets Manager
 
 ## Troubleshooting
 
 ### Common Issues
 
-**ALB deployment taking too long:**
-- ALB deployments typically take 3-5 minutes
-- Check AWS console for load balancer status
+**ALB returns 403 Forbidden:**
+- Verify x-api-key header is correct
+- Check ALB listener rule configuration
+- Ensure API key matches value in Secrets Manager
 
-**API Gateway domain not found:**
-- Ensure serve-message-api is deployed first
-- Check outputs: `terraform output api_gateway_domain_name`
+**S3 upload doesn't trigger pipeline:**
+- Verify file is uploaded to `input/` prefix with `.csv` suffix
+- Check S3 bucket notification configuration
+- Verify Lambda has S3 invoke permission
 
-**Custom domain not resolving:**
-- DNS propagation can take 5-10 minutes
-- Verify Route53 records point to ALB DNS name
+**ECS task fails to start:**
+- Check Docker image exists in ECR
+- Verify ECS task role has permissions for Secrets Manager
+- Check VPC subnets and security groups
+- Review Lambda trigger logs
 
-**Lambda function errors:**
-- Check CloudWatch logs: `/aws/lambda/serve-message-*`
-- Verify environment variables are set correctly
-- Ensure DynamoDB table exists and is accessible
+**Pipeline execution fails:**
+- Check ECS task logs: `/ecs/serve-analyze-{env}`
+- Verify Secrets Manager secrets exist (GEMINI_API_KEY, SERVE_API_KEY)
+- Check S3 permissions for input file access
+- Verify DynamoDB table exists and is accessible
+
+**No failure notifications:**
+- Confirm SNS subscription
+- Check EventBridge rule configuration
+- Verify Slack webhook URL (if using Slack)
 
 ### Useful Commands
 
 ```bash
 # Check ALB status
-aws elbv2 describe-load-balancers --names serve-message-alb-dev
+aws elbv2 describe-load-balancers --names ai-dev --profile work
 
 # Test DNS resolution
 dig ai-dev.goodparty.org
 
-# Check API Gateway endpoints
-curl -v https://abc123.execute-api.us-east-1.amazonaws.com/dev/health
+# View Lambda trigger logs
+aws logs tail /aws/lambda/serve-analyze-trigger-dev --follow --profile work
 
-# View Lambda logs
-aws logs tail /aws/lambda/serve-message-set-dev --follow
+# View ECS task logs
+aws logs tail /ecs/serve-analyze-dev --follow --profile work
+
+# List running ECS tasks
+aws ecs list-tasks --cluster serve-analyze-dev --profile work
+
+# Describe specific task
+aws ecs describe-tasks --cluster serve-analyze-dev --tasks TASK_ARN --profile work
+
+# Check S3 bucket notifications
+aws s3api get-bucket-notification-configuration \
+  --bucket serve-analyze-data-dev --profile work
+
+# Test HTTP trigger
+curl -X POST https://ai-dev.goodparty.org/serve/messages/process \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_KEY" \
+  -d '{"csvS3Path":"s3://serve-analyze-data-dev/input/test.csv"}'
+
+# Test S3 trigger
+aws s3 cp test.csv s3://serve-analyze-data-dev/input/test-$(date +%s).csv --profile work
 ```
 
 ## Future Enhancements
 
 ### Planned Additions
-1. **ML Service**: `/ml/*` path for machine learning APIs
-2. **Analytics Service**: `/analytics/*` path for data insights
-3. **WebSocket Support**: Real-time features via API Gateway WebSocket
-4. **Multi-Region**: Global deployment for better performance
+1. **ML Service**: `/ml/*` path for machine learning inference APIs
+2. **Analytics Service**: `/analytics/*` path for data insights and reporting
+3. **Step Functions**: Orchestrate complex multi-stage pipelines
+4. **Multi-Region**: Global deployment for better performance and resilience
 5. **WAF Integration**: Web Application Firewall for enhanced security
 
 ### Infrastructure Improvements
-1. **Blue/Green Deployments**: Zero-downtime deployments
-2. **Auto Scaling**: DynamoDB auto-scaling based on usage
-3. **Backup Strategy**: Automated DynamoDB backups
+1. **ECS Auto Scaling**: Scale Fargate tasks based on queue depth
+2. **S3 Batch Operations**: Process large batches of files efficiently
+3. **Cost Optimization**: Fargate Spot for non-critical workloads
 4. **Monitoring Dashboard**: CloudWatch dashboard for operational metrics
-5. **CI/CD Pipeline**: Automated deployments via GitHub Actions
+5. **CI/CD Pipeline**: Automated Docker builds and deployments via GitHub Actions
+6. **Automated Retry**: Lambda-based retry logic for failed tasks
+7. **Data Archival**: Lifecycle policies for S3 data retention
+
+### Documentation
+- ✅ **FAILURE_MONITORING.md**: Complete failure detection and recovery guide
+- ✅ **MONITORING_SUMMARY.md**: Quick reference for monitoring
+- ✅ **SLACK_SETUP.md**: Slack integration for failure alerts
+- ✅ **S3_TRIGGER_DEPLOYMENT.md**: S3 event trigger deployment guide
+- ✅ **USAGE.md**: End-to-end usage examples
+- ✅ **ENVIRONMENTS.md**: Environment comparison and deployment flow
 
 ---
 
-**🚀 Ready for Production!**
+**🚀 Production-Ready Infrastructure!**
 
-This infrastructure follows AWS Well-Architected principles and is designed to scale from prototype to enterprise workloads while maintaining cost efficiency and operational simplicity.
+This infrastructure implements AWS best practices for serverless AI workloads:
+- **Cost Efficient**: Pay only for task execution time (scale to zero)
+- **Highly Available**: Multi-AZ deployment with automatic failover
+- **Scalable**: Fargate scales horizontally, handles concurrent pipelines
+- **Observable**: Complete monitoring with real-time failure alerts
+- **Secure**: Network isolation, encryption at rest/transit, IAM least privilege
+- **Maintainable**: Infrastructure as code, modular Terraform design
