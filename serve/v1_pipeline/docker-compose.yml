@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  v1-pipeline:
+    image: v1-pipeline:dev
+    platform: linux/arm64
+    container_name: v1-pipeline-local
+
+    environment:
+      CAMPAIGN_NAME: ${CAMPAIGN_NAME:-berkley}
+
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+
+      SKIP_CLUSTERING: ${SKIP_CLUSTERING:-false}
+      DEBUG: ${DEBUG:-false}
+
+    volumes:
+      - ${LOCAL_DATA_DIR:-./data}:/app/data:ro
+      - ${LOCAL_OUTPUT_DIR:-./output}:/app/output
+
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 8G
