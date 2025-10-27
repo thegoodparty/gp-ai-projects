@@ -252,7 +252,7 @@ class SQSEventPublisher:
             response = self.sqs_client.send_message(
                 QueueUrl=self.queue_url,
                 MessageBody=message_body,
-                MessageGroupId="gp-queue-polls",  # FIFO queue grouping for poll messages
+                MessageGroupId=f"gp-queue-polls-{event.data.pollId}",
                 MessageDeduplicationId=str(uuid.uuid4())  # Unique per message
             )
             logger.debug(f"Sent {event.type} to SQS: MessageId={response['MessageId']}")
