@@ -132,34 +132,6 @@ resource "aws_s3_bucket_policy" "alb_logs_policy" {
 
 data "aws_caller_identity" "current" {}
 
-# Target Group for Lambda Function
-resource "aws_lb_target_group" "serve_message" {
-  name        = "serve-message-${var.environment}"
-  target_type = "lambda"
-
-  tags = {
-    Name        = "serve-message-${var.environment}"
-    Environment = var.environment
-    Purpose     = "Lambda Target Group"
-  }
-}
-
-# Target Group Attachment for Lambda
-resource "aws_lb_target_group_attachment" "serve_message" {
-  target_group_arn = aws_lb_target_group.serve_message.arn
-  target_id        = var.serve_message_lambda_arn
-  depends_on       = [aws_lambda_permission.alb_invoke]
-}
-
-# Lambda permission for ALB to invoke function
-resource "aws_lambda_permission" "alb_invoke" {
-  statement_id  = "AllowExecutionFromALB"
-  action        = "lambda:InvokeFunction"
-  function_name = var.serve_message_lambda_function_name
-  principal     = "elasticloadbalancing.amazonaws.com"
-  source_arn    = aws_lb_target_group.serve_message.arn
-}
-
 # HTTPS Listener
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.serve_messages_alb.arn
@@ -209,63 +181,3 @@ resource "aws_lb_listener" "http" {
     Environment = var.environment
   }
 }
-
-# Listener Rule for /serve/messages/* with valid API key
-resource "aws_lb_listener_rule" "serve_messages_valid" {
-  listener_arn = aws_lb_listener.https.arn
-  priority     = 20
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.serve_message.arn
-  }
-
-  condition {
-    path_pattern {
-      values = ["/serve/messages/*"]
-    }
-  }
-
-  condition {
-    http_header {
-      http_header_name = "x-api-key"
-      values          = [var.api_key]
-    }
-  }
-
-  tags = {
-    Name        = "ai-serve-messages-valid-${var.environment}"
-    Environment = var.environment
-  }
-}
-
-# Listener Rule for /serve/messages/* without valid API key - return 403
-resource "aws_lb_listener_rule" "serve_messages_invalid" {
-  listener_arn = aws_lb_listener.https.arn
-  priority     = 30
-
-  action {
-    type = "fixed-response"
-
-    fixed_response {
-      content_type = "application/json"
-      message_body = jsonencode({
-        error = "Forbidden"
-        message = "Invalid or missing API key"
-      })
-      status_code = "403"
-    }
-  }
-
-  condition {
-    path_pattern {
-      values = ["/serve/messages/*"]
-    }
-  }
-
-  tags = {
-    Name        = "ai-serve-messages-invalid-${var.environment}"
-    Environment = var.environment
-  }
-}
-

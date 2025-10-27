@@ -66,7 +66,8 @@ module "serve_analyze_fargate" {
   private_subnet_ids                 = var.private_subnet_ids
   ecr_repository_url                 = data.terraform_remote_state.shared_ecr.outputs.repository_url
   docker_image_tag                   = "serve-analyze-qa"
-  dynamodb_table_name                = "serve-messages-qa"
+  sqs_queue_arn                      = "arn:aws:sqs:us-west-2:333022194791:qa-Queue.fifo"
+  sqs_queue_url                      = "https://sqs.us-west-2.amazonaws.com/333022194791/qa-Queue.fifo"
   shared_slack_notifier_lambda_arn   = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
   failure_notification_email         = var.failure_notification_email
 }

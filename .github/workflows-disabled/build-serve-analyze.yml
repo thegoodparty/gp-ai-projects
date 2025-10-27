@@ -1,0 +1,111 @@
+name: Build and Push Serve Analyze
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - qa
+      - serve
+    tags:
+      - 'v*'
+    paths:
+      - 'serve/v1_pipeline/**'
+      - 'serve/hierarchical_discovery/**'
+      - 'shared/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev/qa/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: gp-ai-projects
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Determine environment and tag
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+            TAG="serve-analyze-${ENV}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="serve-analyze-${GITHUB_REF#refs/tags/}"
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAG="serve-analyze-prod"
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
+            TAG="serve-analyze-qa"
+            ENV="qa"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            TAG="serve-analyze-dev"
+            ENV="dev"
+          else
+            TAG="serve-analyze-${GITHUB_SHA::8}"
+            ENV="dev"
+          fi
+
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "Building for environment: ${ENV} with tag: ${TAG}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./serve/v1_pipeline/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:v1-pipeline-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Image digest
+        run: echo "Image pushed with tags ${{ steps.env.outputs.tag }} and v1-pipeline-latest"
+
+      - name: Update ECS task definition (optional)
+        if: steps.env.outputs.environment == 'dev'
+        run: |
+          echo "Optionally trigger ECS task definition update here"
+          echo "Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}"

@@ -1,0 +1,155 @@
+# Hierarchical Clustering Discovery Pipeline Configuration
+
+# Data source configuration
+data_source: "cara"  # Options: "josh", "cara", "berkeley", "heather", "japjeet", "joanna", "jonathan", "all", "test_1msg", "test_2msg", "test_3msg"
+
+# Content filtering configuration (inherited from discovery)
+filtering:
+  enabled: true
+  remove_profanity: true
+  remove_non_substantive: true
+  min_length: 0
+  require_civic_relevance: true
+  max_message_length: 5000
+
+# AI message processing configuration (unified preprocessing/splitting/anonymization)
+ai_processing:
+  enabled: true
+  llm_batch_size: 50
+
+# Embedding generation configuration
+embeddings:
+  model: "gemini"
+  dimensions_3072: true
+  batch_size: 100
+
+# Dimensionality reduction configuration (separate stage)
+dimensionality_reduction:
+  pca_enabled: true                # 3072d → 50d (preserves variance while reducing computation)
+  pca_dimensions: 50               # Optimal intermediate reduction before UMAP
+
+  umap_enabled: true               # Enabled for clustering (research-backed optimal configuration)
+  umap_dimensions: 15              # Optimal for clustering (10-20 range recommended)
+  umap_n_neighbors: 15             # Preserves local structure (15-30 range)
+  umap_min_dist: 0.0               # Tighter clusters for hierarchical analysis (0.0 for clustering)
+  umap_metric: "cosine"            # Cosine for semantic similarity
+
+  umap_3d_visualization: true      # Enabled for 3D visualization only (50d → 3d)
+
+# Hierarchical clustering configuration
+hierarchical:
+  # Core parameters (deterministic hierarchical clustering)
+  linkage: "complete"                # Options: "ward", "complete", "average", "single"
+  affinity: "cosine"                 # Options: "euclidean", "manhattan", "cosine"
+  n_clusters: 15                     # Fixed number of clusters
+  distance_threshold: null           # Alternative to n_clusters (set one or the other)
+  compute_distances: true            # Required for dendrogram generation
+
+  # Multi-clustering configuration
+  multi_cluster_analysis: true       # Enable to use optimal_k mode (returns single optimal k)
+  cluster_ranges: "optimal_k"        # "optimal_k" for data-driven selection, "auto" for adaptive, or list like [10, 20, 30, 40]
+
+  # Optimal k selection configuration (used when cluster_ranges: "optimal_k")
+  optimal_k_config:
+    enabled: true
+    min_k: 5                         # Minimum number of clusters to test
+    max_k: 50                        # Maximum number of clusters to test
+    min_cluster_size: 5              # Minimum cluster size constraint
+    min_substantial_clusters: 3      # Minimum number of substantial clusters required
+    max_cv: 1.0                      # Maximum coefficient of variation for cluster size balance
+
+    # Numerical constants for B/W ratio calculation
+    max_bw_ratio: 1000.0             # Upper bound for B/W ratio (when within-cluster distance near zero)
+    zero_epsilon: 1.0e-10            # Epsilon for near-zero checks in division
+
+# Dendrogram visualization configuration
+dendrogram:
+  enabled: true
+  max_display_clusters: 30          # Limit for readability
+  figsize: [15, 10]                 # Figure dimensions
+  orientation: "top"                # "top", "bottom", "left", "right"
+  leaf_rotation: 90                 # Leaf label rotation
+  leaf_font_size: 10                # Font size for leaf labels
+  truncate_mode: "level"            # "level" or "lastp"
+  p: 30                             # Truncation parameter
+  show_leaf_counts: true            # Show cluster sizes
+  color_threshold: null             # Auto-determine color threshold
+  distance_sort: "descending"       # Sort clusters by distance
+
+# Cluster analysis configuration (inherited from discovery)
+analysis:
+  enabled: true
+  parallel_analysis: true
+  max_workers: 50
+  max_example_messages: 50
+  save_example_messages: 5
+
+  # LLM configuration for analysis
+  llm_config:
+    model: "flash"
+    temperature: 0.0
+    thinking_budget: 0
+    max_connections: 100
+    max_keepalive_connections: 25
+
+  # Multi-cluster analysis settings
+  multi_cluster:
+    max_connections: 25              # Reduced for multi-cluster to avoid API overload
+    max_keepalive_connections: 10    # Connection pool size
+    chunk_size: 5                    # Clusters processed per batch
+    delay_between_runs: 5.0          # Seconds between different cluster counts
+    delay_between_clusters: 0.2      # Seconds between individual cluster analyses
+    delay_between_chunks: 1.0        # Seconds between batches
+
+# Cluster merger configuration (post-processing to merge similar clusters)
+cluster_merger:
+  enabled: true                       # Enable LLM-based cluster merging
+  embedding_similarity_threshold: 0.92 # Cosine similarity threshold for embedding pre-filter (0.0-1.0)
+  similarity_threshold: 0.8          # LLM similarity threshold for merging (0.0-1.0)
+  max_workers: 10                    # Parallel LLM calls for cluster comparison
+
+# Performance configuration
+performance:
+  max_connections: 100
+  max_keepalive_connections: 25
+  enable_parallel_processing: true
+
+# Output configuration
+output:
+  save_intermediates: true
+  export_formats: ["json", "csv", "markdown"]
+
+  # Directory structure
+  base_dir: "output"
+  subdirs:
+    reports: "reports"
+    visualizations: "visualizations"
+    dendrograms: "dendrograms"       # Hierarchical-specific
+    checkpoints: "checkpoints"
+    exports: "exports"
+
+  # File naming
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+  # Visualization (handled by visualization_generator stage)
+
+# Error handling configuration
+error_handling:
+  continue_on_error: false
+
+# Checkpointing configuration
+checkpoints:
+  enabled: true
+  auto_save: true
+  save_frequency: "stage"
+  max_checkpoints: 10
+  compression: true
+
+# Accountability tracking configuration
+accountability:
+  enabled: true
+  include_filtered: true
+  include_embeddings: false
+  append_to_original: true
+  export_format: "csv"
+  detailed_tracking: true

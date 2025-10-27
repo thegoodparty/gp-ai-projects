@@ -21,16 +21,23 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_secretsmanager_secret_version" "ai_secrets" {
+  secret_id = "AI_SECRETS_${upper(var.environment)}"
+}
+
+locals {
+  ai_secrets = jsondecode(data.aws_secretsmanager_secret_version.ai_secrets.secret_string)
+  api_key    = local.ai_secrets["SERVE_API_KEY"]
+}
+
 module "alb" {
   source = "../../../modules/alb"
 
-  environment                        = var.environment
-  vpc_id                            = var.vpc_id
-  public_subnet_ids                 = var.public_subnet_ids
-  certificate_arn                   = var.certificate_arn
-  serve_message_lambda_arn          = var.serve_message_lambda_arn
-  serve_message_lambda_function_name = var.serve_message_lambda_function_name
-  api_key                           = var.api_key
+  environment       = var.environment
+  vpc_id            = var.vpc_id
+  public_subnet_ids = var.public_subnet_ids
+  certificate_arn   = var.certificate_arn
+  api_key           = local.api_key
 }
 
 module "route53" {

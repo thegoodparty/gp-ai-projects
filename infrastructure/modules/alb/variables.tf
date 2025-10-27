@@ -26,16 +26,6 @@ variable "certificate_arn" {
   type        = string
 }
 
-variable "serve_message_lambda_arn" {
-  description = "ARN of the Lambda function to target"
-  type        = string
-}
-
-variable "serve_message_lambda_function_name" {
-  description = "Name of the Lambda function for permissions"
-  type        = string
-}
-
 variable "api_key" {
   description = "API key for authentication (set via TF_VAR_api_key environment variable)"
   type        = string

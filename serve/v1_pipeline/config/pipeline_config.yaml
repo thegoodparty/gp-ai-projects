@@ -1,0 +1,108 @@
+# V1 Message Analysis Pipeline Configuration
+
+pipeline:
+  # Pipeline mode: 'integrated' (all stages) or 'standalone' (individual stages)
+  mode: "integrated"
+
+# Data consolidation stage configuration
+consolidation:
+  # Input directory containing R1/R2/R3 files
+  input_dir: "../../input"
+
+  # Output directory for consolidated data
+  output_dir: "../output/consolidated"
+
+# Message clustering stage configuration
+clustering:
+  # Enable/disable clustering stage
+  enabled: true
+
+  # Note: hierarchical_discovery handles all dataset sizes:
+  # - 1 message: Direct LLM analysis (no clustering)
+  # - 2-9 messages: Limited clustering or batch analysis
+  # - 10+ messages: Full hierarchical clustering with optimal k selection
+
+  # Skip clustering on errors (continue pipeline)
+  skip_on_error: true
+
+  # Clustering configuration
+  optimal_clusters: 15
+
+  # Use existing hierarchical discovery pipeline
+  use_existing_pipeline: true
+  return_raw: true
+  skip_visualizations: true
+
+# Data merging configuration
+merging:
+  # Field to match records on
+  match_on: "phone_number"
+
+  # How to handle missing analysis data
+  handle_missing: "use_defaults"
+
+# LLM-based cluster recommendations
+top_clusters:
+  # Enable/disable LLM-based cluster recommendations
+  enabled: false
+
+  # Number of top clusters to recommend
+  count: 3
+
+  # Minimum unique respondents required for cluster to be considered
+  min_respondents: 10
+
+  # LLM model to use for recommendations
+  llm_model: "flash"  # Options: "flash", "pro"
+
+  # Temperature for LLM generation (0.0 = deterministic)
+  temperature: 0.0
+
+  # Skip recommendation stage on errors (log but continue)
+  skip_on_error: true
+
+# Event publishing configuration
+# IMPORTANT: Only runs when entire pipeline completes successfully with no errors
+# Any publishing failure will fail the entire pipeline (exit code != 0)
+#
+# Modes:
+#   - s3: Save events to S3 for validation (current)
+#   - sqs: Publish to existing SQS queues (future)
+#
+# Existing SQS Queues (per environment):
+#   - Dev:  develop-Queue.fifo  (https://sqs.us-west-2.amazonaws.com/333022194791/develop-Queue.fifo)
+#   - QA:   qa-Queue.fifo       (https://sqs.us-west-2.amazonaws.com/333022194791/qa-Queue.fifo)
+#   - Prod: master-Queue.fifo   (https://sqs.us-west-2.amazonaws.com/333022194791/master-Queue.fifo)
+sqs_events:
+  # Enable/disable event publishing
+  enabled: true
+
+  # S3 configuration (always saves events for validation)
+  s3_bucket: "${S3_OUTPUT_BUCKET}"
+  s3_prefix: "events"
+
+  # SQS configuration (optional - set to false to disable SQS publishing)
+  publish_to_sqs: true  # Set to true to enable SQS publishing
+  queue_url: "${SQS_QUEUE_URL}"  # Set per environment in ECS task definition
+
+  # Publishing settings
+  publish_top_n: 3  # Number of top clusters to publish (up to 3)
+  min_unique_respondents: 1  # Minimum unique respondents required
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+
+  # Log to file as well as console
+  log_to_file: true
+  log_file: "./logs/pipeline.log"
+
+# Performance configuration
+performance:
+  # Maximum concurrent operations
+  max_concurrency: 50
+
+  # Memory management
+  stream_large_datasets: true
+  max_records_in_memory: 10000
