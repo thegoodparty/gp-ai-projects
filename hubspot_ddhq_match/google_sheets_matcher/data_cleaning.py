@@ -104,6 +104,7 @@ class DataCleaner:
 
         df['office_name'] = df['properties_candidate_office'].fillna('')
         df['official_office_name'] = df['properties_official_office_name'].fillna('')
+        df['office_level'] = df['properties_office_level'].fillna('')
         df['state'] = df['properties_state'].apply(self.standardize_state_code)
         df['city'] = df['properties_city'].fillna('')
         df['district'] = df['properties_candidate_district'].fillna('')
@@ -130,6 +131,7 @@ class DataCleaner:
                 'candidate_name': row['properties_candidate_name'],
                 'office_name': row['office_name'],
                 'official_office_name': row['official_office_name'],
+                'office_level': row['office_level'],
                 'state': row['state'],
                 'city': row['city'],
                 'district': row['district'],
