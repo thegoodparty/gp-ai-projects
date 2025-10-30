@@ -179,7 +179,7 @@ class ProductionMatcher:
                 candidate_races_considered=""
             )
 
-        prompt = f"""Analyze this HubSpot candidate and determine if it's a federal/state race or if it matches a local race.
+        prompt = f"""Match this HubSpot candidate to a local/municipal race from the Google Sheets list.
 
 HubSpot Candidate:
 - Office: {hubspot_record['office_name']}
@@ -188,30 +188,6 @@ HubSpot Candidate:
 - District: {hubspot_record.get('district', 'N/A')}
 - Election Date: {hubspot_record['election_date']}
 - Election Type: {hubspot_record['election_type']}
-
-STEP 1: CHECK IF FEDERAL OR STATE LEVEL RACE
-First, determine if this is a federal or state level office:
-
-FEDERAL OFFICES (return "FEDERAL_RACE"):
-- President/President of the United States
-- U.S. Senate/US Senate/United States Senate
-- U.S. House of Representatives/US House/Congressional District
-
-STATE OFFICES (return "STATE_RACE"):
-- Governor/Lieutenant Governor (unless it's a school board like "Governor Mifflin School Board")
-- State Senate/State House/State Assembly/State Legislature
-- State Representative/State Senator
-- Attorney General/Secretary of State/State Treasurer/State Auditor/State Comptroller
-- State Supreme Court/State Appeals Court
-
-If this is a FEDERAL or STATE office, return:
-{{
-  "match_index": null,
-  "confidence": 95,
-  "reasoning": "Federal race: [office name]" OR "State race: [office name]"
-}}
-
-STEP 2: IF LOCAL/MUNICIPAL RACE, MATCH AGAINST GOOGLE SHEETS
 
 Google Sheets Races (top {len(candidate_races)} semantic matches):
 """
@@ -224,7 +200,7 @@ Google Sheets Races (top {len(candidate_races)} semantic matches):
         races_considered = " | ".join(races_list)
 
         prompt += """
-If this is a LOCAL/MUNICIPAL race, does it match a race in the list above?
+Does the HubSpot candidate match any of the races above?
 
 CRITICAL MATCHING RULES:
 1. Municipality/jurisdiction names MUST be identical (city, town, borough, county, school district name)
@@ -264,6 +240,8 @@ OR if match found (exact or group-level):
   "confidence": <70-100 for exact, 60-75 for group-level>,
   "reasoning": "<brief explanation, specify if group-level match>"
 }
+
+IMPORTANT: In the reasoning field, use single quotes (') instead of double quotes (") when referring to office names or races to avoid JSON parsing errors.
 """
 
         try:
@@ -279,33 +257,6 @@ OR if match found (exact or group-level):
             match_index = result.match_index
             confidence = result.confidence
             reasoning = result.reasoning
-
-            reasoning_lower = reasoning.lower()
-            is_federal = reasoning_lower.startswith('federal race:')
-            is_state = reasoning_lower.startswith('state race:')
-
-            if is_federal or is_state:
-                race_type = "FEDERAL_RACE" if is_federal else "STATE_RACE"
-                return MatchResult(
-                    hubspot_company_id=hubspot_record['company_id'],
-                    candidate_name=hubspot_record.get('candidate_name', ''),
-                    candidate_office=hubspot_record['office_name'],
-                    state=hubspot_record['state'],
-                    city=hubspot_record.get('city', ''),
-                    district=hubspot_record.get('district', ''),
-                    election_date=str(hubspot_record['election_date']),
-                    election_type=hubspot_record['election_type'],
-                    matched_race_id=None,
-                    matched_race_name=race_type,
-                    match_confidence=confidence,
-                    match_reasoning=reasoning,
-                    partition_key=self.build_partition_key(
-                        hubspot_record['election_date'],
-                        hubspot_record['state'],
-                        hubspot_record['election_type']
-                    ),
-                    candidate_races_considered=races_considered
-                )
 
             if match_index is not None and confidence >= 60:
                 matched_race = candidate_races.iloc[match_index - 1]
@@ -377,6 +328,53 @@ OR if match found (exact or group-level):
 
     async def match_single_record(self, hubspot_record: pd.Series) -> MatchResult:
         """Match a single HubSpot record"""
+
+        office_level = str(hubspot_record.get('office_level', '')).strip().upper()
+
+        if office_level == 'FEDERAL':
+            return MatchResult(
+                hubspot_company_id=hubspot_record['company_id'],
+                candidate_name=hubspot_record.get('candidate_name', ''),
+                candidate_office=hubspot_record['office_name'],
+                state=hubspot_record['state'],
+                city=hubspot_record.get('city', ''),
+                district=hubspot_record.get('district', ''),
+                election_date=str(hubspot_record['election_date']),
+                election_type=hubspot_record['election_type'],
+                matched_race_id=None,
+                matched_race_name='FEDERAL_RACE',
+                match_confidence=100.0,
+                match_reasoning='Federal race (filtered by office_level field)',
+                partition_key=self.build_partition_key(
+                    hubspot_record['election_date'],
+                    hubspot_record['state'],
+                    hubspot_record['election_type']
+                ),
+                candidate_races_considered=''
+            )
+
+        if office_level == 'STATE':
+            return MatchResult(
+                hubspot_company_id=hubspot_record['company_id'],
+                candidate_name=hubspot_record.get('candidate_name', ''),
+                candidate_office=hubspot_record['office_name'],
+                state=hubspot_record['state'],
+                city=hubspot_record.get('city', ''),
+                district=hubspot_record.get('district', ''),
+                election_date=str(hubspot_record['election_date']),
+                election_type=hubspot_record['election_type'],
+                matched_race_id=None,
+                matched_race_name='STATE_RACE',
+                match_confidence=100.0,
+                match_reasoning='State race (filtered by office_level field)',
+                partition_key=self.build_partition_key(
+                    hubspot_record['election_date'],
+                    hubspot_record['state'],
+                    hubspot_record['election_type']
+                ),
+                candidate_races_considered=''
+            )
+
         candidate_races = self.search_partition(hubspot_record, top_k=5)
         match_result = await self.validate_match_with_llm(hubspot_record, candidate_races)
         return match_result

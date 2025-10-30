@@ -40,6 +40,7 @@ class DataExtractor:
           properties_candidate_name,
           properties_candidate_office,
           properties_official_office_name,
+          properties_office_level,
           properties_state,
           properties_city,
           properties_candidate_district,
@@ -77,14 +78,27 @@ class DataExtractor:
             self.logger.debug(f"Header row: {raw_data[0]}")
 
             df = pd.DataFrame(raw_data[1:])
-            df.columns = [
-                'race_id_empty',
-                'date',
-                'state_election_type',
-                'race_name_orig',
-                'election_type_clean',
-                'race_name_with_state'
-            ]
+
+            if len(df.columns) == 4:
+                df.columns = [
+                    'race_id',
+                    'date',
+                    'state_election_type',
+                    'race_name_orig'
+                ]
+                df['election_type_clean'] = df['state_election_type']
+                df['race_name_with_state'] = df['race_name_orig']
+            elif len(df.columns) == 6:
+                df.columns = [
+                    'race_id_empty',
+                    'date',
+                    'state_election_type',
+                    'race_name_orig',
+                    'election_type_clean',
+                    'race_name_with_state'
+                ]
+            else:
+                raise ValueError(f"Unexpected number of columns: {len(df.columns)}. Expected 4 or 6.")
 
             self.logger.info(f"✅ Google Sheets races extracted: {len(df):,} records")
             self.logger.debug(f"Columns: {list(df.columns)}")

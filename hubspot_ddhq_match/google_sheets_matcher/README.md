@@ -11,7 +11,7 @@ This pipeline matches **candidate office names** from HubSpot companies to **rac
 - **Date + State + Election Type Partitioned FAISS** - Pre-built indices for efficient exact matching
 - **Semantic Similarity** - Gemini embeddings for race/office name matching
 - **LLM Validation** - Gemini Flash for intelligent match confirmation with confidence scoring
-- **High Concurrency** - ThreadPoolExecutor + asyncio for 1500 concurrent workers
+- **High Concurrency** - ThreadPoolExecutor + asyncio for 200 concurrent workers (optimized for API rate limits)
 - **Cost Efficient** - ~$0.0007 per 50 records
 
 ## Architecture
@@ -165,7 +165,7 @@ The pipeline script automatically runs all 5 steps in sequence:
 1. Progress bars for data extraction and cleaning
 2. Embedding generation progress with cost tracking
 3. FAISS partition building (75 partitions by date+state+election_type)
-4. High-speed matching with concurrent LLM validation (1500 workers)
+4. High-speed matching with concurrent LLM validation (200 workers)
 5. Final statistics: match rate, confidence distribution, cost breakdown
 
 **Output files created:**
@@ -221,10 +221,10 @@ Filters HubSpot to only dates present in Google Sheets:
 
 ```bash
 # Test mode (50 HubSpot records)
-ENVIRONMENT=test BATCH_SIZE=150 MAX_WORKERS=400 uv run generate_embeddings.py
+ENVIRONMENT=test BATCH_SIZE=150 MAX_WORKERS=200 uv run generate_embeddings.py
 
 # Production mode (all records)
-ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=400 uv run generate_embeddings.py
+ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=200 uv run generate_embeddings.py
 ```
 
 Generates semantic embeddings for race/office matching:
@@ -240,17 +240,17 @@ Generates semantic embeddings for race/office matching:
 
 ```bash
 # Test mode (50 test records)
-ENVIRONMENT=test BATCH_SIZE=1000 MAX_WORKERS=1500 uv run parallel_production_matcher.py
+ENVIRONMENT=test BATCH_SIZE=1000 MAX_WORKERS=200 uv run parallel_production_matcher.py
 
 # Production mode (all records)
-ENVIRONMENT=production BATCH_SIZE=1000 MAX_WORKERS=1500 uv run parallel_production_matcher.py
+ENVIRONMENT=production BATCH_SIZE=1000 MAX_WORKERS=200 uv run parallel_production_matcher.py
 ```
 
 Executes high-performance matching with:
 - **75 FAISS partitions** (date + state + election type)
 - **Semantic search** (top 5 candidates per HubSpot record)
 - **LLM validation** (70% confidence threshold)
-- **1500 concurrent workers** for maximum throughput
+- **200 concurrent workers** for optimal throughput (avoids rate limits)
 
 **Output**: `output/hubspot_googlesheets_race_matches_latest.parquet`, `hubspot_googlesheets_race_matches_{timestamp}.tsv`
 
@@ -303,7 +303,7 @@ These will NOT match (by design):
 ## Performance
 
 - **FAISS partition building**: ~0.1 seconds for 75 partitions
-- **Matching throughput**: ~17 records/second with 1500 workers
+- **Matching throughput**: ~10-15 records/second with 200 workers (rate-limit optimized)
 - **Total pipeline time**: ~5 minutes for 50 records (including LLM calls)
 
 ## Output Schema
@@ -387,12 +387,14 @@ If data extraction fails:
 2. Check `DATABRICKS_SERVER_HOSTNAME` format (e.g., `dbc-xxx.cloud.databricks.com`)
 3. Verify `DATABRICKS_HTTP_PATH` points to an active SQL warehouse
 
-### Out of Memory Errors
+### Out of Memory Errors or Rate Limit Errors
 
-If the pipeline crashes during production matching:
-1. Reduce `MAX_WORKERS` (default 1500): `MAX_WORKERS=800 uv run run_full_pipeline.py`
+If the pipeline crashes or hits rate limits during production matching:
+1. Reduce `MAX_WORKERS` (recommended 200): `MAX_WORKERS=100 uv run run_full_pipeline.py`
 2. Reduce `BATCH_SIZE` (default 1000): `BATCH_SIZE=500 uv run run_full_pipeline.py`
 3. Run individual steps separately instead of full pipeline
+
+**Note**: Gemini API has rate limits of 10,000 requests/min and 8M tokens/min. MAX_WORKERS=200 stays well under these limits.
 
 ### Low Match Rate
 
