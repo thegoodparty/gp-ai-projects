@@ -22,10 +22,12 @@ class VoterContactPlanGenerator:
             phase_1_7w_date = campaign_info.primary_date - timedelta(weeks=7)
             phase_1_start_date_3d_buffer = date.today() + timedelta(days=3)
             phase_1_start_date = phase_1_start_date_3d_buffer if phase_1_7w_date < phase_1_start_date_3d_buffer else phase_1_7w_date
+            phase_1_final_task_1d_buffer = campaign_info.primary_date - timedelta(days=1)
             # Calculate Phase 2 start date:
             phase_2_7w_date = campaign_info.election_date - timedelta(weeks=7)
             phase_2_start_date_1d_buffer = campaign_info.primary_date + timedelta(days=1)
             phase_2_start_date = phase_2_start_date_1d_buffer if phase_2_7w_date < phase_2_start_date_1d_buffer else phase_2_7w_date
+            phase_2_final_task_1d_buffer = campaign_info.election_date - timedelta(days=1)
 
             prompt = f"""
 # TIMELINE CONTEXT:
@@ -47,20 +49,14 @@ General Election Date: {campaign_info.election_date}
 - NO Voter Outreach Task date can be before {phase_1_start_date}.
 ## PHASE 1 GUIDELINES:
 - ALL 7 Phase 1 Voter Outreach Tasks MUST be between {phase_1_start_date} and before {campaign_info.primary_date}.
-- ONLY include {primary_contact_strategy.p2p_texts} P2P Texts and {primary_contact_strategy.robocalls} Robocalls in Phase 1 of the Campaign Plan.
-- The number of P2P Text Voter Outreach Tasks before {campaign_info.primary_date} should NOT exceed {primary_contact_strategy.p2p_texts}.
-- The number of Robocall Voter Outreach Tasks before {campaign_info.primary_date} should NOT exceed {primary_contact_strategy.robocalls}.
 - There must be AT LEAST 1 Voter Outreach Task every 7 days (MAXIMUM 7 days between Voter Outreach Tasks).
-- The FINAL Voter Outreach Task in Phase 1 MUST be between {campaign_info.primary_date - timedelta(days=1)} and before {campaign_info.primary_date}.
+- The FINAL Voter Outreach Task in Phase 1 MUST be between {phase_1_final_task_1d_buffer} and before {campaign_info.primary_date}.
 - List Voter Outreach Tasks chronologically from {phase_1_start_date} through {campaign_info.primary_date}.
 
 ## PHASE 2 GUIDELINES:
 - ALL 7 Phase 2 Voter Outreach Tasks MUST be between {phase_2_start_date} and before {campaign_info.election_date}.
-- ONLY include {general_contact_strategy.p2p_texts} P2P Texts and {general_contact_strategy.robocalls} Robocalls in Phase 2 of the Campaign Plan.
-- The number of P2P Text Voter Outreach Tasks before {campaign_info.election_date} should NOT exceed {general_contact_strategy.p2p_texts}.
-- The number of Robocall Voter Outreach Tasks before {campaign_info.election_date} should NOT exceed {general_contact_strategy.robocalls}.
 - There must be AT LEAST 1 Voter Outreach Task every 7 days (MAXIMUM 7 days between Voter Outreach Tasks).
-- The FINAL Voter Outreach Task in Phase 2 MUST be between {campaign_info.election_date - timedelta(days=1)} and before {campaign_info.election_date}.
+- The FINAL Voter Outreach Task in Phase 2 MUST be between {phase_2_final_task_1d_buffer} and before {campaign_info.election_date}.
 - List Voter Outreach Tasks chronologically from {phase_2_start_date} through {campaign_info.election_date}.
 
 # VOTER OUTREACH TASKS: (Format: outreachType: outreachDescription)
@@ -99,6 +95,7 @@ General Election Date: {campaign_info.election_date}
             start_7w_date = campaign_info.election_date - timedelta(weeks=7)
             start_date_3d_buffer = date.today() + timedelta(days=3)
             start_date = start_date_3d_buffer if start_7w_date < start_date_3d_buffer else start_7w_date
+            final_task_1d_buffer = campaign_info.election_date - timedelta(days=1)
             
             prompt = f"""
 # TIMELINE CONTEXT:
@@ -115,13 +112,10 @@ General Election Date: {campaign_info.election_date}
 - Generate a Campaign Plan containing Voter Outreach Tasks.
 
 # GOAL COMPLETION GUIDELINES:
-- ONLY include {general_contact_strategy.p2p_texts} P2P Texts and {general_contact_strategy.robocalls} Robocalls in the Campaign Plan.
 - NO Voter Outreach Task date can be before {start_date}.
 - ALL 7 Voter Outreach Tasks MUST be between {start_date} and before {campaign_info.election_date}.
-- The number of P2P Text Voter Outreach Tasks before {campaign_info.election_date} should NOT exceed {general_contact_strategy.p2p_texts}.
-- The number of Robocall Voter Outreach Tasks before {campaign_info.election_date} should NOT exceed {general_contact_strategy.robocalls}.
 - There must be AT LEAST 1 Voter Outreach Task every 7 days (MAXIMUM 7 days between Voter Outreach Tasks).
-- The FINAL Voter Outreach Task MUST be between {campaign_info.election_date - timedelta(days=1)} and before {campaign_info.election_date}.
+- The FINAL Voter Outreach Task MUST be between {final_task_1d_buffer} and before {campaign_info.election_date}.
 - List Voter Outreach Tasks chronologically from {campaign_info.election_date - start_date} through {campaign_info.election_date}.
 
 # VOTER OUTREACH TASKS: (Format: outreachType: outreachDescription)
@@ -180,8 +174,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -212,8 +204,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -244,8 +234,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -276,8 +264,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -308,8 +294,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -340,8 +324,6 @@ if __name__ == "__main__":
     campaign_info_with_primary = CampaignInfo(
         candidate_name="John Doe",
         office_and_jurisdiction="Mayor, Springfield, MA",
-        # election_date=date(2025, 11, 5),
-        # primary_date=date(2025, 8, 1),
         election_date=election_date_weeks,
         primary_date=primary_date_weeks,
         race_type="Nonpartisan",
@@ -430,7 +412,6 @@ if __name__ == "__main__":
     campaign_info_no_primary = CampaignInfo(
         candidate_name="Jane Smith",
         office_and_jurisdiction="City Council, District 3, Boston, MA",
-        # election_date=date(2025, 7, 22),
         election_date=election_date_8_weeks,
         primary_date=None,
         race_type="Nonpartisan",
@@ -531,3 +512,5 @@ if __name__ == "__main__":
     print(f"Signup Date: {date.today()}")
     print(f"Election Date: {election_date_1_weeks}")
     print(result_1_weeks)
+
+    print("\n" + "="*60 + "\n")
