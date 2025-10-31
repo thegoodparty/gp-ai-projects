@@ -316,36 +316,11 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             logger.error(f"Failed to clean campaign data: {str(e)}")
             raise
         
-        progress_tracker.update(30, "processing", "Generating campaign overview...", 
+        progress_tracker.update(30, "processing", "Generating campaign overview...",
                               "Successfully cleaned campaign data")
-        
+
         # Step 2: Generate sections with progress updates
         sections = {}
-        
-        # Generate contact strategies first (needed for Section 6)
-        progress_tracker.update(30, "processing", "Generating contact strategies...", 
-                              "Calculating optimal contact strategies")
-        
-        try:
-            if cleaned_campaign_info.has_primary:
-                primary_contact_strategy = orchestrator.campaign_utils.optimize_contact_strategy(
-                    date.today(), 
-                    cleaned_campaign_info.primary_date
-                )
-                general_contact_strategy = orchestrator.campaign_utils.optimize_contact_strategy(
-                    cleaned_campaign_info.primary_date, 
-                    cleaned_campaign_info.election_date
-                )
-            else:
-                general_contact_strategy = orchestrator.campaign_utils.optimize_contact_strategy(
-                    date.today(), 
-                    cleaned_campaign_info.election_date
-                )
-                primary_contact_strategy = None
-            logger.info("Successfully generated contact strategies")
-        except Exception as e:
-            logger.error(f"Failed to generate contact strategies: {str(e)}")
-            raise
 
         # Section 1: Overview
         progress_tracker.update(35, "processing", "Creating campaign strategy overview...", 
@@ -405,15 +380,15 @@ async def generate_campaign_plan_background(campaign_info: CampaignInfo, progres
             sections[5] = "5. KNOW YOUR COMMUNITY\n\nSection could not be generated due to an error."
         
         # Section 6: Voter Contact Plan
-        progress_tracker.update(75, "processing", "Creating voter contact strategy...", 
+        progress_tracker.update(75, "processing", "Creating voter contact strategy...",
                               "Generating section 6: Voter Contact Plan")
-        
+
         try:
             from ai_generated_campaign_plan.sections.six_voter_contact_plan import VoterContactPlanGenerator
             contact_generator = VoterContactPlanGenerator()
             if hasattr(contact_generator, 'llm_client'):
                 contact_generator.llm_client = orchestrator.llm_client
-            sections[6] = await contact_generator.generate_section(cleaned_campaign_info, primary_contact_strategy, general_contact_strategy)
+            sections[6] = await contact_generator.generate_section(cleaned_campaign_info)
             logger.info("Successfully generated section 6: Voter Contact Plan")
         except Exception as e:
             logger.error(f"Failed to generate section 6: {str(e)}")

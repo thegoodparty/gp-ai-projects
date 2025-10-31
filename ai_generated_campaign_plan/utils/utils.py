@@ -97,42 +97,6 @@ extract the following fields as a JSON object:
         except Exception as e:
             self.logger.error(f"Failed to clean campaign info: {str(e)}")
             raise RuntimeError(f"Failed to clean campaign info: {str(e)}")
-
-    def optimize_contact_strategy(self, start_date: date, end_date: date) -> ContactOptimization:
-        """
-        Determine optimal number of contacts based on campaign parameters.
-        
-        Args:
-            start_date: Campaign start date
-            end_date: Campaign end date
-            
-        Returns:
-            ContactOptimization: Optimized contact strategy with reasoning
-        """
-        days_available = (end_date - start_date).days
-        
-        self.logger.info(f"Optimizing contact strategy")
-        self.logger.debug(f"Days available: {days_available}")
-        
-        if days_available <= 21:
-            optimization = ContactOptimization(
-                p2p_texts=2,
-                robocalls=2,
-            )
-        elif days_available <= 45:
-            optimization = ContactOptimization(
-                p2p_texts=3,
-                robocalls=2,
-            )
-        else:
-            optimization = ContactOptimization(
-                p2p_texts=4,
-                robocalls=3,
-            )
-        
-        self.logger.info(f"Contact optimization complete: {optimization.p2p_texts} texts, {optimization.robocalls} robocalls")
-        
-        return optimization
     
 
 
@@ -156,6 +120,3 @@ if __name__ == "__main__":
     ))
     print(cleaned_campaign_info)
     print("--------------------------------")
-    print(processor.optimize_contact_strategy(date.today(), cleaned_campaign_info.primary_date))
-    print("--------------------------------")
-    print(processor.optimize_contact_strategy(cleaned_campaign_info.primary_date, cleaned_campaign_info.election_date))

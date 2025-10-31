@@ -215,19 +215,6 @@ Actual costs may vary based on provider pricing changes.
             # Step 1: Clean and enhance campaign data
             cleaned_campaign_info = self.campaign_utils.clean_campaign_info(campaign_info)
             
-            if cleaned_campaign_info.has_primary:
-                primary_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    date.today(), cleaned_campaign_info.primary_date
-                )
-                general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    cleaned_campaign_info.primary_date, cleaned_campaign_info.election_date
-                )
-            else:
-                primary_contact_strategy = None
-                general_contact_strategy = self.campaign_utils.optimize_contact_strategy(
-                    date.today(), cleaned_campaign_info.election_date
-                )
-            
             # Step 2: Generate individual sections  
             sections = {}
             
@@ -285,7 +272,7 @@ Actual costs may vary based on provider pricing changes.
             async def generate_section_6():
                 try:
                     self.logger.debug("Generating Section 6: Voter Contact Plan")
-                    result = await self.voter_contact_plan_generator.generate_section(cleaned_campaign_info, primary_contact_strategy, general_contact_strategy)
+                    result = await self.voter_contact_plan_generator.generate_section(cleaned_campaign_info)
                     self._track_llm_usage("Section 6")
                     self.logger.info("✓ Section 6: Voter Contact Plan complete")
                     return result
