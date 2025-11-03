@@ -39,11 +39,13 @@ class VoterContactPlanGenerator:
         end_date = primary_date
 
         window_days = (end_date - start_date).days
-        if window_days < 1:
-            self.logger.error(f"Phase 1 window is {window_days} days. Minimum 1 day required.")
-            start_date = max(today, end_date - timedelta(days=1))
-            window_days = (end_date - start_date).days
-            self.logger.warning(f"Adjusted Phase 1 start to {start_date} ({window_days}-day minimum window)")
+        if window_days < 0:
+            self.logger.error(f"Phase 1 window is {window_days} days (negative). Adjusting to same-day minimum.")
+            start_date = end_date
+            window_days = 0
+            self.logger.warning(f"Adjusted Phase 1 start to {start_date} (0-day emergency window)")
+        elif window_days == 0:
+            self.logger.warning(f"Phase 1 has 0-day window (same-day tasks). All tasks will be scheduled for {end_date}.")
 
         self.logger.info(f"Phase 1 dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -74,11 +76,13 @@ class VoterContactPlanGenerator:
         end_date = election_date
 
         window_days = (end_date - start_date).days
-        if window_days < 1:
-            self.logger.error(f"Phase 2 window is {window_days} days. Minimum 1 day required.")
-            start_date = max(primary_date + timedelta(days=1), end_date - timedelta(days=1))
+        if window_days < 0:
+            self.logger.error(f"Phase 2 window is {window_days} days (negative). Adjusting to same-day minimum.")
+            start_date = primary_date + timedelta(days=1)
             window_days = (end_date - start_date).days
-            self.logger.warning(f"Adjusted Phase 2 start to {start_date} ({window_days}-day minimum window)")
+            self.logger.warning(f"Adjusted Phase 2 start to {start_date} ({window_days}-day window)")
+        elif window_days == 0:
+            self.logger.warning(f"Phase 2 has 0-day window (same-day tasks). All tasks will be scheduled for {end_date}.")
 
         self.logger.info(f"Phase 2 dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -110,11 +114,13 @@ class VoterContactPlanGenerator:
         end_date = election_date
 
         window_days = (end_date - start_date).days
-        if window_days < 1:
-            self.logger.error(f"General election window is {window_days} days. Minimum 1 day required.")
-            start_date = max(today, end_date - timedelta(days=1))
-            window_days = (end_date - start_date).days
-            self.logger.warning(f"Adjusted general start to {start_date} ({window_days}-day minimum window)")
+        if window_days < 0:
+            self.logger.error(f"General election window is {window_days} days (negative). Adjusting to same-day minimum.")
+            start_date = end_date
+            window_days = 0
+            self.logger.warning(f"Adjusted general start to {start_date} (0-day emergency window)")
+        elif window_days == 0:
+            self.logger.warning(f"General election has 0-day window (same-day tasks). All tasks will be scheduled for {end_date}.")
 
         self.logger.info(f"General only dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -694,6 +700,46 @@ if __name__ == "__main__":
                 additional_race_context="Test zero-day window fix"
             ),
             "expected_behavior": "Should trigger >= safety check and create minimum 1-day window (today to today+3 becomes today to election)."
+        },
+        {
+            "name": "TEST 19: EDGE CASE - Election Is TODAY",
+            "description": "Election date is today (0-day window, all tasks same day)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 5",
+                office_and_jurisdiction="Town Council, Test City, MA",
+                election_date=today,
+                primary_date=None,
+                race_type=RaceType.NONPARTISAN,
+                seats_available=1,
+                number_of_opponents=1,
+                win_number=500,
+                total_likely_voters=2000,
+                available_cell_phones=400,
+                available_landlines=50,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test election today"
+            ),
+            "expected_behavior": "Should generate 0-day window plan with all 7 tasks scheduled for today (emergency GOTV scenario)."
+        },
+        {
+            "name": "TEST 20: EDGE CASE - Primary Is TODAY",
+            "description": "Primary date is today (0-day Phase 1 window)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 6",
+                office_and_jurisdiction="School Board, Test City, MA",
+                election_date=today + timedelta(days=45),
+                primary_date=today,
+                race_type=RaceType.PARTISAN,
+                seats_available=1,
+                number_of_opponents=2,
+                win_number=1500,
+                total_likely_voters=6000,
+                available_cell_phones=1200,
+                available_landlines=150,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test primary today"
+            ),
+            "expected_behavior": "Should generate 0-day Phase 1 window (all tasks today) and normal Phase 2 (45 days for general)."
         },
     ]
 
