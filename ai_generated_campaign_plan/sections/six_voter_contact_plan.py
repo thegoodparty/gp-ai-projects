@@ -77,10 +77,10 @@ class VoterContactPlanGenerator:
 
         window_days = (end_date - start_date).days
         if window_days < 0:
-            self.logger.error(f"Phase 2 window is {window_days} days (negative). Adjusting to same-day minimum.")
-            start_date = primary_date + timedelta(days=1)
-            window_days = (end_date - start_date).days
-            self.logger.warning(f"Adjusted Phase 2 start to {start_date} ({window_days}-day window)")
+            self.logger.error(f"Phase 2 window is {window_days} days (negative). Setting to same-day emergency scenario.")
+            start_date = end_date
+            window_days = 0
+            self.logger.warning(f"Adjusted Phase 2 to same-day emergency: {start_date} (0-day window)")
         elif window_days == 0:
             self.logger.warning(f"Phase 2 has 0-day window (same-day tasks). All tasks will be scheduled for {end_date}.")
 
@@ -740,6 +740,26 @@ if __name__ == "__main__":
                 additional_race_context="Test primary today"
             ),
             "expected_behavior": "Should generate 0-day Phase 1 window (all tasks today) and normal Phase 2 (45 days for general)."
+        },
+        {
+            "name": "TEST 21: EDGE CASE - Phase 2 Negative Window Bug Fix",
+            "description": "Primary and election only 1 day apart - tests Phase 2 fallback logic",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 7",
+                office_and_jurisdiction="Special Election, Test City, MA",
+                election_date=today + timedelta(days=60),
+                primary_date=today + timedelta(days=59),
+                race_type=RaceType.PARTISAN,
+                seats_available=1,
+                number_of_opponents=1,
+                win_number=800,
+                total_likely_voters=3000,
+                available_cell_phones=600,
+                available_landlines=100,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test Phase 2 with 1-day gap between primary and election"
+            ),
+            "expected_behavior": "Phase 1: Normal 49-day window before primary. Phase 2: 0-day window (primary+1 == election) - should handle gracefully with same-day emergency scenario."
         },
     ]
 
