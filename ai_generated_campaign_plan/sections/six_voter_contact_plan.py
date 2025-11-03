@@ -32,11 +32,18 @@ class VoterContactPlanGenerator:
         else:
             start_date = today + timedelta(days=3)
 
-        if start_date > primary_date:
+        if start_date >= primary_date:
             start_date = today
-            self.logger.warning(f"Start date would exceed primary date. Using today as start date.")
+            self.logger.warning(f"Start date would be on or after primary date. Using today as start date.")
 
         end_date = primary_date
+
+        window_days = (end_date - start_date).days
+        if window_days < 1:
+            self.logger.error(f"Phase 1 window is {window_days} days. Minimum 1 day required.")
+            start_date = max(today, end_date - timedelta(days=1))
+            window_days = (end_date - start_date).days
+            self.logger.warning(f"Adjusted Phase 1 start to {start_date} ({window_days}-day minimum window)")
 
         self.logger.info(f"Phase 1 dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -60,7 +67,18 @@ class VoterContactPlanGenerator:
             election_date - timedelta(days=49)
         )
 
+        if start_date >= election_date:
+            start_date = primary_date + timedelta(days=1)
+            self.logger.warning(f"Phase 2 start would be on or after election. Using day after primary.")
+
         end_date = election_date
+
+        window_days = (end_date - start_date).days
+        if window_days < 1:
+            self.logger.error(f"Phase 2 window is {window_days} days. Minimum 1 day required.")
+            start_date = max(primary_date + timedelta(days=1), end_date - timedelta(days=1))
+            window_days = (end_date - start_date).days
+            self.logger.warning(f"Adjusted Phase 2 start to {start_date} ({window_days}-day minimum window)")
 
         self.logger.info(f"Phase 2 dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -85,11 +103,18 @@ class VoterContactPlanGenerator:
         else:
             start_date = today + timedelta(days=3)
 
-        if start_date > election_date:
+        if start_date >= election_date:
             start_date = today
-            self.logger.warning(f"Start date would exceed election date. Using today as start date.")
+            self.logger.warning(f"Start date would be on or after election date. Using today as start date.")
 
         end_date = election_date
+
+        window_days = (end_date - start_date).days
+        if window_days < 1:
+            self.logger.error(f"General election window is {window_days} days. Minimum 1 day required.")
+            start_date = max(today, end_date - timedelta(days=1))
+            window_days = (end_date - start_date).days
+            self.logger.warning(f"Adjusted general start to {start_date} ({window_days}-day minimum window)")
 
         self.logger.info(f"General only dates: {start_date} to {end_date} ({(end_date - start_date).days} days)")
         return (start_date, end_date)
@@ -100,6 +125,27 @@ class VoterContactPlanGenerator:
 
         has_primary = campaign_info.has_primary
         today = date.today()
+
+        if campaign_info.election_date < today:
+            error_msg = f"Election date {campaign_info.election_date} is in the past"
+            self.logger.error(error_msg)
+            return f"## 6. VOTER CONTACT PLAN\n\nError: {error_msg}. Cannot generate plan for past elections."
+
+        if has_primary:
+            if campaign_info.primary_date is None:
+                error_msg = "Primary date is None but has_primary is True"
+                self.logger.error(error_msg)
+                return f"## 6. VOTER CONTACT PLAN\n\nError: {error_msg}. Invalid campaign data."
+
+            if campaign_info.primary_date < today:
+                error_msg = f"Primary date {campaign_info.primary_date} is in the past"
+                self.logger.error(error_msg)
+                return f"## 6. VOTER CONTACT PLAN\n\nError: {error_msg}. Cannot generate plan for past primaries."
+
+            if campaign_info.primary_date >= campaign_info.election_date:
+                error_msg = "Primary date must be before election date"
+                self.logger.error(error_msg)
+                return f"## 6. VOTER CONTACT PLAN\n\nError: {error_msg}. Invalid campaign dates."
 
         if has_primary:
             phase_1_start, phase_1_end = self._calculate_phase_1_dates(campaign_info)
@@ -568,6 +614,86 @@ if __name__ == "__main__":
                 additional_race_context="Focus on affordable housing"
             ),
             "expected_behavior": "Start date calculation (today + 3) would exceed election date. System uses today as start (2-day window). All 7 tasks must fit (requires same-day scheduling)."
+        },
+        {
+            "name": "TEST 15: BUG FIX - Past Election Date",
+            "description": "Election date is in the past (should return error)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate",
+                office_and_jurisdiction="City Council, Test City, MA",
+                election_date=today - timedelta(days=30),
+                primary_date=None,
+                race_type=RaceType.NONPARTISAN,
+                seats_available=1,
+                number_of_opponents=1,
+                win_number=1000,
+                total_likely_voters=5000,
+                available_cell_phones=1000,
+                available_landlines=100,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test past election"
+            ),
+            "expected_behavior": "Should return error message: 'Election date is in the past. Cannot generate plan for past elections.'"
+        },
+        {
+            "name": "TEST 16: BUG FIX - Past Primary Date",
+            "description": "Primary date is in the past (should return error)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 2",
+                office_and_jurisdiction="School Board, Test City, MA",
+                election_date=today + timedelta(days=60),
+                primary_date=today - timedelta(days=10),
+                race_type=RaceType.PARTISAN,
+                seats_available=1,
+                number_of_opponents=2,
+                win_number=2000,
+                total_likely_voters=8000,
+                available_cell_phones=1500,
+                available_landlines=200,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test past primary"
+            ),
+            "expected_behavior": "Should return error message: 'Primary date is in the past. Cannot generate plan for past primaries.'"
+        },
+        {
+            "name": "TEST 17: BUG FIX - Primary After Election",
+            "description": "Primary date is after election date (should return error)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 3",
+                office_and_jurisdiction="Mayor, Test City, MA",
+                election_date=today + timedelta(days=30),
+                primary_date=today + timedelta(days=60),
+                race_type=RaceType.PARTISAN,
+                seats_available=1,
+                number_of_opponents=3,
+                win_number=5000,
+                total_likely_voters=15000,
+                available_cell_phones=3000,
+                available_landlines=500,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test invalid date order"
+            ),
+            "expected_behavior": "Should return error message: 'Primary date must be before election date. Invalid campaign dates.'"
+        },
+        {
+            "name": "TEST 18: BUG FIX - Zero-Day Window (Election = Today + 3)",
+            "description": "Election exactly 3 days from today (tests >= fix)",
+            "campaign_info": CampaignInfo(
+                candidate_name="Test Candidate 4",
+                office_and_jurisdiction="Selectboard, Test City, MA",
+                election_date=today + timedelta(days=3),
+                primary_date=None,
+                race_type=RaceType.NONPARTISAN,
+                seats_available=1,
+                number_of_opponents=1,
+                win_number=800,
+                total_likely_voters=3000,
+                available_cell_phones=600,
+                available_landlines=50,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Test zero-day window fix"
+            ),
+            "expected_behavior": "Should trigger >= safety check and create minimum 1-day window (today to today+3 becomes today to election)."
         },
     ]
 
