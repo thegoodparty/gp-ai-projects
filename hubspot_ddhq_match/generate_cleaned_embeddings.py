@@ -73,21 +73,17 @@ class EmbeddingGenerator:
         if pd.notna(row.get('first_name')) and pd.notna(row.get('last_name')):
             name = f"{row['first_name']} {row['last_name']}"
         
-        # State + Office (to match DDHQ race format)
-        state = ""
-        if pd.notna(row.get('state')):
-            state = row['state']
-        
-        office = ""
-        if pd.notna(row.get('candidate_office')):
-            office = row['candidate_office']
-        elif pd.notna(row.get('official_office_name')):
-            office = row['official_office_name']
-        
-        state_office = f"{state} {office}".strip()
-        
-        # Format: name: Name | race: State Office 
-        return f"name: {name} | race: {state_office}"
+        # Race: Use official_office_name (already has state), or fall back to state + candidate_office
+        race = ""
+        if pd.notna(row.get('official_office_name')):
+            race = row['official_office_name']
+        elif pd.notna(row.get('candidate_office')):
+            state = row.get('state', '')
+            candidate_office = row['candidate_office']
+            race = f"{state} {candidate_office}".strip()
+
+        # Format: name: Name | race: Race
+        return f"name: {name} | race: {race}"
     
     def create_name_race_embedding_text_ddhq(self, row: pd.Series) -> str:
         """Create name+race focused embedding text for DDHQ"""

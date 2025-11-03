@@ -271,7 +271,7 @@ class ParallelProductionMatcher:
             'full_name': hubspot_record.get('full_name', 'N/A'),
             'state': hubspot_record.get('state', 'N/A'),
             'city': hubspot_record.get('city', 'N/A'),
-            'office': hubspot_record.get('candidate_office', hubspot_record.get('official_office_name', 'N/A')),
+            'office': hubspot_record.get('official_office_name', hubspot_record.get('candidate_office', 'N/A')),
             'embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A')
         }
         
