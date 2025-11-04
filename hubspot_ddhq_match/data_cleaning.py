@@ -114,34 +114,79 @@ class DataCleaner:
     def clean_office_field(self, office_series: pd.Series, field_name: str) -> pd.Series:
         """Clean office/race name fields"""
         cleaned = office_series.astype(str).str.strip()
-        
+
         # Replace 'nan' and 'None' with actual NaN
         cleaned = cleaned.replace(['nan', 'None'], '')
         cleaned = cleaned.replace('', np.nan)
-        
+
         # Fix multiple spaces
         cleaned = cleaned.str.replace(r'\s+', ' ', regex=True)
-        
+
         # Remove unreasonably long office names (likely data corruption)
         mask_reasonable_length = cleaned.str.len() <= 150
         cleaned = cleaned.where(mask_reasonable_length)
-        
+
         # Standardize common office name patterns
         def standardize_office_name(office):
             if pd.isna(office):
                 return office
-            
+
             # Common standardizations
             office = re.sub(r'\bBoard\b', 'Board', office, flags=re.IGNORECASE)
             office = re.sub(r'\bCouncil\b', 'Council', office, flags=re.IGNORECASE)
             office = re.sub(r'\bMayor\b', 'Mayor', office, flags=re.IGNORECASE)
             office = re.sub(r'\bSchool\b', 'School', office, flags=re.IGNORECASE)
             office = re.sub(r'\bDistrict\b', 'District', office, flags=re.IGNORECASE)
-            
+
             return office
-        
+
         cleaned = cleaned.apply(standardize_office_name)
-        
+
+        return cleaned
+
+    def clean_office_level_field(self, office_level_series: pd.Series) -> pd.Series:
+        """Standardize office_level to FEDERAL, STATE, LOCAL, or None"""
+
+        def standardize_office_level(office_level):
+            if pd.isna(office_level) or office_level == '':
+                return None
+
+            office_level_upper = str(office_level).strip().upper()
+
+            if office_level_upper in ['FEDERAL', 'FEDERAL-DOWNLOAD', 'PRESIDENTIAL']:
+                return 'FEDERAL'
+
+            if 'FEDERAL' in office_level_upper:
+                return 'FEDERAL'
+
+            if office_level_upper in ['STATE', 'STATE LEGISLATIVE', 'STATEWIDE', 'LEGISLATIVE']:
+                return 'STATE'
+
+            if 'STATE' in office_level_upper and 'INTERSTATE' not in office_level_upper:
+                return 'STATE'
+
+            if office_level_upper in ['LOCAL', 'CITY', 'COUNTY', 'TOWNSHIP', 'TOWN',
+                                       'MUNICIPAL', 'REGIONAL', 'SCHOOL BOARD', 'MAYOR',
+                                       'TOWN COUNCIL', 'CLERK/TREASURER', 'BALLOT INITIATIVE',
+                                       'COUNTY/CITY', 'COUNTY COUNCIL']:
+                return 'LOCAL'
+
+            if any(keyword in office_level_upper for keyword in ['LOCAL', 'CITY', 'COUNTY',
+                                                                   'TOWNSHIP', 'MUNICIPAL',
+                                                                   'REGIONAL']):
+                return 'LOCAL'
+
+            return None
+
+        cleaned = office_level_series.apply(standardize_office_level)
+
+        standardized_count = (cleaned != office_level_series).sum()
+        self.logger.info(f"Standardized office_level: {standardized_count:,} values normalized")
+
+        value_counts = cleaned.value_counts(dropna=False)
+        for level, count in value_counts.items():
+            self.logger.debug(f"   {level}: {count:,}")
+
         return cleaned
     
     def expand_hubspot_elections(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -206,7 +251,11 @@ class DataCleaner:
         # Clean office fields
         df['candidate_office'] = self.clean_office_field(df['candidate_office'], 'candidate_office')
         df['official_office_name'] = self.clean_office_field(df['official_office_name'], 'official_office_name')
-        
+
+        # Standardize office_level field
+        if 'office_level' in df.columns:
+            df['office_level'] = self.clean_office_level_field(df['office_level'])
+
         # Remove records without basic name information
         has_name = df['first_name'].notna() & df['last_name'].notna()
         df = df[has_name]

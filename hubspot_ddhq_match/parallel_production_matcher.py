@@ -302,7 +302,9 @@ Match {i}:
   - Embedding: {candidate['embedding_text']}
 """
         
-        prompt = f"""You are a political candidate matching expert. Your task is to match candidates between HubSpot and DDHQ databases with EXTREME PRECISION to avoid false positives.
+        prompt = f"""You are a political candidate matching expert. Your task is to match LOCAL/MUNICIPAL candidates between HubSpot and DDHQ databases with EXTREME PRECISION to avoid false positives.
+
+NOTE: Federal races (Congress, Senate, President) and State-level races (Governor, State Legislature) have already been filtered out. You are ONLY matching local/municipal races (City Council, Mayor, County offices, School Board, Township, etc.).
 
 HubSpot Candidate:
 - Name: {hubspot_info['name']}
@@ -323,21 +325,22 @@ CRITICAL MATCHING RULES - ALL must be satisfied:
    - REJECT: Different genders (Stanley→Susan), unrelated names (Marco→Erick), random similarities
 
 2. GEOGRAPHIC REQUIREMENTS (MANDATORY):
-   - If HubSpot has a state, DDHQ race MUST be in the same state
-   - REJECT: Any cross-state matches unless truly exceptional circumstances
+   - State: DDHQ race MUST be in the same state as HubSpot candidate
+   - Jurisdiction: For local races, city/county/municipality must match
+   - REJECT: Any cross-state or cross-jurisdiction matches
 
 3. VALIDATION EXAMPLES:
-   
-   VALID MATCHES (High Confidence):
-   - "John Smith" → "John Smith" (exact match)
-   - "Bob Johnson" → "Robert Johnson" (nickname variation)
-   - "Mary O'Connor" → "Mary O'Connor" (exact match)
-   
-   INVALID MATCHES (Must Reject):
+
+   VALID LOCAL MATCHES (High Confidence):
+   - "John Smith" for Berkeley City Council → "John Smith, Berkeley City Council" (exact match)
+   - "Bob Johnson" for County Commissioner → "Robert Johnson, County Commissioner" (nickname variation)
+   - "Mary O'Connor" for School Board → "Mary O'Connor, School Board" (exact match)
+
+   INVALID LOCAL MATCHES (Must Reject):
    - "Stanley Pokras" → "Susan Kopras" (gender mismatch, different first name)
    - "Test User" → "Ronald Test" (test data, unrelated)
    - "Marco Huerta" → "Erick Huerta" (different first name entirely)
-   - "JR Giron (NE)" → "John Ewing Jr. (NE)" (different last name entirely)
+   - "Jane Doe, Arlington City Council" → "Jane Doe, Arlington County Board" (different jurisdiction type)
    - "Morrio Clark (NC)" → "Laura Clark (SC)" (different state, different first name)
 
 4. CONFIDENCE CALIBRATION:
@@ -504,10 +507,82 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
     
     async def _process_hubspot_record(self, hubspot_record: pd.Series, record_index: int) -> Dict[str, Any]:
         """Process a single HubSpot record through the matching pipeline"""
-        
+
         record_start_time = time.time()
-        
+
         try:
+            office_level = str(hubspot_record.get('office_level', '')).strip().upper()
+
+            if office_level == 'FEDERAL':
+                self.logger.debug(f"Record {record_index}: Pre-filtered as FEDERAL race")
+                return {
+                    'hubspot_row_index': record_index,
+                    'hubspot_gp_candidacy_id': hubspot_record.get('gp_candidacy_id', 'N/A'),
+                    'hubspot_candidate_id': hubspot_record.get('candidacy_id', 'N/A'),
+                    'hubspot_first_name': hubspot_record.get('first_name', 'N/A'),
+                    'hubspot_last_name': hubspot_record.get('last_name', 'N/A'),
+                    'hubspot_full_name': hubspot_record.get('full_name', 'N/A'),
+                    'hubspot_state': hubspot_record.get('state', 'N/A'),
+                    'hubspot_city': hubspot_record.get('city', 'N/A'),
+                    'hubspot_candidate_office': hubspot_record.get('candidate_office', 'N/A'),
+                    'hubspot_official_office_name': hubspot_record.get('official_office_name', 'N/A'),
+                    'hubspot_party_affiliation': hubspot_record.get('party_affiliation', 'N/A'),
+                    'hubspot_embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A'),
+                    'hubspot_election_date': hubspot_record.get('election_date', 'N/A'),
+                    'hubspot_election_type': hubspot_record.get('election_type', 'N/A'),
+                    'llm_best_match': None,
+                    'llm_confidence': 100.0,
+                    'llm_reasoning': 'Federal race (pre-filtered by office_level field)',
+                    'top_10_candidates': 'FEDERAL_RACE',
+                    'has_match': False,
+                    'ddhq_matched_index': None,
+                    'ddhq_candidate': 'FEDERAL_RACE',
+                    'ddhq_race_name': 'FEDERAL_RACE',
+                    'ddhq_candidate_party': None,
+                    'ddhq_is_winner': None,
+                    'ddhq_race_id': None,
+                    'ddhq_candidate_id': None,
+                    'ddhq_election_type': None,
+                    'ddhq_date': None,
+                    'ddhq_embedding_text': None,
+                    'match_similarity': None
+                }
+
+            if office_level == 'STATE':
+                self.logger.debug(f"Record {record_index}: Pre-filtered as STATE race")
+                return {
+                    'hubspot_row_index': record_index,
+                    'hubspot_gp_candidacy_id': hubspot_record.get('gp_candidacy_id', 'N/A'),
+                    'hubspot_candidate_id': hubspot_record.get('candidacy_id', 'N/A'),
+                    'hubspot_first_name': hubspot_record.get('first_name', 'N/A'),
+                    'hubspot_last_name': hubspot_record.get('last_name', 'N/A'),
+                    'hubspot_full_name': hubspot_record.get('full_name', 'N/A'),
+                    'hubspot_state': hubspot_record.get('state', 'N/A'),
+                    'hubspot_city': hubspot_record.get('city', 'N/A'),
+                    'hubspot_candidate_office': hubspot_record.get('candidate_office', 'N/A'),
+                    'hubspot_official_office_name': hubspot_record.get('official_office_name', 'N/A'),
+                    'hubspot_party_affiliation': hubspot_record.get('party_affiliation', 'N/A'),
+                    'hubspot_embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A'),
+                    'hubspot_election_date': hubspot_record.get('election_date', 'N/A'),
+                    'hubspot_election_type': hubspot_record.get('election_type', 'N/A'),
+                    'llm_best_match': None,
+                    'llm_confidence': 100.0,
+                    'llm_reasoning': 'State race (pre-filtered by office_level field)',
+                    'top_10_candidates': 'STATE_RACE',
+                    'has_match': False,
+                    'ddhq_matched_index': None,
+                    'ddhq_candidate': 'STATE_RACE',
+                    'ddhq_race_name': 'STATE_RACE',
+                    'ddhq_candidate_party': None,
+                    'ddhq_is_winner': None,
+                    'ddhq_race_id': None,
+                    'ddhq_candidate_id': None,
+                    'ddhq_election_type': None,
+                    'ddhq_date': None,
+                    'ddhq_embedding_text': None,
+                    'match_similarity': None
+                }
+
             # Step 1: Date-partitioned FAISS similarity search
             faiss_start_time = time.time()
             similar_candidates = self._search_similar_candidates(hubspot_record.to_dict(), k=10)
@@ -915,14 +990,31 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         # Calculate file sizes
         parquet_size_mb = os.path.getsize(parquet_file) / (1024 * 1024)
         tsv_size_mb = os.path.getsize(tsv_file) / (1024 * 1024)
-        
+
+        # Calculate match statistics
+        total_records = len(results_df)
+        local_matches = results_df['has_match'].sum()
+        federal_races = (results_df['ddhq_race_name'] == 'FEDERAL_RACE').sum()
+        state_races = (results_df['ddhq_race_name'] == 'STATE_RACE').sum()
+        no_match = total_records - local_matches - federal_races - state_races
+
         print(f"\n💾 Results saved to output folder:")
         print(f"   Parquet: {parquet_file} ({parquet_size_mb:.1f} MB)")
         print(f"   TSV: {tsv_file} ({tsv_size_mb:.1f} MB)")
-        print(f"   Records: {len(results_df):,}")
-        print(f"   Matches: {results_df['has_match'].sum():,}")
-        print(f"   Latest files also saved for easy access")
-        
+        print(f"\n📊 MATCH STATISTICS:")
+        print(f"   Total records: {total_records:,}")
+        print(f"   Local/municipal matches: {local_matches:,} ({local_matches/total_records*100:.1f}%)")
+        print(f"   Federal races (pre-filtered): {federal_races:,} ({federal_races/total_records*100:.1f}%)")
+        print(f"   State races (pre-filtered): {state_races:,} ({state_races/total_records*100:.1f}%)")
+        print(f"   No match: {no_match:,} ({no_match/total_records*100:.1f}%)")
+
+        if local_matches > 0:
+            matched_df = results_df[results_df['has_match'] == True]
+            avg_confidence = matched_df['llm_confidence'].mean()
+            print(f"   Average confidence (local matches): {avg_confidence:.1f}%")
+
+        print(f"\n   Latest files also saved for easy access")
+
         return parquet_file
     
     def cleanup(self):
