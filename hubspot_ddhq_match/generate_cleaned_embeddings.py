@@ -33,12 +33,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Reduce noise from HTTP libraries in debug mode
-if LOG_LEVEL == 'DEBUG':
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('asyncio').setLevel(logging.WARNING)
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
@@ -49,10 +43,10 @@ class EmbeddingGenerator:
         
         # Use environment variables if provided, otherwise use parameters or defaults
         if batch_size is None:
-            batch_size = int(os.getenv('BATCH_SIZE', '50'))  # Default 50 for embeddings (safer)
-        
+            batch_size = int(os.getenv('BATCH_SIZE', '100'))  # Default 100 for embeddings (conservative)
+
         if max_concurrent_batches is None:
-            max_concurrent_batches = int(os.getenv('MAX_WORKERS', '2'))  # Default 2 for embeddings (conservative)
+            max_concurrent_batches = int(os.getenv('MAX_WORKERS', '80'))  # Default 50 for embeddings (rate-limit safe)
         
         self.batch_size = batch_size
         self.max_concurrent_batches = max_concurrent_batches

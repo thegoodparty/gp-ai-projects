@@ -94,7 +94,15 @@ class Logger:
             self.default_level = LogLevel.DEBUG
         else:
             self.default_level = LogLevel.WARNING
-    
+
+        self._configure_third_party_loggers()
+
+    def _configure_third_party_loggers(self):
+        """Reduce noise from HTTP and async libraries"""
+        logging.getLogger('httpcore').setLevel(logging.WARNING)
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('asyncio').setLevel(logging.WARNING)
+
     def get_logger(self, name: str, level: Optional[LogLevel] = None) -> logging.Logger:
         """
         Get or create a logger with the specified name and configuration.

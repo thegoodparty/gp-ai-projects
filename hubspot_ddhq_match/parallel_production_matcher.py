@@ -42,9 +42,9 @@ class ParallelProductionMatcher:
         print("=" * 50)
         print(f"🔧 Configuration: {max_workers} workers, batch size {batch_size}")
         
-        # Load data and build FAISS index
+        # Load data and initialize lazy-loading
         self._load_data()
-        self._build_faiss_index()
+        self._init_lazy_loading()
         self._init_llm()
         
         # Initialize progress tracking
@@ -74,95 +74,111 @@ class ParallelProductionMatcher:
         self.hubspot_df = pd.read_parquet(hubspot_file)
         self.ddhq_df = pd.read_parquet(ddhq_file)
         
-        # Sort HubSpot data by election date for optimal cache performance
-        print("🔄 Sorting HubSpot data by election date for cache optimization...")
-        self.hubspot_df = self.hubspot_df.sort_values('election_date', na_position='last')
+        # Sort HubSpot data by date + state + election_type for optimal cache performance
+        print("🔄 Sorting HubSpot data by (date, state, election_type) for lazy-load cache optimization...")
+        self.hubspot_df = self.hubspot_df.sort_values(
+            ['election_date', 'state', 'election_type'],
+            na_position='last'
+        )
         
         print(f"   HubSpot (filtered by DDHQ dates): {len(self.hubspot_df):,} records")
         print(f"   DDHQ (full dataset): {len(self.ddhq_df):,} records")
     
-    def _build_faiss_index(self):
-        print("🔍 Pre-building ALL FAISS indices (Date + Election Type) for maximum speed...")
-        
-        # SPEED OPTIMIZATION: Pre-build all indices (no lazy loading)
-        self.faiss_indices = {}  # "{date}_{election_type}" -> FAISS index
-        self.partition_records = {}   # "{date}_{election_type}" -> DataFrame slice
-        
-        # Pre-compute date + election type partitions AND build all FAISS indices
-        print("📊 Building all date + election type partitions and FAISS indices...")
-        unique_combinations = self.ddhq_df[['date', 'election_type']].drop_duplicates()
-        
-        partition_sizes = []
-        for _, row in unique_combinations.iterrows():
-            date = row['date']
-            election_type = row['election_type']
-            partition_key = f"{date}_{election_type}"
-            
-            # Filter to this specific date + election type combination
+    def _init_lazy_loading(self):
+        print("🔍 Initializing lazy-loading with garbage collection (Date + State + Election Type)...")
+
+        # MEMORY OPTIMIZATION: Lazy-load partitions with GC (not pre-build all)
+        self.faiss_indices = {}  # "{date}_{state}_{election_type}" -> FAISS index (cache)
+        self.partition_records = {}   # "{date}_{state}_{election_type}" -> DataFrame slice (cache)
+        self.last_partition_key = None  # Track partition changes for GC
+        self.partition_build_count = 0  # Statistics
+        self.partition_gc_count = 0  # Statistics
+
+        print("   ✅ Lazy-loading initialized - partitions will be built on-demand")
+        print("   ♻️  Garbage collection enabled - old partitions will be freed automatically")
+
+    def _get_or_build_partition(self, date, state, election_type):
+        """Lazy-load partition with garbage collection when partition changes"""
+        partition_key = f"{date}_{state}_{election_type}"
+
+        # Check if we've moved to a new partition
+        if self.last_partition_key is not None and self.last_partition_key != partition_key:
+            # Garbage collect old partition
+            if self.last_partition_key in self.faiss_indices:
+                del self.faiss_indices[self.last_partition_key]
+            if self.last_partition_key in self.partition_records:
+                del self.partition_records[self.last_partition_key]
+
+            self.partition_gc_count += 1
+            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+
+        # Build partition if not already cached
+        if partition_key not in self.faiss_indices:
+            self.logger.debug(f"🔨 Building partition on-demand: {partition_key}")
+
+            # Filter DDHQ records for this partition (date + state + election_type)
             partition_records = self.ddhq_df[
-                (self.ddhq_df['date'] == date) & 
+                (self.ddhq_df['date'] == date) &
+                (self.ddhq_df['extracted_state'] == state) &
                 (self.ddhq_df['election_type'] == election_type)
             ].copy()
-            
-            if len(partition_records) > 0:
-                self.partition_records[partition_key] = partition_records
-                partition_sizes.append(len(partition_records))
-                
-                # Build FAISS index immediately
-                embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
-                embedding_dim = embeddings.shape[1]
-                index = faiss.IndexFlatIP(embedding_dim)
-                faiss.normalize_L2(embeddings)
-                index.add(embeddings)
-                self.faiss_indices[partition_key] = index
-        
-        print(f"   ALL {len(self.faiss_indices)} date+election_type FAISS indices pre-built")
-        if partition_sizes:
-            print(f"   Partition sizes: min={min(partition_sizes)}, max={max(partition_sizes):,}, avg={sum(partition_sizes)/len(partition_sizes):.0f}")
-        print("   🚀 Zero lazy-loading delays - maximum concurrency ready!")
-    
+
+            if len(partition_records) == 0:
+                self.logger.debug(f"⚠️  Empty partition: {partition_key}")
+                self.last_partition_key = partition_key
+                return None, None
+
+            # Build FAISS index
+            embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
+            embedding_dim = embeddings.shape[1]
+            index = faiss.IndexFlatIP(embedding_dim)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+
+            # Cache
+            self.faiss_indices[partition_key] = index
+            self.partition_records[partition_key] = partition_records
+            self.partition_build_count += 1
+
+            self.logger.debug(f"✅ Built partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records)")
+
+        # Update last partition tracker
+        self.last_partition_key = partition_key
+
+        return self.faiss_indices.get(partition_key), self.partition_records.get(partition_key)
+
     def _init_llm(self):
         print("🤖 Initializing Gemini LLM...")
-        # Configure for MAXIMUM THROUGHPUT - push to theoretical limits for 10k/min
-        target_concurrency = 1200  # Maximum concurrent connections for true 10k/min target
+        # Configure for HIGH THROUGHPUT with reliability (reduced from 1200 to avoid API corruption)
+        target_concurrency = 500  # Balanced for throughput + reliability (~5k/min target)
         self.llm_client = GeminiClient(
             default_model=GeminiModelType.FLASH,
             default_temperature=0.0,
             max_connections=target_concurrency,
-            max_keepalive_connections=target_concurrency // 4  # 300 keepalive
+            max_keepalive_connections=target_concurrency // 4  # 125 keepalive
             # Removed thinking_budget to avoid token limit issues that cause JSON truncation
         )
-        print(f"   Gemini Flash initialized with {target_concurrency} max connections (MAXIMUM THROUGHPUT - 10k/min target)")
-    
-    def _get_partition_index(self, date, election_type):
-        """Get FAISS index for specific date + election type - INSTANT ACCESS (pre-built)"""
-        partition_key = f"{date}_{election_type}"
-        return self.faiss_indices.get(partition_key, None)
-    
-    def _get_partition_records(self, date, election_type):
-        """Get DataFrame records for specific date + election type partition"""
-        partition_key = f"{date}_{election_type}"
-        return self.partition_records.get(partition_key, None)
-    
+        print(f"   Gemini Flash initialized with {target_concurrency} max connections (HIGH THROUGHPUT with reliability)")
+
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for k most similar DDHQ candidates using date + election type partitioned FAISS"""
-        
+        """Search for k most similar DDHQ candidates using date + state + election type partitioned FAISS"""
+
         search_start_time = time.time()
-        
-        # Get target date and election type from HubSpot record
+
+        # Get target date, state, and election type from HubSpot record
         target_date = hubspot_record.get('election_date')
+        target_state = hubspot_record.get('state')
         target_election_type = hubspot_record.get('election_type')
-        
-        if pd.isna(target_date) or pd.isna(target_election_type):
-            self.logger.warning(f"Missing date or election_type for candidate: {self._get_candidate_name(hubspot_record)}")
-            return []  # Cannot search without both date and election type
-        
-        # Get the specific partition index and records
-        faiss_index = self._get_partition_index(target_date, target_election_type)
-        partition_records = self._get_partition_records(target_date, target_election_type)
-        
+
+        if pd.isna(target_date) or pd.isna(target_state) or pd.isna(target_election_type):
+            self.logger.warning(f"Missing date, state, or election_type for candidate: {self._get_candidate_name(hubspot_record)}")
+            return []  # Cannot search without all three keys
+
+        # Lazy-load partition with garbage collection
+        faiss_index, partition_records = self._get_or_build_partition(target_date, target_state, target_election_type)
+
         if faiss_index is None or partition_records is None:
-            partition_key = f"{target_date}_{target_election_type}"
+            partition_key = f"{target_date}_{target_state}_{target_election_type}"
             self.logger.warning(f"No partition found for {partition_key}")
             return []
         
@@ -364,8 +380,11 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 # Use dedicated thread pool for maximum LLM concurrency
                 llm_call_start = time.time()
                 response = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, 
-                    lambda: self.llm_client.generate_content(prompt)
+                    self.thread_pool,
+                    lambda: self.llm_client.generate_content(
+                        prompt,
+                        max_tokens=200  # Keep response short to avoid truncation
+                    )
                 )
                 llm_call_duration = time.time() - llm_call_start
                 
@@ -833,6 +852,12 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         print(f"   Target achievement: {target_achievement:.1f}% of 10k/min goal")
         print(f"   Matches found: {self.matched_count:,} ({self.matched_count/self.processed_count*100:.1f}%)")
         print(f"   Total LLM cost: ${self.total_cost:.2f}")
+
+        print(f"\n♻️  LAZY-LOADING STATISTICS:")
+        print(f"   Partitions built: {self.partition_build_count}")
+        print(f"   Partitions GC'd: {self.partition_gc_count}")
+        print(f"   Peak partitions in memory: {self.partition_build_count - self.partition_gc_count}")
+        print(f"   Memory efficiency: {self.partition_gc_count / max(1, self.partition_build_count) * 100:.1f}% of partitions freed")
         
         return pd.DataFrame(processed_rows)
     
@@ -906,10 +931,10 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
             self.thread_pool.shutdown(wait=True)
 
 async def main():
-    # Configuration - OPTIMIZED FOR 10K/MINUTE THROUGHPUT
+    # Configuration - OPTIMIZED FOR HIGH THROUGHPUT WITH RELIABILITY
     BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))  # Process 1000 records concurrently
     MAX_RECORDS = int(os.getenv('MAX_RECORDS')) if os.getenv('MAX_RECORDS') else None
-    MAX_WORKERS = int(os.getenv('MAX_WORKERS', 1500))  # Maximum workers for true 10k/min target
+    MAX_WORKERS = int(os.getenv('MAX_WORKERS', 500))  # Balanced for reliability (~5k/min)
     
     matcher = ParallelProductionMatcher(
         batch_size=BATCH_SIZE, 
