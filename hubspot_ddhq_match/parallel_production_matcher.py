@@ -90,30 +90,48 @@ class ParallelProductionMatcher:
         # MEMORY OPTIMIZATION: Lazy-load partitions with GC (not pre-build all)
         self.faiss_indices = {}  # "{date}_{state}_{election_type}" -> FAISS index (cache)
         self.partition_records = {}   # "{date}_{state}_{election_type}" -> DataFrame slice (cache)
+        self.empty_partitions = set()  # Track empty partitions to avoid rebuilding
         self.last_partition_key = None  # Track partition changes for GC
         self.partition_build_count = 0  # Statistics
         self.partition_gc_count = 0  # Statistics
+
+        # Thread safety for concurrent partition building
+        import threading
+        self.partition_lock = threading.Lock()
 
         print("   ✅ Lazy-loading initialized - partitions will be built on-demand")
         print("   ♻️  Garbage collection enabled - old partitions will be freed automatically")
 
     def _get_or_build_partition(self, date, state, election_type):
-        """Lazy-load partition with garbage collection when partition changes"""
+        """Lazy-load partition with garbage collection when partition changes (thread-safe)"""
         partition_key = f"{date}_{state}_{election_type}"
 
-        # Check if we've moved to a new partition
-        if self.last_partition_key is not None and self.last_partition_key != partition_key:
-            # Garbage collect old partition
-            if self.last_partition_key in self.faiss_indices:
-                del self.faiss_indices[self.last_partition_key]
-            if self.last_partition_key in self.partition_records:
-                del self.partition_records[self.last_partition_key]
+        # Fast path: Check if already built or known to be empty (no lock needed)
+        if partition_key in self.empty_partitions:
+            return None, None
+        if partition_key in self.faiss_indices:
+            return self.faiss_indices[partition_key], self.partition_records[partition_key]
 
-            self.partition_gc_count += 1
-            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+        # Slow path: Need to build partition (acquire lock to prevent race conditions)
+        with self.partition_lock:
+            # Double-check after acquiring lock (another thread might have built it)
+            if partition_key in self.empty_partitions:
+                return None, None
+            if partition_key in self.faiss_indices:
+                return self.faiss_indices[partition_key], self.partition_records[partition_key]
 
-        # Build partition if not already cached
-        if partition_key not in self.faiss_indices:
+            # Check if we've moved to a new partition (garbage collection)
+            if self.last_partition_key is not None and self.last_partition_key != partition_key:
+                # Garbage collect old partition
+                if self.last_partition_key in self.faiss_indices:
+                    del self.faiss_indices[self.last_partition_key]
+                if self.last_partition_key in self.partition_records:
+                    del self.partition_records[self.last_partition_key]
+
+                self.partition_gc_count += 1
+                self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+
+            # Build the partition
             self.logger.debug(f"🔨 Building partition on-demand: {partition_key}")
 
             # Filter DDHQ records for this partition (date + state + election_type)
@@ -125,10 +143,100 @@ class ParallelProductionMatcher:
 
             if len(partition_records) == 0:
                 self.logger.debug(f"⚠️  Empty partition: {partition_key}")
+                self.empty_partitions.add(partition_key)  # Cache empty result
                 self.last_partition_key = partition_key
                 return None, None
 
             # Build FAISS index
+            embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
+            embedding_dim = embeddings.shape[1]
+            index = faiss.IndexFlatIP(embedding_dim)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+
+            # Cache the results
+            self.faiss_indices[partition_key] = index
+            self.partition_records[partition_key] = partition_records
+            self.partition_build_count += 1
+            self.last_partition_key = partition_key
+
+            self.logger.debug(f"✅ Built partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records)")
+
+            return index, partition_records
+
+    def _get_or_build_date_range_partition(self, base_date, state, runoff_type):
+        """
+        Build a date-range partition for runoff elections that includes ALL races with dates >= base_date.
+
+        Args:
+            base_date: The starting date (general_election_date or primary_election_date)
+            state: State abbreviation
+            runoff_type: 'runoff' (the HubSpot election type)
+
+        Returns:
+            tuple: (faiss_index, partition_records) or (None, None) if empty
+        """
+        partition_key = f"AFTER_{base_date}_{state}_{runoff_type}"
+
+        # Check if we've moved to a new partition (garbage collection)
+        if self.last_partition_key is not None and self.last_partition_key != partition_key:
+            if self.last_partition_key in self.faiss_indices:
+                del self.faiss_indices[self.last_partition_key]
+            if self.last_partition_key in self.partition_records:
+                del self.partition_records[self.last_partition_key]
+            self.partition_gc_count += 1
+            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+
+        # Build date-range partition if not already cached
+        if partition_key not in self.faiss_indices:
+            self.logger.debug(f"🔨 Building DATE-RANGE partition on-demand: {partition_key}")
+
+            # Convert base_date to datetime for comparison
+            base_date_dt = pd.to_datetime(base_date)
+
+            # Determine which election types to include based on the base election
+            # We need to infer if this is a primary runoff or general runoff
+            # Check which election types exist on the base_date in this state
+            base_date_elections = self.ddhq_df[
+                (self.ddhq_df['date'] == base_date) &
+                (self.ddhq_df['extracted_state'] == state)
+            ]
+
+            # Determine if this is primary-based or general-based runoff
+            has_general_on_base = 'general' in base_date_elections['election_type'].values
+            has_primary_on_base = 'primary' in base_date_elections['election_type'].values
+
+            # Include appropriate election types
+            if has_general_on_base:
+                # General runoff: include general + runoff types
+                valid_types = ['general', 'runoff']
+                self.logger.debug(f"   Detected GENERAL runoff - including types: {valid_types}")
+            elif has_primary_on_base:
+                # Primary runoff: include primary + runoff types
+                valid_types = ['primary', 'runoff']
+                self.logger.debug(f"   Detected PRIMARY runoff - including types: {valid_types}")
+            else:
+                # Unknown base - include all runoff-related types
+                valid_types = ['primary', 'general', 'runoff']
+                self.logger.debug(f"   Unknown base election type - including all types: {valid_types}")
+
+            # Filter DDHQ records: date >= base_date AND state = target_state AND election_type matches
+            partition_records = self.ddhq_df[
+                (pd.to_datetime(self.ddhq_df['date']) >= base_date_dt) &
+                (self.ddhq_df['extracted_state'] == state) &
+                (self.ddhq_df['election_type'].isin(valid_types))
+            ].copy()
+
+            if len(partition_records) == 0:
+                self.logger.debug(f"⚠️  Empty DATE-RANGE partition: {partition_key}")
+                self.last_partition_key = partition_key
+                return None, None
+
+            # Get unique dates included
+            unique_dates = partition_records['date'].unique()
+            self.logger.debug(f"   Date-range partition includes {len(unique_dates)} unique dates: {sorted(unique_dates)}")
+
+            # Build FAISS index from aggregated records
             embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
             embedding_dim = embeddings.shape[1]
             index = faiss.IndexFlatIP(embedding_dim)
@@ -140,7 +248,68 @@ class ParallelProductionMatcher:
             self.partition_records[partition_key] = partition_records
             self.partition_build_count += 1
 
-            self.logger.debug(f"✅ Built partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records)")
+            self.logger.debug(f"✅ Built DATE-RANGE partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_dates)} dates)")
+
+        # Update last partition tracker
+        self.last_partition_key = partition_key
+
+        return self.faiss_indices.get(partition_key), self.partition_records.get(partition_key)
+
+    def _get_or_build_stateless_partition(self, date, election_type):
+        """
+        Build a state-less fallback partition for records missing state data.
+        Aggregates ALL states for the given date+election_type.
+
+        Args:
+            date: Election date
+            election_type: Election type (primary, general, runoff)
+
+        Returns:
+            tuple: (faiss_index, partition_records) or (None, None) if empty
+        """
+        partition_key = f"{date}_ALL_STATES_{election_type}"
+
+        # Check if we've moved to a new partition (garbage collection)
+        if self.last_partition_key is not None and self.last_partition_key != partition_key:
+            if self.last_partition_key in self.faiss_indices:
+                del self.faiss_indices[self.last_partition_key]
+            if self.last_partition_key in self.partition_records:
+                del self.partition_records[self.last_partition_key]
+            self.partition_gc_count += 1
+            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+
+        # Build state-less partition if not already cached
+        if partition_key not in self.faiss_indices:
+            self.logger.debug(f"🔨 Building STATE-LESS partition on-demand: {partition_key}")
+
+            # Filter DDHQ records: date = target_date AND election_type = target_type (all states)
+            partition_records = self.ddhq_df[
+                (self.ddhq_df['date'] == date) &
+                (self.ddhq_df['election_type'] == election_type)
+            ].copy()
+
+            if len(partition_records) == 0:
+                self.logger.debug(f"⚠️  Empty STATE-LESS partition: {partition_key}")
+                self.last_partition_key = partition_key
+                return None, None
+
+            # Get unique states included
+            unique_states = partition_records['extracted_state'].unique()
+            self.logger.debug(f"   State-less partition includes {len(unique_states)} states: {sorted(unique_states)}")
+
+            # Build FAISS index from aggregated records
+            embeddings = np.array(partition_records['embedding_name_race'].tolist(), dtype=np.float32)
+            embedding_dim = embeddings.shape[1]
+            index = faiss.IndexFlatIP(embedding_dim)
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+
+            # Cache
+            self.faiss_indices[partition_key] = index
+            self.partition_records[partition_key] = partition_records
+            self.partition_build_count += 1
+
+            self.logger.debug(f"✅ Built STATE-LESS partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_states)} states)")
 
         # Update last partition tracker
         self.last_partition_key = partition_key
@@ -155,58 +324,78 @@ class ParallelProductionMatcher:
             default_model=GeminiModelType.FLASH,
             default_temperature=0.0,
             max_connections=target_concurrency,
-            max_keepalive_connections=target_concurrency // 4  # 125 keepalive
-            # Removed thinking_budget to avoid token limit issues that cause JSON truncation
+            max_keepalive_connections=target_concurrency // 4,  # 125 keepalive
+            max_retries=9,  # Handle all retries in LLM client (no outer retry loop)
+            base_delay=1.0  # Exponential backoff starting at 1 second
         )
-        print(f"   Gemini Flash initialized with {target_concurrency} max connections (HIGH THROUGHPUT with reliability)")
+        print(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
 
-    def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for k most similar DDHQ candidates using date + state + election type partitioned FAISS"""
+    def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
+        """
+        Search for k most similar DDHQ candidates using date + state + election type partitioned FAISS
 
-        search_start_time = time.time()
+        Returns:
+            tuple: (candidates, partition_type)
+                - candidates: List of similar candidates
+                - partition_type: 'standard' or 'stateless_fallback'
+        """
 
         # Get target date, state, and election type from HubSpot record
         target_date = hubspot_record.get('election_date')
         target_state = hubspot_record.get('state')
         target_election_type = hubspot_record.get('election_type')
 
-        if pd.isna(target_date) or pd.isna(target_state) or pd.isna(target_election_type):
-            self.logger.warning(f"Missing date, state, or election_type for candidate: {self._get_candidate_name(hubspot_record)}")
-            return []  # Cannot search without all three keys
+        # Check if we need state-less fallback partition
+        partition_type = 'standard'
+        if pd.isna(target_state):
+            if pd.isna(target_date) or pd.isna(target_election_type):
+                self.logger.warning(f"Missing date and election_type for candidate: {self._get_candidate_name(hubspot_record)}")
+                return ([], 'standard')
 
-        # Lazy-load partition with garbage collection
-        faiss_index, partition_records = self._get_or_build_partition(target_date, target_state, target_election_type)
+            # Use state-less fallback partition (all states for this date+type)
+            self.logger.debug(f"Using STATE-LESS partition for candidate without state: {self._get_candidate_name(hubspot_record)}")
+            faiss_index, partition_records = self._get_or_build_stateless_partition(target_date, target_election_type)
+            partition_type = 'stateless_fallback'
+        else:
+            # Standard partition with date + state + election_type
+            if pd.isna(target_date) or pd.isna(target_election_type):
+                self.logger.warning(f"Missing date or election_type for candidate: {self._get_candidate_name(hubspot_record)}")
+                return ([], 'standard')
+
+            # Lazy-load partition with garbage collection
+            faiss_index, partition_records = self._get_or_build_partition(target_date, target_state, target_election_type)
 
         if faiss_index is None or partition_records is None:
-            partition_key = f"{target_date}_{target_state}_{target_election_type}"
-            self.logger.warning(f"No partition found for {partition_key}")
-            return []
-        
+            # Partition is empty (already logged once during build, now cached)
+            return ([], partition_type)
+
         # Prepare embedding for search
         hubspot_embedding = np.array(hubspot_record['embedding_name_race'])
         query_embedding = hubspot_embedding.astype(np.float32).reshape(1, -1)
         faiss.normalize_L2(query_embedding)
-        
+
         # Search within the specific date + election type partition
         search_actual_start = time.time()
         similarities, indices = faiss_index.search(query_embedding, min(k, len(partition_records)))
         search_actual_duration = time.time() - search_actual_start
-        
+
         # Check if FAISS returned any valid results
         if len(similarities[0]) == 0 or len(indices[0]) == 0:
+            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if pd.isna(target_state) else f"{target_date}_{target_state}_{target_election_type}"
             self.logger.debug(f"FAISS returned empty results for partition {partition_key}")
-            return []
-        
+            return ([], partition_type)
+
         # Convert results with comprehensive bounds checking
         all_candidates = []
         for similarity, idx in zip(similarities[0], indices[0]):
             # Comprehensive safety checks
-            if idx < 0 or idx >= len(partition_records):  
+            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if pd.isna(target_state) else f"{target_date}_{target_state}_{target_election_type}"
+            if idx < 0 or idx >= len(partition_records):
                 self.logger.warning(f"FAISS returned invalid index {idx} for partition {partition_key} with {len(partition_records)} records")
                 continue
             if similarity <= 0:  # Skip non-matches
                 continue
-                
+
             ddhq_record = partition_records.iloc[idx]
             all_candidates.append({
                 'rank': len(all_candidates) + 1,
@@ -222,14 +411,117 @@ class ParallelProductionMatcher:
                 'election_type': ddhq_record.get('election_type', 'N/A'),  # Will always match HubSpot
                 'date': ddhq_record.get('date', 'N/A')  # Will always match HubSpot
             })
-        
+
         # Sort by similarity and return top k
         all_candidates.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        search_total_duration = time.time() - search_start_time
-        
-        return all_candidates[:k]
-    
+
+        return (all_candidates[:k], partition_type)
+
+    def _search_similar_candidates_with_runoff_fallback(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str, str]:
+        """
+        Search for similar candidates with runoff election date-range logic.
+
+        For runoff elections, builds a date-range partition that includes ALL races with dates >= base election date.
+
+        Returns:
+            tuple: (candidates, match_source, fallback_date)
+                - candidates: List of similar candidates
+                - match_source: 'direct', 'date_range_runoff', or 'stateless_fallback'
+                - fallback_date: Base date used for date-range (or None for non-runoff)
+        """
+        election_type = hubspot_record.get('election_type')
+
+        if election_type != 'runoff':
+            # Non-runoff elections use standard search (may use stateless fallback if state is missing)
+            candidates, partition_type = self._search_similar_candidates(hubspot_record, k)
+            # Pass along partition type as match_source
+            match_source = 'stateless_fallback' if partition_type == 'stateless_fallback' else 'direct'
+            return (candidates, match_source, None)
+
+        # Runoff election: Build date-range partition from base election date onwards
+
+        target_state = hubspot_record.get('state')
+
+        if pd.isna(target_state):
+            self.logger.warning(f"Runoff record missing state information")
+            return ([], 'no_match', None)
+
+        # Determine base date: prefer general_election_date, fallback to primary_election_date, then election_date
+        general_date = hubspot_record.get('general_election_date')
+        primary_date = hubspot_record.get('primary_election_date')
+        election_date = hubspot_record.get('election_date')
+
+        if not pd.isna(general_date):
+            base_date = general_date
+            base_type = 'general'
+            self.logger.debug(f"Runoff using general_election_date as base: {base_date}")
+        elif not pd.isna(primary_date):
+            base_date = primary_date
+            base_type = 'primary'
+            self.logger.debug(f"Runoff using primary_election_date as base: {base_date}")
+        elif not pd.isna(election_date):
+            base_date = election_date
+            base_type = 'runoff'
+            self.logger.debug(f"Runoff using election_date (runoff date itself) as base: {base_date}")
+        else:
+            self.logger.warning(f"Runoff record missing all date fields (general, primary, election_date)")
+            return ([], 'no_match', None)
+
+        # Build date-range partition: all races with dates >= base_date in this state
+        faiss_index, partition_records = self._get_or_build_date_range_partition(
+            base_date=str(base_date),
+            state=target_state,
+            runoff_type='runoff'
+        )
+
+        if faiss_index is None or partition_records is None or len(partition_records) == 0:
+            self.logger.warning(f"Date-range partition is empty for base_date={base_date}, state={target_state}")
+            return ([], 'no_match', None)
+
+        # Search in the date-range partition using HubSpot runoff record's embedding
+        hubspot_embedding = np.array(hubspot_record['embedding_name_race'])
+        query_embedding = hubspot_embedding.astype(np.float32).reshape(1, -1)
+        faiss.normalize_L2(query_embedding)
+
+        # Search FAISS
+        similarities, indices = faiss_index.search(query_embedding, min(k, len(partition_records)))
+
+        if len(similarities[0]) == 0 or len(indices[0]) == 0:
+            self.logger.debug(f"FAISS returned empty results for date-range partition")
+            return ([], 'no_match', None)
+
+        # Convert results
+        all_candidates = []
+        for similarity, idx in zip(similarities[0], indices[0]):
+            if idx < 0 or idx >= len(partition_records):
+                self.logger.warning(f"FAISS returned invalid index {idx}")
+                continue
+            if similarity <= 0:
+                continue
+
+            ddhq_record = partition_records.iloc[idx]
+            all_candidates.append({
+                'rank': len(all_candidates) + 1,
+                'similarity': float(similarity),
+                'ddhq_index': ddhq_record.name,
+                'candidate': ddhq_record['candidate'],
+                'race_name': ddhq_record['race_name'],
+                'candidate_party': ddhq_record.get('candidate_party', 'N/A'),
+                'is_winner': ddhq_record.get('is_winner', 'N/A'),
+                'embedding_text': ddhq_record.get('embedding_name_race_text', 'N/A'),
+                'ddhq_race_id': ddhq_record.get('race_id', 'N/A'),
+                'ddhq_candidate_id': ddhq_record.get('candidate_id', 'N/A'),
+                'election_type': ddhq_record.get('election_type', 'N/A'),
+                'date': ddhq_record.get('date', 'N/A')
+            })
+
+        # Sort by similarity
+        all_candidates.sort(key=lambda x: x['similarity'], reverse=True)
+
+        self.logger.debug(f"Runoff date-range search: Found {len(all_candidates)} candidates (base_date={base_date}, {len(partition_records)} total records in range)")
+
+        return (all_candidates[:k], 'date_range_runoff', str(base_date))
+
     def _calibrate_confidence(self, llm_result: Dict, hubspot_record: Dict, matched_candidate: Dict) -> Dict:
         """Adjust confidence based on match quality indicators"""
         
@@ -279,18 +571,20 @@ class ParallelProductionMatcher:
         llm_result['confidence'] = confidence
         return llm_result
     
-    async def _validate_with_llm(self, hubspot_record: Dict, similar_candidates: List[Dict]) -> Dict[str, Any]:
-        """Use LLM to validate and select the best match with enhanced retry logic"""
-        
+    async def _validate_with_llm(self, hubspot_record: Dict, similar_candidates: List[Dict], match_source: str = 'direct', fallback_date: str = None) -> Dict[str, Any]:
+        """Use LLM to validate and select the best match (retries handled by LLM client)"""
+
         hubspot_info = {
             'name': self._get_candidate_name(hubspot_record),
             'full_name': hubspot_record.get('full_name', 'N/A'),
             'state': hubspot_record.get('state', 'N/A'),
             'city': hubspot_record.get('city', 'N/A'),
             'office': hubspot_record.get('official_office_name', hubspot_record.get('candidate_office', 'N/A')),
-            'embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A')
+            'embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A'),
+            'election_type': hubspot_record.get('election_type', 'N/A'),
+            'election_date': hubspot_record.get('election_date', 'N/A')
         }
-        
+
         candidates_text = ""
         for i, candidate in enumerate(similar_candidates, 1):
             candidates_text += f"""
@@ -301,10 +595,20 @@ Match {i}:
   - Winner: {candidate['is_winner']}
   - Embedding: {candidate['embedding_text']}
 """
-        
-        prompt = f"""You are a political candidate matching expert. Your task is to match LOCAL/MUNICIPAL candidates between HubSpot and DDHQ databases with EXTREME PRECISION to avoid false positives.
 
-NOTE: Federal races (Congress, Senate, President) and State-level races (Governor, State Legislature) have already been filtered out. You are ONLY matching local/municipal races (City Council, Mayor, County offices, School Board, Township, etc.).
+        # Build prompt (no runoff-specific context needed - LLM just validates matching)
+        prompt = f"""TASK: Match a HubSpot candidate to DDHQ candidates and return JSON ONLY.
+NOTE: Federal and state races are pre-filtered. Only match local/municipal races.
+
+OUTPUT FORMAT (REQUIRED):
+{{"best_match": <number or null>, "confidence": <0-100>, "reasoning": "<brief explanation>"}}
+
+EXAMPLE OUTPUT:
+{{"best_match": 1, "confidence": 95, "reasoning": "Exact name, state, and office match."}}
+OR if no match:
+{{"best_match": null, "confidence": 0, "reasoning": "No valid match found."}}
+
+---
 
 HubSpot Candidate:
 - Name: {hubspot_info['name']}
@@ -317,11 +621,12 @@ HubSpot Candidate:
 DDHQ Candidates (ranked by similarity):
 {candidates_text}
 
-CRITICAL MATCHING RULES - ALL must be satisfied:
+MATCHING RULES:
 
 1. NAME REQUIREMENTS (MANDATORY):
    - First name: Must be exact match, clear nickname (Bob/Robert), or obvious variant (Jon/John)
    - Last name: Must be exact match or extremely close phonetic variant
+   - Suffixes: Jr., Sr., II, III, IV, V are acceptable variations (John Smith Jr. = John Smith)
    - REJECT: Different genders (Stanley→Susan), unrelated names (Marco→Erick), random similarities
 
 2. GEOGRAPHIC REQUIREMENTS (MANDATORY):
@@ -335,6 +640,7 @@ CRITICAL MATCHING RULES - ALL must be satisfied:
    - "John Smith" for Berkeley City Council → "John Smith, Berkeley City Council" (exact match)
    - "Bob Johnson" for County Commissioner → "Robert Johnson, County Commissioner" (nickname variation)
    - "Mary O'Connor" for School Board → "Mary O'Connor, School Board" (exact match)
+   - "John Smith Jr." for Mayor → "John Smith, Mayor" (suffix variation - acceptable)
 
    INVALID LOCAL MATCHES (Must Reject):
    - "Stanley Pokras" → "Susan Kopras" (gender mismatch, different first name)
@@ -357,153 +663,120 @@ CRITICAL MATCHING RULES - ALL must be satisfied:
    - Clear gender mismatches
    - Completely unrelated names
 
-INSTRUCTIONS:
-- Analyze each candidate systematically against ALL rules
-- Be extremely conservative - false positives are worse than false negatives
-- If uncertain, REJECT the match
-- Only match when you are highly confident it's the same person
+Be extremely conservative - false positives are worse than false negatives. If uncertain, REJECT.
 
-RESPOND IN VALID JSON (no markdown, no extra text):
-{{{{
-  "best_match": 3,
-  "confidence": 87,
-  "reasoning": "Exact names, same state, similar office - same person."
-}}}}
+OUTPUT JSON ONLY (no explanation, no markdown):"""
 
-IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no strict match."""
-
-        # Enhanced retry logic for data accuracy - retry 9 times like golden data
-        max_retries = 9
-        base_delay = 1.0
-        
         llm_validation_start = time.time()
-        
-        for attempt in range(max_retries):
+
+        try:
+            # Use dedicated thread pool for maximum LLM concurrency
+            # Retries are handled internally by GeminiClient (max_retries=9)
+            llm_call_start = time.time()
+            response = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool,
+                lambda: self.llm_client.generate_content(prompt)
+            )
+            llm_call_duration = time.time() - llm_call_start
+
+            # Handle None response from API failures
+            if response is None:
+                raise ValueError("LLM returned None response - likely API failure after all retries")
+
+            response_text = response.strip()
+
+            # Simple cleaning - remove markdown blocks but don't over-process
+            if response_text.startswith('```json'):
+                response_text = response_text[7:]
+                if response_text.endswith('```'):
+                    response_text = response_text[:-3]
+            elif response_text.startswith('```'):
+                response_text = response_text[3:]
+                if response_text.endswith('```'):
+                    response_text = response_text[:-3]
+
+            response_text = response_text.strip()
+
+            # Fix double braces that LLM sometimes adds (mimicking the prompt's escaped braces)
+            if response_text.startswith('{{') and response_text.endswith('}}'):
+                response_text = response_text[1:-1].strip()
+
+            # Try direct parsing first - most LLM responses are valid JSON
             try:
-                # Use dedicated thread pool for maximum LLM concurrency
-                llm_call_start = time.time()
-                response = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool,
-                    lambda: self.llm_client.generate_content(
-                        prompt,
-                        max_tokens=200  # Keep response short to avoid truncation
-                    )
-                )
-                llm_call_duration = time.time() - llm_call_start
-                
-                # Handle None response from API failures
-                if response is None:
-                    raise ValueError("LLM returned None response - likely API failure")
-                
-                response_text = response.strip()
-                
-                # Simple cleaning - remove markdown blocks but don't over-process
-                if response_text.startswith('```json'):
-                    response_text = response_text[7:]
-                    if response_text.endswith('```'):
-                        response_text = response_text[:-3]
-                elif response_text.startswith('```'):
-                    response_text = response_text[3:]
-                    if response_text.endswith('```'):
-                        response_text = response_text[:-3]
-                
-                response_text = response_text.strip()
-                
-                # Try direct parsing first - most LLM responses are valid JSON
-                try:
-                    result = json.loads(response_text)
-                except json.JSONDecodeError:
-                    # Only if direct parsing fails, try minimal cleaning
-                    # Remove trailing commas and try again
-                    import re
-                    cleaned_text = re.sub(r',(\s*[}\]])', r'\1', response_text)
-                    result = json.loads(cleaned_text)
-                
-                # Apply confidence calibration if there's a match
-                if result.get('best_match') is not None:
-                    best_match_idx = result['best_match'] - 1
-                    if 0 <= best_match_idx < len(similar_candidates):
-                        matched_candidate = similar_candidates[best_match_idx]
-                        result = self._calibrate_confidence(result, hubspot_record, matched_candidate)
-                    else:
-                        # Handle invalid match index
-                        self.logger.warning(f"LLM returned invalid best_match index {result['best_match']} for {len(similar_candidates)} candidates")
-                        result['best_match'] = None
-                        result['confidence'] = 0
-                        result['reasoning'] = f"Invalid match index {result['best_match']} for {len(similar_candidates)} candidates"
-                
-                # Track LLM cost
-                stats = self.llm_client.get_usage_stats()
-                self.total_cost = stats.get('total_cost', 0.0)
-                
-                llm_validation_total = time.time() - llm_validation_start
-                candidate_name = self._get_candidate_name(hubspot_record)
-                self.logger.debug(f"🤖 LLM validation for {candidate_name}: Total={llm_validation_total:.3f}s | Call={llm_call_duration:.3f}s | Attempts={attempt+1}")
-                
-                return result
-                
-            except Exception as e:
-                # Enhanced error logging with more context
-                error_context = {
-                    'candidate_name': self._get_candidate_name(hubspot_record),
-                    'candidate_state': hubspot_record.get('state', 'N/A'),
-                    'candidate_office': hubspot_record.get('candidate_office', 'N/A'),
-                    'error_type': type(e).__name__,
-                    'error_message': str(e),
-                    'response_length': len(response_text) if 'response_text' in locals() else 0,
-                    'response_preview': response_text[:200] + '...' if 'response_text' in locals() and len(response_text) > 200 else response_text if 'response_text' in locals() else 'No response captured'
-                }
-                
-                # For transient errors, retry with exponential backoff
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    candidate_name = error_context['candidate_name']
-                    candidate_state = error_context['candidate_state']
-                    error_type = error_context['error_type']
-                    error_message = error_context['error_message']
-                    response_preview = error_context['response_preview']
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{max_retries} failed for {candidate_name} ({candidate_state}): {error_type}: {error_message}. Response preview: {response_preview}. Retrying in {delay:.1f}s")
-                    await asyncio.sleep(delay)
+                result = json.loads(response_text)
+            except json.JSONDecodeError:
+                # Only if direct parsing fails, try minimal cleaning
+                # Remove trailing commas and try again
+                import re
+                cleaned_text = re.sub(r',(\s*[}\]])', r'\1', response_text)
+                result = json.loads(cleaned_text)
+
+            # Apply confidence calibration if there's a match
+            if result.get('best_match') is not None:
+                best_match_idx = result['best_match'] - 1
+                if 0 <= best_match_idx < len(similar_candidates):
+                    matched_candidate = similar_candidates[best_match_idx]
+                    result = self._calibrate_confidence(result, hubspot_record, matched_candidate)
                 else:
-                    # Final attempt failed - log comprehensive details
-                    self.logger.error(f"LLM FINAL FAILURE after {max_retries} attempts:")
-                    candidate_name = error_context['candidate_name']
-                    candidate_state = error_context['candidate_state']
-                    candidate_office = error_context['candidate_office']
-                    error_type = error_context['error_type']
-                    error_message = error_context['error_message']
-                    response_length = error_context['response_length']
-                    response_preview = error_context['response_preview']
-                    self.logger.error(f"  Candidate: {candidate_name} ({candidate_state}) - {candidate_office}")
-                    self.logger.error(f"  Error Type: {error_type}")
-                    self.logger.error(f"  Error Message: {error_message}")
-                    self.logger.error(f"  Response Length: {response_length} chars")
-                    self.logger.error(f"  Response Preview: {response_preview}")
-                    
-                    # For JSON errors, log character analysis
-                    if 'json' in error_context['error_type'].lower() or 'control character' in error_context['error_message'].lower():
-                        if 'response_text' in locals():
-                            # Log problematic characters
-                            problematic_chars = []
-                            for i, char in enumerate(response_text[:500]):  # First 500 chars
-                                char_code = ord(char)
-                                if char_code <= 31 or char_code == 127:  # Control characters
-                                    problematic_chars.append(f'pos {i}: \\x{char_code:02x} ({repr(char)})')
-                            
-                            if problematic_chars:
-                                self.logger.error(f"  Control Characters Found: {problematic_chars[:5]}")  # First 5
-                            else:
-                                self.logger.error(f"  No obvious control characters found in first 500 chars")
-                        
-                        # Try to identify JSON structure issues
-                        if 'response_text' in locals():
-                            self.logger.error(f"  Full Response (first 1000 chars): {repr(response_text[:1000])}")
-                    
-                    return {
-                        "best_match": None,
-                        "confidence": 0,
-                        "reasoning": f"LLM validation error after {max_retries} attempts: {error_context['error_type']}: {error_context['error_message']}"
-                    }
+                    # Handle invalid match index
+                    self.logger.warning(f"LLM returned invalid best_match index {result['best_match']} for {len(similar_candidates)} candidates")
+                    result['best_match'] = None
+                    result['confidence'] = 0
+                    result['reasoning'] = f"Invalid match index {result['best_match']} for {len(similar_candidates)} candidates"
+
+            # Track LLM cost
+            stats = self.llm_client.get_usage_stats()
+            self.total_cost = stats.get('total_cost', 0.0)
+
+            llm_validation_total = time.time() - llm_validation_start
+            candidate_name = self._get_candidate_name(hubspot_record)
+            self.logger.debug(f"🤖 LLM validation for {candidate_name}: Total={llm_validation_total:.3f}s | Call={llm_call_duration:.3f}s")
+
+            return result
+
+        except Exception as e:
+            # Enhanced error logging with context
+            error_context = {
+                'candidate_name': self._get_candidate_name(hubspot_record),
+                'candidate_state': hubspot_record.get('state', 'N/A'),
+                'candidate_office': hubspot_record.get('candidate_office', 'N/A'),
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'response_length': len(response_text) if 'response_text' in locals() else 0,
+                'response_preview': response_text[:200] + '...' if 'response_text' in locals() and len(response_text) > 200 else response_text if 'response_text' in locals() else 'No response captured'
+            }
+
+            # Log failure (retries already handled by LLM client)
+            self.logger.error(f"LLM validation failed after all retries:")
+            self.logger.error(f"  Candidate: {error_context['candidate_name']} ({error_context['candidate_state']}) - {error_context['candidate_office']}")
+            self.logger.error(f"  Error Type: {error_context['error_type']}")
+            self.logger.error(f"  Error Message: {error_context['error_message']}")
+            self.logger.error(f"  Response Length: {error_context['response_length']} chars")
+            self.logger.error(f"  Response Preview: {error_context['response_preview']}")
+
+            # For JSON errors, log character analysis
+            if 'json' in error_context['error_type'].lower() or 'control character' in error_context['error_message'].lower():
+                if 'response_text' in locals():
+                    # Log problematic characters
+                    problematic_chars = []
+                    for i, char in enumerate(response_text[:500]):  # First 500 chars
+                        char_code = ord(char)
+                        if char_code <= 31 or char_code == 127:  # Control characters
+                            problematic_chars.append(f'pos {i}: \\x{char_code:02x} ({repr(char)})')
+
+                    if problematic_chars:
+                        self.logger.error(f"  Control Characters Found: {problematic_chars[:5]}")  # First 5
+                    else:
+                        self.logger.error(f"  No obvious control characters found in first 500 chars")
+
+                    # Try to identify JSON structure issues
+                    self.logger.error(f"  Full Response (first 1000 chars): {repr(response_text[:1000])}")
+
+            return {
+                "best_match": None,
+                "confidence": 0,
+                "reasoning": f"LLM validation error after all retries: {error_context['error_type']}: {error_context['error_message']}"
+            }
     
     async def _process_hubspot_record(self, hubspot_record: pd.Series, record_index: int) -> Dict[str, Any]:
         """Process a single HubSpot record through the matching pipeline"""
@@ -583,14 +856,14 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                     'match_similarity': None
                 }
 
-            # Step 1: Date-partitioned FAISS similarity search
+            # Step 1: Date-partitioned FAISS similarity search with runoff fallback
             faiss_start_time = time.time()
-            similar_candidates = self._search_similar_candidates(hubspot_record.to_dict(), k=10)
+            similar_candidates, match_source, fallback_date = self._search_similar_candidates_with_runoff_fallback(hubspot_record.to_dict(), k=10)
             faiss_duration = time.time() - faiss_start_time
-            
+
             # Step 2: LLM validation
             llm_start_time = time.time()
-            llm_result = await self._validate_with_llm(hubspot_record.to_dict(), similar_candidates)
+            llm_result = await self._validate_with_llm(hubspot_record.to_dict(), similar_candidates, match_source, fallback_date)
             llm_duration = time.time() - llm_start_time
             
             # Prepare match result
@@ -610,12 +883,16 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                 'hubspot_embedding_text': hubspot_record.get('embedding_name_race_text', 'N/A'),
                 'hubspot_election_date': hubspot_record.get('election_date', 'N/A'),
                 'hubspot_election_type': hubspot_record.get('election_type', 'N/A'),
-                
+
                 # LLM validation results
                 'llm_best_match': llm_result.get('best_match'),
                 'llm_confidence': llm_result.get('confidence', 0),
                 'llm_reasoning': llm_result.get('reasoning', 'N/A'),
-                
+
+                # Runoff fallback tracking
+                'match_source': match_source,
+                'runoff_fallback_date': fallback_date,
+
                 # Top 10 similarity candidates (stored as JSON strings for parquet)
                 'top_10_candidates': json.dumps([{
                     'rank': c['rank'],
@@ -625,7 +902,7 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
                     'candidate_party': c['candidate_party'],
                     'is_winner': c['is_winner']
                 } for c in similar_candidates]),
-                
+
                 # Matched DDHQ record (if any)
                 'has_match': llm_result.get('best_match') is not None,
                 'ddhq_matched_index': None,
@@ -930,6 +1207,7 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
 
         print(f"\n♻️  LAZY-LOADING STATISTICS:")
         print(f"   Partitions built: {self.partition_build_count}")
+        print(f"   Empty partitions (cached): {len(self.empty_partitions)}")
         print(f"   Partitions GC'd: {self.partition_gc_count}")
         print(f"   Peak partitions in memory: {self.partition_build_count - self.partition_gc_count}")
         print(f"   Memory efficiency: {self.partition_gc_count / max(1, self.partition_build_count) * 100:.1f}% of partitions freed")
@@ -998,6 +1276,11 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         state_races = (results_df['ddhq_race_name'] == 'STATE_RACE').sum()
         no_match = total_records - local_matches - federal_races - state_races
 
+        # Partition usage statistics
+        direct_matches = (results_df['match_source'] == 'direct').sum() if 'match_source' in results_df.columns else 0
+        runoff_date_range = (results_df['match_source'] == 'date_range_runoff').sum() if 'match_source' in results_df.columns else 0
+        stateless_fallback = (results_df['match_source'] == 'stateless_fallback').sum() if 'match_source' in results_df.columns else 0
+
         print(f"\n💾 Results saved to output folder:")
         print(f"   Parquet: {parquet_file} ({parquet_size_mb:.1f} MB)")
         print(f"   TSV: {tsv_file} ({tsv_size_mb:.1f} MB)")
@@ -1008,10 +1291,20 @@ IMPORTANT: Keep reasoning under 100 characters. Return null for best_match if no
         print(f"   State races (pre-filtered): {state_races:,} ({state_races/total_records*100:.1f}%)")
         print(f"   No match: {no_match:,} ({no_match/total_records*100:.1f}%)")
 
+        if runoff_date_range > 0 or stateless_fallback > 0:
+            print(f"\n🔧 PARTITION USAGE STATISTICS:")
+            if direct_matches > 0:
+                print(f"   Standard partitions (date+state+type): {direct_matches:,}")
+            if runoff_date_range > 0:
+                print(f"   Runoff date-range partitions (date >= base): {runoff_date_range:,}")
+            if stateless_fallback > 0:
+                print(f"   State-less fallback partitions (missing state): {stateless_fallback:,}")
+                print(f"   (State-less partitions aggregate all states for date+election_type)")
+
         if local_matches > 0:
             matched_df = results_df[results_df['has_match'] == True]
             avg_confidence = matched_df['llm_confidence'].mean()
-            print(f"   Average confidence (local matches): {avg_confidence:.1f}%")
+            print(f"\n   Average confidence (local matches): {avg_confidence:.1f}%")
 
         print(f"\n   Latest files also saved for easy access")
 

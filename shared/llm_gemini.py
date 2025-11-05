@@ -269,16 +269,47 @@ class GeminiClient:
 
         for attempt in range(self.max_retries):
             try:
+                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} starting...")
                 response = self.client.models.generate_content(
                     model=model_name,
                     contents=prompt,
                     config=config
                 )
 
+                # Log response details for debugging None issues
+                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Response received. Type: {type(response)}, Has text attr: {hasattr(response, 'text')}")
+
+                if response is None:
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Response is None!")
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Retrying None response in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.logger.error(f"Response is None after {self.max_retries} attempts")
+                        return None
+
+                response_text = response.text
+                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text type: {type(response_text)}, length: {len(response_text) if response_text else 0}")
+
+                if response_text is None:
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None! Response obj: {response}")
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Retrying None response.text in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.logger.error(f"response.text is None after {self.max_retries} attempts")
+                        return None
+
                 self._track_usage(response, model_name)
-                return response.text
+                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Success! Returning response.")
+                return response_text
 
             except Exception as e:
+                self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Exception caught: {type(e).__name__}: {str(e)}")
                 if attempt < self.max_retries - 1:
                     delay = self.base_delay * (2 ** attempt)
                     self.logger.warning(f"Content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")

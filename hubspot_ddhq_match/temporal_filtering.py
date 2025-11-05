@@ -24,47 +24,66 @@ class TemporalFilter:
         
     def filter_hubspot_by_ddhq_dates(self, hubspot_df: pd.DataFrame, ddhq_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Filter HubSpot records to only include those with election dates that exactly match DDHQ election dates
+        Filter HubSpot records to only include those with election dates that exactly match DDHQ election dates.
+        Special handling for runoff elections: if runoff date doesn't match, check if general_election_date matches.
         """
         self.logger.info("🗓️ Starting temporal filtering...")
-        
+
         original_count = len(hubspot_df)
-        
+
         # Get all unique election dates from DDHQ
         ddhq_unique_dates = set(pd.to_datetime(ddhq_df['date']).dt.date)
         self.logger.info(f"   DDHQ unique election dates: {len(ddhq_unique_dates):,}")
         self.logger.info(f"   Date range: {min(ddhq_unique_dates)} to {max(ddhq_unique_dates)}")
-        
+
         # Convert HubSpot election dates to date objects for comparison
         # Note: After cleaning, each HubSpot record now has a single election_date
         hubspot_election_dates = pd.to_datetime(hubspot_df['election_date'], errors='coerce').dt.date
-        
-        # Check which HubSpot records have election dates that match DDHQ dates
+
+        # Standard temporal match: election_date exists in DDHQ
         temporal_match = hubspot_election_dates.isin(ddhq_unique_dates)
-        
+
+        # Special handling for runoffs: if runoff date doesn't match, check general_election_date
+        is_runoff = hubspot_df['election_type'] == 'runoff'
+        has_general_date = hubspot_df['general_election_date'].notna()
+        general_dates = pd.to_datetime(hubspot_df['general_election_date'], errors='coerce').dt.date
+        general_match = general_dates.isin(ddhq_unique_dates)
+
+        # Runoff fallback: runoff records where runoff_date doesn't match but general_date does
+        runoff_fallback_match = is_runoff & has_general_date & general_match & ~temporal_match
+
+        # Combined filter: standard match OR runoff with general fallback
+        final_match = temporal_match | runoff_fallback_match
+
         # Apply the filter
-        hubspot_filtered = hubspot_df[temporal_match].copy()
-        
+        hubspot_filtered = hubspot_df[final_match].copy()
+
         final_count = len(hubspot_filtered)
         removed_count = original_count - final_count
         retention_rate = final_count / original_count * 100
-        
+
+        # Count statistics
+        standard_matches = temporal_match.sum()
+        runoff_fallback_matches = runoff_fallback_match.sum()
+
         self.logger.info(f"✅ Temporal filtering complete:")
         self.logger.info(f"   Original records: {original_count:,}")
         self.logger.info(f"   Filtered records: {final_count:,}")
+        self.logger.info(f"   Standard date matches: {standard_matches:,}")
+        self.logger.info(f"   Runoff fallback matches: {runoff_fallback_matches:,}")
         self.logger.info(f"   Removed records:  {removed_count:,}")
         self.logger.info(f"   Retention rate:   {retention_rate:.1f}%")
-        
+
         # Log match statistics by election type
         if 'election_type' in hubspot_filtered.columns:
             primary_records = hubspot_filtered[hubspot_filtered['election_type'] == 'primary']
             general_records = hubspot_filtered[hubspot_filtered['election_type'] == 'general']
-            
+            runoff_records = hubspot_filtered[hubspot_filtered['election_type'] == 'runoff']
+
             self.logger.info(f"   Primary election records: {len(primary_records):,}")
             self.logger.info(f"   General election records: {len(general_records):,}")
-        else:
-            self.logger.info(f"   Date matches: {temporal_match.sum():,}")
-        
+            self.logger.info(f"   Runoff election records: {len(runoff_records):,}")
+
         return hubspot_filtered
     
     def save_filtered_data(self, hubspot_filtered: pd.DataFrame) -> str:
