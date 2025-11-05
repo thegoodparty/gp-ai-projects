@@ -1,0 +1,24 @@
+# Dev Shared Infrastructure Configuration (ALB + Route53)
+# Copy this file to terraform.tfvars and update with actual values
+
+environment        = "dev"
+aws_region         = "us-west-2"
+custom_domain_name = "ai-dev.goodparty.org"
+
+# VPC Configuration (us-west-2)
+# Use the prod/master VPC shared across all environments
+vpc_id = "vpc-XXXXXXXXXXXXXXXXX"
+
+# Public subnets for Application Load Balancer (minimum 2 for multi-AZ)
+public_subnet_ids = [
+  "subnet-XXXXXXXXXXXXXXXXX",  # us-west-2a public
+  "subnet-XXXXXXXXXXXXXXXXX"   # us-west-2b public
+]
+
+# SSL/TLS Certificate ARN (*.goodparty.org wildcard)
+# Get from AWS Certificate Manager in us-west-2
+certificate_arn = "arn:aws:acm:us-west-2:XXXXXXXXXXXX:certificate/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+
+# Route53 Hosted Zone ID (goodparty.org)
+# Get from Route53 hosted zones
+route53_zone_id = "ZXXXXXXXXXXXXX"

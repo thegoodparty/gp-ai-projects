@@ -1,0 +1,17 @@
+# Dev Environment Configuration
+# Copy this file to terraform.tfvars and update with actual values
+
+# VPC Configuration (us-west-2)
+# Use the prod/master VPC shared across all environments
+vpc_id = "vpc-XXXXXXXXXXXXXXXXX"
+
+# Private subnets for ECS Fargate tasks (minimum 2 for multi-AZ)
+# These subnets should have NAT gateway access for outbound internet
+private_subnet_ids = [
+  "subnet-XXXXXXXXXXXXXXXXX",  # us-west-2a private
+  "subnet-XXXXXXXXXXXXXXXXX"   # us-west-2b private
+]
+
+# Email for pipeline failure notifications (optional)
+# Leave empty "" to disable email notifications
+failure_notification_email = "your-email@example.com"
