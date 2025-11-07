@@ -226,9 +226,10 @@ IMPORTANT: THERE MUST BE ALL 7 PHASE 1 VOTER OUTREACH TASKS BETWEEN {phase_1_sta
 IMPORTANT: THERE MUST BE ALL 7 PHASE 2 VOTER OUTREACH TASKS BETWEEN {phase_2_start} AND {phase_2_end}.
 
 # OUTPUT FORMAT REQUIREMENTS:
-Generate the voter contact plan using this EXACT format with proper date formatting:
+Generate the voter contact plan using this EXACT format with proper date formatting.
+CRITICAL: Each task MUST be on its own separate line. Use newlines between each task.
 
-CORRECT FORMAT EXAMPLES:
+CORRECT FORMAT EXAMPLES (each on separate line):
 - January 15 – P2P Text: Early Text – Candidate introduction + race message
 - January 22 – Robocall: Early Robocall – Candidate introduction + race message
 - February 5 – P2P Text: Mid campaign Text – Persuasion message
@@ -238,9 +239,12 @@ CORRECT FORMAT EXAMPLES:
 ...
 - {phase_2_end.strftime('%B')} {phase_2_end.day} – General Election Day
 
-CRITICAL: Every date MUST be in format "Month DD" (e.g., "March 7" NOT "Mar 7" or "03/07")
+CRITICAL FORMATTING RULES:
+1. Every date MUST be in format "Month DD" (e.g., "March 7" NOT "Mar 7" or "03/07")
+2. Each task MUST be on a NEW LINE starting with "-"
+3. Put a line break after each task
 
-Do NOT add thinking or reasoning. Generate ONLY the formatted task list with proper date formatting.
+Do NOT add thinking or reasoning. Generate ONLY the formatted task list with each task on a separate line.
 """
         else:
             start_date, end_date = self._calculate_general_only_dates(campaign_info)
@@ -291,24 +295,28 @@ CAMPAIGN CONTEXT:
 IMPORTANT: THERE MUST BE ALL 7 VOTER OUTREACH TASKS BETWEEN {start_date} AND {end_date}.
 
 # OUTPUT FORMAT REQUIREMENTS:
-Generate the voter contact plan using this EXACT format with proper date formatting:
+Generate the voter contact plan using this EXACT format with proper date formatting.
+CRITICAL: Each task MUST be on its own separate line. Use newlines between each task.
 
-CORRECT FORMAT EXAMPLES:
+CORRECT FORMAT EXAMPLES (each on separate line):
 - January 15 – P2P Text: Early Text – Candidate intro + race message
 - January 22 – Robocall: Early Robocall – Candidate intro + race message
 - February 5 – P2P Text: Mid campaign Text – Persuasion message
 ...
 - {end_date.strftime('%B')} {end_date.day} – General Election Day
 
-CRITICAL: Every date MUST be in format "Month DD" (e.g., "March 7" NOT "Mar 7" or "03/07")
+CRITICAL FORMATTING RULES:
+1. Every date MUST be in format "Month DD" (e.g., "March 7" NOT "Mar 7" or "03/07")
+2. Each task MUST be on a NEW LINE starting with "-"
+3. Put a line break after each task
 
-Do NOT add thinking or reasoning. Generate ONLY the formatted task list with proper date formatting.
+Do NOT add thinking or reasoning. Generate ONLY the formatted task list with each task on a separate line.
 """
 
         try:
             response = self.llm_client.generate_content(
                 prompt=prompt,
-                system_instruction="You are a campaign strategist. Generate the voter contact plan in the exact format shown with exactly 7 tasks per phase. CRITICAL: All dates must use format 'Month DD' (e.g., 'January 15' NOT 'Jan 15'). Do not add thinking or reasoning.",
+                system_instruction="You are a campaign strategist. Generate the voter contact plan in the exact format shown with exactly 7 tasks per phase. CRITICAL: All dates must use format 'Month DD' (e.g., 'January 15' NOT 'Jan 15'). Each task MUST be on a separate line with a line break between tasks. Do not add thinking or reasoning.",
                 temperature=0.1
             )
 
@@ -760,6 +768,26 @@ if __name__ == "__main__":
                 additional_race_context="Test Phase 2 with 1-day gap between primary and election"
             ),
             "expected_behavior": "Phase 1: Normal 49-day window before primary. Phase 2: 0-day window (primary+1 == election) - should handle gracefully with same-day emergency scenario."
+        },
+        {
+            "name": "TEST 22: Very Far Future - General Only (November 4, 2026)",
+            "description": "General election ~362 days away, no primary - tests very long timeline planning",
+            "campaign_info": CampaignInfo(
+                candidate_name="Andrew Sullivan",
+                office_and_jurisdiction="State Senator, District 5, MA",
+                election_date=date(2026, 11, 4),
+                primary_date=None,
+                race_type=RaceType.PARTISAN,
+                seats_available=1,
+                number_of_opponents=2,
+                win_number=25000,
+                total_likely_voters=120000,
+                available_cell_phones=15000,
+                available_landlines=2000,
+                incumbent_status=IncumbentStatus.NOT_APPLICABLE,
+                additional_race_context="Focus on economic development and healthcare reform"
+            ),
+            "expected_behavior": "Start 49 days before election (max window applies). Should generate plan starting in mid-September 2026."
         },
     ]
 
