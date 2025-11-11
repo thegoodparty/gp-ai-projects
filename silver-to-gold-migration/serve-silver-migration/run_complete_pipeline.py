@@ -217,7 +217,7 @@ class SilverToGoldPipeline:
                 'error': None
             }
 
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             return {
                 'status_code': None,
                 'response_data': None,
