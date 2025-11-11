@@ -60,11 +60,11 @@ class SQSEventPublisher:
             if record.poll_id:
                 polls[record.poll_id].append(record)
 
-        total_issues = 0
         total_complete_events = 0
-        all_issues = []
+        all_events = []
 
         for poll_id, records in polls.items():
+            poll_issues = []
             logger.info(f"Processing poll_id: {poll_id} ({len(records)} records)")
 
             cluster_stats = self._aggregate_cluster_stats(records)
@@ -74,7 +74,7 @@ class SQSEventPublisher:
             logger.info(f"  Processing top {len(top_clusters)} clusters")
 
             for rank, cluster_data in enumerate(top_clusters, start=1):
-                all_issues.append(
+                poll_issues.append(
                     PollIssueAnalysisData(
                         pollId=poll_id,
                         rank=rank,
@@ -88,12 +88,11 @@ class SQSEventPublisher:
 
                 logger.info(f"  ✅ Rank {rank}: {cluster_data['theme']} ({cluster_data['responseCount']} respondents) - saved locally")
 
-                total_issues += 1
-
             unique_respondents = len(set(record.phone_number for record in records))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
-            complete_event = self._build_complete_event(poll_id, unique_respondents, all_issues)
+            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues)
+            all_events.append(complete_event)
 
             if self.publish_to_sqs:
                 self._send_to_sqs(complete_event)
@@ -103,11 +102,10 @@ class SQSEventPublisher:
 
             total_complete_events += 1
 
-        self._save_events_locally([complete_event])
+        self._save_events_locally(all_events.to_json())
 
         return {
             'polls_processed': len(polls),
-            'issues_sent': total_issues,
             'complete_events_sent': total_complete_events
         }
 
@@ -188,7 +186,7 @@ class SQSEventPublisher:
         """
         logger.info(f"Publishing empty poll completion event for poll_id: {poll_id}")
 
-        complete_event = self._build_complete_event(poll_id, total_responses=0)
+        complete_event = self._build_complete_event(poll_id, total_responses=0, issues=[])
         events = [complete_event.to_json()]
 
         if self.publish_to_sqs:
@@ -201,7 +199,6 @@ class SQSEventPublisher:
 
         return {
             'polls_processed': 1,
-            'issue_events_sent': 0,
             'complete_events_sent': 1
         }
 
