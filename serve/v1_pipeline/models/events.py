@@ -14,20 +14,10 @@ class PollIssueAnalysisData:
     responseCount: int
 
 @dataclass
-class PollIssueAnalysisEvent:
-    data: PollIssueAnalysisData
-    type: str = 'pollIssueAnalysis'
-
-    def to_json(self) -> dict:
-        return {
-            'type': self.type,
-            'data': asdict(self.data)
-        }
-
-@dataclass
 class PollAnalysisCompleteData:
     pollId: str
     totalResponses: int
+    issues: list[PollIssueAnalysisData]
 
 @dataclass
 class PollAnalysisCompleteEvent:

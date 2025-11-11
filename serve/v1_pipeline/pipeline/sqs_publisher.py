@@ -18,7 +18,6 @@ from serve.v1_pipeline.models.events import (
     PollAnalysisCompleteData,
     PollAnalysisCompleteEvent,
     PollIssueAnalysisData,
-    PollIssueAnalysisEvent,
 )
 from serve.v1_pipeline.models.unified_record import UnifiedCampaignRecord
 from shared.logger import get_logger
@@ -61,9 +60,9 @@ class SQSEventPublisher:
             if record.poll_id:
                 polls[record.poll_id].append(record)
 
-        total_issue_events = 0
+        total_issues = 0
         total_complete_events = 0
-        all_events = []
+        all_issues = []
 
         for poll_id, records in polls.items():
             logger.info(f"Processing poll_id: {poll_id} ({len(records)} records)")
@@ -75,24 +74,26 @@ class SQSEventPublisher:
             logger.info(f"  Processing top {len(top_clusters)} clusters")
 
             for rank, cluster_data in enumerate(top_clusters, start=1):
-                event = self._build_issue_event(poll_id, rank, cluster_data)
+                all_issues.append(
+                    PollIssueAnalysisData(
+                        pollId=poll_id,
+                        rank=rank,
+                        theme=cluster_data['theme'],
+                        summary=cluster_data['summary'],
+                        analysis=cluster_data['analysis'],
+                        quotes=cluster_data['quotes'],
+                        responseCount=cluster_data['responseCount']
+                    )
+                )
 
-                all_events.append(event.to_json())
+                logger.info(f"  ✅ Rank {rank}: {cluster_data['theme']} ({cluster_data['responseCount']} respondents) - saved locally")
 
-                if self.publish_to_sqs:
-                    self._send_to_sqs(event)
-                    logger.info(f"  ✅ Rank {rank}: {cluster_data['theme']} ({cluster_data['responseCount']} respondents) - sent to SQS + saved locally")
-                else:
-                    logger.info(f"  ✅ Rank {rank}: {cluster_data['theme']} ({cluster_data['responseCount']} respondents) - saved locally")
-
-                total_issue_events += 1
+                total_issues += 1
 
             unique_respondents = len(set(record.phone_number for record in records))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
-            complete_event = self._build_complete_event(poll_id, unique_respondents)
-
-            all_events.append(complete_event.to_json())
+            complete_event = self._build_complete_event(poll_id, unique_respondents, all_issues)
 
             if self.publish_to_sqs:
                 self._send_to_sqs(complete_event)
@@ -102,11 +103,11 @@ class SQSEventPublisher:
 
             total_complete_events += 1
 
-        self._save_events_locally(all_events)
+        self._save_events_locally([complete_event])
 
         return {
             'polls_processed': len(polls),
-            'issue_events_sent': total_issue_events,
+            'issues_sent': total_issues,
             'complete_events_sent': total_complete_events
         }
 
@@ -170,26 +171,13 @@ class SQSEventPublisher:
 
         return ranked[:self.top_n]
 
-    def _build_issue_event(self, poll_id: str, rank: int, cluster_data: dict) -> PollIssueAnalysisEvent:
-        return PollIssueAnalysisEvent(
-            type='pollIssueAnalysis',
-            data=PollIssueAnalysisData(
-                pollId=poll_id,
-                rank=rank,
-                theme=cluster_data['theme'],
-                summary=cluster_data['summary'],
-                analysis=cluster_data['analysis'],
-                quotes=cluster_data['quotes'],
-                responseCount=cluster_data['responseCount']
-            )
-        )
-
-    def _build_complete_event(self, poll_id: str, total_responses: int) -> PollAnalysisCompleteEvent:
+    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData]) -> PollAnalysisCompleteEvent:
         return PollAnalysisCompleteEvent(
             type='pollAnalysisComplete',
             data=PollAnalysisCompleteData(
                 pollId=poll_id,
-                totalResponses=total_responses
+                totalResponses=total_responses,
+                issues=issues
             )
         )
 
@@ -239,7 +227,7 @@ class SQSEventPublisher:
             logger.error(f"Failed to save events locally: {e}", exc_info=True)
             raise
 
-    def _send_to_sqs(self, event: PollIssueAnalysisEvent | PollAnalysisCompleteEvent) -> None:
+    def _send_to_sqs(self, event: PollAnalysisCompleteEvent) -> None:
         """Send event to SQS FIFO queue with proper MessageGroupId"""
         if not self.publish_to_sqs or not self.sqs_client:
             logger.warning("SQS publishing disabled but _send_to_sqs called")
