@@ -944,14 +944,14 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         async def process_state_with_semaphore(state: str) -> Dict[str, Any]:
             async with semaphore:
                 try:
-                    # Add 1-hour timeout per state to prevent indefinite hangs
+                    # Add 2-hour timeout per state to prevent indefinite hangs
                     return await asyncio.wait_for(
                         self.process_single_state(state, batch_size, output_prefix),
-                        timeout=3600 * 2  # 2 hour
+                        timeout=3600 * 2  # 2 hours
                     )
                 except asyncio.TimeoutError:
-                    self.logger.error(f"⏱️ TIMEOUT: {state} exceeded 1 hour processing time - skipping")
-                    raise RuntimeError(f"State {state} processing timeout after 1 hour")
+                    self.logger.error(f"⏱️ TIMEOUT: {state} exceeded 2 hours processing time - skipping")
+                    raise RuntimeError(f"State {state} processing timeout after 2 hours")
                 except Exception as e:
                     # Check for quota exhaustion - re-raise to stop all processing
                     error_str = str(e).lower()

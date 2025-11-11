@@ -197,8 +197,9 @@ class SilverToGoldPipeline:
             'token': self.api_token
         }
 
-        payload = {
-            'includeTurnout': False
+        # Add query parameter to skip turnout calculation
+        params = {
+            'includeTurnout': 'false'
         }
 
         try:
@@ -206,7 +207,8 @@ class SilverToGoldPipeline:
                 url,
                 headers=headers,
                 cookies=cookies,
-                json=payload,
+                params=params,
+                json={},
                 timeout=30
             )
 
