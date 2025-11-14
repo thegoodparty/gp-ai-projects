@@ -100,9 +100,9 @@ class TemporalFilter:
         # Save timestamped and latest versions
         timestamped_file = os.path.join(offline_data_dir, f"hubspot_filtered_to_match_ddhq_dates_{timestamp}.parquet")
         latest_file = os.path.join(offline_data_dir, "hubspot_filtered_to_match_ddhq_dates_latest.parquet")
-        
-        hubspot_filtered.to_parquet(timestamped_file, index=False)
-        hubspot_filtered.to_parquet(latest_file, index=False)
+
+        hubspot_filtered.to_parquet(timestamped_file, index=False, engine='pyarrow', coerce_timestamps='us')
+        hubspot_filtered.to_parquet(latest_file, index=False, engine='pyarrow', coerce_timestamps='us')
         
         self.logger.info(f"✅ Filtered data saved:")
         self.logger.info(f"   Timestamped: {timestamped_file}")

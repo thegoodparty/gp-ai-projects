@@ -24,8 +24,13 @@ from shared.logger import get_logger
 class DataExtractor:
     def __init__(self):
         self.logger = get_logger(__name__)
-        
-        # Import Databricks client from shared directory
+
+        self.hubspot_table = os.getenv('HUBSPOT_TABLE', 'dbt.m_general__candidacy')
+        self.ddhq_table = os.getenv('DDHQ_TABLE', 'dbt.stg_airbyte_source__ddhq_gdrive_election_results')
+
+        self.logger.debug(f"HubSpot table: {self.hubspot_table}")
+        self.logger.debug(f"DDHQ table: {self.ddhq_table}")
+
         try:
             from shared.databricks_client import DatabricksClient
             self.db_client = DatabricksClient()
@@ -37,10 +42,10 @@ class DataExtractor:
     def extract_hubspot_candidacy(self) -> pd.DataFrame:
         """Extract HubSpot candidacy data from Databricks"""
         self.logger.info("📥 Extracting HubSpot candidacy data...")
-        
-        query = """
+
+        query = f"""
         SELECT *
-        FROM dbt.m_general__candidacy
+        FROM {self.hubspot_table}
         ORDER BY updated_at DESC
         """
         
@@ -55,10 +60,10 @@ class DataExtractor:
     def extract_ddhq_election_results(self) -> pd.DataFrame:
         """Extract DDHQ election results from Databricks"""
         self.logger.info("📥 Extracting DDHQ election results...")
-        
-        query = """
+
+        query = f"""
         SELECT *
-        FROM dbt.stg_airbyte_source__ddhq_gdrive_election_results
+        FROM {self.ddhq_table}
         ORDER BY date DESC
         """
         
@@ -73,45 +78,41 @@ class DataExtractor:
     def save_raw_data(self, hubspot_df: pd.DataFrame, ddhq_df: pd.DataFrame):
         """Save raw extracted data to offline_data directory"""
         self.logger.info("💾 Saving raw datasets...")
-        
-        # Create offline_data directory relative to script location
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         offline_data_dir = os.path.join(current_dir, "offline_data")
         os.makedirs(offline_data_dir, exist_ok=True)
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save HubSpot data
+
         hubspot_parquet = os.path.join(offline_data_dir, f"hubspot_candidacy_{timestamp}.parquet")
         hubspot_tsv = os.path.join(offline_data_dir, f"hubspot_candidacy_{timestamp}.tsv")
         hubspot_latest_parquet = os.path.join(offline_data_dir, "hubspot_candidacy_latest.parquet")
         hubspot_latest_tsv = os.path.join(offline_data_dir, "hubspot_candidacy_latest.tsv")
-        
-        hubspot_df.to_parquet(hubspot_parquet, index=False)
+
+        hubspot_df.to_parquet(hubspot_parquet, index=False, engine='pyarrow', coerce_timestamps='us')
         hubspot_df.to_csv(hubspot_tsv, sep='\t', index=False)
-        hubspot_df.to_parquet(hubspot_latest_parquet, index=False)
+        hubspot_df.to_parquet(hubspot_latest_parquet, index=False, engine='pyarrow', coerce_timestamps='us')
         hubspot_df.to_csv(hubspot_latest_tsv, sep='\t', index=False)
-        
-        # Save DDHQ data
+
         ddhq_parquet = os.path.join(offline_data_dir, f"ddhq_election_results_{timestamp}.parquet")
         ddhq_tsv = os.path.join(offline_data_dir, f"ddhq_election_results_{timestamp}.tsv")
         ddhq_latest_parquet = os.path.join(offline_data_dir, "ddhq_election_results_latest.parquet")
         ddhq_latest_tsv = os.path.join(offline_data_dir, "ddhq_election_results_latest.tsv")
-        
-        ddhq_df.to_parquet(ddhq_parquet, index=False)
+
+        ddhq_df.to_parquet(ddhq_parquet, index=False, engine='pyarrow', coerce_timestamps='us')
         ddhq_df.to_csv(ddhq_tsv, sep='\t', index=False)
-        ddhq_df.to_parquet(ddhq_latest_parquet, index=False)
+        ddhq_df.to_parquet(ddhq_latest_parquet, index=False, engine='pyarrow', coerce_timestamps='us')
         ddhq_df.to_csv(ddhq_latest_tsv, sep='\t', index=False)
-        
-        # Calculate file sizes
+
         hubspot_size_mb = os.path.getsize(hubspot_parquet) / (1024 * 1024)
         ddhq_size_mb = os.path.getsize(ddhq_parquet) / (1024 * 1024)
-        
+
         self.logger.info(f"✅ Raw data saved:")
         self.logger.info(f"   HubSpot: {hubspot_parquet} ({hubspot_size_mb:.1f} MB)")
         self.logger.info(f"   DDHQ: {ddhq_parquet} ({ddhq_size_mb:.1f} MB)")
         self.logger.info(f"   Latest files also saved for pipeline")
-        
+
         return hubspot_parquet, ddhq_parquet
     
     def print_data_summary(self, hubspot_df: pd.DataFrame, ddhq_df: pd.DataFrame):

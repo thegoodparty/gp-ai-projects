@@ -22,6 +22,7 @@ import faiss
 import json
 import asyncio
 import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from tqdm.asyncio import tqdm
@@ -32,16 +33,19 @@ from shared.llm_gemini import GeminiClient, GeminiModelType
 from shared.logger import get_logger
 
 class ParallelProductionMatcher:
-    def __init__(self, batch_size: int = 1000, max_records: Optional[int] = None, max_workers: int = 1500):
+    def __init__(self, batch_size: int = 1000, max_records: Optional[int] = None, max_workers: int = 1500,
+                 hubspot_file: Optional[str] = None, ddhq_file: Optional[str] = None):
         self.logger = get_logger(__name__)
         self.batch_size = batch_size
         self.max_records = max_records
         self.max_workers = max_workers
-        
-        print("🚀 PARALLEL PRODUCTION HUBSPOT-DDHQ MATCHER")
-        print("=" * 50)
-        print(f"🔧 Configuration: {max_workers} workers, batch size {batch_size}")
-        
+        self.hubspot_file_override = hubspot_file
+        self.ddhq_file_override = ddhq_file
+
+        self.logger.info("🚀 PARALLEL PRODUCTION HUBSPOT-DDHQ MATCHER")
+        self.logger.info("=" * 50)
+        self.logger.info(f"🔧 Configuration: {max_workers} workers, batch size {batch_size}")
+
         # Load data and initialize lazy-loading
         self._load_data()
         self._init_lazy_loading()
@@ -52,46 +56,67 @@ class ParallelProductionMatcher:
         self.matched_count = 0
         self.total_cost = 0.0
         
-        # Create ThreadPoolExecutor for maximum concurrency
+        # Create ThreadPoolExecutor matching semaphore limit
+        # Keep high worker count - HTTP connection pool limits actual concurrency
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
-        
+
+        # Add semaphore for bounded concurrency to prevent OOM
+        self.semaphore = asyncio.Semaphore(self.max_workers)
+
         records_to_process = min(len(self.hubspot_df), max_records) if max_records else len(self.hubspot_df)
-        print(f"\n✅ Ready to process {records_to_process:,} temporally-aligned HubSpot records")
+        self.logger.info(f"\n✅ Ready to process {records_to_process:,} temporally-aligned HubSpot records")
     
     def _get_candidate_name(self, hubspot_record: Dict) -> str:
         """Helper method to construct candidate name from HubSpot record"""
         return f"{hubspot_record.get('first_name', '')} {hubspot_record.get('last_name', '')}".strip()
-    
+
+    def _is_missing(self, x) -> bool:
+        """Helper to check if value is missing (None, NaN, or blank string)"""
+        return pd.isna(x) or (isinstance(x, str) and not x.strip())
+
+    async def _process_hubspot_record_with_semaphore(self, hubspot_record: pd.Series, record_index: int) -> Dict[str, Any]:
+        """Wrapper for _process_hubspot_record that uses semaphore to prevent OOM"""
+        async with self.semaphore:
+            return await self._process_hubspot_record(hubspot_record, record_index)
+
     def _load_data(self):
-        print("📥 Loading offline data...")
+        self.logger.info("📥 Loading offline data...")
         current_dir = os.path.dirname(os.path.abspath(__file__))
         offline_data_dir = os.path.join(current_dir, "offline_data")
-        
-        # Use full embeddings dataset
-        hubspot_file = os.path.join(offline_data_dir, 'hubspot_filtered_with_embeddings_latest.parquet')
-        ddhq_file = os.path.join(offline_data_dir, 'ddhq_with_embeddings_cleaned_latest.parquet')
-        
+
+        # Use override files if provided, otherwise use defaults
+        if self.hubspot_file_override and self.ddhq_file_override:
+            hubspot_file = self.hubspot_file_override
+            ddhq_file = self.ddhq_file_override
+            self.logger.info(f"   Using custom data files:")
+            self.logger.info(f"   - HubSpot: {os.path.basename(hubspot_file)}")
+            self.logger.info(f"   - DDHQ: {os.path.basename(ddhq_file)}")
+        else:
+            # Use full embeddings dataset
+            hubspot_file = os.path.join(offline_data_dir, 'hubspot_filtered_with_embeddings_latest.parquet')
+            ddhq_file = os.path.join(offline_data_dir, 'ddhq_with_embeddings_cleaned_latest.parquet')
+
         self.hubspot_df = pd.read_parquet(hubspot_file)
         self.ddhq_df = pd.read_parquet(ddhq_file)
         
         # Sort HubSpot data by date + state + election_type for optimal cache performance
-        print("🔄 Sorting HubSpot data by (date, state, election_type) for lazy-load cache optimization...")
+        self.logger.info("🔄 Sorting HubSpot data by (date, state, election_type) for lazy-load cache optimization...")
         self.hubspot_df = self.hubspot_df.sort_values(
             ['election_date', 'state', 'election_type'],
             na_position='last'
         )
         
-        print(f"   HubSpot (filtered by DDHQ dates): {len(self.hubspot_df):,} records")
-        print(f"   DDHQ (full dataset): {len(self.ddhq_df):,} records")
+        self.logger.info(f"   HubSpot (filtered by DDHQ dates): {len(self.hubspot_df):,} records")
+        self.logger.info(f"   DDHQ (full dataset): {len(self.ddhq_df):,} records")
     
     def _init_lazy_loading(self):
-        print("🔍 Initializing lazy-loading with garbage collection (Date + State + Election Type)...")
+        self.logger.info("🔍 Initializing lazy-loading with LRU cache (Date + State + Election Type)...")
 
-        # MEMORY OPTIMIZATION: Lazy-load partitions with GC (not pre-build all)
-        self.faiss_indices = {}  # "{date}_{state}_{election_type}" -> FAISS index (cache)
-        self.partition_records = {}   # "{date}_{state}_{election_type}" -> DataFrame slice (cache)
+        # MEMORY OPTIMIZATION: Lazy-load partitions with LRU eviction (not pre-build all)
+        self.faiss_indices = OrderedDict()  # "{date}_{state}_{election_type}" -> FAISS index (LRU cache)
+        self.partition_records = OrderedDict()   # "{date}_{state}_{election_type}" -> DataFrame slice (LRU cache)
         self.empty_partitions = set()  # Track empty partitions to avoid rebuilding
-        self.last_partition_key = None  # Track partition changes for GC
+        self.MAX_CACHE_SIZE = 64  # LRU cache limit
         self.partition_build_count = 0  # Statistics
         self.partition_gc_count = 0  # Statistics
 
@@ -99,17 +124,21 @@ class ParallelProductionMatcher:
         import threading
         self.partition_lock = threading.Lock()
 
-        print("   ✅ Lazy-loading initialized - partitions will be built on-demand")
-        print("   ♻️  Garbage collection enabled - old partitions will be freed automatically")
+        self.logger.info(f"   ✅ Lazy-loading initialized with LRU cache (max {self.MAX_CACHE_SIZE} partitions)")
+        self.logger.info("   ♻️  LRU eviction enabled - least recently used partitions will be freed automatically")
 
     def _get_or_build_partition(self, date, state, election_type):
-        """Lazy-load partition with garbage collection when partition changes (thread-safe)"""
+        """Lazy-load partition with LRU eviction (thread-safe)"""
         partition_key = f"{date}_{state}_{election_type}"
 
         # Fast path: Check if already built or known to be empty (no lock needed)
         if partition_key in self.empty_partitions:
             return None, None
         if partition_key in self.faiss_indices:
+            # Mark as recently used (move to end of OrderedDict)
+            with self.partition_lock:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
             return self.faiss_indices[partition_key], self.partition_records[partition_key]
 
         # Slow path: Need to build partition (acquire lock to prevent race conditions)
@@ -118,18 +147,9 @@ class ParallelProductionMatcher:
             if partition_key in self.empty_partitions:
                 return None, None
             if partition_key in self.faiss_indices:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
                 return self.faiss_indices[partition_key], self.partition_records[partition_key]
-
-            # Check if we've moved to a new partition (garbage collection)
-            if self.last_partition_key is not None and self.last_partition_key != partition_key:
-                # Garbage collect old partition
-                if self.last_partition_key in self.faiss_indices:
-                    del self.faiss_indices[self.last_partition_key]
-                if self.last_partition_key in self.partition_records:
-                    del self.partition_records[self.last_partition_key]
-
-                self.partition_gc_count += 1
-                self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
 
             # Build the partition
             self.logger.debug(f"🔨 Building partition on-demand: {partition_key}")
@@ -144,7 +164,6 @@ class ParallelProductionMatcher:
             if len(partition_records) == 0:
                 self.logger.debug(f"⚠️  Empty partition: {partition_key}")
                 self.empty_partitions.add(partition_key)  # Cache empty result
-                self.last_partition_key = partition_key
                 return None, None
 
             # Build FAISS index
@@ -158,9 +177,15 @@ class ParallelProductionMatcher:
             self.faiss_indices[partition_key] = index
             self.partition_records[partition_key] = partition_records
             self.partition_build_count += 1
-            self.last_partition_key = partition_key
 
-            self.logger.debug(f"✅ Built partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records)")
+            # LRU eviction: Remove oldest entry if cache is full
+            if len(self.faiss_indices) > self.MAX_CACHE_SIZE:
+                oldest_key, _ = self.faiss_indices.popitem(last=False)
+                self.partition_records.popitem(last=False)
+                self.partition_gc_count += 1
+                self.logger.debug(f"♻️  LRU eviction {self.partition_gc_count}: {oldest_key} (cache size: {len(self.faiss_indices)})")
+
+            self.logger.debug(f"✅ Built partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records, cache: {len(self.faiss_indices)}/{self.MAX_CACHE_SIZE})")
 
             return index, partition_records
 
@@ -178,17 +203,20 @@ class ParallelProductionMatcher:
         """
         partition_key = f"AFTER_{base_date}_{state}_{runoff_type}"
 
-        # Check if we've moved to a new partition (garbage collection)
-        if self.last_partition_key is not None and self.last_partition_key != partition_key:
-            if self.last_partition_key in self.faiss_indices:
-                del self.faiss_indices[self.last_partition_key]
-            if self.last_partition_key in self.partition_records:
-                del self.partition_records[self.last_partition_key]
-            self.partition_gc_count += 1
-            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+        # Check cache and mark as recently used
+        if partition_key in self.faiss_indices:
+            with self.partition_lock:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
+            return self.faiss_indices[partition_key], self.partition_records[partition_key]
 
         # Build date-range partition if not already cached
-        if partition_key not in self.faiss_indices:
+        with self.partition_lock:
+            # Double-check after lock
+            if partition_key in self.faiss_indices:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
+                return self.faiss_indices[partition_key], self.partition_records[partition_key]
             self.logger.debug(f"🔨 Building DATE-RANGE partition on-demand: {partition_key}")
 
             # Convert base_date to datetime for comparison
@@ -229,7 +257,6 @@ class ParallelProductionMatcher:
 
             if len(partition_records) == 0:
                 self.logger.debug(f"⚠️  Empty DATE-RANGE partition: {partition_key}")
-                self.last_partition_key = partition_key
                 return None, None
 
             # Get unique dates included
@@ -248,12 +275,16 @@ class ParallelProductionMatcher:
             self.partition_records[partition_key] = partition_records
             self.partition_build_count += 1
 
-            self.logger.debug(f"✅ Built DATE-RANGE partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_dates)} dates)")
+            # LRU eviction: Remove oldest entry if cache is full
+            if len(self.faiss_indices) > self.MAX_CACHE_SIZE:
+                oldest_key, _ = self.faiss_indices.popitem(last=False)
+                self.partition_records.popitem(last=False)
+                self.partition_gc_count += 1
+                self.logger.debug(f"♻️  LRU eviction {self.partition_gc_count}: {oldest_key} (cache size: {len(self.faiss_indices)})")
 
-        # Update last partition tracker
-        self.last_partition_key = partition_key
+            self.logger.debug(f"✅ Built DATE-RANGE partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_dates)} dates, cache: {len(self.faiss_indices)}/{self.MAX_CACHE_SIZE})")
 
-        return self.faiss_indices.get(partition_key), self.partition_records.get(partition_key)
+            return index, partition_records
 
     def _get_or_build_stateless_partition(self, date, election_type):
         """
@@ -269,17 +300,20 @@ class ParallelProductionMatcher:
         """
         partition_key = f"{date}_ALL_STATES_{election_type}"
 
-        # Check if we've moved to a new partition (garbage collection)
-        if self.last_partition_key is not None and self.last_partition_key != partition_key:
-            if self.last_partition_key in self.faiss_indices:
-                del self.faiss_indices[self.last_partition_key]
-            if self.last_partition_key in self.partition_records:
-                del self.partition_records[self.last_partition_key]
-            self.partition_gc_count += 1
-            self.logger.debug(f"♻️  GC partition {self.partition_gc_count}: {self.last_partition_key}")
+        # Check cache and mark as recently used
+        if partition_key in self.faiss_indices:
+            with self.partition_lock:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
+            return self.faiss_indices[partition_key], self.partition_records[partition_key]
 
         # Build state-less partition if not already cached
-        if partition_key not in self.faiss_indices:
+        with self.partition_lock:
+            # Double-check after lock
+            if partition_key in self.faiss_indices:
+                self.faiss_indices.move_to_end(partition_key)
+                self.partition_records.move_to_end(partition_key)
+                return self.faiss_indices[partition_key], self.partition_records[partition_key]
             self.logger.debug(f"🔨 Building STATE-LESS partition on-demand: {partition_key}")
 
             # Filter DDHQ records: date = target_date AND election_type = target_type (all states)
@@ -290,7 +324,6 @@ class ParallelProductionMatcher:
 
             if len(partition_records) == 0:
                 self.logger.debug(f"⚠️  Empty STATE-LESS partition: {partition_key}")
-                self.last_partition_key = partition_key
                 return None, None
 
             # Get unique states included
@@ -309,15 +342,19 @@ class ParallelProductionMatcher:
             self.partition_records[partition_key] = partition_records
             self.partition_build_count += 1
 
-            self.logger.debug(f"✅ Built STATE-LESS partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_states)} states)")
+            # LRU eviction: Remove oldest entry if cache is full
+            if len(self.faiss_indices) > self.MAX_CACHE_SIZE:
+                oldest_key, _ = self.faiss_indices.popitem(last=False)
+                self.partition_records.popitem(last=False)
+                self.partition_gc_count += 1
+                self.logger.debug(f"♻️  LRU eviction {self.partition_gc_count}: {oldest_key} (cache size: {len(self.faiss_indices)})")
 
-        # Update last partition tracker
-        self.last_partition_key = partition_key
+            self.logger.debug(f"✅ Built STATE-LESS partition {self.partition_build_count}: {partition_key} ({len(partition_records)} records from {len(unique_states)} states, cache: {len(self.faiss_indices)}/{self.MAX_CACHE_SIZE})")
 
-        return self.faiss_indices.get(partition_key), self.partition_records.get(partition_key)
+            return index, partition_records
 
     def _init_llm(self):
-        print("🤖 Initializing Gemini LLM...")
+        self.logger.info("🤖 Initializing Gemini LLM...")
         # Configure for HIGH THROUGHPUT with reliability (reduced from 1200 to avoid API corruption)
         target_concurrency = 500  # Balanced for throughput + reliability (~5k/min target)
         self.llm_client = GeminiClient(
@@ -328,7 +365,7 @@ class ParallelProductionMatcher:
             max_retries=9,  # Handle all retries in LLM client (no outer retry loop)
             base_delay=1.0  # Exponential backoff starting at 1 second
         )
-        print(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
+        self.logger.info(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
 
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
         """
@@ -347,7 +384,7 @@ class ParallelProductionMatcher:
 
         # Check if we need state-less fallback partition
         partition_type = 'standard'
-        if pd.isna(target_state):
+        if self._is_missing(target_state):
             if pd.isna(target_date) or pd.isna(target_election_type):
                 self.logger.warning(f"Missing date and election_type for candidate: {self._get_candidate_name(hubspot_record)}")
                 return ([], 'standard')
@@ -381,7 +418,7 @@ class ParallelProductionMatcher:
 
         # Check if FAISS returned any valid results
         if len(similarities[0]) == 0 or len(indices[0]) == 0:
-            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if pd.isna(target_state) else f"{target_date}_{target_state}_{target_election_type}"
+            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if self._is_missing(target_state) else f"{target_date}_{target_state}_{target_election_type}"
             self.logger.debug(f"FAISS returned empty results for partition {partition_key}")
             return ([], partition_type)
 
@@ -389,7 +426,7 @@ class ParallelProductionMatcher:
         all_candidates = []
         for similarity, idx in zip(similarities[0], indices[0]):
             # Comprehensive safety checks
-            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if pd.isna(target_state) else f"{target_date}_{target_state}_{target_election_type}"
+            partition_key = f"{target_date}_ALL_STATES_{target_election_type}" if self._is_missing(target_state) else f"{target_date}_{target_state}_{target_election_type}"
             if idx < 0 or idx >= len(partition_records):
                 self.logger.warning(f"FAISS returned invalid index {idx} for partition {partition_key} with {len(partition_records)} records")
                 continue
@@ -442,7 +479,7 @@ class ParallelProductionMatcher:
 
         target_state = hubspot_record.get('state')
 
-        if pd.isna(target_state):
+        if self._is_missing(target_state):
             self.logger.warning(f"Runoff record missing state information")
             return ([], 'no_match', None)
 
@@ -673,10 +710,24 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
             # Use dedicated thread pool for maximum LLM concurrency
             # Retries are handled internally by GeminiClient (max_retries=9)
             llm_call_start = time.time()
-            response = await asyncio.get_event_loop().run_in_executor(
-                self.thread_pool,
-                lambda: self.llm_client.generate_content(prompt)
-            )
+
+            # Hard timeout to prevent infinite hangs (even if HTTP client stalls)
+            async def _llm_call():
+                return await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool,
+                    lambda: self.llm_client.generate_content(prompt)
+                )
+
+            try:
+                response = await asyncio.wait_for(_llm_call(), timeout=120.0)  # 120s hard limit
+            except asyncio.TimeoutError:
+                self.logger.warning(f"LLM call timed out after 120s for {hubspot_record['first_name']} {hubspot_record['last_name']}")
+                return {
+                    'best_match': None,
+                    'confidence': 0,
+                    'reasoning': 'LLM call timed out after 120 seconds'
+                }
+
             llm_call_duration = time.time() - llm_call_start
 
             # Handle None response from API failures
@@ -684,6 +735,7 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
                 raise ValueError("LLM returned None response - likely API failure after all retries")
 
             response_text = response.strip()
+            original_response = response_text
 
             # Simple cleaning - remove markdown blocks but don't over-process
             if response_text.startswith('```json'):
@@ -710,6 +762,10 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
                 import re
                 cleaned_text = re.sub(r',(\s*[}\]])', r'\1', response_text)
                 result = json.loads(cleaned_text)
+
+            # Store prompt and response for training data
+            result['_llm_prompt'] = prompt
+            result['_llm_response'] = original_response
 
             # Apply confidence calibration if there's a match
             if result.get('best_match') is not None:
@@ -775,7 +831,9 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
             return {
                 "best_match": None,
                 "confidence": 0,
-                "reasoning": f"LLM validation error after all retries: {error_context['error_type']}: {error_context['error_message']}"
+                "reasoning": f"LLM validation error after all retries: {error_context['error_type']}: {error_context['error_message']}",
+                "_llm_prompt": prompt if 'prompt' in locals() else 'N/A',
+                "_llm_response": original_response if 'original_response' in locals() else 'N/A'
             }
     
     async def _process_hubspot_record(self, hubspot_record: pd.Series, record_index: int) -> Dict[str, Any]:
@@ -888,6 +946,8 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
                 'llm_best_match': llm_result.get('best_match'),
                 'llm_confidence': llm_result.get('confidence', 0),
                 'llm_reasoning': llm_result.get('reasoning', 'N/A'),
+                'llm_prompt': llm_result.get('_llm_prompt', 'N/A'),
+                'llm_response': llm_result.get('_llm_response', 'N/A'),
 
                 # Runoff fallback tracking
                 'match_source': match_source,
@@ -982,7 +1042,8 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
         self.logger.info(f"🔄 Batch {batch_num}/{total_batches} ({progress_pct:.1f}%) - Processing {batch_size} records")
         
         # Create tasks for parallel processing - all records in batch run concurrently
-        tasks = [self._process_hubspot_record(row, idx) for idx, (_, row) in enumerate(batch_df.iterrows())]
+        # Use semaphore wrapper to prevent OOM and respect concurrency limits
+        tasks = [self._process_hubspot_record_with_semaphore(row, idx) for idx, (_, row) in enumerate(batch_df.iterrows())]
         
         # Execute all tasks in parallel with error handling
         start_time = time.time()
@@ -1045,135 +1106,129 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
         
         if self.max_records:
             records_to_process = self.hubspot_df.sample(n=min(self.max_records, len(self.hubspot_df)), random_state=123)
-            print(f"   🎲 Using random sample of {len(records_to_process):,} records (seed=123 for reproducibility)")
+            self.logger.info(f"   🎲 Using random sample of {len(records_to_process):,} records (seed=123 for reproducibility)")
         else:
             records_to_process = self.hubspot_df
         
-        print(f"\n🚀 Processing {len(records_to_process):,} HubSpot records with HIGH THROUGHPUT CONCURRENCY...")
-        print(f"   Target: 10,000 records/minute = 140 records/second (MATCHED SPAWN RATE)")
-        print(f"   Workers: {self.max_workers} (designed for EXTREME 10k/min throughput)")
+        self.logger.info(f"\n🚀 Processing {len(records_to_process):,} HubSpot records with HIGH THROUGHPUT CONCURRENCY...")
+        self.logger.info(f"   Target: 10,000 records/minute = 140 records/second (MATCHED SPAWN RATE)")
+        self.logger.info(f"   Workers: {self.max_workers} (designed for EXTREME 10k/min throughput)")
         
-        # SPEED OPTIMIZATION: Process ALL records concurrently (not in sequential batches)
-        print(f"   🔥 Creating {len(records_to_process):,} concurrent tasks...")
-        
-        # Create ALL tasks at once - maximum concurrency
+        # CONCURRENT PROCESSING: Launch all tasks, semaphore limits concurrency
+        self.logger.info(f"   🔥 Launching {len(records_to_process):,} concurrent tasks (semaphore limits to {self.max_workers})...")
+
+        # Pre-allocate results array
+        start_time = time.time()
+        results = [None] * len(records_to_process)
+
+        # Create ALL tasks at once - semaphore controls actual concurrency
         all_tasks = []
         for idx, (_, row) in enumerate(records_to_process.iterrows()):
-            task = self._process_hubspot_record(row, idx)
+            task = self._process_hubspot_record_with_semaphore(row, idx)
             all_tasks.append(task)
-        
-        print(f"   ⚡ Launching {len(all_tasks):,} concurrent LLM calls...")
-        
-        # Use tqdm for progress tracking
-        pbar = tqdm(total=len(all_tasks), desc="Processing records", unit="record")
-        
-        # BATCH LAUNCHING: Overcome sub-millisecond timing precision limits
-        start_time = time.time()
-        results = [None] * len(all_tasks)  # Pre-allocate results array
-        
-        calls_per_second = 140  # 10k records/minute = 140 records/second spawn rate
-        batch_size = 140  # Launch 140 calls per batch
-        batch_interval = 1.0  # 1 second between batches for 10k/min
-        actual_rate = batch_size / batch_interval  # 140 / 1.0 = 140/sec = 10k/min
-        
-        print(f"   🎯 Target rate: {calls_per_second} calls/second ({calls_per_second * 60}/min) - 10K/MIN SPAWN RATE")
-        print(f"   📦 Batch strategy: {batch_size} calls every {batch_interval*1000:.0f}ms (10k/min pacing)")
-        print(f"   ⚡ Actual rate: {actual_rate:.0f} calls/second")
-        
-        # Track running tasks
-        running_tasks = {}
-        completed_count = 0
-        total_launched = 0
-        
-        # Launch tasks in batches with precise timing
-        batch_count = 0
-        for batch_start in range(0, len(all_tasks), batch_size):
-            batch_tasks = all_tasks[batch_start:batch_start + batch_size]
-            batch_count += 1
-            
-            # Launch entire batch simultaneously
-            batch_launch_start = time.time()
-            for i, task in enumerate(batch_tasks):
-                task_index = batch_start + i
-                actual_task = asyncio.create_task(task)
-                running_tasks[task_index] = actual_task
-                total_launched += 1
-            
-            batch_launch_time = time.time() - batch_launch_start
-            elapsed_total = time.time() - start_time
-            current_rate = total_launched / elapsed_total if elapsed_total > 0 else 0
-            
-            # Log batch timing
-            print(f"   📦 Batch {batch_count:2d}: Launched {len(batch_tasks):2d} tasks in {batch_launch_time*1000:.1f}ms | Total: {total_launched:4d} | Rate: {current_rate:.0f}/sec")
-            
-            # Wait for next batch (only if more batches remain)
-            if batch_start + batch_size < len(all_tasks):
-                await asyncio.sleep(batch_interval)
-            
-            # Check for completed tasks every 5 starts to maintain awareness
-            if batch_count % 5 == 0:
-                # Check for completed tasks
-                completed_indices = []
-                for task_idx, running_task in list(running_tasks.items()):
-                    if running_task.done():
-                        try:
-                            results[task_idx] = await running_task
-                        except Exception as e:
-                            results[task_idx] = e
-                        completed_indices.append(task_idx)
-                        completed_count += 1
-                
-                # Remove completed tasks
-                for idx in completed_indices:
-                    del running_tasks[idx]
-                
-                # Update progress
-                elapsed = time.time() - start_time
-                actual_rate = total_launched / elapsed if elapsed > 0 else 0
-                pbar.update(len(completed_indices))
-                pbar.set_postfix({
-                    'started': i + 1,
-                    'completed': completed_count,
-                    'rate': f"{actual_rate:.1f}/sec",
-                    'running': len(running_tasks)
-                })
-        
-        print(f"   ✅ All {len(all_tasks)} tasks started")
-        print(f"   ⏳ Waiting for remaining {len(running_tasks)} tasks to complete...")
-        
-        # Wait for all remaining tasks to complete
-        while running_tasks:
-            completed_indices = []
-            for task_idx, running_task in list(running_tasks.items()):
-                if running_task.done():
-                    try:
-                        results[task_idx] = await running_task
-                    except Exception as e:
-                        results[task_idx] = e
-                    completed_indices.append(task_idx)
-                    completed_count += 1
-            
-            # Remove completed tasks
-            for idx in completed_indices:
-                del running_tasks[idx]
-            
-            # Update progress
-            pbar.update(len(completed_indices))
-            pbar.set_postfix({
-                'completed': completed_count,
-                'remaining': len(running_tasks)
-            })
-            
-            # Small delay to avoid busy waiting
-            if running_tasks:
-                await asyncio.sleep(0.1)
-        
-        pbar.close()
+
+        self.logger.info(f"   ⚡ Executing {len(all_tasks):,} tasks with max {self.max_workers} concurrent...")
+
+        # Execute all tasks concurrently (gather preserves order)
+        # The semaphore inside each task limits actual concurrency
+        results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        elapsed = time.time() - start_time
+        rate = len(results) / elapsed if elapsed > 0 else 0
+        self.logger.info(f"   ✅ Completed {len(results):,} tasks in {elapsed:.1f}s ({rate:.1f}/sec)")
+
+        unprocessed_indices = [i for i, r in enumerate(results) if r is None or (isinstance(r, Exception) and 'timeout' in str(r).lower())]
+
+        successfully_retried = 0
+        still_failed = 0
+
+        if unprocessed_indices:
+            self.logger.info(f"\n🔄 RETRY: Found {len(unprocessed_indices)} unprocessed/timed-out rows")
+            self.logger.info(f"   Retrying indices: {unprocessed_indices[:10]}{'...' if len(unprocessed_indices) > 10 else ''}")
+
+            total_retries = len(unprocessed_indices)
+            group_size = min(200, self.max_workers)
+            self.logger.info(f"   Using batch size: {group_size} (parallel processing)")
+
+            retry_tasks = []
+            for idx in unprocessed_indices:
+                row = records_to_process.iloc[idx]
+                # CRITICAL: Use semaphore wrapper to prevent retry concurrency explosion
+                task = self._process_hubspot_record_with_semaphore(row, idx)
+                retry_tasks.append((idx, task))
+
+            quota_exhausted = False
+
+            retry_results = []
+            with tqdm(total=total_retries, desc="Retrying failed tasks", unit="record") as retry_pbar:
+                for i in range(0, len(retry_tasks), group_size):
+                    if quota_exhausted:
+                        for j in range(i, len(retry_tasks)):
+                            idx, _ = retry_tasks[j]
+                            results[idx] = Exception("Quota exhausted during retry - skipped")
+                            retry_pbar.update(1)
+                        break
+
+                    group = retry_tasks[i:i + group_size]
+                    group_indices = [idx for idx, _ in group]
+                    group_tasks = [task for _, task in group]
+
+                    group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
+
+                    for result_idx, (idx, result) in enumerate(zip(group_indices, group_results)):
+                        if isinstance(result, Exception):
+                            error_str = str(result).lower()
+
+                            if "quota exhausted" in error_str or "resource_exhausted" in error_str:
+                                self.logger.error(f"🚨 Quota exhausted during retry - stopping further processing")
+                                quota_exhausted = True
+                                results[idx] = result
+                                still_failed += 1
+                            else:
+                                self.logger.error(f"❌ Error retrying index {idx}: {result}")
+                                results[idx] = result
+                                still_failed += 1
+                        else:
+                            results[idx] = result
+                            if result.get('has_match'):
+                                successfully_retried += 1
+                            elif 'Processing error' in str(result.get('llm_reasoning', '')):
+                                still_failed += 1
+                            else:
+                                successfully_retried += 1
+
+                        retry_pbar.update(1)
+                        self.logger.info(f"🔍 DEBUG A: After retry_pbar.update({idx})")
+
+                    self.logger.info(f"🔍 DEBUG B: Exited inner for loop (processed {len(group_indices)} results)")
+
+                    if quota_exhausted:
+                        self.logger.info("🔍 DEBUG C: Quota exhausted, breaking")
+                        break
+
+                self.logger.info(f"🔍 DEBUG D: Exited outer for loop (processed {len(retry_tasks)} retry batches)")
+
+            self.logger.info("🔍 DEBUG E: About to exit tqdm context manager")
+
+        self.logger.info("🔍 DEBUG F: Successfully exited tqdm context manager")
+
+        self.logger.info(f"   ✅ Retry processing completed: {successfully_retried} successful, {still_failed} failed")
+        self.logger.info("🔍 DEBUG G: Printed retry completion message")
+
         total_duration = time.time() - start_time
-        
-        # Process results
-        processed_rows = []
+        self.logger.info(f"🔍 DEBUG H: Starting results processing loop ({len(results)} results)")
+
+        # Process results incrementally to avoid memory issues with large DataFrame creation
+        CHUNK_SIZE = 10000
+        processed_dfs = []
+        temp_rows = []
+        total_rows_count = 0
+
         for i, result in enumerate(results):
+            # Log progress every 10000 records
+            if i > 0 and i % CHUNK_SIZE == 0:
+                self.logger.info(f"🔍 DEBUG I: Processing result {i}/{len(results)}")
+
             if isinstance(result, Exception):
                 # Handle exceptions
                 row = records_to_process.iloc[i].copy()
@@ -1187,32 +1242,55 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
                     'has_match': False,
                     'top_10_candidates': 'CONCURRENT_ERROR'
                 }
-                processed_rows.append(error_result)
+                temp_rows.append(error_result)
             else:
-                processed_rows.append(result)
-        
+                temp_rows.append(result)
+
+            # Create DataFrame chunk every CHUNK_SIZE records
+            if len(temp_rows) >= CHUNK_SIZE:
+                chunk_df = pd.DataFrame(temp_rows)
+                processed_dfs.append(chunk_df)
+                total_rows_count += len(temp_rows)
+                self.logger.info(f"🔍 DEBUG I-chunk: Created DataFrame chunk {len(processed_dfs)} with {len(temp_rows)} rows (total: {total_rows_count})")
+                temp_rows = []
+
+        # Handle remaining rows
+        if temp_rows:
+            chunk_df = pd.DataFrame(temp_rows)
+            processed_dfs.append(chunk_df)
+            total_rows_count += len(temp_rows)
+            self.logger.info(f"🔍 DEBUG I-final: Created final DataFrame chunk with {len(temp_rows)} rows (total: {total_rows_count})")
+
+        self.logger.info(f"🔍 DEBUG J: Completed results processing loop ({total_rows_count} rows in {len(processed_dfs)} chunks)")
+
         # Calculate final performance metrics
-        total_records = len(processed_rows)
+        total_records = total_rows_count
         records_per_second = total_records / max(0.1, total_duration)
         records_per_minute = records_per_second * 60
         target_achievement = (records_per_minute / 10000) * 100  # 10k/min target
-        
-        print(f"\n🎯 PERFORMANCE RESULTS:")
-        print(f"   Total time: {total_duration:.1f}s")
-        print(f"   Records processed: {total_records:,}")
-        print(f"   Speed: {records_per_second:.1f} rec/sec = {records_per_minute:.0f} rec/min")
-        print(f"   Target achievement: {target_achievement:.1f}% of 10k/min goal")
-        print(f"   Matches found: {self.matched_count:,} ({self.matched_count/self.processed_count*100:.1f}%)")
-        print(f"   Total LLM cost: ${self.total_cost:.2f}")
 
-        print(f"\n♻️  LAZY-LOADING STATISTICS:")
-        print(f"   Partitions built: {self.partition_build_count}")
-        print(f"   Empty partitions (cached): {len(self.empty_partitions)}")
-        print(f"   Partitions GC'd: {self.partition_gc_count}")
-        print(f"   Peak partitions in memory: {self.partition_build_count - self.partition_gc_count}")
-        print(f"   Memory efficiency: {self.partition_gc_count / max(1, self.partition_build_count) * 100:.1f}% of partitions freed")
-        
-        return pd.DataFrame(processed_rows)
+        self.logger.info(f"🔍 DEBUG K: About to print performance results ({total_records} records)")
+
+        self.logger.info(f"\n🎯 PERFORMANCE RESULTS:")
+        self.logger.info(f"   Total time: {total_duration:.1f}s")
+        self.logger.info(f"   Records processed: {total_records:,}")
+        self.logger.info(f"   Speed: {records_per_second:.1f} rec/sec = {records_per_minute:.0f} rec/min")
+        self.logger.info(f"   Target achievement: {target_achievement:.1f}% of 10k/min goal")
+        self.logger.info(f"   Matches found: {self.matched_count:,} ({self.matched_count/self.processed_count*100:.1f}%)")
+        self.logger.info(f"   Total LLM cost: ${self.total_cost:.2f}")
+
+        self.logger.info(f"\n♻️  LAZY-LOADING STATISTICS:")
+        self.logger.info(f"   Partitions built: {self.partition_build_count}")
+        self.logger.info(f"   Empty partitions (cached): {len(self.empty_partitions)}")
+        self.logger.info(f"   Partitions GC'd: {self.partition_gc_count}")
+        self.logger.info(f"   Peak partitions in memory: {self.partition_build_count - self.partition_gc_count}")
+        self.logger.info(f"   Memory efficiency: {self.partition_gc_count / max(1, self.partition_build_count) * 100:.1f}% of partitions freed")
+
+        self.logger.info(f"🔍 DEBUG L: About to concatenate {len(processed_dfs)} DataFrame chunks into final result")
+        result_df = pd.concat(processed_dfs, ignore_index=True)
+        self.logger.info(f"🔍 DEBUG M: Successfully created final DataFrame with shape {result_df.shape}")
+
+        return result_df
     
     def _save_intermediate_results(self, result_dfs: List[pd.DataFrame], batch_count: int):
         """Save intermediate results to output folder"""
@@ -1229,45 +1307,47 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
         
         try:
             combined_df = pd.concat(result_dfs, ignore_index=True)
-            combined_df.to_parquet(intermediate_file, index=False)
+            combined_df.to_parquet(intermediate_file, index=False, engine='pyarrow', coerce_timestamps='us')
             self.logger.debug(f"Saved intermediate results: {len(combined_df)} records to {intermediate_file}")
         except Exception as e:
             self.logger.error(f"Failed to save intermediate results: {str(e)}")
     
+    def _convert_timestamps_to_compatible_format(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert nanosecond timestamps to microsecond precision for Parquet compatibility"""
+        df = df.copy()
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                # Convert datetime64[ns] to datetime64[us] (microseconds)
+                df[col] = df[col].astype('datetime64[us]')
+        return df
+
     def save_results(self, results_df: pd.DataFrame) -> str:
         """Save final results to parquet and TSV files in output folder"""
-        
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         output_dir = os.path.join(current_dir, "output")
-        
+
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # File names
-        parquet_filename = f"parallel_hubspot_ddhq_matches_{timestamp}.parquet"
-        tsv_filename = f"parallel_hubspot_ddhq_matches_{timestamp}.tsv"
+
+        # Convert timestamps to compatible format (fix nanosecond precision issue)
+        results_df = self._convert_timestamps_to_compatible_format(results_df)
+
+        # File names (only latest versions)
         latest_parquet_filename = "parallel_hubspot_ddhq_matches_latest.parquet"
         latest_tsv_filename = "parallel_hubspot_ddhq_matches_latest.tsv"
-        
+
         # File paths
-        parquet_file = os.path.join(output_dir, parquet_filename)
-        tsv_file = os.path.join(output_dir, tsv_filename)
         latest_parquet_file = os.path.join(output_dir, latest_parquet_filename)
         latest_tsv_file = os.path.join(output_dir, latest_tsv_filename)
-        
-        # Save timestamped versions
-        results_df.to_parquet(parquet_file, index=False)
-        results_df.to_csv(tsv_file, sep='\t', index=False)
-        
-        # Save latest versions
-        results_df.to_parquet(latest_parquet_file, index=False)
+
+        # Save latest versions only
+        results_df.to_parquet(latest_parquet_file, index=False, engine='pyarrow', coerce_timestamps='us')
         results_df.to_csv(latest_tsv_file, sep='\t', index=False)
-        
+
         # Calculate file sizes
-        parquet_size_mb = os.path.getsize(parquet_file) / (1024 * 1024)
-        tsv_size_mb = os.path.getsize(tsv_file) / (1024 * 1024)
+        parquet_size_mb = os.path.getsize(latest_parquet_file) / (1024 * 1024)
+        tsv_size_mb = os.path.getsize(latest_tsv_file) / (1024 * 1024)
 
         # Calculate match statistics
         total_records = len(results_df)
@@ -1281,40 +1361,35 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
         runoff_date_range = (results_df['match_source'] == 'date_range_runoff').sum() if 'match_source' in results_df.columns else 0
         stateless_fallback = (results_df['match_source'] == 'stateless_fallback').sum() if 'match_source' in results_df.columns else 0
 
-        print(f"\n💾 Results saved to output folder:")
-        print(f"   Parquet: {parquet_file} ({parquet_size_mb:.1f} MB)")
-        print(f"   TSV: {tsv_file} ({tsv_size_mb:.1f} MB)")
-        print(f"\n📊 MATCH STATISTICS:")
-        print(f"   Total records: {total_records:,}")
-        print(f"   Local/municipal matches: {local_matches:,} ({local_matches/total_records*100:.1f}%)")
-        print(f"   Federal races (pre-filtered): {federal_races:,} ({federal_races/total_records*100:.1f}%)")
-        print(f"   State races (pre-filtered): {state_races:,} ({state_races/total_records*100:.1f}%)")
-        print(f"   No match: {no_match:,} ({no_match/total_records*100:.1f}%)")
+        self.logger.info(f"\n💾 Results saved to output folder:")
+        self.logger.info(f"   Parquet: {latest_parquet_file} ({parquet_size_mb:.1f} MB)")
+        self.logger.info(f"   TSV: {latest_tsv_file} ({tsv_size_mb:.1f} MB)")
+        self.logger.info(f"\n📊 MATCH STATISTICS:")
+        self.logger.info(f"   Total records: {total_records:,}")
+        self.logger.info(f"   Local/municipal matches: {local_matches:,} ({local_matches/total_records*100:.1f}%)")
+        self.logger.info(f"   Federal races (pre-filtered): {federal_races:,} ({federal_races/total_records*100:.1f}%)")
+        self.logger.info(f"   State races (pre-filtered): {state_races:,} ({state_races/total_records*100:.1f}%)")
+        self.logger.info(f"   No match: {no_match:,} ({no_match/total_records*100:.1f}%)")
 
         if runoff_date_range > 0 or stateless_fallback > 0:
-            print(f"\n🔧 PARTITION USAGE STATISTICS:")
+            self.logger.info(f"\n🔧 PARTITION USAGE STATISTICS:")
             if direct_matches > 0:
-                print(f"   Standard partitions (date+state+type): {direct_matches:,}")
+                self.logger.info(f"   Standard partitions (date+state+type): {direct_matches:,}")
             if runoff_date_range > 0:
-                print(f"   Runoff date-range partitions (date >= base): {runoff_date_range:,}")
+                self.logger.info(f"   Runoff date-range partitions (date >= base): {runoff_date_range:,}")
             if stateless_fallback > 0:
-                print(f"   State-less fallback partitions (missing state): {stateless_fallback:,}")
-                print(f"   (State-less partitions aggregate all states for date+election_type)")
+                self.logger.info(f"   State-less fallback partitions (missing state): {stateless_fallback:,}")
+                self.logger.info(f"   (State-less partitions aggregate all states for date+election_type)")
 
         if local_matches > 0:
             matched_df = results_df[results_df['has_match'] == True]
             avg_confidence = matched_df['llm_confidence'].mean()
-            print(f"\n   Average confidence (local matches): {avg_confidence:.1f}%")
+            self.logger.info(f"\n   Average confidence (local matches): {avg_confidence:.1f}%")
 
-        print(f"\n   Latest files also saved for easy access")
+        self.logger.info(f"\n   Latest files also saved for easy access")
 
-        return parquet_file
+        return latest_parquet_file
     
-    def cleanup(self):
-        """Cleanup resources"""
-        if hasattr(self, 'thread_pool'):
-            self.thread_pool.shutdown(wait=True)
-
 async def main():
     # Configuration - OPTIMIZED FOR HIGH THROUGHPUT WITH RELIABILITY
     BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))  # Process 1000 records concurrently
@@ -1330,15 +1405,22 @@ async def main():
     try:
         # Process all records
         results_df = await matcher.process_all_records()
-        
+
+        matcher.logger.info(f"🔍 DEBUG N: Returned from process_all_records() with DataFrame shape {results_df.shape}")
+
         # Save results
         results_file = matcher.save_results(results_df)
-        
-        print(f"\n🎉 Parallel matching complete! Results saved to {results_file}")
-        
-    finally:
-        # Cleanup resources
-        matcher.cleanup()
+
+        matcher.logger.info(f"\n🎉 Parallel matching complete! Results saved to {results_file}")
+
+        # Force immediate exit - all work is done, files saved
+        matcher.logger.info("💥 Forcing immediate exit to allow S3 upload to proceed...")
+        os._exit(0)
+
+    except Exception as e:
+        matcher.logger.error(f"❌ Pipeline failed: {e}")
+        matcher.logger.error(f"Stack trace:", exc_info=True)
+        os._exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())

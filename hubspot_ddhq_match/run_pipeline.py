@@ -3,12 +3,13 @@
 """
 HUBSPOT-DDHQ MATCHING PIPELINE RUNNER
 
-Runs all 5 steps of the matching pipeline in order:
+Runs all 6 steps of the matching pipeline in order:
 1. Data Extraction from Databricks
 2. Data Cleaning (name standardization, election expansion)
 3. Temporal Filtering (align HubSpot with DDHQ dates)
 4. Embedding Generation (semantic embeddings with Gemini)
 5. Production Matching (FAISS + LLM with lazy-loading + GC)
+6. Runoff Enrichment (discover and match runoffs from DDHQ)
 
 USAGE:
     # Development mode (200 test records)
@@ -41,13 +42,26 @@ class PipelineRunner:
 
         self.environment = os.getenv('ENVIRONMENT', 'production').lower()
         self.max_records = os.getenv('MAX_RECORDS', None)
+        self.run_id = os.getenv('RUN_ID', None)
+        self.s3_output_prefix = os.getenv('S3_OUTPUT_PREFIX', None)
+
+        self.embedding_batch_size = os.getenv('EMBEDDING_BATCH_SIZE', '100')
+        self.embedding_max_workers = os.getenv('EMBEDDING_MAX_WORKERS', '80')
+        self.matching_batch_size = os.getenv('MATCHING_BATCH_SIZE', '1000')
+        self.matching_max_workers = os.getenv('MATCHING_MAX_WORKERS', '2000')
 
         print("=" * 70)
         print("🚀 HUBSPOT-DDHQ MATCHING PIPELINE RUNNER")
         print("=" * 70)
         print(f"Environment: {self.environment.upper()}")
+        if self.run_id:
+            print(f"Run ID: {self.run_id}")
+        if self.s3_output_prefix:
+            print(f"S3 Output Prefix: {self.s3_output_prefix}")
         if self.max_records:
             print(f"Max Records: {self.max_records}")
+        print(f"Embedding: batch_size={self.embedding_batch_size}, max_workers={self.embedding_max_workers}")
+        print(f"Matching: batch_size={self.matching_batch_size}, max_workers={self.matching_max_workers}")
         if self.skip_steps:
             print(f"Skipping steps: {', '.join(self.skip_steps)}")
         print(f"Started at: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -62,14 +76,17 @@ class PipelineRunner:
             print()
             return True
 
-        print(f"▶️  STEP {step_num}/5: {step_name}")
+        print(f"▶️  STEP {step_num}/6: {step_name}")
         print(f"   Script: {script_path}")
 
         step_start = datetime.now()
 
         try:
-            # Build command
-            cmd = ['uv', 'run', script_path]
+            # Build command (use python directly if in Docker, otherwise use uv)
+            if os.path.exists('/.dockerenv') or os.getenv('ECS_CONTAINER_METADATA_URI'):
+                cmd = ['python', script_path]
+            else:
+                cmd = ['uv', 'run', script_path]
 
             # Set up environment variables
             env = os.environ.copy()
@@ -135,14 +152,14 @@ class PipelineRunner:
             return False
 
         # Step 4: Embedding Generation
-        # Environment and concurrency defaults are set in the script itself
         success = self.run_step(
             step_num=4,
             step_name="Embedding Generation",
             script_path=os.path.join(script_dir, 'generate_cleaned_embeddings.py'),
             env_vars={
                 'ENVIRONMENT': self.environment,
-                # BATCH_SIZE and MAX_WORKERS use script defaults (150, 400)
+                'BATCH_SIZE': self.embedding_batch_size,
+                'MAX_WORKERS': self.embedding_max_workers
             }
         )
         if not success:
@@ -151,7 +168,8 @@ class PipelineRunner:
         # Step 5: Production Matching
         env_vars = {
             'ENVIRONMENT': self.environment,
-            # BATCH_SIZE and MAX_WORKERS use script defaults (1000, 1500)
+            'BATCH_SIZE': self.matching_batch_size,
+            'MAX_WORKERS': self.matching_max_workers
         }
         if self.max_records:
             env_vars['MAX_RECORDS'] = self.max_records
@@ -161,6 +179,18 @@ class PipelineRunner:
             step_name="Production Matching",
             script_path=os.path.join(script_dir, 'parallel_production_matcher.py'),
             env_vars=env_vars
+        )
+        if not success:
+            return False
+
+        # Step 6: Runoff Enrichment
+        success = self.run_step(
+            step_num=6,
+            step_name="Runoff Enrichment",
+            script_path=os.path.join(script_dir, 'enrich_runoffs.py'),
+            env_vars={
+                'ENVIRONMENT': self.environment
+            }
         )
         if not success:
             return False
@@ -178,6 +208,10 @@ class PipelineRunner:
         else:
             print("❌ PIPELINE FAILED")
         print("=" * 70)
+        if self.run_id:
+            print(f"Run ID: {self.run_id}")
+        if self.s3_output_prefix:
+            print(f"S3 Output Prefix: {self.s3_output_prefix}")
         print(f"Total Duration: {total_duration:.1f}s ({total_duration/60:.1f} minutes)")
         print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -186,8 +220,8 @@ class PipelineRunner:
             output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
             print()
             print("📊 Results saved to:")
-            print(f"   {output_dir}/parallel_hubspot_ddhq_matches_latest.parquet")
-            print(f"   {output_dir}/parallel_hubspot_ddhq_matches_latest.tsv")
+            print(f"   {output_dir}/matches.parquet (uploaded to S3)")
+            print(f"   {output_dir}/discovered_runoffs_latest.parquet (local only)")
 
         print("=" * 70)
 
@@ -198,6 +232,7 @@ def main():
     parser.add_argument('--skip-temporal', action='store_true', help='Skip temporal filtering step')
     parser.add_argument('--skip-embeddings', action='store_true', help='Skip embedding generation step')
     parser.add_argument('--skip-matching', action='store_true', help='Skip matching step')
+    parser.add_argument('--skip-runoff-enrichment', action='store_true', help='Skip runoff enrichment step')
 
     args = parser.parse_args()
 
@@ -213,6 +248,8 @@ def main():
         skip_steps.append('embedding_generation')
     if args.skip_matching:
         skip_steps.append('production_matching')
+    if args.skip_runoff_enrichment:
+        skip_steps.append('runoff_enrichment')
 
     # Run pipeline
     runner = PipelineRunner(skip_steps=skip_steps)

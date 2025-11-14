@@ -426,15 +426,15 @@ class DataCleaner:
         hubspot_file = os.path.join(offline_data_dir, f"hubspot_candidacy_cleaned_{timestamp}.parquet")
         hubspot_latest = os.path.join(offline_data_dir, "hubspot_candidacy_cleaned_latest.parquet")
         
-        hubspot_df.to_parquet(hubspot_file, index=False)
-        hubspot_df.to_parquet(hubspot_latest, index=False)
-        
+        hubspot_df.to_parquet(hubspot_file, index=False, engine='pyarrow', coerce_timestamps='us')
+        hubspot_df.to_parquet(hubspot_latest, index=False, engine='pyarrow', coerce_timestamps='us')
+
         # Save DDHQ cleaned data
         ddhq_file = os.path.join(offline_data_dir, f"ddhq_election_results_cleaned_{timestamp}.parquet")
         ddhq_latest = os.path.join(offline_data_dir, "ddhq_election_results_cleaned_latest.parquet")
-        
-        ddhq_df.to_parquet(ddhq_file, index=False)
-        ddhq_df.to_parquet(ddhq_latest, index=False)
+
+        ddhq_df.to_parquet(ddhq_file, index=False, engine='pyarrow', coerce_timestamps='us')
+        ddhq_df.to_parquet(ddhq_latest, index=False, engine='pyarrow', coerce_timestamps='us')
         
         self.logger.info(f"✅ Cleaned data saved:")
         self.logger.info(f"   HubSpot: {hubspot_file}")
