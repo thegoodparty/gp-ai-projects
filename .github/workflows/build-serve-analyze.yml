@@ -87,7 +87,7 @@ jobs:
         with:
           context: .
           file: ./serve/v1_pipeline/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
