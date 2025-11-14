@@ -1,0 +1,19 @@
+[project]
+name = "gp-v1-pipeline"
+version = "0.1.0"
+description = "V1 Message Analysis Pipeline for GoodParty"
+requires-python = ">=3.11"
+dependencies = [
+    "gp-shared",
+    "pyyaml>=6.0.0",
+    "boto3>=1.40.50",
+    "scipy>=1.15.0",
+    "scikit-learn>=1.6.1",
+    "matplotlib>=3.10.0",
+    "seaborn>=0.13.2",
+    "umap-learn>=0.5.7",
+    "plotly>=5.27.0",
+]
+
+[tool.uv.sources]
+gp-shared = { workspace = true }

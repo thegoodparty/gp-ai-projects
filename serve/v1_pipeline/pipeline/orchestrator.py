@@ -219,12 +219,16 @@ class V1PipelineOrchestrator:
 
         for _, row in df.iterrows():
             try:
-                # Parse sent_at datetime - handle both old and new formats, default to now if missing
                 sent_at_raw = row.get('sent_at', row.get('Sent At', None))
-                if sent_at_raw and pd.notna(sent_at_raw):
-                    sent_at = pd.to_datetime(sent_at_raw)
-                else:
-                    sent_at = datetime.utcnow()
+                sent_at = datetime.utcnow()
+
+                if pd.notna(sent_at_raw) and sent_at_raw:
+                    try:
+                        timestamp_str = str(sent_at_raw)
+                        timestamp_str = timestamp_str.replace('.000Z', 'Z').replace('..', '.')
+                        sent_at = pd.to_datetime(timestamp_str)
+                    except Exception:
+                        pass
 
                 # Handle both old format (Contact Phone Number) and new format (phone_number)
                 phone_number_raw = str(row.get('phone_number', row.get('Contact Phone Number', '')))
