@@ -1,3 +1,27 @@
+terraform {
+  required_version = ">= 1.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  backend "s3" {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "shared/github-actions-iam/terraform.tfstate"
+    region = "us-west-2"
+
+    use_lockfile = true
+    encrypt      = true
+  }
+}
+
+provider "aws" {
+  region = "us-west-2"
+}
+
 # GitHub Actions OIDC Provider for AWS
 # This allows GitHub Actions to authenticate to AWS without long-lived credentials
 
@@ -35,7 +59,7 @@ resource "aws_iam_role" "github_actions_ecr_push" {
           }
           StringLike = {
             # Replace with your GitHub org/repo
-            "token.actions.githubusercontent.com:sub" = "repo:goodparty/gp-ai-projects:*"
+            "token.actions.githubusercontent.com:sub" = "repo:thegoodparty/gp-ai-projects:*"
           }
         }
       }
