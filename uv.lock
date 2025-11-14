@@ -7,6 +7,14 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "gp-ai-projects",
+    "gp-ddhq-matcher",
+    "gp-shared",
+    "gp-v1-pipeline",
+]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
@@ -902,6 +910,7 @@ dependencies = [
     { name = "numpy" },
     { name = "openai" },
     { name = "pandas" },
+    { name = "pillow" },
     { name = "plotly" },
     { name = "pyarrow" },
     { name = "pydantic" },
@@ -954,6 +963,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "openai", specifier = ">=1.93.1" },
     { name = "pandas", specifier = ">=2.2.3" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "plotly", specifier = ">=5.27.0" },
     { name = "pyarrow", specifier = ">=21.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -980,6 +990,93 @@ provides-extras = ["dev"]
 dev = [
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
+]
+
+[[package]]
+name = "gp-ddhq-matcher"
+version = "0.1.0"
+source = { virtual = "hubspot_ddhq_match" }
+dependencies = [
+    { name = "boto3" },
+    { name = "faiss-cpu" },
+    { name = "gp-shared" },
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.40.50" },
+    { name = "faiss-cpu", specifier = ">=1.12.0" },
+    { name = "gp-shared", virtual = "shared" },
+    { name = "pyarrow", specifier = ">=21.0.0" },
+]
+
+[[package]]
+name = "gp-shared"
+version = "0.1.0"
+source = { virtual = "shared" }
+dependencies = [
+    { name = "databricks-sql-connector" },
+    { name = "google-api-python-client" },
+    { name = "google-auth" },
+    { name = "google-auth-httplib2" },
+    { name = "google-auth-oauthlib" },
+    { name = "google-genai" },
+    { name = "httpx" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "tavily-python" },
+    { name = "tqdm" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "databricks-sql-connector", specifier = ">=4.0.5" },
+    { name = "google-api-python-client", specifier = ">=2.184.0" },
+    { name = "google-auth", specifier = ">=2.40.3" },
+    { name = "google-auth-httplib2", specifier = ">=0.2.0" },
+    { name = "google-auth-oauthlib", specifier = ">=1.2.2" },
+    { name = "google-genai", specifier = ">=1.24.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "numpy", specifier = ">=2.3.1" },
+    { name = "pandas", specifier = ">=2.2.3" },
+    { name = "pillow", specifier = ">=10.0.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
+    { name = "tavily-python", specifier = ">=0.7.8" },
+    { name = "tqdm", specifier = ">=4.67.1" },
+]
+
+[[package]]
+name = "gp-v1-pipeline"
+version = "0.1.0"
+source = { virtual = "serve/v1_pipeline" }
+dependencies = [
+    { name = "boto3" },
+    { name = "gp-shared" },
+    { name = "matplotlib" },
+    { name = "plotly" },
+    { name = "pyyaml" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "seaborn" },
+    { name = "umap-learn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.40.50" },
+    { name = "gp-shared", virtual = "shared" },
+    { name = "matplotlib", specifier = ">=3.10.0" },
+    { name = "plotly", specifier = ">=5.27.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
+    { name = "scikit-learn", specifier = ">=1.6.1" },
+    { name = "scipy", specifier = ">=1.15.0" },
+    { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "umap-learn", specifier = ">=0.5.7" },
 ]
 
 [[package]]

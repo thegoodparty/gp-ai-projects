@@ -13,12 +13,13 @@ build/
 venv/
 ENV/
 
-# Data directories
+# Data directories (with wildcards to catch numbered variants)
 **/data/
 **/output/
+**/output[0-9]*/
 **/logs/
 **/cache/
-**/offline_data/
+**/offline_data*/
 **/vector_store/
 
 # Data files
@@ -32,20 +33,31 @@ ENV/
 *.index
 
 # Large project directories (not needed for serve-analyze)
-hubspot_ddhq_match/
+# hubspot_ddhq_match/ - commented out because we now build ddhq-matcher images
 playground/
 stitch_l2_BR_DDHQ/
 bronze_data/
 ai_generated_campaign_plan/
 
-# Other serve projects (not needed for serve-analyze)
+# Serve data directories (exclude data/output files, keep code)
 serve/messages/
 serve/data/
 serve/input/
 serve/results/
 serve/logs/
 serve/cache/
+serve/classify/output*/
+serve/classify/data/
+serve/classify/logs/
+serve/analyze_texts/output*/
+serve/analyze_texts/data/
+serve/hierarchical_discovery/output*/
+serve/hierarchical_discovery/offline_data*/
+serve/v1_pipeline/output*/
 serve/*.log
+
+# Unused serve projects (not needed for v1_pipeline)
+serve/v1_tevyn_api/
 
 # IDE
 .vscode/
