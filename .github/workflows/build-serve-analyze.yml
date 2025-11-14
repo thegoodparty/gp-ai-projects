@@ -3,18 +3,16 @@ name: Build and Push Serve Analyze
 on:
   push:
     branches:
-      - main
       - develop
       - qa
-      - serve
-    tags:
-      - 'v*'
+      - prod
     paths:
       - 'serve/v1_pipeline/**'
       - 'serve/hierarchical_discovery/**'
       - 'shared/**'
       - 'pyproject.toml'
       - 'uv.lock'
+      - '.github/workflows/build-serve-analyze.yml'
   workflow_dispatch:
     inputs:
       environment:
@@ -56,10 +54,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ENV="${{ github.event.inputs.environment }}"
             TAG="serve-analyze-${ENV}"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAG="serve-analyze-${GITHUB_REF#refs/tags/}"
-            ENV="prod"
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
             TAG="serve-analyze-prod"
             ENV="prod"
           elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
@@ -69,8 +64,8 @@ jobs:
             TAG="serve-analyze-dev"
             ENV="dev"
           else
-            TAG="serve-analyze-${GITHUB_SHA::8}"
-            ENV="dev"
+            echo "ERROR: Workflow triggered from unexpected branch: ${{ github.ref }}"
+            exit 1
           fi
 
           echo "tag=${TAG}" >> $GITHUB_OUTPUT

@@ -2,9 +2,9 @@ name: Lint and Type Check
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [develop, qa, prod]
   push:
-    branches: [main, develop]
+    branches: [develop, qa, prod]
 
 jobs:
   lint:
