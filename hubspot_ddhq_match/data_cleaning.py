@@ -222,9 +222,6 @@ class DataCleaner:
                 runoff_row = row.copy()
                 runoff_row['election_type'] = 'runoff'
                 runoff_row['election_date'] = runoff_row['runoff_election_date']
-                # Clear the other election dates to avoid confusion
-                runoff_row['primary_election_date'] = pd.NaT
-                runoff_row['general_election_date'] = pd.NaT
                 expanded_records.append(runoff_row)
         
         expanded_df = pd.DataFrame(expanded_records)
