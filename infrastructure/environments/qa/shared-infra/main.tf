@@ -140,3 +140,95 @@ resource "aws_lb_listener_rule" "serve_analyze_invalid" {
     Environment = var.environment
   }
 }
+
+data "terraform_remote_state" "ddhq_matcher" {
+  backend = "s3"
+
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "ddhq-matcher-fargate/qa/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+resource "aws_lb_target_group" "ddhq_matcher" {
+  name        = "ddhq-matcher-${var.environment}"
+  target_type = "lambda"
+
+  tags = {
+    Name        = "ddhq-matcher-${var.environment}"
+    Environment = var.environment
+    Purpose     = "DDHQ Matcher Lambda Target Group"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "ddhq_matcher" {
+  target_group_arn = aws_lb_target_group.ddhq_matcher.arn
+  target_id        = data.terraform_remote_state.ddhq_matcher.outputs.lambda_function_arn
+  depends_on       = [aws_lambda_permission.ddhq_matcher_alb_invoke]
+}
+
+resource "aws_lambda_permission" "ddhq_matcher_alb_invoke" {
+  statement_id  = "AllowExecutionFromALB"
+  action        = "lambda:InvokeFunction"
+  function_name = data.terraform_remote_state.ddhq_matcher.outputs.lambda_function_name
+  principal     = "elasticloadbalancing.amazonaws.com"
+  source_arn    = aws_lb_target_group.ddhq_matcher.arn
+}
+
+resource "aws_lb_listener_rule" "ddhq_matcher_valid" {
+  listener_arn = module.alb.https_listener_arn
+  priority     = 20
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ddhq_matcher.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/match/hubspot-ddhq"]
+    }
+  }
+
+  condition {
+    http_header {
+      http_header_name = "x-api-key"
+      values          = [local.api_key]
+    }
+  }
+
+  tags = {
+    Name        = "ddhq-matcher-valid-${var.environment}"
+    Environment = var.environment
+  }
+}
+
+resource "aws_lb_listener_rule" "ddhq_matcher_invalid" {
+  listener_arn = module.alb.https_listener_arn
+  priority     = 25
+
+  action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "application/json"
+      message_body = jsonencode({
+        error = "Forbidden"
+        message = "Invalid or missing API key"
+      })
+      status_code = "403"
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/match/hubspot-ddhq"]
+    }
+  }
+
+  tags = {
+    Name        = "ddhq-matcher-invalid-${var.environment}"
+    Environment = var.environment
+  }
+}
