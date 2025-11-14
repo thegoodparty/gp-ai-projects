@@ -94,12 +94,24 @@ class GeminiClient:
                 "limits": httpx.Limits(
                     max_connections=max_connections,
                     max_keepalive_connections=max_keepalive_connections
+                ),
+                "timeout": httpx.Timeout(
+                    connect=10.0,
+                    read=120.0,
+                    write=30.0,
+                    pool=10.0
                 )
             },
             asyncClientArgs={
                 "limits": httpx.Limits(
                     max_connections=max_connections,
                     max_keepalive_connections=max_keepalive_connections
+                ),
+                "timeout": httpx.Timeout(
+                    connect=10.0,
+                    read=120.0,
+                    write=30.0,
+                    pool=10.0
                 )
             }
         )
@@ -269,15 +281,11 @@ class GeminiClient:
 
         for attempt in range(self.max_retries):
             try:
-                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} starting...")
                 response = self.client.models.generate_content(
                     model=model_name,
                     contents=prompt,
                     config=config
                 )
-
-                # Log response details for debugging None issues
-                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Response received. Type: {type(response)}, Has text attr: {hasattr(response, 'text')}")
 
                 if response is None:
                     self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Response is None!")
@@ -291,10 +299,9 @@ class GeminiClient:
                         return None
 
                 response_text = response.text
-                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text type: {type(response_text)}, length: {len(response_text) if response_text else 0}")
 
                 if response_text is None:
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None! Response obj: {response}")
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None!")
                     if attempt < self.max_retries - 1:
                         delay = self.base_delay * (2 ** attempt)
                         self.logger.warning(f"Retrying None response.text in {delay}s...")
