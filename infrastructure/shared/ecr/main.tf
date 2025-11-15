@@ -47,16 +47,16 @@ resource "aws_ecr_lifecycle_policy" "ai_projects" {
     rules = [
       {
         rulePriority = 1
-        description  = "Never expire environment images (main, master, prod, qa, dev, release)"
+        description  = "Never expire environment images (tags containing main, master, prod, qa, dev, release)"
         selection = {
           tagStatus = "tagged"
-          tagPrefixList = [
-            "main",
-            "master",
-            "prod",
-            "qa",
-            "dev",
-            "release"
+          tagPatternList = [
+            "*main*",
+            "*master*",
+            "*prod*",
+            "*qa*",
+            "*dev*",
+            "*release*"
           ]
           countType   = "imageCountMoreThan"
           countNumber = 999
@@ -81,38 +81,10 @@ resource "aws_ecr_lifecycle_policy" "ai_projects" {
       },
       {
         rulePriority = 3
-        description  = "Keep serve-analyze images for 180 days (stable project)"
+        description  = "Keep latest/staging tags for 60 days"
         selection = {
           tagStatus     = "tagged"
-          tagPrefixList = ["serve-analyze-"]
-          countType     = "sinceImagePushed"
-          countUnit     = "days"
-          countNumber   = 180
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 4
-        description  = "Keep campaign-planner images for 90 days (active development)"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["campaign-planner-"]
-          countType     = "sinceImagePushed"
-          countUnit     = "days"
-          countNumber   = 90
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 5
-        description  = "Keep latest/dev/staging tags for 60 days"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["latest", "dev", "staging"]
+          tagPrefixList = ["latest", "staging"]
           countType     = "sinceImagePushed"
           countUnit     = "days"
           countNumber   = 60
@@ -122,26 +94,26 @@ resource "aws_ecr_lifecycle_policy" "ai_projects" {
         }
       },
       {
-        rulePriority = 6
-        description  = "Keep untagged images for 90 days (previous latest builds)"
+        rulePriority = 4
+        description  = "Keep untagged images for 7 days (previous latest builds)"
         selection = {
           tagStatus   = "untagged"
           countType   = "sinceImagePushed"
           countUnit   = "days"
-          countNumber = 90
+          countNumber = 7
         }
         action = {
           type = "expire"
         }
       },
       {
-        rulePriority = 7
-        description  = "Cleanup any other images after 30 days"
+        rulePriority = 5
+        description  = "Cleanup any other images after 7 days"
         selection = {
           tagStatus   = "any"
           countType   = "sinceImagePushed"
           countUnit   = "days"
-          countNumber = 30
+          countNumber = 7
         }
         action = {
           type = "expire"

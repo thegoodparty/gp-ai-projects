@@ -77,46 +77,40 @@ docker push ${ECR_REPO}:serve-analyze-prod
 Convention-based retention policy to prevent active projects from evicting stable ones:
 
 **Priority 1**: Environment images - **Never expire** ✅
-- Tags: `main`, `master`, `prod`, `dev`, `release`
-- Example: `main`, `dev`, `prod`, `v1-pipeline-prod`, `campaign-planner-release`
+- Tags: Any tag *containing* `main`, `master`, `prod`, `qa`, `dev`, or `release`
+- Example: `main`, `dev`, `prod`, `ddhq-matcher-dev`, `serve-analyze-prod`, `campaign-planner-release`
 
 **Priority 2**: Versioned releases - **365 days**
 - Tags: `v1.*`, `v2.*`, `v3.*`, etc.
 - Example: `v1.0.0`, `v2.1.3`, `campaign-planner-v1.5.2`
 
-**Priority 3**: serve-analyze images - **180 days** (stable project)
-- Tags: `serve-analyze-*`
+**Priority 3**: Development tags - **60 days**
+- Tags: `latest`, `staging`
 
-**Priority 4**: campaign-planner images - **90 days** (active development)
-- Tags: `campaign-planner-*`
-
-**Priority 5**: Development tags - **60 days**
-- Tags: `latest`, `staging` (note: `dev` never expires, see Priority 1)
-
-**Priority 6**: Untagged images - **90 days**
+**Priority 4**: Untagged images - **7 days**
 - Previous builds when tag moves (e.g., old "latest" builds)
 - Intermediate/dangling layers
 
-**Priority 7**: Catch-all - **30 days**
+**Priority 5**: Catch-all - **7 days**
 - Any other tags not matching above rules
 
 **Key Benefits:**
-- 🔒 Environment images (`main`, `master`, `prod`, `dev`, `release`) **never expire**
+- 🔒 Environment images (containing `main`, `master`, `prod`, `qa`, `dev`, `release`) **never expire**
 - 📦 Versioned releases kept for 1 year
-- 🎯 Per-project retention (stable vs active development)
-- 🔄 Previous "latest" builds kept for 90 days even when tag moves
-- 🧹 Automatic cleanup of old/untagged images
+- 🔄 Previous "latest" builds kept for 7 days even when tag moves
+- 🧹 Aggressive cleanup of old/untagged images (7 days)
+- 💰 Significant storage cost savings
 
 **Important Note on "latest" Tags:**
-When you push a new image with tag `v1-pipeline-latest`, the tag moves to the new image and the previous image becomes **untagged**. We keep untagged images for 90 days so you can roll back if needed.
+When you push a new image with tag `v1-pipeline-latest`, the tag moves to the new image and the previous image becomes **untagged**. We keep untagged images for 7 days so you can roll back if needed.
 
 Example:
 ```
 Day 1:  Image A tagged "v1-pipeline-latest"
 Day 10: Push Image B with "v1-pipeline-latest"
         → Tag moves to Image B
-        → Image A becomes untagged but kept for 90 days
-Day 100: Image A deleted (90 days after becoming untagged)
+        → Image A becomes untagged but kept for 7 days
+Day 17: Image A deleted (7 days after becoming untagged)
 ```
 
 ## Usage in Terraform
@@ -144,11 +138,12 @@ resource "aws_ecs_task_definition" "example" {
 ### Basic Tag Formats
 
 **Environment Tags (Never Expire):**
-- `main` - Main branch build (any project)
-- `master` - Master branch build
-- `prod` - Production deployment
-- `dev` - Development deployment
-- `release` - Release build
+- Any tag containing `main` - Main branch builds (e.g., `main`, `feature-main`)
+- Any tag containing `master` - Master branch builds (e.g., `master`)
+- Any tag containing `prod` - Production deployments (e.g., `prod`, `ddhq-matcher-prod`, `serve-analyze-prod`)
+- Any tag containing `qa` - QA deployments (e.g., `qa`, `ddhq-matcher-qa`)
+- Any tag containing `dev` - Development deployments (e.g., `dev`, `ddhq-matcher-dev`, `serve-analyze-dev`)
+- Any tag containing `release` - Release builds (e.g., `release`, `campaign-planner-release`)
 
 **Versioned Releases (365 days):**
 - `v1.0.0`, `v2.1.3` - Semantic version tags
@@ -158,14 +153,14 @@ resource "aws_ecs_task_definition" "example" {
 - `{project}-{version}` - Project versioned releases
 
 **Examples:**
-- `main` ← **Never expires** (environment tag)
-- `dev` ← **Never expires** (environment tag)
-- `prod` ← **Never expires** (environment tag)
+- `main` ← **Never expires** (contains "main")
+- `dev` ← **Never expires** (contains "dev")
+- `prod` ← **Never expires** (contains "prod")
+- `ddhq-matcher-dev` ← **Never expires** (contains "dev")
 - `serve-analyze-prod` ← **Never expires** (contains "prod")
 - `campaign-planner-release` ← **Never expires** (contains "release")
 - `v1.5.2` ← 365 days (versioned release)
-- `serve-analyze-latest` ← 180 days (project-specific)
-- `campaign-planner-dev` ← 90 days (project-specific, but `dev` alone never expires)
+- `campaign-planner-dev` ← **Never expires** (contains "dev")
 - `staging` ← 60 days (dev tag)
 
 ### Moving Tag Problem
@@ -179,7 +174,7 @@ Day 1:  Image A tagged "serve-analyze-latest"
 Day 10: Push Image B with "serve-analyze-latest"
         → Tag moves to Image B
         → Image A becomes UNTAGGED
-        → Image A deleted after 90 days (untagged retention)
+        → Image A deleted after 7 days (untagged retention)
 ```
 
 ### Recommended Tagging Strategies
@@ -194,19 +189,19 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
 docker buildx build --platform linux/arm64 -t serve-analyze-dev-${TIMESTAMP} ../..
 docker push ${ECR_REPO}:serve-analyze-dev-${TIMESTAMP}
-# → Tag: serve-analyze-dev-20251010-143022 (180 days retention)
+# → Tag: serve-analyze-dev-20251010-143022 (never expires - contains "dev")
 
 # Git commit SHA (best for traceability)
 GIT_SHA=$(git rev-parse --short HEAD)
 docker buildx build --platform linux/arm64 -t serve-analyze-dev-${GIT_SHA} ../..
 docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
-# → Tag: serve-analyze-dev-abc1234 (180 days retention)
+# → Tag: serve-analyze-dev-abc1234 (never expires - contains "dev")
 ```
 
 **Benefits:**
-- ✅ Every build stays tagged (180-day retention, not 90-day untagged)
+- ✅ Every build stays tagged (never expires if contains env keyword)
 - ✅ Easy to identify builds by timestamp/commit
-- ✅ Full rollback capability for 6 months
+- ✅ Full rollback capability indefinitely
 - ✅ No tag collisions
 
 **Strategy 2: Moving Tags + Versioned Releases**
@@ -255,7 +250,7 @@ ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
 # Build once
 docker buildx build --platform linux/arm64 -t serve-analyze ../..
 
-# Timestamped tag (keeps build tagged for 180 days)
+# Timestamped tag (never expires - contains "dev")
 docker tag serve-analyze:latest ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
 docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}
 
@@ -280,12 +275,11 @@ docker push ${ECR_REPO}:serve-analyze-prod
 
 | Tag Pattern | Retention | Use Case | Tag Moves? |
 |-------------|-----------|----------|------------|
-| `main`, `master`, `prod`, `dev`, `release` | **Never** | Environment deployments | Yes (but never expires) |
+| Tags containing `main`, `master`, `prod`, `qa`, `dev`, `release` | **Never** | Environment deployments | Yes (but never expires) |
 | `v1.0.0`, `v2.1.3` | **365 days** | Versioned releases | No |
-| `{project}-*` | **180 days** (serve-analyze)<br>**90 days** (campaign-planner) | Project-specific builds | Depends on strategy |
-| `latest`, `staging` | **60 days** (tagged)<br>**90 days** (untagged) | Development/testing | Yes (becomes untagged) |
-| Untagged images | **90 days** | Previous "latest" builds | N/A |
-| Other tags | **30 days** | Temporary/experimental | Depends |
+| `latest`, `staging` | **60 days** (tagged)<br>**7 days** (untagged) | Development/testing | Yes (becomes untagged) |
+| Untagged images | **7 days** | Previous "latest" builds | N/A |
+| Other tags | **7 days** | Temporary/experimental | Depends |
 
 ### Best Practices
 
@@ -307,7 +301,7 @@ ECR_REPO=333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects
 # Use timestamps to keep all builds tagged
 GIT_SHA=$(git rev-parse --short HEAD)
 docker buildx build --platform linux/arm64 -t serve-analyze-dev-${GIT_SHA} ../..
-docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}  # 180 days, never becomes untagged
+docker push ${ECR_REPO}:serve-analyze-dev-${GIT_SHA}  # Never expires (contains "dev")
 
 # Or just use "dev" if you only need current deployment
 docker push ${ECR_REPO}:serve-analyze-dev           # Never expires (tag moves but never deleted)
@@ -316,7 +310,7 @@ docker push ${ECR_REPO}:serve-analyze-dev           # Never expires (tag moves b
 **3. Rollback Safety:**
 - Use versioned tags (`v1.2.3`) for releases you may need to rollback to
 - Use timestamped tags (`serve-analyze-dev-20251010-143022`) to keep full build history
-- Avoid relying on untagged image retention (90 days) for critical builds
+- Avoid relying on untagged image retention (7 days) for critical builds
 
 **4. Tag Naming:**
 - Include project name for multi-project repositories: `serve-analyze-dev-abc1234`
