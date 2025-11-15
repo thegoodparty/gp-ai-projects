@@ -1,4 +1,4 @@
-name: Build and Push Serve Analyze
+name: Build and Push DDHQ Matcher
 
 on:
   push:
@@ -7,12 +7,11 @@ on:
       - qa
       - prod
     paths:
-      - 'serve/v1_pipeline/**'
-      - 'serve/hierarchical_discovery/**'
+      - 'hubspot_ddhq_match/**'
       - 'shared/**'
       - 'pyproject.toml'
       - 'uv.lock'
-      - '.github/workflows/build-serve-analyze.yml'
+      - '.github/workflows/build-ddhq-matcher.yml'
   workflow_dispatch:
     inputs:
       environment:
@@ -53,15 +52,15 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ENV="${{ github.event.inputs.environment }}"
-            TAG="serve-analyze-${ENV}"
+            TAG="ddhq-matcher-${ENV}"
           elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
-            TAG="serve-analyze-prod"
+            TAG="ddhq-matcher-prod"
             ENV="prod"
           elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
-            TAG="serve-analyze-qa"
+            TAG="ddhq-matcher-qa"
             ENV="qa"
           elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
-            TAG="serve-analyze-dev"
+            TAG="ddhq-matcher-dev"
             ENV="dev"
           else
             echo "ERROR: Workflow triggered from unexpected branch: ${{ github.ref }}"
@@ -86,15 +85,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./serve/v1_pipeline/Dockerfile
+          file: ./hubspot_ddhq_match/deployment/Dockerfile
           platforms: linux/arm64
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:v1-pipeline-latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:ddhq-matcher-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
 
       - name: Image digest
-        run: echo "Image pushed with tags ${{ steps.env.outputs.tag }} and v1-pipeline-latest"
+        run: echo "Image pushed with tags ${{ steps.env.outputs.tag }} and ddhq-matcher-latest"
