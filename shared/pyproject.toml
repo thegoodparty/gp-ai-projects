@@ -1,0 +1,29 @@
+[project]
+name = "gp-shared"
+version = "0.1.0"
+description = "Shared utilities for GoodParty AI projects"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.1.1",
+    "pydantic>=2.0.0",
+    "google-genai>=1.24.0",
+    "httpx>=0.28.1",
+    "numpy>=2.3.1",
+    "tqdm>=4.67.1",
+    "pillow>=10.0.0",
+    "google-auth>=2.40.3",
+    "google-auth-oauthlib>=1.2.2",
+    "google-auth-httplib2>=0.2.0",
+    "google-api-python-client>=2.184.0",
+    "databricks-sql-connector>=4.0.5",
+    "pandas>=2.2.3",
+    "tavily-python>=0.7.8",
+]
+[tool.setuptools]
+py-modules = [
+    "llm_gemini",
+    "databricks_client",
+    "google_sheets_client",
+    "tavily_client",
+    "logger"
+]

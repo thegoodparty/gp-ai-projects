@@ -1,0 +1,17 @@
+# Production Environment Configuration
+# Copy this file to terraform.tfvars and update with actual values
+
+# VPC Configuration (us-west-2)
+# Production VPC (gp-master-api VPC)
+vpc_id = "vpc-XXXXXXXXXXXXXXXXX"
+
+# Private subnets for ECS Fargate tasks (minimum 2 for multi-AZ)
+# These subnets should have NAT gateway access for outbound internet
+private_subnet_ids = [
+  "subnet-XXXXXXXXXXXXXXXXX",  # us-west-2a private
+  "subnet-XXXXXXXXXXXXXXXXX"   # us-west-2b private
+]
+
+# Email for pipeline failure notifications (required for production)
+# Production should always have alerting configured
+failure_notification_email = "team@example.com"

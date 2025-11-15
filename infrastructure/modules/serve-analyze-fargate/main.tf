@@ -493,14 +493,17 @@ resource "aws_cloudwatch_event_target" "send_to_sns" {
 
     input_template = <<EOF
 {
-  "alarm": "ECS Task Failed",
+  "alarm": "🔴 Serve-Analyze Pipeline Failed - ${var.environment}",
+  "pipeline": "Campaign Message Analysis",
   "environment": "${var.environment}",
   "cluster": <clusterArn>,
   "taskArn": <taskArn>,
   "stoppedReason": <stoppedReason>,
   "exitCode": <exitCode>,
   "time": <time>,
-  "logs": "https://console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#logsV2:log-groups/log-group/$252Fecs$252Fserve-analyze-${var.environment}"
+  "logs": "https://console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#logsV2:log-groups/log-group/$252Fecs$252Fserve-analyze-${var.environment}",
+  "s3_bucket": "${aws_s3_bucket.pipeline_data.id}",
+  "description": "Serve-Analyze pipeline failed during execution. Check CloudWatch logs for detailed error information."
 }
 EOF
   }

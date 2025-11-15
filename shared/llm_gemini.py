@@ -94,12 +94,24 @@ class GeminiClient:
                 "limits": httpx.Limits(
                     max_connections=max_connections,
                     max_keepalive_connections=max_keepalive_connections
+                ),
+                "timeout": httpx.Timeout(
+                    connect=10.0,
+                    read=120.0,
+                    write=30.0,
+                    pool=10.0
                 )
             },
             asyncClientArgs={
                 "limits": httpx.Limits(
                     max_connections=max_connections,
                     max_keepalive_connections=max_keepalive_connections
+                ),
+                "timeout": httpx.Timeout(
+                    connect=10.0,
+                    read=120.0,
+                    write=30.0,
+                    pool=10.0
                 )
             }
         )
@@ -275,10 +287,36 @@ class GeminiClient:
                     config=config
                 )
 
+                if response is None:
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Response is None!")
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Retrying None response in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.logger.error(f"Response is None after {self.max_retries} attempts")
+                        return None
+
+                response_text = response.text
+
+                if response_text is None:
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None!")
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Retrying None response.text in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.logger.error(f"response.text is None after {self.max_retries} attempts")
+                        return None
+
                 self._track_usage(response, model_name)
-                return response.text
+                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Success! Returning response.")
+                return response_text
 
             except Exception as e:
+                self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Exception caught: {type(e).__name__}: {str(e)}")
                 if attempt < self.max_retries - 1:
                     delay = self.base_delay * (2 ** attempt)
                     self.logger.warning(f"Content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")

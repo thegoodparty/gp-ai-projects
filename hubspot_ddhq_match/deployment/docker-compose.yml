@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  ddhq-matcher:
+    build:
+      context: ../..
+      dockerfile: hubspot_ddhq_match/deployment/Dockerfile
+    platform: linux/arm64
+
+    environment:
+      ENVIRONMENT: development
+
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      DATABRICKS_API_KEY: ${DATABRICKS_API_KEY}
+      DATABRICKS_SERVER_HOSTNAME: ${DATABRICKS_SERVER_HOSTNAME}
+      DATABRICKS_HTTP_PATH: ${DATABRICKS_HTTP_PATH}
+
+      S3_OUTPUT_BUCKET: local-output
+      S3_OUTPUT_PREFIX: output/local_test
+      RUN_ID: local_test
+
+      HUBSPOT_TABLE: ${HUBSPOT_TABLE:-dbt.m_general__candidacy}
+      DDHQ_TABLE: ${DDHQ_TABLE:-dbt.stg_airbyte_source__ddhq_gdrive_election_results}
+
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      EMBEDDING_MAX_WORKERS: ${EMBEDDING_MAX_WORKERS:-80}
+
+      MATCHING_BATCH_SIZE: ${MATCHING_BATCH_SIZE:-1000}
+      MATCHING_MAX_WORKERS: ${MATCHING_MAX_WORKERS:-2000}
+
+    volumes:
+      - ../output:/app/hubspot_ddhq_match/output
+      - ../offline_data:/app/hubspot_ddhq_match/offline_data
+
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G

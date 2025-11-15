@@ -1,0 +1,14 @@
+[project]
+name = "gp-ddhq-matcher"
+version = "0.1.0"
+description = "HubSpot to DDHQ race matching system for GoodParty"
+requires-python = ">=3.11"
+dependencies = [
+    "gp-shared",
+    "faiss-cpu>=1.12.0",
+    "pyarrow>=21.0.0",
+    "boto3>=1.40.50",
+]
+
+[tool.uv.sources]
+gp-shared = { workspace = true }

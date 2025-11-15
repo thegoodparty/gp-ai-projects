@@ -100,7 +100,9 @@ class DataLoader:
             if col in row:
                 try:
                     if pd.notna(row[col]):
-                        return pd.to_datetime(row[col])
+                        timestamp_str = str(row[col])
+                        timestamp_str = timestamp_str.replace('.000Z', 'Z').replace('..', '.')
+                        return pd.to_datetime(timestamp_str)
                 except:
                     continue
 

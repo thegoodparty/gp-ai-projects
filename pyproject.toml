@@ -1,9 +1,11 @@
 [project]
 name = "gp-ai-projects"
 version = "0.1.0"
-description = "AI projects at goodparty"
+description = "AI projects at goodparty - workspace root"
 readme = "README.md"
 requires-python = ">=3.11"
+
+# Workspace root - for local development, install all dependencies
 dependencies = [
     "python-dotenv>=1.1.1",
     "pydantic>=2.0.0",
@@ -38,6 +40,7 @@ dependencies = [
     "aiohttp>=3.11.11",
     "boto3>=1.40.50",
     "spacy>=3.8.7",
+    "pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +50,9 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
 ]
+
+[tool.uv.workspace]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match"]
 
 [build-system]
 requires = ["hatchling"]

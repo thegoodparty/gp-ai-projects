@@ -33,12 +33,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Reduce noise from HTTP libraries in debug mode
-if LOG_LEVEL == 'DEBUG':
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('asyncio').setLevel(logging.WARNING)
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
@@ -49,10 +43,10 @@ class EmbeddingGenerator:
         
         # Use environment variables if provided, otherwise use parameters or defaults
         if batch_size is None:
-            batch_size = int(os.getenv('BATCH_SIZE', '50'))  # Default 50 for embeddings (safer)
-        
+            batch_size = int(os.getenv('BATCH_SIZE', '100'))  # Default 100 for embeddings (conservative)
+
         if max_concurrent_batches is None:
-            max_concurrent_batches = int(os.getenv('MAX_WORKERS', '2'))  # Default 2 for embeddings (conservative)
+            max_concurrent_batches = int(os.getenv('MAX_WORKERS', '80'))  # Default 50 for embeddings (rate-limit safe)
         
         self.batch_size = batch_size
         self.max_concurrent_batches = max_concurrent_batches
@@ -73,21 +67,17 @@ class EmbeddingGenerator:
         if pd.notna(row.get('first_name')) and pd.notna(row.get('last_name')):
             name = f"{row['first_name']} {row['last_name']}"
         
-        # State + Office (to match DDHQ race format)
-        state = ""
-        if pd.notna(row.get('state')):
-            state = row['state']
-        
-        office = ""
-        if pd.notna(row.get('candidate_office')):
-            office = row['candidate_office']
-        elif pd.notna(row.get('official_office_name')):
-            office = row['official_office_name']
-        
-        state_office = f"{state} {office}".strip()
-        
-        # Format: name: Name | race: State Office 
-        return f"name: {name} | race: {state_office}"
+        # Race: Use official_office_name (already has state), or fall back to state + candidate_office
+        race = ""
+        if pd.notna(row.get('official_office_name')):
+            race = row['official_office_name']
+        elif pd.notna(row.get('candidate_office')):
+            state = row.get('state', '')
+            candidate_office = row['candidate_office']
+            race = f"{state} {candidate_office}".strip()
+
+        # Format: name: Name | race: Race
+        return f"name: {name} | race: {race}"
     
     def create_name_race_embedding_text_ddhq(self, row: pd.Series) -> str:
         """Create name+race focused embedding text for DDHQ"""
@@ -198,16 +188,16 @@ class EmbeddingGenerator:
         # Save HubSpot with embeddings (using names expected by pipeline and matcher)
         hubspot_file = os.path.join(offline_data_dir, f"hubspot_filtered_with_embeddings_{timestamp}.parquet")
         hubspot_latest = os.path.join(offline_data_dir, "hubspot_filtered_with_embeddings_latest.parquet")
-        
-        hubspot_df.to_parquet(hubspot_file, index=False)
-        hubspot_df.to_parquet(hubspot_latest, index=False)
-        
+
+        hubspot_df.to_parquet(hubspot_file, index=False, engine='pyarrow', coerce_timestamps='us')
+        hubspot_df.to_parquet(hubspot_latest, index=False, engine='pyarrow', coerce_timestamps='us')
+
         # Save DDHQ with embeddings
         ddhq_file = os.path.join(offline_data_dir, f"ddhq_with_embeddings_cleaned_{timestamp}.parquet")
         ddhq_latest = os.path.join(offline_data_dir, "ddhq_with_embeddings_cleaned_latest.parquet")
-        
-        ddhq_df.to_parquet(ddhq_file, index=False)
-        ddhq_df.to_parquet(ddhq_latest, index=False)
+
+        ddhq_df.to_parquet(ddhq_file, index=False, engine='pyarrow', coerce_timestamps='us')
+        ddhq_df.to_parquet(ddhq_latest, index=False, engine='pyarrow', coerce_timestamps='us')
         
         # Calculate file sizes
         hubspot_size = os.path.getsize(hubspot_file) / (1024 * 1024)

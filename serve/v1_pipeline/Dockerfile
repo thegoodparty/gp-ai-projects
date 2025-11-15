@@ -9,11 +9,18 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock README.md ./
-COPY serve/ ./serve/
+COPY uv.lock ./uv.lock
+COPY pyproject.toml ./pyproject.toml
+COPY shared/pyproject.toml ./shared/pyproject.toml
+COPY serve/v1_pipeline/pyproject.toml ./serve/v1_pipeline/pyproject.toml
 COPY shared/ ./shared/
+COPY serve/v1_pipeline/ ./serve/v1_pipeline/
+COPY serve/__init__.py ./serve/__init__.py
+COPY serve/hierarchical_discovery/ ./serve/hierarchical_discovery/
 
-RUN uv sync --frozen --no-dev
+WORKDIR /app/serve/v1_pipeline
+RUN uv sync --frozen --no-dev --package gp-v1-pipeline
+WORKDIR /app
 
 FROM python:3.12-slim
 

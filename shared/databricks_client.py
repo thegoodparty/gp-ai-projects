@@ -87,28 +87,33 @@ class DatabricksClient:
     def execute_query(self, query: str) -> pd.DataFrame:
         """
         Execute SQL query and return results as DataFrame.
-        
+
         Args:
             query: SQL query string
-            
+
         Returns:
             DataFrame with query results
         """
         self.logger.debug(f"Executing query: {query[:100]}...")
-        
+
         connection = self.connect()
-        
+
         try:
             with connection.cursor() as cursor:
                 cursor.execute(query)
-                
+
                 columns = [desc[0] for desc in cursor.description]
                 data = cursor.fetchall()
-                
+
                 df = pd.DataFrame(data, columns=columns)
+
+                for col in df.columns:
+                    if pd.api.types.is_datetime64_any_dtype(df[col]):
+                        df[col] = pd.to_datetime(df[col], utc=True).dt.floor('us')
+
                 self.logger.info(f"Query returned {len(df)} rows, {len(df.columns)} columns")
                 return df
-                
+
         except Exception as e:
             self.logger.error(f"Query execution failed: {str(e)}")
             raise
