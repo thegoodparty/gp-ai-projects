@@ -102,7 +102,7 @@ class SQSEventPublisher:
 
             total_complete_events += 1
 
-        self._save_events_locally(all_events.to_json())
+        self._save_events_locally(all_events)
 
         return {
             'polls_processed': len(polls),
