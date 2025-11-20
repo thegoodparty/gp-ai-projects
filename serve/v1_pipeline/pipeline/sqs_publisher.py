@@ -92,7 +92,7 @@ class SQSEventPublisher:
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
             complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues)
-            all_events.append(complete_event)
+            all_events.append(complete_event.to_json())
 
             if self.publish_to_sqs:
                 self._send_to_sqs(complete_event)
@@ -102,7 +102,7 @@ class SQSEventPublisher:
 
             total_complete_events += 1
 
-        self._save_events_locally(all_events.to_json())
+        self._save_events_locally(all_events)
 
         return {
             'polls_processed': len(polls),
