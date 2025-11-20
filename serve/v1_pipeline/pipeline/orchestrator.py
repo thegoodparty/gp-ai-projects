@@ -346,7 +346,6 @@ class V1PipelineOrchestrator:
 
                         sqs_result = {
                             'success': True,
-                            'issue_events_sent': 0,
                             'complete_events_sent': total_complete_events
                         }
                         logger.info(f"✅ Published {total_complete_events} empty poll completion events")
@@ -508,7 +507,6 @@ class V1PipelineOrchestrator:
 
                     sqs_stats = {
                         'polls_processed': len(poll_ids),
-                        'issue_events_sent': 0,
                         'complete_events_sent': total_complete_events
                     }
                 else:
@@ -518,7 +516,6 @@ class V1PipelineOrchestrator:
                 sqs_time = time.time() - sqs_start
 
                 logger.info(f"✅ Event saving completed in {sqs_time:.2f}s")
-                logger.info(f"   Saved {sqs_stats['issue_events_sent']} issue events")
                 logger.info(f"   Saved {sqs_stats['complete_events_sent']} complete events")
 
                 sqs_result = {
