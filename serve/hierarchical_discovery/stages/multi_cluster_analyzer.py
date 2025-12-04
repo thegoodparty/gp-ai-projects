@@ -378,6 +378,11 @@ class MultiClusterAnalyzer:
                               total_clusters: int, person_metrics: Dict[str, Any]) -> str:
         """Create analysis prompt for cluster theme generation with person-level context"""
 
+        # Log inputs for data analysis
+        logger.info(f"[ANALYSIS_PROMPT_INPUT] cluster_id={cluster_id} cluster_size={cluster_size} total_clusters={total_clusters} num_example_texts={len(example_texts)}")
+        logger.debug(f"[ANALYSIS_PROMPT_INPUT_DETAIL] cluster_id={cluster_id} example_texts={example_texts}")
+        logger.debug(f"[ANALYSIS_PROMPT_INPUT_DETAIL] cluster_id={cluster_id} person_metrics={person_metrics}")
+
         examples_text = "\n".join([f"- {text}" for text in example_texts[:10]])  # Limit to 10 examples in prompt
 
         # Include person-level context in the prompt
@@ -427,6 +432,10 @@ Focus on:
 - What citizens want done (MANDATORY action items)
 - Direct citizen voices through clean verbatim quotes
 - How this relates to local governance and community engagement"""
+
+        # Log output for data analysis
+        logger.info(f"[ANALYSIS_PROMPT_OUTPUT] cluster_id={cluster_id} prompt_length={len(prompt)}")
+        logger.debug(f"[ANALYSIS_PROMPT_OUTPUT_DETAIL] cluster_id={cluster_id} prompt={prompt}")
 
         return prompt
 
