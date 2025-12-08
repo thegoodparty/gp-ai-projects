@@ -47,73 +47,12 @@ resource "aws_ecr_lifecycle_policy" "ai_projects" {
     rules = [
       {
         rulePriority = 1
-        description  = "Never expire environment images (tags containing main, master, prod, qa, dev, release)"
-        selection = {
-          tagStatus = "tagged"
-          tagPatternList = [
-            "*main*",
-            "*master*",
-            "*prod*",
-            "*qa*",
-            "*dev*",
-            "*release*"
-          ]
-          countType   = "imageCountMoreThan"
-          countNumber = 999
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep versioned releases (v1.0.0, v2.1.3) for 365 days"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["v1.", "v2.", "v3.", "v4.", "v5."]
-          countType     = "sinceImagePushed"
-          countUnit     = "days"
-          countNumber   = 365
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 3
-        description  = "Keep latest/staging tags for 60 days"
-        selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["latest", "staging"]
-          countType     = "sinceImagePushed"
-          countUnit     = "days"
-          countNumber   = 60
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 4
-        description  = "Keep untagged images for 7 days (previous latest builds)"
+        description  = "Cleanup untagged images after 30 days (referenced images protected by AWS)"
         selection = {
           tagStatus   = "untagged"
           countType   = "sinceImagePushed"
           countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 5
-        description  = "Cleanup any other images after 7 days"
-        selection = {
-          tagStatus   = "any"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
+          countNumber = 30
         }
         action = {
           type = "expire"
