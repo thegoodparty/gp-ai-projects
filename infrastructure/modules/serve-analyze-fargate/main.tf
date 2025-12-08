@@ -83,7 +83,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "pipeline_data_lifecycle" {
     status = "Enabled"
 
     expiration {
-      days = 30
+      days = 60
     }
 
     filter {
@@ -96,7 +96,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "pipeline_data_lifecycle" {
     status = "Enabled"
 
     transition {
-      days          = 7
+      days          = 60
       storage_class = "GLACIER"
     }
 
