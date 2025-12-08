@@ -18,6 +18,7 @@ from shared.logger import get_logger
 load_dotenv()
 
 GEMINI_PRICING = {
+    'gemini-3-pro-preview': {'input': 2.00, 'output': 12.00},
     'gemini-2.5-flash': {'input': 0.075, 'output': 0.30},
     'gemini-2.5-pro': {'input': 2.50, 'output': 7.50},
     'gemini-2.5-flash-lite': {'input': 0.0375, 'output': 0.15},
@@ -49,6 +50,7 @@ Usage Examples:
 """
 
 class GeminiModelType(Enum):
+    PRO_3 = "gemini-3-pro-preview"
     FLASH = "gemini-2.5-flash"
     PRO = "gemini-2.5-pro"
     FLASH_LITE = "gemini-2.5-flash-lite"
@@ -159,9 +161,9 @@ class GeminiClient:
         budget = thinking_budget if thinking_budget is not None else self.thinking_budget
         
         if budget is not None:
-            if self.default_model == GeminiModelType.PRO:
+            if self.default_model in (GeminiModelType.PRO, GeminiModelType.PRO_3):
                 if budget == 0:
-                    self.logger.warning("Cannot disable thinking for Gemini 2.5 Pro - using minimum budget of 128")
+                    self.logger.warning(f"Cannot disable thinking for {self.default_model.value} - using minimum budget of 128")
                     budget = 128
                 elif budget < 128 or budget > 32768:
                     self.logger.warning(f"Invalid budget {budget} for Pro model. Using valid range 128-32768")
@@ -516,8 +518,8 @@ class GeminiClient:
             raise
     
     def disable_thinking(self):
-        if self.default_model == GeminiModelType.PRO:
-            self.logger.warning("Cannot disable thinking for Gemini 2.5 Pro model - it only supports dynamic thinking")
+        if self.default_model in (GeminiModelType.PRO, GeminiModelType.PRO_3):
+            self.logger.warning(f"Cannot disable thinking for {self.default_model.value} - it only supports dynamic thinking")
             return
         self.thinking_budget = 0
         self.logger.info("Thinking disabled for this client")
@@ -528,10 +530,10 @@ class GeminiClient:
     
     def set_thinking_budget(self, budget: int):
         model_name = self.default_model.value
-        
-        if self.default_model == GeminiModelType.PRO:
+
+        if self.default_model in (GeminiModelType.PRO, GeminiModelType.PRO_3):
             if budget == 0:
-                self.logger.warning("Cannot disable thinking for Gemini 2.5 Pro - using minimum budget of 128")
+                self.logger.warning(f"Cannot disable thinking for {model_name} - using minimum budget of 128")
                 budget = 128
             elif budget < 128 or budget > 32768:
                 self.logger.warning(f"Invalid budget {budget} for Pro model. Using valid range 128-32768")
