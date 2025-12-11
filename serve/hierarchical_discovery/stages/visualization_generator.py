@@ -27,7 +27,7 @@ class VisualizationGenerator:
     def _load_from_accountability_csv(self, csv_file: Path, result_data: Dict[str, Any]) -> List:
         """Load clustered messages from accountability CSV with original and processed text"""
         import pandas as pd
-        from models import ClusteredMessage, ClusterAssignment, EmbeddingData
+        from serve.hierarchical_discovery.models import ClusteredMessage, ClusterAssignment, EmbeddingData
 
         df = pd.read_csv(csv_file)
         logger.info(f"CSV total rows: {len(df)}")
@@ -857,7 +857,7 @@ class VisualizationGenerator:
         # Load cluster analyses
         analyses_data = result_data.get('cluster_analyses', [])
         for analysis_data in analyses_data:
-            from models import ClusterTheme, ClusterAnalysis
+            from serve.hierarchical_discovery.models import ClusterTheme, ClusterAnalysis
 
             theme = ClusterTheme(
                 theme=analysis_data.get('theme', 'Unknown'),
@@ -900,7 +900,7 @@ class VisualizationGenerator:
                 clustered_messages_data = result_data.get('clustered_messages', [])
                 clustered_messages = []
                 for msg_data in clustered_messages_data:
-                    from models import ClusteredMessage, ClusterAssignment, EmbeddingData
+                    from serve.hierarchical_discovery.models import ClusteredMessage, ClusterAssignment, EmbeddingData
 
                     coordinates = msg_data.get('coordinates', {})
                     embedding_data = EmbeddingData(
@@ -938,7 +938,7 @@ class VisualizationGenerator:
             clustered_messages_data = result_data.get('clustered_messages', [])
             clustered_messages = []
             for msg_data in clustered_messages_data:
-                from models import ClusteredMessage, ClusterAssignment, EmbeddingData
+                from serve.hierarchical_discovery.models import ClusteredMessage, ClusterAssignment, EmbeddingData
 
                 coordinates = msg_data.get('coordinates', {})
                 embedding_data = EmbeddingData(

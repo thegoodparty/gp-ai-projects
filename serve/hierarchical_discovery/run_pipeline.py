@@ -28,9 +28,9 @@ def main():
     parser.add_argument(
         "--data-source",
         type=str,
-        choices=["josh", "cara", "berkeley", "heather", "japjeet", "joanna", "jonathan", "all",
-                 "test_1msg", "test_2msg", "test_3msg"],
-        help="Override data source from config"
+        help="Override data source from config. Can be a predefined name (josh, cara, berkeley, etc.), "
+             "a UUID filename (e.g., 019a5be5-2f4b-73b2-a757-54606b56f4d5), "
+             "or a path to a CSV file"
     )
     parser.add_argument(
         "--disable-optimization",

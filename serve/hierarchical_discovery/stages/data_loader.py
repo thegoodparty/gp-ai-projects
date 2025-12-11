@@ -209,7 +209,100 @@ class DataLoader:
                 logger.info(f"Loading specified campaigns: {campaigns}")
                 return self.load_multiple_campaigns(campaigns)
             else:
-                raise ValueError(f"Unknown data source: {data_source}. Available: {list(self.data_files.keys())}")
+                # Try to load as a file path or UUID filename
+                return self._load_from_path(data_source)
+
+    def _load_from_path(self, data_source: str) -> List[RawMessage]:
+        """Load data from a file path or UUID filename"""
+        # Check if it's a direct path
+        path = Path(data_source)
+        if path.exists():
+            logger.info(f"Loading from direct path: {path}")
+            return self._load_csv_file(path, data_source)
+
+        # Check if it's a filename in serve/data/
+        serve_data_path = Path("serve/data") / f"{data_source}.csv"
+        if serve_data_path.exists():
+            logger.info(f"Loading from serve/data: {serve_data_path}")
+            return self._load_csv_file(serve_data_path, data_source)
+
+        # Check without .csv extension
+        serve_data_path_no_ext = Path("serve/data") / data_source
+        if serve_data_path_no_ext.exists():
+            logger.info(f"Loading from serve/data: {serve_data_path_no_ext}")
+            return self._load_csv_file(serve_data_path_no_ext, data_source)
+
+        # Try with .csv extension on the original path
+        path_with_csv = Path(f"{data_source}.csv")
+        if path_with_csv.exists():
+            logger.info(f"Loading from path with .csv: {path_with_csv}")
+            return self._load_csv_file(path_with_csv, data_source)
+
+        raise ValueError(
+            f"Unknown data source: {data_source}. "
+            f"Not found as predefined campaign, file path, or in serve/data/. "
+            f"Available predefined: {list(self.data_files.keys())}"
+        )
+
+    def _load_csv_file(self, file_path: Path, campaign_name: str) -> List[RawMessage]:
+        """Load messages from a CSV file path"""
+        logger.info(f"Loading data from: {file_path}")
+
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            logger.error(f"Failed to load CSV file {file_path}: {e}")
+            raise
+
+        text_column = self._identify_text_column(df)
+        if not text_column:
+            logger.warning(f"No text column found in {file_path}")
+            return []
+
+        logger.info(f"Found text column '{text_column}' with {df[text_column].dropna().shape[0]} non-null messages")
+
+        raw_messages = []
+
+        for row_index, row in df.iterrows():
+            # Skip rows with no text content
+            if pd.isna(row.get(text_column, '')):
+                continue
+
+            text_content = str(row[text_column]).strip()
+            if not text_content:
+                continue
+
+            # Extract metadata and debug log for first few messages
+            metadata = self._extract_metadata(row, text_column)
+
+            # Create RawMessage with complete tracking
+            # Use actual CSV line number (row_index + 2 to account for 0-based index + header row)
+            actual_csv_line_number = int(row_index) + 2
+            raw_message = RawMessage(
+                id=str(uuid.uuid4()),
+                csv_file=str(file_path),
+                csv_row_index=actual_csv_line_number,
+                original_text=text_content,
+                timestamp=self._parse_timestamp(row),
+                campaign_source=campaign_name,
+                metadata=metadata,
+                created_at=datetime.now()
+            )
+
+            # Debug first few messages with comprehensive metadata logging
+            if len(raw_messages) < 5:
+                phone = metadata.get("Contact Phone Number", "NOT_FOUND")
+                sent_at = metadata.get("Sent At", "NOT_FOUND")
+                logger.info(f"RAW MESSAGE {len(raw_messages)} (csv_row={actual_csv_line_number}):")
+                logger.info(f"  phone='{phone}', sent_at='{sent_at}'")
+                logger.info(f"  text_snippet='{text_content[:50]}...'")
+                logger.info(f"  metadata_keys={list(metadata.keys())}")
+                logger.info(f"  full_metadata={metadata}")
+
+            raw_messages.append(raw_message)
+
+        logger.info(f"Loaded {len(raw_messages)} messages from {file_path}")
+        return raw_messages
 
     def validate_data(self, messages: List[RawMessage]) -> Dict[str, Any]:
         """Validate loaded data and return statistics"""

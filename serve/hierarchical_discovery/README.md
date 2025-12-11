@@ -576,6 +576,55 @@ Embedding similarity alone causes false positives:
 
 Result: Only truly similar themes are merged.
 
+## Braintrust Integration (LLM Observability)
+
+The pipeline integrates with [Braintrust](https://www.braintrust.dev/) for LLM observability and prompt evaluation.
+
+### Automatic Enablement
+
+Braintrust logging automatically enables when `BRAINTRUST_API_KEY` is set in your environment:
+
+```bash
+# Add to your .env file
+BRAINTRUST_API_KEY=your-braintrust-api-key
+BRAINTRUST_PROJECT=hierarchical-discovery  # Optional, defaults to "hierarchical-discovery"
+```
+
+No code changes or configuration flags needed. If the API key is not set, the pipeline runs normally without logging.
+
+### What Gets Logged
+
+Cluster analysis LLM calls are logged with structured input/output:
+
+**Input (shows in Braintrust UI as JSON):**
+- `cluster_info`: cluster_id, total_messages, unique_citizens, coverage metrics
+- `messages`: Sample of 10 messages from the cluster
+
+**Output:**
+- Complete `ClusterAnalysisResponse`: theme, category, sentiment, key_topics, action_items, etc.
+
+**Metadata:**
+- Full prompt text (for debugging)
+- cluster_id, total_clusters, cluster_size
+- Duration in milliseconds
+
+### Viewing Logs
+
+After running the pipeline:
+
+1. Go to [https://www.braintrust.dev/](https://www.braintrust.dev/)
+2. Navigate to your project (default: "hierarchical-discovery")
+3. View logs with structured input/output side-by-side
+4. Filter by tags: `cluster-analysis`, `k-{cluster_count}`
+
+### Prompt Management (Optional)
+
+Prompts can be managed in Braintrust's UI for iteration without code changes:
+
+1. Create a prompt in Braintrust with slug `cluster-analysis-v1`
+2. The pipeline will load it automatically (falls back to local if not found)
+3. Edit prompts in the UI and re-run to test changes
+
 ## Dependencies
 
 **Core Libraries:**

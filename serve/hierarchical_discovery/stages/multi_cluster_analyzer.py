@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from shared.logger import get_logger
 from shared.llm_gemini import GeminiClient, GeminiModelType
 from ..models import PipelineConfig, ClusterAnalysis, ClusterTheme, ClusteredMessage
+from ..braintrust_integration import init_braintrust, traced_llm_call, flush_logs, load_prompt_from_braintrust
 from .cluster_merger import cluster_merger_stage
 from .cluster_merger_analysis import analyze_cluster_merger
 
@@ -55,6 +56,9 @@ class MultiClusterAnalyzer:
             max_keepalive_connections=multi_cluster_config.get('max_keepalive_connections', 10)
         )
 
+        # Initialize Braintrust logging (auto-enables if BRAINTRUST_API_KEY is set)
+        init_braintrust()
+
         self.max_example_messages = analysis_config.get('max_example_messages', 30)
         self.save_example_messages = analysis_config.get('save_example_messages', 5)
 
@@ -71,6 +75,9 @@ class MultiClusterAnalyzer:
         return False
 
     def cleanup(self):
+        # Flush any pending Braintrust logs
+        flush_logs()
+        
         if hasattr(self, 'llm_client') and hasattr(self.llm_client, 'close'):
             try:
                 self.llm_client.close()
@@ -317,14 +324,43 @@ class MultiClusterAnalyzer:
         # Create analysis prompt with person-level context
         prompt = self._create_analysis_prompt(cluster_id, example_texts, len(messages), total_clusters, person_metrics)
 
+        # Build clean structured input for Braintrust UI display
+        # This shows as formatted JSON in Braintrust, separate from the prompt
+        input_data = {
+            "cluster_info": {
+                "cluster_id": cluster_id,
+                "total_messages": len(messages),
+                "unique_citizens": person_metrics['unique_respondents'],
+                "avg_mentions_per_citizen": round(person_metrics['avg_mentions_per_respondent'], 1),
+                "respondent_coverage_pct": round(person_metrics['respondent_coverage_pct'], 1),
+                "total_clusters": total_clusters
+            },
+            "messages": example_texts[:10]  # Sample messages for Braintrust display
+        }
+
         try:
-            # Generate theme analysis with structured output
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.llm_client.generate_structured_content(
+            # Define the LLM call function to be traced
+            def make_llm_call():
+                return self.llm_client.generate_structured_content(
                     prompt=prompt,
                     response_schema=ClusterAnalysisResponse,
                     system_instruction="You are an expert civic message analyst. Analyze citizen messages and identify themes, issues, and actionable items."
+                )
+
+            # Generate theme analysis with structured output and Braintrust tracing
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: traced_llm_call(
+                    name="cluster_analysis",
+                    input_data=input_data,
+                    llm_call_fn=make_llm_call,
+                    prompt=prompt,  # Full prompt stored in metadata for debugging
+                    metadata={
+                        "cluster_id": cluster_id,
+                        "total_clusters": total_clusters,
+                        "cluster_size": len(messages)
+                    },
+                    tags=["cluster-analysis", f"k-{total_clusters}"]
                 )
             )
 
@@ -378,21 +414,32 @@ class MultiClusterAnalyzer:
                               total_clusters: int, person_metrics: Dict[str, Any]) -> str:
         """Create analysis prompt for cluster theme generation with person-level context"""
 
-        examples_text = "\n".join([f"- {text}" for text in example_texts[:10]])  # Limit to 10 examples in prompt
+        examples_text = "\n".join([f"- {text}" for text in example_texts[:30]])  # Limit to 10 examples in prompt
 
         # Include person-level context in the prompt
         unique_respondents = person_metrics.get('unique_respondents', cluster_size)
         avg_mentions = person_metrics.get('avg_mentions_per_respondent', 1.0)
         coverage_pct = person_metrics.get('respondent_coverage_pct', 0.0)
 
-        prompt = f"""Analyze this cluster of civic engagement messages from political campaigns.
+        # Build variables for prompt template
+        variables = {
+            "cluster_id": cluster_id,
+            "cluster_size": cluster_size,
+            "unique_respondents": unique_respondents,
+            "avg_mentions": f"{avg_mentions:.1f}",
+            "coverage_pct": f"{coverage_pct:.1f}",
+            "total_clusters": total_clusters,
+            "examples_text": examples_text
+        }
+
+        fallback_prompt = """Analyze this cluster of civic engagement messages from political campaigns.
 
 CLUSTER INFO:
 - Cluster ID: {cluster_id}
 - Total Messages: {cluster_size} messages
 - Unique Citizens: {unique_respondents} different people
-- Average Mentions per Citizen: {avg_mentions:.1f}
-- Respondent Coverage: {coverage_pct:.1f}% of all survey respondents
+- Average Mentions per Citizen: {avg_mentions}
+- Respondent Coverage: {coverage_pct}% of all survey respondents
 - Part of {total_clusters} total clusters
 
 ATOMIC MESSAGES (focused civic concerns after preprocessing and splitting):
@@ -428,7 +475,12 @@ Focus on:
 - Direct citizen voices through clean verbatim quotes
 - How this relates to local governance and community engagement"""
 
-        return prompt
+        # Load from Braintrust if available, otherwise use fallback
+        return load_prompt_from_braintrust(
+            prompt_name="cluster-analysis",
+            fallback_prompt=fallback_prompt,
+            variables=variables
+        )
 
     def _calculate_person_level_metrics(self, clustered_messages: List[ClusteredMessage],
                                       total_respondents: int) -> Dict[str, Any]:

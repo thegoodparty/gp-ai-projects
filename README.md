@@ -57,6 +57,10 @@ TAVILY_API_KEY=your_tavily_api_key
 DATABRICKS_API_KEY=your_databricks_api_key
 DATABRICKS_SERVER_HOSTNAME=your-workspace.cloud.databricks.com
 DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/your-warehouse-id
+
+# Braintrust (Optional - enables LLM observability)
+# Get your API key at https://www.braintrust.dev/
+BRAINTRUST_API_KEY=your_braintrust_api_key
 ```
 
 ## Running the Projects
