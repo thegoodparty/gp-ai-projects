@@ -115,13 +115,9 @@ This report summarizes the results of analyzing civic engagement messages throug
         for i, analysis in enumerate(pipeline_result.cluster_analyses[:15], 1):
             report_content += f"""### {i}. {analysis.theme_analysis.theme}
 
-**Cluster ID:** {analysis.cluster_id} | **Size:** {analysis.size} messages | **Sentiment:** {analysis.theme_analysis.sentiment} | **Confidence:** {analysis.theme_analysis.confidence_score:.2f}
+**Cluster ID:** {analysis.cluster_id} | **Size:** {analysis.size} messages
 
 {analysis.theme_analysis.summary}
-
-**Key Topics:** {', '.join(analysis.theme_analysis.key_topics)}
-
-**Civic Relevance:** {analysis.theme_analysis.civic_relevance}
 
 **Example Messages:**
 """
@@ -162,7 +158,6 @@ This report summarizes the results of analyzing civic engagement messages throug
 
 ### Data Quality
 - **Filtering Pass Rate:** {len([m for m in pipeline_result.filtered_messages if m.filter_result.passed])/len(pipeline_result.raw_messages)*100:.1f}%
-- **Average Cluster Confidence:** {sum(a.theme_analysis.confidence_score for a in pipeline_result.cluster_analyses)/len(pipeline_result.cluster_analyses):.3f}
 - **Noise Ratio:** {pipeline_result.pipeline_state.noise_points/len(pipeline_result.clustered_messages)*100:.1f}%
 
 ### Hierarchical Clustering Benefits

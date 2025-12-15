@@ -379,14 +379,11 @@ class VisualizationGenerator:
             return go.Figure()
 
         # Prepare table data
-        headers = ['Cluster ID', 'Size', 'Theme', 'Sentiment', 'Confidence', 'Key Topics']
+        headers = ['Cluster ID', 'Size', 'Theme']
 
         cluster_ids = []
         sizes = []
         themes = []
-        sentiments = []
-        confidences = []
-        key_topics = []
 
         for analysis in sorted(cluster_analyses, key=lambda x: x.size, reverse=True):
             # Handle hierarchical sub-clusters in table display
@@ -398,12 +395,6 @@ class VisualizationGenerator:
                 cluster_ids.append(f"Cluster {analysis.cluster_id}")
             sizes.append(analysis.size)
             themes.append(analysis.theme_analysis.theme)
-            sentiments.append(analysis.theme_analysis.sentiment.title())
-            confidences.append(f"{analysis.theme_analysis.confidence_score:.2f}")
-            topics_str = ", ".join(analysis.theme_analysis.key_topics[:3])  # Show top 3 topics
-            if len(analysis.theme_analysis.key_topics) > 3:
-                topics_str += "..."
-            key_topics.append(topics_str)
 
         # Create table
         fig = go.Figure(data=[go.Table(
@@ -414,7 +405,7 @@ class VisualizationGenerator:
                 font=dict(size=12, color='black')
             ),
             cells=dict(
-                values=[cluster_ids, sizes, themes, sentiments, confidences, key_topics],
+                values=[cluster_ids, sizes, themes],
                 fill_color='white',
                 align='left',
                 font=dict(size=11),
@@ -831,7 +822,7 @@ class VisualizationGenerator:
 
     <div class="section">
         <h2>📋 Cluster Analysis Summary</h2>
-        <p>Detailed analysis of each cluster including themes, sentiment, and key topics identified by AI.</p>
+        <p>Detailed analysis of each cluster including themes identified by AI.</p>
         {summary_table_html}
     </div>
 
@@ -861,11 +852,7 @@ class VisualizationGenerator:
 
             theme = ClusterTheme(
                 theme=analysis_data.get('theme', 'Unknown'),
-                summary=analysis_data.get('summary', ''),
-                key_topics=analysis_data.get('key_topics', []),
-                sentiment=analysis_data.get('sentiment', 'neutral'),
-                civic_relevance=analysis_data.get('civic_relevance', ''),
-                confidence_score=analysis_data.get('confidence_score', 0.5)
+                summary=analysis_data.get('summary', '')
             )
 
             analysis = ClusterAnalysis(

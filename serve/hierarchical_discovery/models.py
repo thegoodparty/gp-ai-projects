@@ -140,17 +140,11 @@ class ClusterTheme:
     """Theme analysis for a cluster"""
     theme: str
     summary: str
-    key_topics: List[str] = field(default_factory=list)
-    sentiment: str = "neutral"
-    civic_relevance: str = ""
-    confidence_score: float = 0.0
     # Enhanced fields for better analysis
-    category: str = ""
     issues_summary: str = ""
     detailed_analysis: str = ""
     verbatim_quotes: List[str] = field(default_factory=list)
     quotes: List[Dict[str, str]] = field(default_factory=list)
-    action_items: List[str] = field(default_factory=list)
     # Person-level metrics for cluster merger
     cluster_id: int = 0
     unique_respondents: int = 0

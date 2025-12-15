@@ -142,11 +142,15 @@ class HierarchicalDiscoveryOrchestrator:
         if not embedded_messages:
             logger.warning("Clustering skipped - no atomic messages")
             logger.info("Returning empty multi-cluster results")
+            # Sanitize dataset name - extract filename without path and extension
+            from pathlib import Path
+            dataset_name = Path(self.config.data_source).stem if self.config.data_source else ""
+            
             return {
                 'messages': [],
                 'cluster_results': {},
                 'pipeline_state': self.pipeline_state,
-                'dataset_name': self.config.data_source,
+                'dataset_name': dataset_name,
                 'cluster_ranges': [],
                 'total_messages': 0
             }

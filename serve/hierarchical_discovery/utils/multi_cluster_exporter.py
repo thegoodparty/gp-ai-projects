@@ -35,7 +35,6 @@ async def export_multi_cluster_results(consolidated_result, output_paths):
 
             row[f'cluster_{suffix}'] = msg['cluster_assignments'].get(cluster_count, '')
             row[f'theme_{suffix}'] = msg['cluster_themes'].get(cluster_count, '')
-            row[f'category_{suffix}'] = msg['cluster_categories'].get(cluster_count, '')
             row[f'issues_summary_{suffix}'] = msg['cluster_issues_summaries'].get(cluster_count, '')
             row[f'detailed_analysis_{suffix}'] = msg['cluster_detailed_analyses'].get(cluster_count, '')
 
@@ -47,16 +46,6 @@ async def export_multi_cluster_results(consolidated_result, output_paths):
                 row[f'quotes_{suffix}'] = json.dumps(quotes_with_phones)
             else:
                 row[f'quotes_{suffix}'] = ''
-
-            action_items = msg['cluster_action_items'].get(cluster_count, [])
-            row[f'action_items_{suffix}'] = ', '.join(action_items) if isinstance(action_items, list) else action_items
-
-            key_topics = msg['cluster_key_topics'].get(cluster_count, [])
-            row[f'key_topics_{suffix}'] = ', '.join(key_topics) if isinstance(key_topics, list) else key_topics
-
-            row[f'sentiment_{suffix}'] = msg['cluster_sentiments'].get(cluster_count, '')
-            row[f'civic_relevance_{suffix}'] = msg['cluster_civic_relevance'].get(cluster_count, '')
-            row[f'confidence_score_{suffix}'] = msg['cluster_confidence_scores'].get(cluster_count, '')
 
             row[f'unique_respondents_{suffix}'] = msg['cluster_unique_respondents'].get(cluster_count, 0)
             row[f'total_mentions_{suffix}'] = msg['cluster_total_mentions'].get(cluster_count, 0)

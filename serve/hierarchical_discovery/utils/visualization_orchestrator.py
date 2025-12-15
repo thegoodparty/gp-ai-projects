@@ -108,10 +108,6 @@ async def generate_dendrograms_and_visualizations(consolidated_result, timestamp
                         'size': analysis.size,
                         'theme': analysis.theme_analysis.theme,
                         'summary': analysis.theme_analysis.summary,
-                        'key_topics': analysis.theme_analysis.key_topics,
-                        'sentiment': analysis.theme_analysis.sentiment,
-                        'civic_relevance': analysis.theme_analysis.civic_relevance,
-                        'confidence_score': analysis.theme_analysis.confidence_score,
                         'example_messages': analysis.example_messages[:3] if hasattr(analysis, 'example_messages') else []
                     }
                     for analysis in analyzed_clusters

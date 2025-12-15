@@ -206,7 +206,7 @@ class ClusterMerger:
         for cluster_id in sorted(candidate_cluster_ids):
             theme = cluster_themes[cluster_id]
             cluster_descriptions.append(
-                f"Cluster {cluster_id}: Theme=\"{theme.theme}\", Category=\"{theme.category}\", Issues=\"{theme.issues_summary}\""
+                f"Cluster {cluster_id}: Theme=\"{theme.theme}\", Issues=\"{theme.issues_summary}\""
             )
 
         clusters_text = "\n".join(cluster_descriptions)
@@ -449,19 +449,13 @@ Example output structure:
                             theme=merged_theme_names[target_id],  # Use LLM-generated merged theme
                             summary=theme.summary,
                             cluster_id=target_id,
-                            category=theme.category,
-                            sentiment=theme.sentiment,
-                            civic_relevance=theme.civic_relevance,
-                            confidence_score=theme.confidence_score,
                             unique_respondents=theme.unique_respondents,
                             total_mentions=theme.total_mentions,
                             avg_mentions_per_respondent=theme.avg_mentions_per_respondent,
                             respondent_coverage_pct=theme.respondent_coverage_pct,
                             issues_summary=theme.issues_summary,
                             detailed_analysis=theme.detailed_analysis,
-                            verbatim_quotes=theme.verbatim_quotes.copy() if theme.verbatim_quotes else [],
-                            action_items=theme.action_items.copy() if theme.action_items else [],
-                            key_topics=theme.key_topics.copy() if theme.key_topics else []
+                            verbatim_quotes=theme.verbatim_quotes.copy() if theme.verbatim_quotes else []
                         )
                     else:
                         merged_themes[target_id] = theme
@@ -480,19 +474,13 @@ Example output structure:
                             theme=theme_name,  # Use LLM-generated merged theme or fallback to base
                             summary=base_theme.summary,
                             cluster_id=target_id,
-                            category=base_theme.category,
-                            sentiment=base_theme.sentiment,
-                            civic_relevance=base_theme.civic_relevance,
-                            confidence_score=base_theme.confidence_score,
                             unique_respondents=base_theme.unique_respondents,
                             total_mentions=base_theme.total_mentions,
                             avg_mentions_per_respondent=base_theme.avg_mentions_per_respondent,
                             respondent_coverage_pct=base_theme.respondent_coverage_pct,
                             issues_summary=base_theme.issues_summary,
                             detailed_analysis=base_theme.detailed_analysis,
-                            verbatim_quotes=base_theme.verbatim_quotes.copy() if base_theme.verbatim_quotes else [],
-                            action_items=base_theme.action_items.copy() if base_theme.action_items else [],
-                            key_topics=base_theme.key_topics.copy() if base_theme.key_topics else []
+                            verbatim_quotes=base_theme.verbatim_quotes.copy() if base_theme.verbatim_quotes else []
                         )
                         logger.debug(f"Successfully created merged theme for cluster {target_id} with name: '{theme_name}'")
                     except Exception as e:
@@ -505,15 +493,11 @@ Example output structure:
                 merged_themes[target_id].unique_respondents += theme.unique_respondents
                 if theme.verbatim_quotes:
                     merged_themes[target_id].verbatim_quotes.extend(theme.verbatim_quotes)
-                if theme.key_topics:
-                    merged_themes[target_id].key_topics.extend(theme.key_topics)
 
         logger.debug(f"Finalizing {len(merged_themes)} merged themes")
         for theme in merged_themes.values():
             if theme.verbatim_quotes:
                 theme.verbatim_quotes = list(dict.fromkeys(theme.verbatim_quotes))[:5]
-            if theme.key_topics:
-                theme.key_topics = list(dict.fromkeys(theme.key_topics))[:10]
 
             unique_resp = theme.unique_respondents
             total_ment = theme.total_mentions

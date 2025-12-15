@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from pathlib import Path
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,7 +27,6 @@ def create_single_message_output(analyzed_message, pipeline_state, data_source):
         'campaign_source': analyzed_message.campaign_source,
         'cluster_assignments': {'0': 0},
         'cluster_themes': {'0': theme.theme},
-        'cluster_categories': {'0': theme.category},
         'cluster_issues_summaries': {'0': theme.issues_summary},
         'cluster_detailed_analyses': {'0': theme.detailed_analysis},
         'cluster_verbatim_quotes': {'0': theme.verbatim_quotes},
@@ -38,11 +38,6 @@ def create_single_message_output(analyzed_message, pipeline_state, data_source):
                 'atomic_message': message_text
             }
         ]},
-        'cluster_action_items': {'0': theme.action_items},
-        'cluster_key_topics': {'0': theme.key_topics},
-        'cluster_sentiments': {'0': theme.sentiment},
-        'cluster_civic_relevance': {'0': theme.civic_relevance},
-        'cluster_confidence_scores': {'0': theme.confidence_score},
         'cluster_metadata': {},
         'cluster_unique_respondents': {'0': 1},
         'cluster_total_mentions': {'0': 1},
@@ -50,7 +45,7 @@ def create_single_message_output(analyzed_message, pipeline_state, data_source):
         'cluster_respondent_coverage_pct': {'0': 100.0}
     }
 
-    logger.info(f"Created single-message output - Theme: {theme.theme}, Category: {theme.category}")
+    logger.info(f"Created single-message output - Theme: {theme.theme}")
 
     return {
         'messages': [msg_data],
@@ -64,7 +59,7 @@ def create_single_message_output(analyzed_message, pipeline_state, data_source):
             }
         },
         'pipeline_state': pipeline_state,
-        'dataset_name': data_source,
+        'dataset_name': Path(data_source).stem if data_source else "",
         'cluster_ranges': ['0'],
         'total_messages': 1
     }
@@ -97,16 +92,10 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
             'campaign_source': embedded_msg.campaign_source,
             'cluster_assignments': {},
             'cluster_themes': {},
-            'cluster_categories': {},
             'cluster_issues_summaries': {},
             'cluster_detailed_analyses': {},
             'cluster_verbatim_quotes': {},
             'cluster_quotes': {},
-            'cluster_action_items': {},
-            'cluster_key_topics': {},
-            'cluster_sentiments': {},
-            'cluster_civic_relevance': {},
-            'cluster_confidence_scores': {},
             'cluster_metadata': {},
             'cluster_unique_respondents': {},
             'cluster_total_mentions': {},
@@ -138,16 +127,10 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
                                     ta = cluster.theme_analysis
                                     theme = getattr(ta, 'theme', f"Cluster {cluster_id}")
 
-                                    msg_data['cluster_categories'][n_clusters_str] = getattr(ta, 'category', '')
                                     msg_data['cluster_issues_summaries'][n_clusters_str] = getattr(ta, 'issues_summary', '')
                                     msg_data['cluster_detailed_analyses'][n_clusters_str] = getattr(ta, 'detailed_analysis', '')
                                     msg_data['cluster_verbatim_quotes'][n_clusters_str] = getattr(ta, 'verbatim_quotes', [])
                                     msg_data['cluster_quotes'][n_clusters_str] = getattr(ta, 'quotes', [])
-                                    msg_data['cluster_action_items'][n_clusters_str] = getattr(ta, 'action_items', [])
-                                    msg_data['cluster_key_topics'][n_clusters_str] = getattr(ta, 'key_topics', [])
-                                    msg_data['cluster_sentiments'][n_clusters_str] = getattr(ta, 'sentiment', '')
-                                    msg_data['cluster_civic_relevance'][n_clusters_str] = getattr(ta, 'civic_relevance', '')
-                                    msg_data['cluster_confidence_scores'][n_clusters_str] = getattr(ta, 'confidence_score', 0.0)
 
                                     msg_data['cluster_unique_respondents'][n_clusters_str] = getattr(cluster, 'unique_respondents', 0)
                                     msg_data['cluster_total_mentions'][n_clusters_str] = getattr(cluster, 'total_mentions', 0)
@@ -155,15 +138,9 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
                                     msg_data['cluster_respondent_coverage_pct'][n_clusters_str] = getattr(cluster, 'respondent_coverage_pct', 0.0)
                                 else:
                                     theme = f"Cluster {cluster_id}"
-                                    msg_data['cluster_categories'][n_clusters_str] = ''
                                     msg_data['cluster_issues_summaries'][n_clusters_str] = ''
                                     msg_data['cluster_detailed_analyses'][n_clusters_str] = ''
                                     msg_data['cluster_verbatim_quotes'][n_clusters_str] = []
-                                    msg_data['cluster_action_items'][n_clusters_str] = []
-                                    msg_data['cluster_key_topics'][n_clusters_str] = []
-                                    msg_data['cluster_sentiments'][n_clusters_str] = ''
-                                    msg_data['cluster_civic_relevance'][n_clusters_str] = ''
-                                    msg_data['cluster_confidence_scores'][n_clusters_str] = 0.0
 
                                     msg_data['cluster_unique_respondents'][n_clusters_str] = 0
                                     msg_data['cluster_total_mentions'][n_clusters_str] = 0
@@ -172,16 +149,10 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
                                 break
                         elif isinstance(cluster, dict) and cluster.get('cluster_id') == cluster_id:
                             theme = cluster.get('theme', f"Cluster {cluster_id}")
-                            msg_data['cluster_categories'][n_clusters_str] = cluster.get('category', '')
                             msg_data['cluster_issues_summaries'][n_clusters_str] = cluster.get('issues_summary', '')
                             msg_data['cluster_detailed_analyses'][n_clusters_str] = cluster.get('detailed_analysis', '')
                             msg_data['cluster_verbatim_quotes'][n_clusters_str] = cluster.get('verbatim_quotes', [])
                             msg_data['cluster_quotes'][n_clusters_str] = cluster.get('quotes', [])
-                            msg_data['cluster_action_items'][n_clusters_str] = cluster.get('action_items', [])
-                            msg_data['cluster_key_topics'][n_clusters_str] = cluster.get('key_topics', [])
-                            msg_data['cluster_sentiments'][n_clusters_str] = cluster.get('sentiment', '')
-                            msg_data['cluster_civic_relevance'][n_clusters_str] = cluster.get('civic_relevance', '')
-                            msg_data['cluster_confidence_scores'][n_clusters_str] = cluster.get('confidence_score', 0.0)
 
                             msg_data['cluster_unique_respondents'][n_clusters_str] = cluster.get('unique_respondents', 0)
                             msg_data['cluster_total_mentions'][n_clusters_str] = cluster.get('total_mentions', 0)
@@ -203,7 +174,7 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
         'messages': consolidated_messages,
         'cluster_results': multi_results,
         'pipeline_state': pipeline_state,
-        'dataset_name': data_source,
+        'dataset_name': Path(data_source).stem if data_source else "",
         'cluster_ranges': list(multi_results.keys()),
         'total_messages': len(consolidated_messages)
     }

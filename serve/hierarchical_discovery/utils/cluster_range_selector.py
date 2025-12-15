@@ -103,7 +103,9 @@ def determine_cluster_ranges(
         logger.info("=" * 60)
         logger.info(f"\n{reasoning}\n")
 
-        dataset_name = config.data_source
+        # Sanitize dataset name - extract filename without path and extension
+        from pathlib import Path
+        dataset_name = Path(config.data_source).stem if config.data_source else ""
         finder.plot_results(output_paths['reports'], valid_results, dataset_name=dataset_name,
                           gap_results=finder.gap_results, stability_scores=finder.stability_scores)
         finder.save_report(output_paths['reports'], optimal_k, reasoning, dataset_name=dataset_name)

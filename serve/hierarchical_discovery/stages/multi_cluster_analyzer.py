@@ -23,21 +23,12 @@ from .cluster_merger_analysis import analyze_cluster_merger
 logger = get_logger(__name__)
 
 class ClusterAnalysisResponse(BaseModel):
-    category: str = Field(..., description="High-level civic category from: Infrastructure, Public Safety, Education, Healthcare, Housing, Transportation, Environment, Governance, Economic Development, Community Services, Other")
-    theme: str = Field(..., description="2-4 word concise theme/label for this cluster")
-    issues_summary: str = Field(..., description="1 sentence describing the core issues or concerns")
-    detailed_analysis: str = Field(..., description="2-3 paragraphs analyzing common concerns, patterns, underlying issues")
-    key_topics: List[str] = Field(default_factory=list, description="5 key topics mentioned in this cluster")
-    sentiment: str = Field(..., description="Overall sentiment: positive, negative, neutral, mixed, or concerned")
-    action_items: List[str] = Field(default_factory=list, description="At least 3 specific, actionable items. If citizens don't explicitly request actions, infer reasonable actions from their concerns")
-    civic_relevance: str = Field(..., description="How this relates to local governance and community needs")
-    confidence: str = Field(..., description="Confidence level: High, Medium, or Low")
+    theme: str = Field(..., description="A single 2-4 word label capturing the core concern.")
+    issues_summary: str = Field(..., description="One sentence describing what constituents are telling you")
+    detailed_analysis: str = Field(..., description="Explain what your constituents are experiencing and why they reached out. Cover the problems, frustrations, or needs they describe and how these connect to local governance.")
 
 class VerbatimQuotesResponse(BaseModel):
     quotes: List[str] = Field(default_factory=list, description="3-5 verbatim quotes (max 15 words each) directly from the messages that represent the cluster theme")
-
-class ActionItemsResponse(BaseModel):
-    action_items: List[str] = Field(default_factory=list, description="3-5 specific, actionable items that local government or campaigns can implement")
 
 class MultiClusterAnalyzer:
     """Efficient multi-cluster analysis with proper API management"""
@@ -322,7 +313,7 @@ class MultiClusterAnalyzer:
         example_texts = [msg.text for msg in sample_messages]
 
         # Create analysis prompt with person-level context
-        prompt = self._create_analysis_prompt(cluster_id, example_texts, len(messages), total_clusters, person_metrics)
+        prompt = self._create_analysis_prompt(example_texts, len(messages), person_metrics)
 
         # Build clean structured input for Braintrust UI display
         # This shows as formatted JSON in Braintrust, separate from the prompt
@@ -335,7 +326,7 @@ class MultiClusterAnalyzer:
                 "respondent_coverage_pct": round(person_metrics['respondent_coverage_pct'], 1),
                 "total_clusters": total_clusters
             },
-            "messages": example_texts[:10]  # Sample messages for Braintrust display
+            "messages": example_texts[:30]  # Sample messages for Braintrust display
         }
 
         try:
@@ -368,12 +359,9 @@ class MultiClusterAnalyzer:
                 logger.warning(f"Empty response for cluster {cluster_id}")
                 return None
 
-            logger.debug(f"Structured LLM response for cluster {cluster_id}: theme='{response.theme}', {len(response.action_items)} actions")
+            logger.debug(f"Structured LLM response for cluster {cluster_id}: theme='{response.theme}'")
 
             cluster_theme = self._convert_response_to_cluster_theme(response, cluster_id)
-
-            # Debug logging: show parsed action items count
-            logger.debug(f"Parsed {len(cluster_theme.action_items)} action items for cluster {cluster_id}: {cluster_theme.action_items}")
 
             # Populate person-level metrics on ClusterTheme
             cluster_theme.cluster_id = cluster_id
@@ -384,9 +372,6 @@ class MultiClusterAnalyzer:
 
             # Generate verbatim quotes from original full messages
             cluster_theme = await self._generate_verbatim_quotes(cluster_theme, cluster_id, sample_messages)
-
-            # Validate action items are present
-            cluster_theme = await self._validate_and_enhance_action_items(cluster_theme, cluster_id, sample_messages)
 
             # Create ClusterAnalysis object with person-level metrics
             cluster_analysis = ClusterAnalysis(
@@ -410,11 +395,11 @@ class MultiClusterAnalyzer:
             logger.error(f"Failed to analyze cluster {cluster_id}: {e}")
             return None
 
-    def _create_analysis_prompt(self, cluster_id: int, example_texts: List[str], cluster_size: int,
-                              total_clusters: int, person_metrics: Dict[str, Any]) -> str:
+    def _create_analysis_prompt(self, example_texts: List[str], cluster_size: int,
+                              person_metrics: Dict[str, Any]) -> str:
         """Create analysis prompt for cluster theme generation with person-level context"""
 
-        examples_text = "\n".join([f"- {text}" for text in example_texts[:30]])  # Limit to 10 examples in prompt
+        examples_text = "\n".join([f"- {text}" for text in example_texts])  # Include all quotes
 
         # Include person-level context in the prompt
         unique_respondents = person_metrics.get('unique_respondents', cluster_size)
@@ -423,57 +408,52 @@ class MultiClusterAnalyzer:
 
         # Build variables for prompt template
         variables = {
-            "cluster_id": cluster_id,
             "cluster_size": cluster_size,
             "unique_respondents": unique_respondents,
             "avg_mentions": f"{avg_mentions:.1f}",
             "coverage_pct": f"{coverage_pct:.1f}",
-            "total_clusters": total_clusters,
             "examples_text": examples_text
         }
 
-        fallback_prompt = """Analyze this cluster of civic engagement messages from political campaigns.
-
-CLUSTER INFO:
-- Cluster ID: {cluster_id}
+        fallback_prompt = """Analyze these civic engagement messages from constituents responding to a local elected official.
+        
+**MESSAGE GROUP INFO:**
 - Total Messages: {cluster_size} messages
-- Unique Citizens: {unique_respondents} different people
-- Average Mentions per Citizen: {avg_mentions}
+- Unique Constituents: {unique_respondents} different people
+- Average Mentions per Constituent: {avg_mentions}
 - Respondent Coverage: {coverage_pct}% of all survey respondents
-- Part of {total_clusters} total clusters
 
-ATOMIC MESSAGES (focused civic concerns after preprocessing and splitting):
+**CONSTITUENT MESSAGES:**
 {examples_text}
 
-Provide a comprehensive analysis of this cluster:
+---
 
-1. **Category**: Identify the high-level civic category (Infrastructure, Public Safety, Education, Healthcare, Housing, Transportation, Environment, Governance, Economic Development, Community Services, or Other)
+**Your task:** Provide an analysis that helps an elected official quickly understand what their constituents are telling them.
 
-2. **Theme**: Create a concise 2-4 word theme/label that captures the essence of this cluster
+**Writing guidelines:**
+- Write at a high school reading level
+- Use active voice, not passive voice
+- Avoid adverbs
+- Keep political terminology when it adds clarity
+- Do not use any direct quotes from constituent messages
+- Address the elected official directly (e.g., "Your constituents want..." not "Constituents expressed...")
 
-3. **Issues Summary**: Write 1 sentence describing the core issues or concerns people are expressing
+**Handling outliers:** Some messages may not fit the dominant pattern. Focus your theme, summary, and analysis on what most messages share in common. Do not try to account for every message—prioritize directional accuracy over completeness.
 
-4. **Detailed Analysis**: Write 2-3 paragraphs analyzing common concerns, patterns, underlying issues, and what citizens are experiencing. Focus on the problems, frustrations, or needs expressed.
+**Output format:**
 
-5. **Key Topics**: List 5 key topics mentioned in this cluster
+1. **Theme**: A concise 2-4 word label capturing the core concern. Avoid using "and" or "&" to combine separate topics—pick the dominant one.
 
-6. **Sentiment**: Identify overall sentiment (positive, negative, neutral, mixed, or concerned)
+2. **Issues Summary**: One sentence describing what constituents are telling you, written in active voice.
 
-7. **Action Items** (MANDATORY): Provide at least 3 specific, actionable items
-   - If citizens don't explicitly request actions, infer reasonable actions from their concerns
-   - Example: Traffic complaints → ["Install traffic calming measures", "Increase traffic enforcement", "Add speed monitoring signs"]
-   - Each action must be specific and actionable by local government or campaigns
+3. **Detailed Analysis**: Explain what your constituents are experiencing and why they reached out. Cover the problems, frustrations, or needs they describe and how these connect to local governance.
 
-8. **Civic Relevance**: Explain how this relates to local governance and community needs
+   **Length guidance based on message count:**
+   - 1-3 messages: 1-2 sentences
+   - 4-10 messages: 1 short paragraph
+   - 11+ messages: up to 2 paragraphs
 
-9. **Confidence**: Rate your confidence (High, Medium, or Low) based on message coherence and theme clarity
-
-Focus on:
-- WHY citizens are contacting campaigns - what problems drive these messages
-- What specific issues, frustrations, or concerns are expressed
-- What citizens want done (MANDATORY action items)
-- Direct citizen voices through clean verbatim quotes
-- How this relates to local governance and community engagement"""
+   Do not pad the analysis. If messages are short or lack substance, keep your analysis brief regardless of message count."""
 
         # Load from Braintrust if available, otherwise use fallback
         return load_prompt_from_braintrust(
@@ -519,32 +499,15 @@ Focus on:
     def _convert_response_to_cluster_theme(self, response: ClusterAnalysisResponse, cluster_id: int) -> ClusterTheme:
         """Convert Pydantic ClusterAnalysisResponse to ClusterTheme dataclass"""
 
-        # Map confidence text to score
-        confidence_score = 0.8  # Default
-        if response.confidence.lower() == 'high':
-            confidence_score = 0.9
-        elif response.confidence.lower() == 'medium':
-            confidence_score = 0.7
-        elif response.confidence.lower() == 'low':
-            confidence_score = 0.3
-
-        # Create ClusterTheme object from structured response
-        # verbatim_quotes will be populated by separate LLM call
         # Use theme as fallback if issues_summary is empty
         summary = response.issues_summary if response.issues_summary.strip() else response.theme
 
         cluster_theme = ClusterTheme(
-            category=response.category,
             theme=response.theme,
             summary=summary,
             issues_summary=summary,
             detailed_analysis=response.detailed_analysis,
-            verbatim_quotes=[],  # Will be populated by _generate_verbatim_quotes
-            key_topics=response.key_topics,
-            sentiment=response.sentiment.lower(),
-            action_items=response.action_items,
-            civic_relevance=response.civic_relevance,
-            confidence_score=confidence_score
+            verbatim_quotes=[]  # Will be populated by _generate_verbatim_quotes
         )
 
         return cluster_theme
@@ -567,7 +530,6 @@ Focus on:
         prompt = f"""Extract 3-5 verbatim quotes that best represent this cluster's theme.
 
 CLUSTER THEME: {cluster_theme.theme}
-CLUSTER CATEGORY: {cluster_theme.category}
 
 ORIGINAL CITIZEN MESSAGES:
 {messages_text}
@@ -647,63 +609,6 @@ Extract 1 quote from each message: ["Ridiculous property taxes", "Can't afford t
 
         return messages[0] if messages else None
 
-    async def _generate_action_items_with_llm(self, cluster_theme: ClusterTheme, sample_messages: List[ClusteredMessage], cluster_id: int) -> List[str]:
-        """Generate action items using structured output"""
-
-        message_texts = [msg.text for msg in sample_messages[:5]]
-        messages_text = "\n".join([f"- {text}" for text in message_texts])
-
-        prompt = f"""Generate 3-5 specific actionable items for local government or campaigns to address citizen concerns.
-
-THEME: {cluster_theme.theme}
-CATEGORY: {cluster_theme.category}
-CITIZEN CONCERNS (atomic civic messages):
-{messages_text}
-
-REQUIREMENTS:
-- Each action must be specific and concrete (not generic like "study the issue")
-- Actions should directly address the concerns expressed in the messages
-- Actions should be realistic for local government or campaign implementation
-- If concerns are implicit (e.g., complaints about traffic), infer appropriate actions"""
-
-        try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.llm_client.generate_structured_content(
-                    prompt=prompt,
-                    response_schema=ActionItemsResponse,
-                    system_instruction="Generate specific, actionable items that local government or campaigns can implement to address citizen concerns."
-                )
-            )
-
-            if not response or not response.action_items:
-                logger.warning(f"Empty response from LLM for action items generation (cluster {cluster_id})")
-                return []
-
-            logger.debug(f"Generated {len(response.action_items)} action items via structured output for cluster {cluster_id}")
-            return response.action_items[:5]
-
-        except Exception as e:
-            logger.error(f"Failed to generate action items via LLM for cluster {cluster_id}: {e}")
-            return []
-
-    async def _validate_and_enhance_action_items(self, cluster_theme: ClusterTheme, cluster_id: int, sample_messages: List[ClusteredMessage]) -> ClusterTheme:
-        """Validate action items and use dedicated LLM call if insufficient"""
-
-        # Check if action items are missing or too few
-        if not cluster_theme.action_items or len(cluster_theme.action_items) < 3:
-            logger.warning(f"Cluster {cluster_id} has insufficient action items ({len(cluster_theme.action_items)}). Making dedicated LLM call for action items.")
-
-            # Make focused LLM call to generate action items
-            generated_actions = await self._generate_action_items_with_llm(cluster_theme, sample_messages, cluster_id)
-
-            if generated_actions and len(generated_actions) >= 3:
-                cluster_theme.action_items = generated_actions
-                logger.debug(f"Successfully generated {len(generated_actions)} action items via LLM for cluster {cluster_id}")
-            else:
-                logger.error(f"Failed to generate sufficient action items for cluster {cluster_id} - keeping {len(cluster_theme.action_items)} existing items")
-
-        return cluster_theme
 
 
     def get_usage_stats(self) -> Dict[str, Any]:

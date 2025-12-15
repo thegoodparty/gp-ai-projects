@@ -302,9 +302,6 @@ All utilities are async-compatible and accept `pipeline_state` and `config` as p
 Columns per k value:
 - `cluster_{k}`: Cluster ID
 - `theme_{k}`: AI-generated theme
-- `category_{k}`: High-level category
-- `sentiment_{k}`: Emotional tone
-- `key_topics_{k}`: Comma-separated topics
 - `detailed_analysis_{k}`: Full analysis
 - `verbatim_quotes_{k}`: Representative quotes
 - `quotes_{k}`: JSON with phone attribution
@@ -321,11 +318,6 @@ Structure per cluster:
   "theme_analysis": {
     "theme": "Road and Sidewalk Repair",
     "summary": "Citizens reporting infrastructure issues",
-    "key_topics": ["road conditions", "street repair"],
-    "sentiment": "concerned",
-    "category": "Infrastructure",
-    "civic_relevance": "Maintaining public infrastructure",
-    "confidence_score": 0.9,
     "quotes": [
       {
         "quote": "Side streets are in horrible shape.",
@@ -601,7 +593,7 @@ Cluster analysis LLM calls are logged with structured input/output:
 - `messages`: Sample of 10 messages from the cluster
 
 **Output:**
-- Complete `ClusterAnalysisResponse`: theme, category, sentiment, key_topics, action_items, etc.
+- Complete `ClusterAnalysisResponse`: theme, issues_summary, detailed_analysis
 
 **Metadata:**
 - Full prompt text (for debugging)
