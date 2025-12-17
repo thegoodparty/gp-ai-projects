@@ -4,7 +4,6 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +26,9 @@ logger = get_logger(__name__)
 
 class SQSEventPublisher:
     def __init__(self, config: dict[str, Any]):
-        # Enable/disable SQS publishing
-        self.publish_to_sqs = config.get('publish_to_sqs', True)
+        # Enable/disable SQS publishing (env var override for local testing)
+        disable_sqs = os.getenv('DISABLE_SQS_PUBLISH', '').lower() in ('true', '1', 'yes')
+        self.publish_to_sqs = not disable_sqs and config.get('publish_to_sqs', True)
 
         # Output directory configuration (configurable, defaults to /app for Docker)
         self.output_dir = config.get('output_dir', '/app/serve/v1_pipeline/output')
@@ -203,26 +203,9 @@ class SQSEventPublisher:
         }
 
     def _save_events_locally(self, events: list[dict]) -> None:
-        """
-        Save events to local filesystem
-        Note: entrypoint.sh will sync this directory to S3 after pipeline completes
-        """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        events_dir = f"{self.output_dir}/events"
-        os.makedirs(events_dir, exist_ok=True)
-
-        events_file = f"{events_dir}/events_{timestamp}.json"
-        events_json = json.dumps(events, indent=2)
-
-        try:
-            with open(events_file, 'w') as f:
-                f.write(events_json)
-            logger.info(f"✅ Saved {len(events)} events to {events_file}")
-            logger.info("   (will be synced to S3 by entrypoint.sh after pipeline completes)")
-        except Exception as e:
-            logger.error(f"Failed to save events locally: {e}", exc_info=True)
-            raise
+        from serve.v1_pipeline.pipeline.event_saver import save_events
+        save_events(events, self.output_dir)
+        logger.info("   (will be synced to S3 by entrypoint.sh after pipeline completes)")
 
     def _send_to_sqs(self, event: PollAnalysisCompleteEvent) -> None:
         """Send event to SQS FIFO queue with proper MessageGroupId"""

@@ -2,12 +2,15 @@
 set -e
 
 echo "=========================================="
-echo "V1 Pipeline - Docker Container"
+echo "Serve Analyze Pipeline - Docker Container"
 echo "=========================================="
 
 log() {
   echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
 }
+
+PIPELINE_MODE="${PIPELINE_MODE:-cluster}"
+log "Pipeline Mode: $PIPELINE_MODE"
 
 if [ -n "$S3_INPUT_PATH" ]; then
   log "Downloading data from S3: $S3_INPUT_PATH"
@@ -45,6 +48,10 @@ if [ "$SKIP_CLUSTERING" = "true" ]; then
   EXTRA_ARGS="$EXTRA_ARGS --skip-clustering"
 fi
 
+if [ "$SKIP_CLASSIFICATION" = "true" ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --skip-classification"
+fi
+
 if [ "$DEBUG" = "true" ]; then
   export ENVIRONMENT="development"
   log "Debug mode enabled"
@@ -52,18 +59,40 @@ fi
 
 log "Configuration:"
 log "  Campaign: $CAMPAIGN_NAME"
+log "  Pipeline Mode: $PIPELINE_MODE"
 log "  Environment: $ENVIRONMENT"
 log "  Input Dir: /app/serve/input/"
 log "  Output Dir: /app/serve/v1_pipeline/output/"
+
+if [ "$PIPELINE_MODE" = "classify" ]; then
+  log "  Poll ID: $POLL_ID"
+  log "  Question: $QUESTION_TEXT"
+  log "  Options: $OPTIONS_JSON"
+  log "  Callback Success: $CALLBACK_SUCCESS_URL"
+  log "  Callback Failure: $CALLBACK_FAILURE_URL"
+fi
 
 log "Starting pipeline execution..."
 log "=========================================="
 
 cd /app
 
-python serve/v1_pipeline/scripts/run_pipeline.py \
-  --campaign="$CAMPAIGN_NAME" \
-  $EXTRA_ARGS
+if [ "$PIPELINE_MODE" = "classify" ]; then
+  python serve/v1_pipeline/scripts/run_pipeline.py \
+    --campaign="$CAMPAIGN_NAME" \
+    --mode=classify \
+    --poll-id="$POLL_ID" \
+    --question-text="$QUESTION_TEXT" \
+    --options-json="$OPTIONS_JSON" \
+    --callback-success-url="${CALLBACK_SUCCESS_URL:-}" \
+    --callback-failure-url="${CALLBACK_FAILURE_URL:-}" \
+    $EXTRA_ARGS
+else
+  python serve/v1_pipeline/scripts/run_pipeline.py \
+    --campaign="$CAMPAIGN_NAME" \
+    --mode=cluster \
+    $EXTRA_ARGS
+fi
 
 PIPELINE_EXIT_CODE=$?
 

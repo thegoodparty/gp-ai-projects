@@ -1,5 +1,5 @@
 {
-  "Comment": "ECS Fargate task execution with automatic retry",
+  "Comment": "ECS Fargate task execution with automatic retry and V2 DLQ support",
   "StartAt": "RunECSTask",
   "States": {
     "RunECSTask": {
@@ -49,9 +49,62 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.snsTopicArn",
-        "Message.$": "States.Format('Pipeline failed after 3 retries\n\nCampaign: {}\nS3 Path: {}\nError: {}', $.campaign, $.s3Path, $.error.Cause)"
+        "Message.$": "States.Format('Pipeline failed after 3 retries\n\nCampaign: {}\nS3 Path: {}\nPipeline Mode: {}\nError: {}', $.campaign, $.s3Path, $.pipelineMode, $.error.Cause)"
       },
-      "End": true
+      "Next": "CheckV2DLQ"
+    },
+    "CheckV2DLQ": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipelineMode",
+              "StringEquals": "classify"
+            },
+            {
+              "Variable": "$.v2DlqUrl",
+              "IsPresent": true
+            },
+            {
+              "Not": {
+                "Variable": "$.v2DlqUrl",
+                "StringEquals": ""
+              }
+            }
+          ],
+          "Next": "SendToDLQ"
+        }
+      ],
+      "Default": "FailState"
+    },
+    "SendToDLQ": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl.$": "$.v2DlqUrl",
+        "MessageBody": {
+          "poll_id.$": "$.originalRequest.poll_id",
+          "campaign_id.$": "$.originalRequest.campaign_id",
+          "s3_bucket.$": "$.originalRequest.s3_bucket",
+          "s3_key.$": "$.originalRequest.s3_key",
+          "question_text.$": "$.originalRequest.question_text",
+          "options.$": "$.originalRequest.options",
+          "callback.$": "$.originalRequest.callback",
+          "failure_info": {
+            "error.$": "$.error",
+            "execution_id.$": "$$.Execution.Id",
+            "failed_at.$": "$$.State.EnteredTime",
+            "retry_count": 3
+          }
+        }
+      },
+      "Next": "FailState"
+    },
+    "FailState": {
+      "Type": "Fail",
+      "Error": "PipelineExecutionFailed",
+      "Cause": "ECS task failed after maximum retries"
     },
     "Success": {
       "Type": "Succeed"

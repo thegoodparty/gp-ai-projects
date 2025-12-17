@@ -369,6 +369,7 @@ resource "aws_lambda_function" "pipeline_trigger" {
       SECURITY_GROUP_ID    = aws_security_group.ecs_tasks.id
       S3_OUTPUT_BUCKET     = aws_s3_bucket.pipeline_data.id
       SNS_TOPIC_ARN        = aws_sns_topic.pipeline_failures.arn
+      V2_DLQ_URL           = aws_sqs_queue.v2_trigger_dlq.url
     }
   }
 
@@ -645,4 +646,96 @@ resource "aws_sns_topic_subscription" "shared_slack_notifier" {
   topic_arn = aws_sns_topic.pipeline_failures.arn
   protocol  = "lambda"
   endpoint  = var.shared_slack_notifier_lambda_arn
+}
+
+# =============================================================================
+# V2 Pipeline - SQS Trigger for Classification Mode
+# =============================================================================
+
+resource "aws_sqs_queue" "v2_trigger" {
+  name                       = "serve-analyze-v2-trigger-${var.environment}"
+  visibility_timeout_seconds = 120
+  message_retention_seconds  = 86400
+  receive_wait_time_seconds  = 20
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.v2_trigger_dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = {
+    Name        = "V2 Pipeline Trigger"
+    Environment = var.environment
+  }
+}
+
+resource "aws_sqs_queue" "v2_trigger_dlq" {
+  name                      = "serve-analyze-v2-trigger-dlq-${var.environment}"
+  message_retention_seconds = 1209600
+
+  tags = {
+    Name        = "V2 Pipeline Trigger DLQ"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_role_policy" "lambda_sqs_access" {
+  name = "sqs-trigger-access"
+  role = aws_iam_role.lambda_trigger.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes"
+        ]
+        Resource = aws_sqs_queue.v2_trigger.arn
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_event_source_mapping" "sqs_trigger" {
+  event_source_arn = aws_sqs_queue.v2_trigger.arn
+  function_name    = aws_lambda_function.pipeline_trigger.arn
+  batch_size       = 1
+
+  function_response_types = ["ReportBatchItemFailures"]
+}
+
+resource "aws_iam_role_policy" "step_functions_sqs_dlq" {
+  name = "sqs-dlq-access"
+  role = aws_iam_role.step_functions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage"
+        ]
+        Resource = aws_sqs_queue.v2_trigger_dlq.arn
+      }
+    ]
+  })
+}
+
+output "v2_trigger_queue_url" {
+  value       = aws_sqs_queue.v2_trigger.url
+  description = "SQS queue URL for V2 pipeline triggers"
+}
+
+output "v2_trigger_queue_arn" {
+  value       = aws_sqs_queue.v2_trigger.arn
+  description = "SQS queue ARN for V2 pipeline triggers"
+}
+
+output "v2_trigger_dlq_url" {
+  value       = aws_sqs_queue.v2_trigger_dlq.url
+  description = "SQS DLQ URL for failed V2 pipeline triggers"
 }
