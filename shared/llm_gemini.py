@@ -14,6 +14,7 @@ from google import genai
 from google.genai import types
 from PIL import Image
 from shared.logger import get_logger
+from shared.braintrust import is_enabled as braintrust_enabled, get_client as get_braintrust_client
 
 load_dotenv()
 
@@ -263,6 +264,32 @@ class GeminiClient:
         self.api_call_count = 0
         return previous_stats
 
+    def _traced_call(
+        self,
+        trace_name: Optional[str],
+        prompt: str,
+        llm_fn,
+        model_name: str,
+        default_trace_name: str,
+        temperature: Optional[float] = None
+    ):
+        if not braintrust_enabled():
+            return llm_fn()
+
+        name = trace_name or default_trace_name
+        environment = os.getenv("ENVIRONMENT", "local")
+        return get_braintrust_client().traced_call(
+            name=name,
+            input_data={"prompt": prompt[:2000] if len(prompt) > 2000 else prompt},
+            llm_call_fn=llm_fn,
+            prompt=prompt,
+            metadata={
+                "model": model_name,
+                "temperature": temperature or self.default_temperature,
+                "environment": environment
+            }
+        )
+
     def generate_content(
         self,
         prompt: str,
@@ -271,7 +298,8 @@ class GeminiClient:
         max_tokens: Optional[int] = None,
         system_instruction: Optional[str] = None,
         thinking_budget: Optional[int] = None,
-        include_thoughts: Optional[bool] = None
+        include_thoughts: Optional[bool] = None,
+        trace_name: Optional[str] = None
     ) -> str:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
@@ -279,82 +307,62 @@ class GeminiClient:
         if system_instruction:
             config.system_instruction = system_instruction
 
-        for attempt in range(self.max_retries):
-            try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config
-                )
+        def _execute_call():
+            for attempt in range(self.max_retries):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config
+                    )
 
-                if response is None:
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Response is None!")
+                    if response is None:
+                        self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Response is None!")
+                        if attempt < self.max_retries - 1:
+                            delay = self.base_delay * (2 ** attempt)
+                            self.logger.warning(f"Retrying None response in {delay}s...")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            self.logger.error(f"Response is None after {self.max_retries} attempts")
+                            return None
+
+                    response_text = response.text
+
+                    if response_text is None:
+                        self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None!")
+                        if attempt < self.max_retries - 1:
+                            delay = self.base_delay * (2 ** attempt)
+                            self.logger.warning(f"Retrying None response.text in {delay}s...")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            self.logger.error(f"response.text is None after {self.max_retries} attempts")
+                            return None
+
+                    self._track_usage(response, model_name)
+                    self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Success! Returning response.")
+                    return response_text
+
+                except Exception as e:
+                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Exception caught: {type(e).__name__}: {str(e)}")
                     if attempt < self.max_retries - 1:
                         delay = self.base_delay * (2 ** attempt)
-                        self.logger.warning(f"Retrying None response in {delay}s...")
+                        self.logger.warning(f"Content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
                         time.sleep(delay)
-                        continue
                     else:
-                        self.logger.error(f"Response is None after {self.max_retries} attempts")
-                        return None
+                        self.logger.error(f"Content generation failed after {self.max_retries} attempts: {str(e)}")
+                        raise
 
-                response_text = response.text
-
-                if response_text is None:
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - response.text is None!")
-                    if attempt < self.max_retries - 1:
-                        delay = self.base_delay * (2 ** attempt)
-                        self.logger.warning(f"Retrying None response.text in {delay}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        self.logger.error(f"response.text is None after {self.max_retries} attempts")
-                        return None
-
-                self._track_usage(response, model_name)
-                self.logger.debug(f"LLM attempt {attempt + 1}/{self.max_retries} - Success! Returning response.")
-                return response_text
-
-            except Exception as e:
-                self.logger.warning(f"LLM attempt {attempt + 1}/{self.max_retries} - Exception caught: {type(e).__name__}: {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    self.logger.warning(f"Content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    self.logger.error(f"Content generation failed after {self.max_retries} attempts: {str(e)}")
-                    raise
-    
-    def generate_content_stream(
-        self,
-        prompt: str,
-        model: Optional[GeminiModelType] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        system_instruction: Optional[str] = None,
-        thinking_budget: Optional[int] = None,
-        include_thoughts: Optional[bool] = None
-    ) -> Iterator[str]:
-        model_name = (model or self.default_model).value
-        config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
+        return self._traced_call(
+            trace_name=trace_name,
+            prompt=prompt,
+            llm_fn=_execute_call,
+            model_name=model_name,
+            default_trace_name="generate_content",
+            temperature=temperature
+        )
         
-        if system_instruction:
-            config.system_instruction = system_instruction
-        
-        try:
-            response = self.client.models.generate_content_stream(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            
-            for chunk in response:
-                yield chunk.text
-                
-        except Exception as e:
-            self.logger.error(f"Streaming generation failed: {str(e)}")
-            raise
-    
     def generate_structured_content(
         self,
         prompt: str,
@@ -364,7 +372,8 @@ class GeminiClient:
         max_tokens: Optional[int] = None,
         system_instruction: Optional[str] = None,
         thinking_budget: Optional[int] = None,
-        include_thoughts: Optional[bool] = None
+        include_thoughts: Optional[bool] = None,
+        trace_name: Optional[str] = None
     ) -> Union[BaseModel, List[BaseModel], Dict[str, Any]]:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
@@ -375,38 +384,48 @@ class GeminiClient:
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
 
-        for attempt in range(self.max_retries):
-            try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config
-                )
-
-                self._track_usage(response, model_name)
-
-                if hasattr(response, 'parsed') and response.parsed:
-                    return response.parsed
-
-                response_text = response.text.strip() if response.text else ""
-                if not response_text:
-                    self.logger.error(f"Empty response from {model_name} for structured content generation")
-                    raise RuntimeError(f"Empty response from {model_name} - no content generated")
-
+        def _execute_call():
+            for attempt in range(self.max_retries):
                 try:
-                    return json.loads(response_text)
-                except json.JSONDecodeError as json_error:
-                    self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
-                    raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config
+                    )
 
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    self.logger.warning(f"Structured content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    self.logger.error(f"Structured content generation failed after {self.max_retries} attempts: {str(e)}")
-                    raise
+                    self._track_usage(response, model_name)
+
+                    if hasattr(response, 'parsed') and response.parsed:
+                        return response.parsed
+
+                    response_text = response.text.strip() if response.text else ""
+                    if not response_text:
+                        self.logger.error(f"Empty response from {model_name} for structured content generation")
+                        raise RuntimeError(f"Empty response from {model_name} - no content generated")
+
+                    try:
+                        return json.loads(response_text)
+                    except json.JSONDecodeError as json_error:
+                        self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
+                        raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
+
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Structured content generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        self.logger.error(f"Structured content generation failed after {self.max_retries} attempts: {str(e)}")
+                        raise
+
+        return self._traced_call(
+            trace_name=trace_name,
+            prompt=prompt,
+            llm_fn=_execute_call,
+            model_name=model_name,
+            default_trace_name="generate_structured_content",
+            temperature=temperature
+        )
     
     def generate_with_search(
         self,
@@ -416,7 +435,8 @@ class GeminiClient:
         max_tokens: Optional[int] = None,
         system_instruction: Optional[str] = None,
         thinking_budget: Optional[int] = None,
-        include_thoughts: Optional[bool] = None
+        include_thoughts: Optional[bool] = None,
+        trace_name: Optional[str] = None
     ) -> Dict[str, Any]:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
@@ -427,51 +447,61 @@ class GeminiClient:
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config.tools = [grounding_tool]
 
-        for attempt in range(self.max_retries):
-            try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config
-                )
+        def _execute_call():
+            for attempt in range(self.max_retries):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config
+                    )
 
-                self._track_usage(response, model_name)
+                    self._track_usage(response, model_name)
 
-                result = {
-                    "text": response.text,
-                    "grounding_metadata": None,
-                    "search_queries": [],
-                    "sources": []
-                }
+                    result = {
+                        "text": response.text,
+                        "grounding_metadata": None,
+                        "search_queries": [],
+                        "sources": []
+                    }
 
-                if hasattr(response, 'candidates') and response.candidates:
-                    candidate = response.candidates[0]
-                    if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
-                        metadata = candidate.grounding_metadata
-                        result["grounding_metadata"] = metadata
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                            metadata = candidate.grounding_metadata
+                            result["grounding_metadata"] = metadata
 
-                        if hasattr(metadata, 'web_search_queries'):
-                            result["search_queries"] = metadata.web_search_queries
+                            if hasattr(metadata, 'web_search_queries'):
+                                result["search_queries"] = metadata.web_search_queries
 
-                        if hasattr(metadata, 'grounding_chunks'):
-                            result["sources"] = [
-                                {
-                                    "title": chunk.web.title if hasattr(chunk, 'web') else "Unknown",
-                                    "uri": chunk.web.uri if hasattr(chunk, 'web') else "Unknown"
-                                }
-                                for chunk in metadata.grounding_chunks
-                            ]
+                            if hasattr(metadata, 'grounding_chunks'):
+                                result["sources"] = [
+                                    {
+                                        "title": chunk.web.title if hasattr(chunk, 'web') else "Unknown",
+                                        "uri": chunk.web.uri if hasattr(chunk, 'web') else "Unknown"
+                                    }
+                                    for chunk in metadata.grounding_chunks
+                                ]
 
-                return result
+                    return result
 
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    self.logger.warning(f"Search-grounded generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
-                    time.sleep(delay)
-                else:
-                    self.logger.error(f"Search-grounded generation failed after {self.max_retries} attempts: {str(e)}")
-                    raise
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Search-grounded generation failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        self.logger.error(f"Search-grounded generation failed after {self.max_retries} attempts: {str(e)}")
+                        raise
+
+        return self._traced_call(
+            trace_name=trace_name,
+            prompt=prompt,
+            llm_fn=_execute_call,
+            model_name=model_name,
+            default_trace_name="generate_with_search",
+            temperature=temperature
+        )
     
     def generate_multimodal_content(
         self,
@@ -483,37 +513,48 @@ class GeminiClient:
         max_tokens: Optional[int] = None,
         system_instruction: Optional[str] = None,
         thinking_budget: Optional[int] = None,
-        include_thoughts: Optional[bool] = None
+        include_thoughts: Optional[bool] = None,
+        trace_name: Optional[str] = None
     ) -> str:
         model_name = (model or self.default_model).value
         config = self._get_base_config(temperature, max_tokens, thinking_budget, include_thoughts)
-        
+
         if system_instruction:
             config.system_instruction = system_instruction
-        
-        try:
-            contents = []
-            
-            if content_type == ContentType.IMAGE:
-                image = Image.open(media_path)
-                contents = [image, prompt]
-            else:
-                with open(media_path, 'rb') as f:
-                    media_data = f.read()
-                contents = [media_data, prompt]
-            
-            response = self.client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config
-            )
-            
-            self._track_usage(response, model_name)
-            return response.text
-            
-        except Exception as e:
-            self.logger.error(f"Multimodal content generation failed: {str(e)}")
-            raise
+
+        def _execute_call():
+            try:
+                contents = []
+
+                if content_type == ContentType.IMAGE:
+                    image = Image.open(media_path)
+                    contents = [image, prompt]
+                else:
+                    with open(media_path, 'rb') as f:
+                        media_data = f.read()
+                    contents = [media_data, prompt]
+
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
+
+                self._track_usage(response, model_name)
+                return response.text
+
+            except Exception as e:
+                self.logger.error(f"Multimodal content generation failed: {str(e)}")
+                raise
+
+        return self._traced_call(
+            trace_name=trace_name,
+            prompt=f"[{content_type.value}] {prompt}",
+            llm_fn=_execute_call,
+            model_name=model_name,
+            default_trace_name="generate_multimodal_content",
+            temperature=temperature
+        )
     
     def disable_thinking(self):
         if self.default_model == GeminiModelType.PRO:

@@ -282,6 +282,10 @@ resource "aws_ecs_task_definition" "pipeline" {
         {
           name      = "SLACK_WEBHOOK_URL"
           valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:SLACK_WEBHOOK_URL::"
+        },
+        {
+          name      = "BRAINTRUST_API_KEY"
+          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:BRAINTRUST_API_KEY::"
         }
       ]
 
@@ -369,6 +373,7 @@ resource "aws_lambda_function" "pipeline_trigger" {
       SECURITY_GROUP_ID    = aws_security_group.ecs_tasks.id
       S3_OUTPUT_BUCKET     = aws_s3_bucket.pipeline_data.id
       SNS_TOPIC_ARN        = aws_sns_topic.pipeline_failures.arn
+      ENVIRONMENT          = var.environment
     }
   }
 

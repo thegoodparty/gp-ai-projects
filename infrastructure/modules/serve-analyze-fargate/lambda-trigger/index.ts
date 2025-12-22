@@ -9,6 +9,7 @@ const SUBNET_IDS = process.env.SUBNET_IDS!.split(',');
 const SECURITY_GROUP_ID = process.env.SECURITY_GROUP_ID!;
 const S3_OUTPUT_BUCKET = process.env.S3_OUTPUT_BUCKET!;
 const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN!;
+const ENVIRONMENT = process.env.ENVIRONMENT || 'dev';
 
 interface PipelineRequest {
   campaign?: string;
@@ -71,6 +72,7 @@ function getApiUrlFromBucket(bucketName: string): string {
   }
 }
 
+
 async function processPipeline(request: PipelineRequest, triggerSource: string, bucketName?: string): Promise<PipelineResponse> {
   const campaign = request.campaign || extractCampaignFromS3Path(request.csvS3Path);
   const timestamp = Date.now();
@@ -91,7 +93,7 @@ async function processPipeline(request: PipelineRequest, triggerSource: string, 
     { Name: 'S3_INPUT_PATH', Value: s3InputPath },
     { Name: 'S3_OUTPUT_PATH', Value: `s3://${S3_OUTPUT_BUCKET}/${outputPrefix}` },
     { Name: 'API_URL', Value: apiUrl },
-    { Name: 'ENVIRONMENT', Value: request.environment || 'production' },
+    { Name: 'ENVIRONMENT', Value: request.environment || ENVIRONMENT },
     { Name: 'TEST_MODE', Value: String(request.testMode || false) },
     { Name: 'SKIP_CLASSIFICATION', Value: String(request.skipClassification || false) },
     { Name: 'SKIP_CLUSTERING', Value: String(request.skipClustering || false) },
@@ -158,7 +160,6 @@ export const handler = async (event: any): Promise<{ statusCode: number; body: s
 
       request = {
         csvS3Path: `s3://${bucketName}/${objectKey}`,
-        environment: 'production',
       };
       triggerSource = 'S3Upload';
 
