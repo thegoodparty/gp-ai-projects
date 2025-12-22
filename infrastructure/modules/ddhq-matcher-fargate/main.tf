@@ -324,7 +324,7 @@ resource "aws_ecs_task_definition" "matcher" {
       environment = [
         {
           name  = "ENVIRONMENT"
-          value = var.environment == "dev" ? "development" : "production"
+          value = var.environment
         },
         {
           name  = "S3_OUTPUT_BUCKET"
