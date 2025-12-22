@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import asyncio
 from typing import Optional, Dict, Any, List, Union, Type, Iterator
@@ -58,6 +59,41 @@ class ContentType(Enum):
     IMAGE = "image"
     AUDIO = "audio"
     VIDEO = "video"
+
+def sanitize_json_string(text: str) -> str:
+    """
+    Sanitize JSON string by removing/escaping invalid control characters.
+
+    Control characters (ASCII 0-31) except tab (\t), newline (\n), and carriage return (\r)
+    are invalid in JSON strings and must be removed or escaped.
+    """
+    import string
+
+    valid_chars = set(string.printable)
+    valid_chars.update(['\t', '\n', '\r'])
+
+    sanitized = ''.join(c if c in valid_chars or ord(c) >= 32 else ' ' for c in text)
+
+    return sanitized
+
+
+def repair_json_quotes(text: str) -> str:
+    """
+    Attempt to repair JSON by replacing unescaped double quotes in the 'reasoning' field with single quotes.
+    This handles cases where the LLM generates text like "Forest Park City Council - Ward 2" inside the reasoning field.
+    """
+    pattern = r'"reasoning":\s*"(.*?)"(?=\s*[,}])'
+
+    def replace_quotes_in_reasoning(match):
+        reasoning_content = match.group(1)
+        repaired_content = reasoning_content.replace('"', "'")
+        return f'"reasoning": "{repaired_content}"'
+
+    try:
+        repaired = re.sub(pattern, replace_quotes_in_reasoning, text, flags=re.DOTALL)
+        return repaired
+    except Exception:
+        return text
 
 class GeminiClient:
     def __init__(
@@ -394,10 +430,16 @@ class GeminiClient:
                     raise RuntimeError(f"Empty response from {model_name} - no content generated")
 
                 try:
-                    return json.loads(response_text)
+                    sanitized_text = sanitize_json_string(response_text)
+                    return json.loads(sanitized_text)
                 except json.JSONDecodeError as json_error:
-                    self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
-                    raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
+                    self.logger.warning(f"Initial JSON parsing failed: {json_error}. Attempting repair...")
+                    try:
+                        repaired_text = repair_json_quotes(sanitized_text)
+                        return json.loads(repaired_text)
+                    except json.JSONDecodeError as repair_error:
+                        self.logger.error(f"Invalid JSON response from {model_name} after repair: '{response_text[:200]}...' Original error: {json_error}, Repair error: {repair_error}")
+                        raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
 
             except Exception as e:
                 if attempt < self.max_retries - 1:

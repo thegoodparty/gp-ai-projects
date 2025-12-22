@@ -21,15 +21,16 @@ class StateProcessingResult:
 
 class VectorStoreGenerator:
     """Generate and manage vector stores for all 50 states + DC systematically"""
-    
-    def __init__(self, catalog="goodparty_data_catalog", l2_table="l2_districts"):
+
+    def __init__(self, catalog="goodparty_data_catalog", schema="dbt", l2_table="m_election_api__district"):
         self.logger = get_logger(__name__)
         self.databricks = DatabricksClient()
         self.embedding_client = GeminiEmbeddingClient()
-        
+
         self.catalog = catalog
+        self.schema = schema
         self.l2_table = l2_table
-        self.l2_table_path = f"{catalog}.sandbox.{l2_table}"
+        self.l2_table_path = f"{catalog}.{schema}.{l2_table}"
         
         # Get the prod_gold_data directory (where this file is located)
         current_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -91,20 +92,21 @@ class VectorStoreGenerator:
         """Create embedding texts and metadata for a state's L2 data"""
         texts = []
         metadata = []
-        
+
         for _, row in df.iterrows():
-            district_name = str(row['district_name'])
-            district_type = str(row['district_type'])
-            
+            # Use the l2_district_name and l2_district_type columns from production table
+            district_name = str(row['l2_district_name'])
+            district_type = str(row['l2_district_type'])
+
             # Use single, well-structured format for embeddings
             text = f"state: {state}, district type: {district_type}, district name: {district_name}"
             texts.append(text)
             metadata.append({
-                'district_name': row['district_name'],
-                'district_type': row['district_type'],
+                'district_name': district_name,
+                'district_type': district_type,
                 'state': row['state']
             })
-        
+
         return texts, metadata
 
     async def generate_state_embeddings(self, state: str, batch_size: int = 100, force_regenerate: bool = False) -> StateProcessingResult:
