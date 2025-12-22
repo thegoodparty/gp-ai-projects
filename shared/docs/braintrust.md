@@ -35,6 +35,8 @@ from shared.braintrust import (
     load_prompt_from_braintrust,
     flush_logs,
     is_enabled,
+    get_client,
+    BraintrustClient,
 )
 
 # Initialize at startup with project name (required)
@@ -45,7 +47,9 @@ result = traced_llm_call(
     name="cluster_analysis",
     input_data={"cluster_id": 5, "messages": ["..."]},
     llm_call_fn=lambda: client.generate_content(prompt),
-    metadata={"source": "hierarchical_discovery"}
+    prompt=prompt_text,  # Optional: log the prompt separately
+    metadata={"source": "hierarchical_discovery"},
+    tags=["production", "v1"]  # Optional: tags for filtering in UI
 )
 
 # Load prompts from Braintrust (with local fallback)
@@ -61,6 +65,13 @@ flush_logs()
 # Check if enabled
 if is_enabled():
     print("Braintrust is active")
+
+# Get direct access to the singleton client
+client = get_client()
+print(f"Current project: {client.get_project()}")
+
+# Reset for testing (clears singleton, allows re-initialization)
+BraintrustClient.reset_instance()
 ```
 
 ## How to Enable for a New Service
