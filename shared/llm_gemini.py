@@ -440,10 +440,16 @@ class GeminiClient:
                         raise RuntimeError(f"Empty response from {model_name} - no content generated")
 
                     try:
-                        return json.loads(response_text)
+                        sanitized_text = sanitize_json_string(response_text)
+                        return json.loads(sanitized_text)
                     except json.JSONDecodeError as json_error:
-                        self.logger.error(f"Invalid JSON response from {model_name}: '{response_text[:200]}...' Error: {json_error}")
-                        raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
+                        self.logger.warning(f"Initial JSON parsing failed: {json_error}. Attempting repair...")
+                        try:
+                            repaired_text = repair_json_quotes(sanitized_text)
+                            return json.loads(repaired_text)
+                        except json.JSONDecodeError as repair_error:
+                            self.logger.error(f"Invalid JSON response from {model_name} after repair: '{response_text[:200]}...' Original error: {json_error}, Repair error: {repair_error}")
+                            raise RuntimeError(f"Invalid JSON response from {model_name}: {json_error}")
 
                 except Exception as e:
                     if attempt < self.max_retries - 1:
@@ -994,40 +1000,6 @@ def example_search_with_thinking():
         print(f"{i+1}. {source['title']}: {source['uri']}")
 
 
-def example_streaming_with_thinking():
-    client = GeminiClient(
-        default_model=GeminiModelType.FLASH,
-        thinking_budget=1024,
-        include_thoughts=True
-    )
-    
-    prompt = "Alice, Bob, and Carol each live in a different house on the same street: red, green, and blue. The person who lives in the red house owns a cat. Bob does not live in the green house. Carol owns a dog. The green house is to the left of the red house. Alice does not own a cat. Who lives in each house, and what pet do they own?"
-    
-    print("Streaming response with thinking:")
-    print("Note: This example demonstrates basic streaming. For thinking-aware streaming, use generate_with_thoughts() instead.")
-    
-    print("\nStreaming answer:")
-    for chunk_text in client.generate_content_stream(
-        prompt,
-        thinking_budget=1024,
-        include_thoughts=True
-    ):
-        print(chunk_text, end='', flush=True)
-    
-    print("\n\nFor detailed thoughts, here's the non-streaming version:")
-    result = client.generate_with_thoughts(
-        prompt,
-        thinking_budget=1024
-    )
-    
-    if result["thoughts"]:
-        print("\nModel's thoughts:")
-        print(result["thoughts"])
-    
-    print("\nFinal answer:")
-    print(result["text"])
-
-
 def example_model_thinking_constraints():
     print("=== Model-Specific Thinking Constraints ===\n")
     
@@ -1062,7 +1034,5 @@ if __name__ == "__main__":
     example_usage()
     print("\n" + "="*50 + "\n")
     example_search_with_thinking()
-    print("\n" + "="*50 + "\n")
-    example_streaming_with_thinking()
     print("\n" + "="*50 + "\n")
     example_model_thinking_constraints()

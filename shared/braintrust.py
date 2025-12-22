@@ -106,31 +106,26 @@ class BraintrustClient:
         if not self._enabled or self._braintrust_logger is None:
             return llm_call_fn()
 
+        result = llm_call_fn()
+
         try:
             with self._braintrust_logger.start_span(name=name) as span:
-                result = llm_call_fn()
+                output_data = self._serialize_output(result)
 
-                try:
-                    output_data = self._serialize_output(result)
+                log_metadata = metadata.copy() if metadata else {}
+                if prompt:
+                    log_metadata["prompt"] = prompt
 
-                    log_metadata = metadata.copy() if metadata else {}
-                    if prompt:
-                        log_metadata["prompt"] = prompt
-
-                    span.log(
-                        input=input_data,
-                        output=output_data,
-                        tags=tags or [],
-                        metadata=log_metadata
-                    )
-                except Exception as e:
-                    logger.warning(f"Braintrust span.log failed: {e}")
-
-                return result
-
+                span.log(
+                    input=input_data,
+                    output=output_data,
+                    tags=tags or [],
+                    metadata=log_metadata
+                )
         except Exception as e:
-            logger.warning(f"Braintrust span failed, running untraced: {e}")
-            return llm_call_fn()
+            logger.warning(f"Braintrust logging failed: {e}")
+
+        return result
 
     def _serialize_output(self, result: Any) -> Dict[str, Any]:
         if result is None:
