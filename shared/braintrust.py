@@ -202,6 +202,16 @@ class BraintrustClient:
             logger.warning(f"Prompt template missing variable: {e}")
             return prompt
         except ValueError as e:
+            # If ValueError is due to invalid format syntax (like literal JSON braces from
+            # an already-interpolated f-string), the string is likely already interpolated.
+            # Return silently without warning to avoid spurious log entries.
+            error_msg = str(e).lower()
+            if any(phrase in error_msg for phrase in [
+                "single '}'", "unmatched", "invalid format", "expected ':'", 
+                "unexpected end of format string"
+            ]):
+                # String appears to be already interpolated (e.g., f-string fallback)
+                return prompt
             logger.warning(f"Prompt template format error: {e}")
             return prompt
 
