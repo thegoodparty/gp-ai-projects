@@ -24,6 +24,8 @@ class BraintrustClient:
         self._enabled = False
         self._project: Optional[str] = None
         self._initialized = False
+        self._cached_prompts: Dict[str, Any] = {}
+        self._prompt_cache_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> 'BraintrustClient':
@@ -50,6 +52,7 @@ class BraintrustClient:
         self._braintrust_module = None
         self._enabled = False
         self._initialized = False
+        self._cached_prompts = {}
 
     def init(self, project: str, api_key: Optional[str] = None) -> bool:
         if self._initialized:
@@ -202,6 +205,84 @@ class BraintrustClient:
             logger.warning(f"Prompt template format error: {e}")
             return prompt
 
+    def get_cached_prompt_object(
+        self,
+        prompt_name: str,
+        warmup_variables: Optional[Dict[str, Any]] = None
+    ) -> Optional[Any]:
+        if not self._enabled or self._braintrust_module is None:
+            return None
+
+        cache_key = f"{self._project}:{prompt_name}"
+
+        if cache_key in self._cached_prompts:
+            return self._cached_prompts[cache_key]
+
+        with self._prompt_cache_lock:
+            if cache_key in self._cached_prompts:
+                return self._cached_prompts[cache_key]
+
+            try:
+                prompt_obj = self._braintrust_module.load_prompt(
+                    project=self._project,
+                    slug=prompt_name
+                )
+
+                if prompt_obj is None:
+                    logger.warning(f"Prompt '{prompt_name}' not found in Braintrust")
+                    self._cached_prompts[cache_key] = None
+                    return None
+
+                if warmup_variables:
+                    _ = prompt_obj.build(**warmup_variables)
+                    logger.debug(f"Prompt '{prompt_name}' cached and warmed up")
+                else:
+                    logger.debug(f"Prompt '{prompt_name}' cached (no warmup)")
+
+                self._cached_prompts[cache_key] = prompt_obj
+                return prompt_obj
+
+            except Exception as e:
+                logger.warning(f"Failed to cache prompt '{prompt_name}': {e}")
+                self._cached_prompts[cache_key] = None
+                return None
+
+    def build_cached_prompt(
+        self,
+        prompt_name: str,
+        variables: Dict[str, Any],
+        fallback_prompt: Optional[str] = None
+    ) -> str:
+        prompt_obj = self._cached_prompts.get(f"{self._project}:{prompt_name}")
+
+        if prompt_obj is not None:
+            try:
+                rendered = prompt_obj.build(**variables)
+
+                if isinstance(rendered, dict) and 'messages' in rendered:
+                    messages = rendered['messages']
+                    if messages and isinstance(messages[0], dict):
+                        return messages[0].get('content', '')
+                    elif messages and hasattr(messages[0], 'content'):
+                        return messages[0].content
+
+                if hasattr(rendered, 'messages') and rendered.messages:
+                    msg = rendered.messages[0]
+                    if isinstance(msg, dict):
+                        return msg.get('content', '')
+                    elif hasattr(msg, 'content'):
+                        return str(msg.content)
+
+                return str(rendered)
+
+            except Exception as e:
+                logger.debug(f"Braintrust build failed for '{prompt_name}': {e}")
+
+        if fallback_prompt:
+            return self._render_prompt(fallback_prompt, variables)
+
+        return ""
+
     def flush(self) -> None:
         if self._braintrust_logger is not None:
             try:
@@ -251,3 +332,18 @@ def is_enabled() -> bool:
 
 def get_client() -> BraintrustClient:
     return BraintrustClient.get_instance()
+
+
+def cache_prompt(
+    prompt_name: str,
+    warmup_variables: Optional[Dict[str, Any]] = None
+) -> Optional[Any]:
+    return BraintrustClient.get_instance().get_cached_prompt_object(prompt_name, warmup_variables)
+
+
+def build_cached_prompt(
+    prompt_name: str,
+    variables: Dict[str, Any],
+    fallback_prompt: Optional[str] = None
+) -> str:
+    return BraintrustClient.get_instance().build_cached_prompt(prompt_name, variables, fallback_prompt)
