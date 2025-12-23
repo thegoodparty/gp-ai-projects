@@ -29,6 +29,15 @@ from tqdm.asyncio import tqdm
 from concurrent.futures import ThreadPoolExecutor
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+from shared.braintrust import (
+    init_braintrust,
+    traced_llm_call,
+    load_prompt_from_braintrust,
+    flush_logs,
+    is_enabled,
+    get_client,
+    BraintrustClient,
+)
 from shared.llm_gemini import GeminiClient, GeminiModelType
 from shared.logger import get_logger
 
@@ -367,6 +376,10 @@ class ParallelProductionMatcher:
         )
         self.logger.info(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
 
+        environment = os.getenv("ENVIRONMENT", "local")
+        self.logger.info(f"Braintrust environment: {environment}")
+        init_braintrust(project="hubspot-ddhq-match")
+
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
         """
         Search for k most similar DDHQ candidates using date + state + election type partitioned FAISS
@@ -634,7 +647,7 @@ Match {i}:
 """
 
         # Build prompt (no runoff-specific context needed - LLM just validates matching)
-        prompt = f"""TASK: Match a HubSpot candidate to DDHQ candidates and return JSON ONLY.
+        fallback_prompt = f"""TASK: Match a HubSpot candidate to DDHQ candidates and return JSON ONLY.
 NOTE: Federal and state races are pre-filtered. Only match local/municipal races.
 
 OUTPUT FORMAT (REQUIRED):
@@ -704,6 +717,21 @@ Be extremely conservative - false positives are worse than false negatives. If u
 
 OUTPUT JSON ONLY (no explanation, no markdown):"""
 
+        # Load prompts from Braintrust (with local fallback)
+        prompt = load_prompt_from_braintrust(
+            prompt_name="hubspot-ddhq-match-validator",
+            fallback_prompt=fallback_prompt,
+            variables={
+                "hubspoot_name": hubspot_info['name'],
+                "hubspoot_full_name": hubspot_info['full_name'],
+                "hubspoot_state": hubspot_info['state'],
+                "hubspoot_city": hubspot_info['city'],
+                "hubspoot_office": hubspot_info['office'],
+                "hubspoot_embedding_text": hubspot_info['embedding_text'],
+                "candidates_text": candidates_text,
+
+            }
+        )
         llm_validation_start = time.time()
 
         try:
@@ -715,7 +743,7 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
             async def _llm_call():
                 return await asyncio.get_event_loop().run_in_executor(
                     self.thread_pool,
-                    lambda: self.llm_client.generate_content(prompt)
+                    lambda: self.llm_client.generate_content(prompt, trace_name="hubspot-ddhq-match")
                 )
 
             try:

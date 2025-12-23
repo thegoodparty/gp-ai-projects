@@ -25,6 +25,7 @@ Each folder in gp-ai-projects maps to a Braintrust project. Pass the project nam
 | `serve/hierarchical_discovery` | `hierarchical-discovery` |
 | `ai_generated_campaign_plan` | `campaign-plan` |
 | `serve/analyze_texts` | `analyze-texts` |
+| `hubspot_ddhq_match` | `hubspot-ddhq-match` |
 
 ## Usage
 
