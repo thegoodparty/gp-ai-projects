@@ -29,6 +29,12 @@ from tqdm.asyncio import tqdm
 from concurrent.futures import ThreadPoolExecutor
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+from shared.braintrust import (
+    init_braintrust,
+ 
+    cache_prompt,
+    build_cached_prompt,
+)
 from shared.llm_gemini import GeminiClient, GeminiModelType
 from shared.logger import get_logger
 
@@ -367,6 +373,116 @@ class ParallelProductionMatcher:
         )
         self.logger.info(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
 
+        environment = os.getenv("ENVIRONMENT", "local")
+        self.logger.info(f"Braintrust environment: {environment}")
+        init_braintrust(project="hubspot-ddhq-match")
+
+        self._init_prompt_cache()
+
+    def _init_prompt_cache(self):
+        self.logger.info("📝 Loading Braintrust prompt template (one-time)...")
+        self._prompt_name = "hubspot-ddhq-match-validator"
+
+        warmup_vars = {
+            "hubspot_name": "warmup",
+            "hubspot_full_name": "warmup",
+            "hubspot_state": "warmup",
+            "hubspot_city": "warmup",
+            "hubspot_office": "warmup",
+            "hubspot_embedding_text": "warmup",
+            "candidates_text": "warmup"
+        }
+
+        prompt_obj = cache_prompt(self._prompt_name, warmup_variables=warmup_vars)
+        if prompt_obj is not None:
+            self.logger.info("   ✅ Braintrust prompt cached (subsequent builds are ~0.03ms)")
+        else:
+            self.logger.warning("   ⚠️ Braintrust prompt not available, using fallback")
+
+    def _build_prompt(self, hubspot_info: Dict, candidates_text: str) -> str:
+        variables = {
+            "hubspot_name": hubspot_info['name'],
+            "hubspot_full_name": hubspot_info['full_name'],
+            "hubspot_state": hubspot_info['state'],
+            "hubspot_city": hubspot_info['city'],
+            "hubspot_office": hubspot_info['office'],
+            "hubspot_embedding_text": hubspot_info['embedding_text'],
+            "candidates_text": candidates_text
+        }
+
+        fallback = f"""TASK: Match a HubSpot candidate to DDHQ candidates and return JSON ONLY.
+NOTE: Federal and state races are pre-filtered. Only match local/municipal races.
+
+OUTPUT FORMAT (REQUIRED):
+{{"best_match": <number or null>, "confidence": <0-100>, "reasoning": "<brief explanation>"}}
+
+EXAMPLE OUTPUT:
+{{"best_match": 1, "confidence": 95, "reasoning": "Exact name, state, and office match."}}
+OR if no match:
+{{"best_match": null, "confidence": 0, "reasoning": "No valid match found."}}
+
+---
+
+HubSpot Candidate:
+- Name: {hubspot_info['name']}
+- Full Name: {hubspot_info['full_name']}
+- State: {hubspot_info['state']}
+- City: {hubspot_info['city']}
+- Office: {hubspot_info['office']}
+- Embedding: {hubspot_info['embedding_text']}
+
+DDHQ Candidates (ranked by similarity):
+{candidates_text}
+
+MATCHING RULES:
+
+1. NAME REQUIREMENTS (MANDATORY):
+   - First name: Must be exact match, clear nickname (Bob/Robert), or obvious variant (Jon/John)
+   - Last name: Must be exact match or extremely close phonetic variant
+   - Suffixes: Jr., Sr., II, III, IV, V are acceptable variations (John Smith Jr. = John Smith)
+   - REJECT: Different genders (Stanley→Susan), unrelated names (Marco→Erick), random similarities
+
+2. GEOGRAPHIC REQUIREMENTS (MANDATORY):
+   - State: DDHQ race MUST be in the same state as HubSpot candidate
+   - Jurisdiction: For local races, city/county/municipality must match
+   - REJECT: Any cross-state or cross-jurisdiction matches
+
+3. VALIDATION EXAMPLES:
+
+   VALID LOCAL MATCHES (High Confidence):
+   - "John Smith" for Berkeley City Council → "John Smith, Berkeley City Council" (exact match)
+   - "Bob Johnson" for County Commissioner → "Robert Johnson, County Commissioner" (nickname variation)
+   - "Mary O'Connor" for School Board → "Mary O'Connor, School Board" (exact match)
+   - "John Smith Jr." for Mayor → "John Smith, Mayor" (suffix variation - acceptable)
+
+   INVALID LOCAL MATCHES (Must Reject):
+   - "Stanley Pokras" → "Susan Kopras" (gender mismatch, different first name)
+   - "Test User" → "Ronald Test" (test data, unrelated)
+   - "Marco Huerta" → "Erick Huerta" (different first name entirely)
+   - "Jane Doe, Arlington City Council" → "Jane Doe, Arlington County Board" (different jurisdiction type)
+   - "Morrio Clark (NC)" → "Laura Clark (SC)" (different state, different first name)
+
+4. CONFIDENCE CALIBRATION:
+   - 95-100: Perfect name + state + office match
+   - 85-94: Very strong name similarity + state match
+   - 75-84: Good name match + state match with minor uncertainty
+   - 70-74: Reasonable match but with some concerns
+   - Below 70: MUST REJECT - return null
+
+5. AUTOMATIC REJECTIONS:
+   - Any name containing "test", "sample", "demo", "fake"
+   - Different states when HubSpot has state data
+   - No meaningful name similarity between first or last names
+   - Clear gender mismatches
+   - Completely unrelated names
+
+Be extremely conservative - false positives are worse than false negatives. If uncertain, REJECT.
+
+OUTPUT JSON ONLY (no explanation, no markdown):"""
+
+        result = build_cached_prompt(self._prompt_name, variables, fallback_prompt=fallback)
+        return result if result else fallback
+
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
         """
         Search for k most similar DDHQ candidates using date + state + election type partitioned FAISS
@@ -633,77 +749,8 @@ Match {i}:
   - Embedding: {candidate['embedding_text']}
 """
 
-        # Build prompt (no runoff-specific context needed - LLM just validates matching)
-        prompt = f"""TASK: Match a HubSpot candidate to DDHQ candidates and return JSON ONLY.
-NOTE: Federal and state races are pre-filtered. Only match local/municipal races.
-
-OUTPUT FORMAT (REQUIRED):
-{{"best_match": <number or null>, "confidence": <0-100>, "reasoning": "<brief explanation>"}}
-
-EXAMPLE OUTPUT:
-{{"best_match": 1, "confidence": 95, "reasoning": "Exact name, state, and office match."}}
-OR if no match:
-{{"best_match": null, "confidence": 0, "reasoning": "No valid match found."}}
-
----
-
-HubSpot Candidate:
-- Name: {hubspot_info['name']}
-- Full Name: {hubspot_info['full_name']}
-- State: {hubspot_info['state']}
-- City: {hubspot_info['city']}
-- Office: {hubspot_info['office']}
-- Embedding: {hubspot_info['embedding_text']}
-
-DDHQ Candidates (ranked by similarity):
-{candidates_text}
-
-MATCHING RULES:
-
-1. NAME REQUIREMENTS (MANDATORY):
-   - First name: Must be exact match, clear nickname (Bob/Robert), or obvious variant (Jon/John)
-   - Last name: Must be exact match or extremely close phonetic variant
-   - Suffixes: Jr., Sr., II, III, IV, V are acceptable variations (John Smith Jr. = John Smith)
-   - REJECT: Different genders (Stanley→Susan), unrelated names (Marco→Erick), random similarities
-
-2. GEOGRAPHIC REQUIREMENTS (MANDATORY):
-   - State: DDHQ race MUST be in the same state as HubSpot candidate
-   - Jurisdiction: For local races, city/county/municipality must match
-   - REJECT: Any cross-state or cross-jurisdiction matches
-
-3. VALIDATION EXAMPLES:
-
-   VALID LOCAL MATCHES (High Confidence):
-   - "John Smith" for Berkeley City Council → "John Smith, Berkeley City Council" (exact match)
-   - "Bob Johnson" for County Commissioner → "Robert Johnson, County Commissioner" (nickname variation)
-   - "Mary O'Connor" for School Board → "Mary O'Connor, School Board" (exact match)
-   - "John Smith Jr." for Mayor → "John Smith, Mayor" (suffix variation - acceptable)
-
-   INVALID LOCAL MATCHES (Must Reject):
-   - "Stanley Pokras" → "Susan Kopras" (gender mismatch, different first name)
-   - "Test User" → "Ronald Test" (test data, unrelated)
-   - "Marco Huerta" → "Erick Huerta" (different first name entirely)
-   - "Jane Doe, Arlington City Council" → "Jane Doe, Arlington County Board" (different jurisdiction type)
-   - "Morrio Clark (NC)" → "Laura Clark (SC)" (different state, different first name)
-
-4. CONFIDENCE CALIBRATION:
-   - 95-100: Perfect name + state + office match
-   - 85-94: Very strong name similarity + state match
-   - 75-84: Good name match + state match with minor uncertainty
-   - 70-74: Reasonable match but with some concerns
-   - Below 70: MUST REJECT - return null
-
-5. AUTOMATIC REJECTIONS:
-   - Any name containing "test", "sample", "demo", "fake"
-   - Different states when HubSpot has state data
-   - No meaningful name similarity between first or last names
-   - Clear gender mismatches
-   - Completely unrelated names
-
-Be extremely conservative - false positives are worse than false negatives. If uncertain, REJECT.
-
-OUTPUT JSON ONLY (no explanation, no markdown):"""
-
+        # Build prompt using cached Braintrust template (1 API call at init, local builds thereafter)
+        prompt = self._build_prompt(hubspot_info, candidates_text)
         llm_validation_start = time.time()
 
         try:
@@ -715,7 +762,7 @@ OUTPUT JSON ONLY (no explanation, no markdown):"""
             async def _llm_call():
                 return await asyncio.get_event_loop().run_in_executor(
                     self.thread_pool,
-                    lambda: self.llm_client.generate_content(prompt)
+                    lambda: self.llm_client.generate_content(prompt, trace_name="hubspot-ddhq-match")
                 )
 
             try:

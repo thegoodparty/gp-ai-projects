@@ -318,6 +318,10 @@ resource "aws_ecs_task_definition" "matcher" {
         {
           name      = "DATABRICKS_SCHEMA"
           valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:DATABRICKS_SCHEMA::"
+        },
+        {
+          name      = "BRAINTRUST_API_KEY"
+          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:BRAINTRUST_API_KEY::"
         }
       ]
 
