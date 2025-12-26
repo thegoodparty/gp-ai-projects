@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import threading
 from typing import Optional, Dict, Any, Callable, TypeVar
 
@@ -196,23 +197,28 @@ class BraintrustClient:
         if not variables:
             return prompt
 
+        # Use a safer formatting approach that only replaces variables that exist
+        # This handles cases where the template has example placeholders like {best_match}
+        # that aren't meant to be replaced. Also handles escaped braces {{ and }}
+        def safe_format(match):
+            # Check if this is an escaped brace ({{ or }})
+            full_match = match.group(0)
+            if full_match == '{{' or full_match == '}}':
+                return full_match  # Keep escaped braces as-is
+            
+            var_name = match.group(1)
+            if var_name in variables:
+                return str(variables[var_name])
+            # Keep the original placeholder if variable doesn't exist
+            return match.group(0)
+
         try:
-            return prompt.format(**variables)
-        except KeyError as e:
-            logger.warning(f"Prompt template missing variable: {e}")
-            return prompt
-        except ValueError as e:
-            # If ValueError is due to invalid format syntax (like literal JSON braces from
-            # an already-interpolated f-string), the string is likely already interpolated.
-            # Return silently without warning to avoid spurious log entries.
-            error_msg = str(e).lower()
-            if any(phrase in error_msg for phrase in [
-                "single '}'", "unmatched", "invalid format", "expected ':'", 
-                "unexpected end of format string"
-            ]):
-                # String appears to be already interpolated (e.g., f-string fallback)
-                return prompt
-            logger.warning(f"Prompt template format error: {e}")
+            # Match {variable_name} but skip {{ and }} (escaped braces)
+            # This regex matches single braces with variable names, but not double braces
+            result = re.sub(r'(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})', safe_format, prompt)
+            return result
+        except Exception as e:
+            logger.debug(f"Prompt template format error (non-critical): {e}")
             return prompt
 
     def get_cached_prompt_object(
