@@ -478,14 +478,8 @@ MATCHING RULES:
 Be extremely conservative - false positives are worse than false negatives. If uncertain, REJECT.
 
 OUTPUT JSON ONLY (no explanation, no markdown):"""
-        print(candidates_text)
+
         result = build_cached_prompt(self._prompt_name, variables, fallback_prompt=fallback)
-        if candidates_text is None or candidates_text in ('', ' '):
-            print("candidates_text is None or candidates_text in ('', ' ')")
-            print(candidates_text)
-        else:
-            print("candidates_text is not None or candidates_text not in ('', ' ')")
-            print(candidates_text)
         return result if result else fallback
 
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
