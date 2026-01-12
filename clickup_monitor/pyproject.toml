@@ -1,0 +1,11 @@
+[project]
+name = "gp-clickup-monitor"
+version = "0.1.0"
+description = "ClickUp task monitor for tagged bugs and tasks"
+requires-python = ">=3.11"
+dependencies = [
+    "gp-shared",
+]
+
+[tool.uv.sources]
+gp-shared = { workspace = true }

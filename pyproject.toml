@@ -53,7 +53,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_monitor"]
 
 [build-system]
 requires = ["hatchling"]

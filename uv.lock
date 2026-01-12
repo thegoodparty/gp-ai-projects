@@ -10,6 +10,7 @@ resolution-markers = [
 [manifest]
 members = [
     "gp-ai-projects",
+    "gp-clickup-monitor",
     "gp-ddhq-matcher",
     "gp-shared",
     "gp-v1-pipeline",
@@ -1059,6 +1060,17 @@ dev = [
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
 ]
+
+[[package]]
+name = "gp-clickup-monitor"
+version = "0.1.0"
+source = { virtual = "clickup_monitor" }
+dependencies = [
+    { name = "gp-shared" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "gp-shared", virtual = "shared" }]
 
 [[package]]
 name = "gp-ddhq-matcher"
