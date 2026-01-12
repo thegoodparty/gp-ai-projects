@@ -18,6 +18,7 @@ dependencies = [
     "databricks-sql-connector>=4.0.5",
     "pandas>=2.2.3",
     "tavily-python>=0.7.8",
+    "slack-sdk>=3.35.0",
 ]
 [tool.setuptools]
 py-modules = [
@@ -25,5 +26,6 @@ py-modules = [
     "databricks_client",
     "google_sheets_client",
     "tavily_client",
+    "slack_client",
     "logger"
 ]

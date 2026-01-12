@@ -41,6 +41,7 @@ dependencies = [
     "boto3>=1.40.50",
     "spacy>=3.8.7",
     "pillow>=10.0.0",
+    "slack-sdk>=3.39.0",
 ]
 
 [project.optional-dependencies]
