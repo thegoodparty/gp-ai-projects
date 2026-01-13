@@ -96,7 +96,7 @@ class Gemini3Client:
             raise ValueError("PRO_3 model does not support MINIMAL thinking level. Use LOW, MEDIUM, or HIGH instead.")
 
         return types.GenerateContentConfig(
-            temperature=temperature or self.default_temperature,
+            temperature=temperature if temperature is not None else self.default_temperature,
             thinking_config=types.ThinkingConfig(
                 thinking_level=level.value,
                 include_thoughts=thoughts
@@ -142,7 +142,7 @@ class Gemini3Client:
             prompt=prompt,
             metadata={
                 "model": model_name,
-                "temperature": temperature or self.default_temperature,
+                "temperature": temperature if temperature is not None else self.default_temperature,
                 "environment": environment
             }
         )
