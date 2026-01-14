@@ -34,10 +34,7 @@ from shared.braintrust import (
     cache_prompt,
     build_cached_prompt,
 )
-from shared.llm_gemini import GeminiClient, GeminiModelType
-=======
 from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
->>>>>>> develop
 from shared.logger import get_logger
 
 class ParallelProductionMatcher:
@@ -365,15 +362,16 @@ class ParallelProductionMatcher:
         self.logger.info("🤖 Initializing Gemini LLM...")
         # Configure for HIGH THROUGHPUT with reliability (reduced from 1200 to avoid API corruption)
         target_concurrency = 500  # Balanced for throughput + reliability (~5k/min target)
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=0.0,
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=target_concurrency,
-            max_keepalive_connections=target_concurrency // 4,  # 125 keepalive
-            max_retries=9,  # Handle all retries in LLM client (no outer retry loop)
-            base_delay=1.0  # Exponential backoff starting at 1 second
+            max_keepalive_connections=target_concurrency // 4,
+            max_retries=9,
+            base_delay=1.0
         )
-        self.logger.info(f"   Gemini Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
+        self.logger.info(f"   Gemini 3 Flash initialized with {target_concurrency} max connections, 9 retries (HIGH THROUGHPUT with reliability)")
 
         environment = os.getenv("ENVIRONMENT", "local")
         self.logger.info(f"Braintrust environment: {environment}")
@@ -758,7 +756,7 @@ Match {i}:
 
         try:
             # Use dedicated thread pool for maximum LLM concurrency
-            # Retries are handled internally by GeminiClient (max_retries=9)
+            # Retries are handled internally by Gemini3Client (max_retries=9)
             llm_call_start = time.time()
 
             # Hard timeout to prevent infinite hangs (even if HTTP client stalls)
