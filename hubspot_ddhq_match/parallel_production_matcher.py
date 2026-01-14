@@ -35,6 +35,9 @@ from shared.braintrust import (
     build_cached_prompt,
 )
 from shared.llm_gemini import GeminiClient, GeminiModelType
+=======
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
+>>>>>>> develop
 from shared.logger import get_logger
 
 class ParallelProductionMatcher:
