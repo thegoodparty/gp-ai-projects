@@ -245,7 +245,7 @@ class BraintrustClient:
                 )
 
                 if prompt_obj is None:
-                    logger.warning(f"Prompt '{prompt_name}' not found in Braintrust")
+                    logger.warning(f"Prompt '{prompt_name}' not found in Braintrust project '{self._project}'")
                     self._cached_prompts[cache_key] = None
                     return None
 
