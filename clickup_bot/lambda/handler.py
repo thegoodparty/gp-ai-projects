@@ -129,11 +129,19 @@ def post_comment(task_id: str, text: str) -> None:
     })
 
 
+def get_header_case_insensitive(headers: dict, name: str, default: str = "") -> str:
+    name_lower = name.lower()
+    for key, value in headers.items():
+        if key.lower() == name_lower:
+            return value
+    return default
+
+
 def handler(event: dict, context: Any) -> dict:
     print(f"Received webhook event: {json.dumps(event)}")
 
     headers = event.get("headers", {})
-    signature = headers.get("x-signature", "")
+    signature = get_header_case_insensitive(headers, "x-signature")
     raw_body = event.get("body", "{}")
 
     if not verify_webhook_signature(raw_body, signature):
@@ -162,7 +170,7 @@ def handler(event: dict, context: Any) -> dict:
             after_tags = item["after"]
             if isinstance(after_tags, list):
                 for tag in after_tags:
-                    tag_name = tag.get("name", "").lower()
+                    tag_name = (tag.get("name") or "").lower()
                     if tag_name in TAG_CONFIG:
                         matched_tag = tag_name
                         break
@@ -215,7 +223,7 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
 
     cluster_arn = os.environ.get("ECS_CLUSTER_ARN")
     task_definition = os.environ.get("ECS_TASK_DEFINITION")
-    subnet_ids = os.environ.get("ECS_SUBNET_IDS", "").split(",")
+    subnet_ids = [s for s in os.environ.get("ECS_SUBNET_IDS", "").split(",") if s]
     security_group_id = os.environ.get("ECS_SECURITY_GROUP_ID")
 
     if not all([cluster_arn, task_definition, subnet_ids, security_group_id]):
@@ -255,7 +263,29 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
             }
         )
 
-        task_arn = response["tasks"][0]["taskArn"] if response.get("tasks") else "unknown"
+        failures = response.get("failures", [])
+        tasks = response.get("tasks", [])
+
+        if failures:
+            failure_reasons = [f.get("reason", "unknown") for f in failures]
+            error_msg = f"ECS task launch failed: {', '.join(failure_reasons)}"
+            print(f"ERROR: {error_msg}")
+            try:
+                post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
+            except HTTPError:
+                pass
+            return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
+
+        if not tasks:
+            error_msg = "ECS run_task returned no tasks and no failures"
+            print(f"ERROR: {error_msg}")
+            try:
+                post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
+            except HTTPError:
+                pass
+            return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
+
+        task_arn = tasks[0]["taskArn"]
         print(f"Started Fargate task: {task_arn}")
 
         return {
