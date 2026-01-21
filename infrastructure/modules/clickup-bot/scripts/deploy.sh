@@ -2,8 +2,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODULE_DIR="$(dirname "$SCRIPT_DIR")"
-LAMBDA_DIR="$MODULE_DIR/lambda"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+LAMBDA_DIR="$REPO_ROOT/clickup_bot/lambda"
 
 FUNCTION_NAME="${1:-clickup-bot-prod}"
 AWS_REGION="${AWS_REGION:-us-west-2}"
