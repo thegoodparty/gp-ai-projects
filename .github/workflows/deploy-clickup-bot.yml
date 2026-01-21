@@ -1,0 +1,72 @@
+name: Deploy ClickUp Bot Lambda
+
+on:
+  push:
+    branches:
+      - develop
+      - prod
+    paths:
+      - 'clickup_bot/lambda/**'
+      - '.github/workflows/deploy-clickup-bot.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    name: Deploy Lambda
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            ENV="dev"
+          else
+            echo "ERROR: Unexpected branch: ${{ github.ref }}"
+            exit 1
+          fi
+
+          FUNCTION_NAME="clickup-bot-${ENV}"
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "function_name=${FUNCTION_NAME}" >> $GITHUB_OUTPUT
+          echo "Deploying to: ${FUNCTION_NAME}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package and deploy Lambda
+        run: |
+          cd clickup_bot/lambda
+          zip -j /tmp/clickup-bot-lambda.zip handler.py
+
+          aws lambda update-function-code \
+            --function-name ${{ steps.env.outputs.function_name }} \
+            --zip-file fileb:///tmp/clickup-bot-lambda.zip \
+            --region ${{ env.AWS_REGION }}
+
+          echo "Deployed ${{ steps.env.outputs.function_name }}"

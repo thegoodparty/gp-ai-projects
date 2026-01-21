@@ -26,6 +26,7 @@ class TaskPriority(Enum):
 
 class ClickUpTask(BaseModel):
     id: str
+    custom_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     status: Optional[Dict[str, Any]] = None
@@ -49,6 +50,9 @@ class ClickUpTask(BaseModel):
         if isinstance(self.status, dict):
             return self.status.get("status", "Unknown")
         return str(self.status) if self.status else "Unknown"
+
+    def get_branch_prefix(self) -> str:
+        return self.custom_id if self.custom_id else self.id
 
 
 class ClickUpComment(BaseModel):
@@ -439,6 +443,35 @@ class ClickUpClient:
 
     def remove_tag_from_task(self, task_id: str, tag_name: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/task/{task_id}/tag/{tag_name}")
+
+    def search_docs(self, workspace_id: str, query: str = "") -> List[Dict[str, Any]]:
+        """Search for ClickUp Docs (v3 API)."""
+        response = self._client.request(
+            method="GET",
+            url=f"https://api.clickup.com/api/v3/workspaces/{workspace_id}/docs",
+            params={"search": query} if query else None
+        )
+        response.raise_for_status()
+        return response.json().get("docs", [])
+
+    def get_doc(self, workspace_id: str, doc_id: str) -> Dict[str, Any]:
+        """Get a specific ClickUp Doc (v3 API)."""
+        response = self._client.request(
+            method="GET",
+            url=f"https://api.clickup.com/api/v3/workspaces/{workspace_id}/docs/{doc_id}"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_doc_pages(self, workspace_id: str, doc_id: str) -> List[Dict[str, Any]]:
+        """Get all pages of a ClickUp Doc (v3 API). Returns list of pages with content."""
+        response = self._client.request(
+            method="GET",
+            url=f"https://api.clickup.com/api/v3/workspaces/{workspace_id}/docs/{doc_id}/pages"
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else data.get("pages", [])
 
     def close(self):
         self._client.close()

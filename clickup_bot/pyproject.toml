@@ -1,0 +1,10 @@
+[project]
+name = "gp-clickup-bot"
+version = "0.1.0"
+description = "ClickUp webhook handler - triggers engineer_agent on gpbot-analyze tag"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

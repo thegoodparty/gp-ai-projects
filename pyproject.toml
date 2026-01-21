@@ -42,6 +42,8 @@ dependencies = [
     "spacy>=3.8.7",
     "pillow>=10.0.0",
     "braintrust>=0.3.10",
+    "claude-agent-sdk>=0.1.19",
+    "slack-sdk>=3.39.0",
 ]
 
 [project.optional-dependencies]
@@ -53,7 +55,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_monitor"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent"]
 
 [build-system]
 requires = ["hatchling"]
