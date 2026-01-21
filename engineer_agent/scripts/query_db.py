@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import sys
 
 from shared.databricks_client import DatabricksClient
 from shared.logger import get_logger

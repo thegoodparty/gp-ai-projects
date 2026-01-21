@@ -103,6 +103,14 @@ async def run_agent(config: AgentConfig) -> dict:
                     "session_id": session_id
                 }
 
+        logger.error("Agent stream ended without ResultMessage")
+        return {
+            "status": "error",
+            "task_id": config.task_id,
+            "error": "Stream ended unexpectedly without result",
+            "session_id": session_id
+        }
+
     except Exception as e:
         logger.exception(f"Agent failed: {e}")
         return {
