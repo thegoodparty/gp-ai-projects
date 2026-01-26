@@ -95,11 +95,18 @@ class Gemini3Client:
         if model == GeminiModelType.PRO_3 and level == ThinkingLevel.MINIMAL:
             raise ValueError("PRO_3 model does not support MINIMAL thinking level. Use LOW, MEDIUM, or HIGH instead.")
 
+        level_map = {
+            ThinkingLevel.MINIMAL: types.ThinkingLevel.MINIMAL,
+            ThinkingLevel.LOW: types.ThinkingLevel.LOW,
+            ThinkingLevel.MEDIUM: types.ThinkingLevel.MEDIUM,
+            ThinkingLevel.HIGH: types.ThinkingLevel.HIGH,
+        }
+
         return types.GenerateContentConfig(
             temperature=temperature if temperature is not None else self.default_temperature,
             thinking_config=types.ThinkingConfig(
-                thinking_level=level.value,
-                include_thoughts=thoughts
+                thinkingLevel=level_map[level],
+                includeThoughts=thoughts
             )
         )
 
@@ -150,7 +157,7 @@ class Gemini3Client:
     def generate_structured_content(
         self,
         prompt: str,
-        response_schema: Type[BaseModel],
+        response_schema: Union[Type[BaseModel], Dict[str, Any]],
         model: Optional[GeminiModelType] = None,
         temperature: Optional[float] = None,
         thinking_level: Optional[ThinkingLevel] = None,
@@ -166,6 +173,8 @@ class Gemini3Client:
         if system_instruction:
             config.system_instruction = system_instruction
 
+        is_pydantic = isinstance(response_schema, type) and issubclass(response_schema, BaseModel)
+
         def _execute_call():
             for attempt in range(self.max_retries):
                 try:
@@ -178,9 +187,11 @@ class Gemini3Client:
 
                     if response.text:
                         data = json.loads(response.text)
-                        if isinstance(data, list):
-                            return [response_schema(**item) for item in data]
-                        return response_schema(**data)
+                        if is_pydantic:
+                            if isinstance(data, list):
+                                return [response_schema(**item) for item in data]
+                            return response_schema(**data)
+                        return data
 
                     raise ValueError("Empty response from API")
 
