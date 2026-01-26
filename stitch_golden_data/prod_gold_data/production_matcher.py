@@ -32,7 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from shared.databricks_client import DatabricksClient
-from shared.llm_gemini import GeminiClient, GeminiModelType, GeminiEmbeddingClient
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
+from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
 from tqdm.asyncio import tqdm
 import time
@@ -76,11 +77,16 @@ class ProductionMatcher:
 
         # Configure LLM client with high concurrency matching DDHQ matcher
         target_concurrency = 1200
-        self.llm = GeminiClient(
+        self.llm = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
+            default_temperature=0.0,
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=target_concurrency,
-            max_keepalive_connections=target_concurrency // 4  # 300 keepalive
+            max_keepalive_connections=target_concurrency // 4,  # 300 keepalive
+            max_retries=11,
+            base_delay=1.0
         )
-        self.embedding_client = GeminiEmbeddingClient(max_retries=9, base_delay=1.0)
+        self.embedding_client = GeminiEmbeddingClient(max_retries=11, base_delay=1.0)
         self.max_workers = max_workers
         
         self.catalog = catalog
@@ -408,42 +414,24 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             },
             "required": ["selected_candidate_number", "selection_confidence", "reasoning"]
         }
-        
-        # Enhanced retry logic for data accuracy - retry 9 times  
-        max_retries = 9
-        base_delay = 1.0
-        
-        for attempt in range(max_retries):
-            try:
-                # Use dedicated thread pool for maximum LLM concurrency
-                response = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, 
-                    lambda: self.llm.generate_structured_content(
-                        prompt=prompt,
-                        response_schema=response_schema,
-                        model=GeminiModelType.FLASH,
-                        thinking_budget=200,
-                        temperature=0.0,
-                    )
+
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool,
+                lambda: self.llm.generate_structured_content(
+                    prompt=prompt,
+                    response_schema=response_schema
                 )
-                break  # Success, exit retry loop
-                
-            except Exception as e:
-                # For transient errors, retry with exponential backoff
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{max_retries} failed for {br_name}: {e}. Retrying in {delay:.1f}s")
-                    await asyncio.sleep(delay)
-                else:
-                    # Final attempt failed
-                    self.logger.error(f"LLM failed after {max_retries} attempts for {br_name}: {e}")
-                    return LLMSelection(
-                        selected_district_name="LLM_ERROR",
-                        selected_district_type="LLM_ERROR",
-                        selection_confidence=0.0,
-                        selection_reasoning=f"LLM generation failed after {max_retries} attempts: {str(e)}",
-                        alternative_matches=None
-                    )
+            )
+        except Exception as e:
+            self.logger.error(f"LLM failed for {br_name}: {e}")
+            return LLMSelection(
+                selected_district_name="LLM_ERROR",
+                selected_district_type="LLM_ERROR",
+                selection_confidence=0.0,
+                selection_reasoning=f"LLM generation failed: {str(e)}",
+                alternative_matches=None
+            )
         
         # Handle potential float or invalid response
         try:
