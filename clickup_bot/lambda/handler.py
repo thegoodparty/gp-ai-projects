@@ -51,7 +51,7 @@ def verify_webhook_signature(body: str, signature: str) -> bool:
     is_valid = hmac.compare_digest(expected, signature)
 
     if not is_valid:
-        print(f"Signature mismatch: expected={expected}, got={signature}")
+        print("Webhook signature verification failed: signature mismatch")
 
     return is_valid
 
