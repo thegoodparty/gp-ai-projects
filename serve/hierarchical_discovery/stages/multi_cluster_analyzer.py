@@ -15,7 +15,7 @@ from collections import defaultdict
 from pydantic import BaseModel, Field
 
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from shared.braintrust import init_braintrust, flush_logs, load_prompt_from_braintrust
 from ..models import PipelineConfig, ClusterAnalysis, ClusterTheme, ClusteredMessage
 from .cluster_merger import cluster_merger_stage
@@ -49,10 +49,10 @@ class MultiClusterAnalyzer:
         llm_config = analysis_config.get('llm_config', {})
         multi_cluster_config = analysis_config.get('multi_cluster', {})
 
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=llm_config.get('temperature', 0.0),
-            thinking_budget=llm_config.get('thinking_budget', 0),
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=multi_cluster_config.get('max_connections', 25),
             max_keepalive_connections=multi_cluster_config.get('max_keepalive_connections', 10)
         )

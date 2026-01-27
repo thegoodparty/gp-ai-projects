@@ -8,7 +8,8 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.metrics.pairwise import cosine_similarity
 
-from shared.llm_gemini import GeminiClient, GeminiEmbeddingClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
+from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
 
 try:
@@ -51,10 +52,10 @@ class ThemeAggregator:
     """
 
     def __init__(self, max_theme_size: int = 30):
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=0.0,
-            thinking_budget=0
+            thinking_level=ThinkingLevel.MINIMAL
         )
         self.embedding_client = GeminiEmbeddingClient()
         self.max_theme_size = max_theme_size

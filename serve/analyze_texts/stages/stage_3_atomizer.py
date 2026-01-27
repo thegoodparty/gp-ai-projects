@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.append(str(Path(__file__).parent.parent.parent.parent))
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from serve.analyze_texts.models import MessageRecord, AtomizationResult
 
 logger = get_logger(__name__)
@@ -28,10 +28,10 @@ class MessageAtomizer:
         max_workers = llm_config.get("max_workers", 400)
         max_connections = llm_config.get("max_connections", 1200)
 
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=llm_config.get("temperature", 0.0),
-            thinking_budget=llm_config.get("thinking_budget", 0),
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=max_connections,
             max_keepalive_connections=max_connections // 4
         )
