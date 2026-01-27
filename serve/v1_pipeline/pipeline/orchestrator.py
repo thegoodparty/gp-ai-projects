@@ -189,25 +189,6 @@ class V1PipelineOrchestrator:
             logger.error(f"Failed to initialize components: {e}", exc_info=True)
             raise
 
-    def _normalize_phone_number(self, phone: str) -> str:
-        """Normalize phone number to digits only (remove formatting)"""
-        import re
-        original = str(phone)
-        normalized = re.sub(r'[^0-9]', '', original)
-        if len(normalized) == 11 and normalized.startswith('1'):
-            normalized = normalized[1:]
-
-        if not normalized:
-            raise ValueError(f"Phone number cannot be empty after normalization: '{original}'")
-
-        if len(normalized) != 10:
-            raise ValueError(f"Invalid phone number length ({len(normalized)} digits): '{original}' → '{normalized}'")
-
-        if original != normalized and normalized:
-            logger.debug(f"Phone normalized: '{original}' → '{normalized}'")
-
-        return normalized
-
     def _convert_to_consolidated_messages(self, df: pd.DataFrame, campaign_name: str, poll_id: str | None = None) -> list[ConsolidatedMessage]:
         """
         Convert consolidated DataFrame to ConsolidatedMessage objects
@@ -230,8 +211,7 @@ class V1PipelineOrchestrator:
                         pass
 
                 # Handle both old format (Contact Phone Number) and new format (phone_number)
-                phone_number_raw = str(row.get('phone_number', row.get('Contact Phone Number', '')))
-                phone_number = self._normalize_phone_number(phone_number_raw)
+                phone_number = str(row.get('phone_number', row.get('Contact Phone Number', ''))).strip()
 
                 # Required: message_text
                 message_text = str(row.get('message_text', row.get('Message Text', '')))
