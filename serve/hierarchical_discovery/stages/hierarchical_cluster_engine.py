@@ -37,17 +37,57 @@ class HierarchicalClusterEngine:
             logger.warning("No embedded messages provided for clustering")
             return []
 
-        logger.info(f"Starting clustering on {len(embedded_messages)} messages")
+        # Separate opt-out/non-substantive messages from clusterable messages
+        opt_out_messages = [m for m in embedded_messages if getattr(m, 'is_opt_out', False)]
+        clusterable_messages = [m for m in embedded_messages if not getattr(m, 'is_opt_out', False)]
 
-        embeddings = self._extract_embeddings(embedded_messages)
+        logger.info(f"Starting clustering on {len(clusterable_messages)} substantive messages "
+                   f"({len(opt_out_messages)} non-substantive will pass through)")
+
+        clustered_messages = []
+
+        # Create pass-through ClusteredMessages for opt-out messages (no cluster assignment)
+        for opt_out_msg in opt_out_messages:
+            cluster_assignment = ClusterAssignment(
+                cluster_id=-1,
+                cluster_confidence=0.0,
+                distance_to_centroid=0.0,
+                is_noise=True,
+                clustering_algorithm="none",
+                clustering_parameters={"reason": "non_substantive_passthrough"}
+            )
+
+            clustered_message = ClusteredMessage(
+                id=opt_out_msg.id,
+                embedded_message_id=opt_out_msg.id,
+                csv_file=opt_out_msg.csv_file,
+                csv_row_index=opt_out_msg.csv_row_index,
+                text=opt_out_msg.text,
+                original_text=opt_out_msg.original_text,
+                campaign_source=opt_out_msg.campaign_source,
+                cluster_assignment=cluster_assignment,
+                embeddings=opt_out_msg.embeddings,
+                metadata=opt_out_msg.metadata,
+                is_opt_out=True,
+                created_at=datetime.now()
+            )
+            clustered_messages.append(clustered_message)
+
+        # Cluster only substantive messages
+        if not clusterable_messages:
+            logger.warning("No substantive messages to cluster")
+            return clustered_messages
+
+        embeddings = self._extract_embeddings(clusterable_messages)
 
         cluster_labels = self._run_hierarchical_clustering(
             embeddings, self.linkage, self.affinity, self.distance_threshold, self.n_clusters
         )
 
-        clustered_messages = self._create_clustered_messages(
-            embedded_messages, cluster_labels, self.linkage, self.affinity, self.n_clusters
+        substantive_clustered = self._create_clustered_messages(
+            clusterable_messages, cluster_labels, self.linkage, self.affinity, self.n_clusters
         )
+        clustered_messages.extend(substantive_clustered)
 
         n_clusters_found = len(set(cluster_labels))
         logger.info(f"Clustering complete: {n_clusters_found} clusters found")

@@ -198,14 +198,19 @@ class ClusteringAdapter:
                                 'quotes': quotes
                             }
 
+                    # Check if this is an opt-out/non-substantive message
+                    is_opt_out = msg_data.get('is_opt_out', False)
+
                     # Store multi-cluster data for this atomic message (use atomic_id as key)
-                    if multi_cluster_data:
+                    # Include non-substantive messages even if they have no cluster data
+                    if multi_cluster_data or is_opt_out:
                         clustering_map[atomic_id] = {
                             'atomic_id': atomic_id,
                             'phone_number': phone_number,
-                            'cluster_data': multi_cluster_data,
+                            'cluster_data': multi_cluster_data if multi_cluster_data else {},
                             'message': message,
-                            'atomic_message': atomic_message
+                            'atomic_message': atomic_message,
+                            'is_opt_out': is_opt_out
                         }
 
                 logger.info(f"Successfully parsed {len(clustering_map)} clustering results from data objects")
@@ -316,21 +321,11 @@ class ClusteringAdapter:
 
             orchestrator = HierarchicalDiscoveryOrchestrator(temp_config_path, data_source_override=normalized_campaign)
 
-            hierarchical_config = getattr(orchestrator.config, 'hierarchical', {})
-            multi_cluster_enabled = hierarchical_config.get('multi_cluster_analysis', False)
-
-            if multi_cluster_enabled:
-                pipeline_result = await orchestrator.run_multi_cluster_pipeline(
-                    disable_optimization=True,
-                    return_data=True,
-                    in_memory_messages=raw_messages
-                )
-            else:
-                pipeline_result = await orchestrator.run_pipeline(
-                    disable_optimization=True,
-                    return_data=True,
-                    in_memory_messages=raw_messages
-                )
+            pipeline_result = await orchestrator.run_pipeline(
+                disable_optimization=True,
+                return_data=True,
+                in_memory_messages=raw_messages
+            )
 
             clustering_map = self._parse_clustering_results_from_objects(pipeline_result)
 

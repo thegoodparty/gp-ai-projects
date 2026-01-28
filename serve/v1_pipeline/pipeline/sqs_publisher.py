@@ -95,8 +95,12 @@ class SQSEventPublisher:
             all_events.append(complete_event.to_json())
 
             if self.publish_to_sqs:
-                self._send_to_sqs(complete_event)
-                logger.info("  ✅ Completion event - sent to SQS + saved locally")
+                try:
+                    self._send_to_sqs(complete_event)
+                    logger.info("  ✅ Completion event - sent to SQS + saved locally")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
+                    logger.info("  ✅ Completion event - saved locally only")
             else:
                 logger.info("  ✅ Completion event - saved locally")
 
@@ -190,8 +194,12 @@ class SQSEventPublisher:
         events = [complete_event.to_json()]
 
         if self.publish_to_sqs:
-            self._send_to_sqs(complete_event)
-            logger.info("  ✅ Empty poll completion event - sent to SQS + saved locally")
+            try:
+                self._send_to_sqs(complete_event)
+                logger.info("  ✅ Empty poll completion event - sent to SQS + saved locally")
+            except Exception as e:
+                logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
+                logger.info("  ✅ Empty poll completion event - saved locally only")
         else:
             logger.info("  ✅ Empty poll completion event - saved locally")
 

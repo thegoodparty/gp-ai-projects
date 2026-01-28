@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import sys
 import time
@@ -708,8 +709,8 @@ class V1PipelineOrchestrator:
 
     def _export_comprehensive_csv(self, unified_records: list[UnifiedCampaignRecord], csv_file_path: Path) -> None:
         """
-        Export comprehensive CSV with all cluster configurations
-        One row per atomic message with cluster data for all k values
+        Export CSV with atomic messages and cluster data
+        One row per atomic message with single cluster assignment
         """
         import csv
 
@@ -717,45 +718,65 @@ class V1PipelineOrchestrator:
             logger.warning("No unified records to export")
             return
 
-        all_cluster_counts: set[str] = set()
-        for record in unified_records:
-            if record.multi_cluster_data:
-                all_cluster_counts.update(record.multi_cluster_data.keys())
-
-        cluster_counts = sorted(all_cluster_counts, key=lambda x: int(x) if x.isdigit() else float('inf'))
-        logger.info(f"Cluster configurations in export: {cluster_counts}")
-
         csv_rows = []
         for record in unified_records:
+            # Opt-out messages: minimal cluster data with descriptive theme
+            if record.is_opt_out:
+                row = {
+                    'atomicId': record.atomic_id,
+                    'phoneNumber': record.phone_number,
+                    'receivedAt': record.sent_at.isoformat() if record.sent_at else '',
+                    'originalMessage': record.original_message or record.message_text,
+                    'atomicMessage': record.atomic_message if record.atomic_message else record.message_text,
+                    'pollId': record.poll_id or record.campaign_id,
+                    'clusterId': '',
+                    'theme': 'Opt Out Request',
+                    'category': '',
+                    'summary': '',
+                    'sentiment': '',
+                    'isOptOut': True,
+                }
+                csv_rows.append(row)
+                continue
+
+            # Substantive messages: include cluster data
+            cluster_data = {}
+            if record.multi_cluster_data:
+                first_key = next(iter(record.multi_cluster_data.keys()), None)
+                if first_key:
+                    cluster_data = record.multi_cluster_data[first_key]
+
+            cluster_id = cluster_data.get('cluster_id', -1)
+
             row = {
-                'atomic_id': record.atomic_id,
-                'phone_number': record.phone_number,
-                'original_message': record.original_message if record.original_message else record.message_text,
-                'atomic_message': record.atomic_message if record.atomic_message else record.message_text,
-                'poll_id': record.poll_id or record.campaign_id,
-                'round': record.round,
+                'atomicId': record.atomic_id,
+                'phoneNumber': record.phone_number,
+                'receivedAt': record.sent_at.isoformat() if record.sent_at else '',
+                'originalMessage': record.original_message or record.message_text,
+                'atomicMessage': record.atomic_message if record.atomic_message else record.message_text,
+                'pollId': record.poll_id or record.campaign_id,
+                'clusterId': cluster_id if cluster_id != -1 else '',
+                'theme': cluster_data.get('cluster_theme', ''),
+                'category': cluster_data.get('cluster_category', ''),
+                'summary': cluster_data.get('issues_summary', ''),
+                'sentiment': cluster_data.get('cluster_sentiment', ''),
+                'isOptOut': False,
             }
-
-            for cluster_count in cluster_counts:
-                cluster_data = record.multi_cluster_data.get(cluster_count, {}) if record.multi_cluster_data else {}
-
-                cluster_id = cluster_data.get('cluster_id', -1)
-                row[f'k{cluster_count}_cluster_id'] = cluster_id if cluster_id != -1 else ''
-                row[f'k{cluster_count}_theme'] = cluster_data.get('cluster_theme', '')
-                row[f'k{cluster_count}_category'] = cluster_data.get('cluster_category', '')
-                row[f'k{cluster_count}_summary'] = cluster_data.get('issues_summary', '')
-                row[f'k{cluster_count}_sentiment'] = cluster_data.get('cluster_sentiment', '')
 
             csv_rows.append(row)
 
         if csv_rows:
-            fieldnames = list(csv_rows[0].keys())
+            fieldnames = ['atomicId', 'phoneNumber', 'receivedAt', 'originalMessage', 'atomicMessage', 'pollId', 'clusterId', 'theme', 'category', 'summary', 'sentiment', 'isOptOut']
             with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(csv_rows)
 
-            logger.info(f"Exported {len(csv_rows)} atomic messages with {len(cluster_counts)} cluster configurations")
+            json_file_path = csv_file_path.with_suffix('.json')
+            with open(json_file_path, 'w', encoding='utf-8') as f:
+                json.dump(csv_rows, f, indent=2)
+
+            logger.info(f"Exported {len(csv_rows)} atomic messages (CSV + JSON)")
         else:
             logger.warning("No CSV rows to write")
 

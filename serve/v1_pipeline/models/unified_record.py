@@ -72,6 +72,9 @@ class UnifiedCampaignRecord:
     updated_at: datetime | None = None
     processing_version: str = "v1.0"
 
+    # Non-substantive message flag
+    is_opt_out: bool = False  # True if STOP/unsubscribe message (passed through but not clustered)
+
     def __post_init__(self) -> None:
         if self.created_at is None:
             self.created_at = datetime.now(timezone.utc)
@@ -94,12 +97,14 @@ class UnifiedCampaignRecord:
         original_message = None
         atomic_message = None
         atomic_id = None
+        is_opt_out = False
         if clustering_result and isinstance(clustering_result, dict):
             if 'cluster_data' in clustering_result:
                 multi_cluster_data = clustering_result['cluster_data']
             original_message = clustering_result.get('message')
             atomic_message = clustering_result.get('atomic_message')
             atomic_id = clustering_result.get('atomic_id')
+            is_opt_out = clustering_result.get('is_opt_out', False)
 
         # Generate atomic_id if not provided (for backward compatibility)
         if not atomic_id:
@@ -125,7 +130,10 @@ class UnifiedCampaignRecord:
             # Multi-cluster data
             multi_cluster_data=multi_cluster_data,
             original_message=original_message,
-            atomic_message=atomic_message
+            atomic_message=atomic_message,
+
+            # Non-substantive flag
+            is_opt_out=is_opt_out
         )
 
 
