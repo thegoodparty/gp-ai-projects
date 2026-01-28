@@ -115,6 +115,33 @@ class TestBuildConfig:
 
         assert "low" in str(config.thinking_config.thinking_level).lower()
 
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_pro3_default_with_minimal_raises_on_generate(self, _mock_genai):
+        """Test that creating a client with PRO_3 default + MINIMAL fails when generating"""
+        client = Gemini3Client(
+            api_key="test-key",
+            default_model=GeminiModelType.PRO_3,
+            thinking_level=ThinkingLevel.MINIMAL
+        )
+
+        with pytest.raises(ValueError, match="PRO_3 model does not support MINIMAL"):
+            client.generate_content(prompt="Test prompt")
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_pro3_default_with_minimal_raises_on_structured_generate(self, _mock_genai):
+        """Test that creating a client with PRO_3 default + MINIMAL fails on structured content"""
+        client = Gemini3Client(
+            api_key="test-key",
+            default_model=GeminiModelType.PRO_3,
+            thinking_level=ThinkingLevel.MINIMAL
+        )
+
+        with pytest.raises(ValueError, match="PRO_3 model does not support MINIMAL"):
+            client.generate_structured_content(
+                prompt="Test prompt",
+                response_schema=SampleResponse
+            )
+
 
 class TestCostCalculation:
     @patch('shared.llm_gemini_3.genai.Client')

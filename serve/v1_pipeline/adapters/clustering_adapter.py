@@ -93,7 +93,6 @@ class ClusteringAdapter:
         if 'hierarchical' not in temp_config:
             temp_config['hierarchical'] = {}
 
-        temp_config['hierarchical']['cluster_ranges'] = 'optimal_k'
         temp_config['hierarchical']['optimal_k_config'] = {
             'min_k': 5,
             'max_k': 50,
@@ -392,15 +391,6 @@ class ClusteringAdapter:
             logger.info(f"✅ Preserved {len(copied_files)} hierarchical discovery output files to {persistent_path}")
         else:
             logger.warning(f"⚠️ No hierarchical discovery outputs found to preserve in {temp_output}")
-
-    def get_optimal_cluster_count(self) -> int:
-        """Get the optimal cluster count from config (defaults to 15)"""
-        clustering_config = self.config.get('clustering', {})
-        n_clusters = clustering_config.get('n_clusters', [15])
-
-        if isinstance(n_clusters, list):
-            return 15 if 15 in n_clusters else n_clusters[0] if n_clusters else 15
-        return int(n_clusters)
 
 
 # Convenience function for direct usage

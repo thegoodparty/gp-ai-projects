@@ -279,10 +279,7 @@ Generate a theme summary that captures the common thread across these concerns. 
         try:
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.llm_client.generate_content(
-                    prompt=prompt,
-                    max_tokens=100
-                )
+                lambda: self.llm_client.generate_content(prompt=prompt)
             )
             return response.strip()
         except Exception as e:

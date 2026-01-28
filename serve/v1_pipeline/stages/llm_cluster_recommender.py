@@ -195,10 +195,12 @@ async def recommend_top_clusters_via_llm(unified_records, config: dict[str, Any]
 
     prompt = _create_evaluation_prompt(filtered_summary)
 
+    model = GeminiModelType.FLASH_3 if llm_model.lower() == 'flash' else GeminiModelType.PRO_3
+    thinking_level = ThinkingLevel.MINIMAL if model == GeminiModelType.FLASH_3 else ThinkingLevel.LOW
     llm_client = Gemini3Client(
-        default_model=GeminiModelType.FLASH_3 if llm_model.lower() == 'flash' else GeminiModelType.PRO_3,
+        default_model=model,
         default_temperature=temperature,
-        thinking_level=ThinkingLevel.MINIMAL
+        thinking_level=thinking_level
     )
 
     try:
