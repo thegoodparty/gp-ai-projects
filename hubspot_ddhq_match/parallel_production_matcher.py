@@ -481,7 +481,6 @@ Be extremely conservative - false positives are worse than false negatives. If u
 OUTPUT JSON ONLY (no explanation, no markdown):"""
 
         result = build_cached_prompt(self._prompt_name, variables, fallback_prompt=fallback)
-        self.logger.info("Resulting prompt: %s", result)  # remove after testing
         return result if result else fallback
 
     def _search_similar_candidates(self, hubspot_record: Dict, k: int = 5) -> tuple[List[Dict[str, Any]], str]:
