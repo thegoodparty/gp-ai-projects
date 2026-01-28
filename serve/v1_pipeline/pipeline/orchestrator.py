@@ -460,7 +460,7 @@ class V1PipelineOrchestrator:
                     }
                 else:
                     # Normal flow - publish events from unified records
-                    sqs_stats = await self.sqs_publisher.publish_events(unified_records)
+                    sqs_stats = await self.sqs_publisher.publish_events(unified_records, campaign_name)
 
                 sqs_time = time.time() - sqs_start
 

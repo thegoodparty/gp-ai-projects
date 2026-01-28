@@ -48,13 +48,15 @@ class SQSEventPublisher:
         # Common configuration
         self.top_n = config.get('publish_top_n', 3)
         self.min_respondents = config.get('min_unique_respondents', 1)
+        self.s3_bucket = config.get('s3_bucket', os.getenv('S3_OUTPUT_BUCKET', ''))
 
         logger.info("Event Publisher initialized")
         logger.info(f"  Output directory: {self.output_dir}")
+        logger.info(f"  S3 bucket: {self.s3_bucket}")
         logger.info(f"  Top N clusters: {self.top_n}")
         logger.info(f"  Min unique respondents: {self.min_respondents}")
 
-    async def publish_events(self, unified_records: list[UnifiedCampaignRecord]) -> dict[str, Any]:
+    async def publish_events(self, unified_records: list[UnifiedCampaignRecord], campaign_name: str = "") -> dict[str, Any]:
         polls = defaultdict(list)
         for record in unified_records:
             if record.poll_id:
@@ -62,6 +64,11 @@ class SQSEventPublisher:
 
         total_complete_events = 0
         all_events = []
+
+        # Build S3 responses location (relative path - consumer uses its own bucket config)
+        responses_location = ""
+        if campaign_name:
+            responses_location = f"serve/v1_pipeline/output/consolidated/{campaign_name}_all_cluster_analysis.json"
 
         for poll_id, records in polls.items():
             poll_issues = []
@@ -78,6 +85,7 @@ class SQSEventPublisher:
                     PollIssueAnalysisData(
                         pollId=poll_id,
                         rank=rank,
+                        clusterId=cluster_data['cluster_id'],
                         theme=cluster_data['theme'],
                         summary=cluster_data['summary'],
                         analysis=cluster_data['analysis'],
@@ -91,7 +99,7 @@ class SQSEventPublisher:
             unique_respondents = len(set(record.phone_number for record in records))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
-            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues)
+            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues, responses_location)
             all_events.append(complete_event.to_json())
 
             if self.publish_to_sqs:
@@ -173,12 +181,13 @@ class SQSEventPublisher:
 
         return ranked[:self.top_n]
 
-    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData]) -> PollAnalysisCompleteEvent:
+    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData], responses_location: str = "") -> PollAnalysisCompleteEvent:
         return PollAnalysisCompleteEvent(
             type='pollAnalysisComplete',
             data=PollAnalysisCompleteData(
                 pollId=poll_id,
                 totalResponses=total_responses,
+                responsesLocation=responses_location,
                 issues=issues
             )
         )
