@@ -33,6 +33,7 @@ from shared.braintrust import (
     init_braintrust,
     cache_prompt,
     build_cached_prompt,
+    flush_logs,
 )
 from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from shared.logger import get_logger
@@ -1460,6 +1461,9 @@ async def main():
 
         matcher.logger.info(f"\n🎉 Parallel matching complete! Results saved to {results_file}")
 
+        # Flush Braintrust logs before exit (os._exit bypasses cleanup handlers)
+        flush_logs()
+
         # Force immediate exit - all work is done, files saved
         matcher.logger.info("💥 Forcing immediate exit to allow S3 upload to proceed...")
         os._exit(0)
@@ -1467,6 +1471,7 @@ async def main():
     except Exception as e:
         matcher.logger.error(f"❌ Pipeline failed: {e}")
         matcher.logger.error(f"Stack trace:", exc_info=True)
+        flush_logs()
         os._exit(1)
 
 if __name__ == "__main__":

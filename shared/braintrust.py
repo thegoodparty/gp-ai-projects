@@ -199,13 +199,8 @@ class BraintrustClient:
 
         # Use a safer formatting approach that only replaces variables that exist
         # This handles cases where the template has example placeholders like {best_match}
-        # that aren't meant to be replaced. Also handles escaped braces {{ and }}
+        # that aren't meant to be replaced
         def safe_format(match):
-            # Check if this is an escaped brace ({{ or }})
-            full_match = match.group(0)
-            if full_match == '{{' or full_match == '}}':
-                return full_match  # Keep escaped braces as-is
-            
             var_name = match.group(1)
             if var_name in variables:
                 return str(variables[var_name])
@@ -280,14 +275,14 @@ class BraintrustClient:
                     if messages and isinstance(messages[0], dict):
                         return messages[0].get('content', '')
                     elif messages and hasattr(messages[0], 'content'):
-                        return messages[0].content
+                        return str(messages[0].content) if messages[0].content is not None else ''
 
                 if hasattr(rendered, 'messages') and rendered.messages:
                     msg = rendered.messages[0]
                     if isinstance(msg, dict):
                         return msg.get('content', '')
                     elif hasattr(msg, 'content'):
-                        return str(msg.content)
+                        return str(msg.content) if msg.content is not None else ''
 
                 return str(rendered)
 
