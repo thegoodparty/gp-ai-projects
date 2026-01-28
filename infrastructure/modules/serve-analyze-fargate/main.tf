@@ -75,37 +75,6 @@ resource "aws_s3_bucket_public_access_block" "pipeline_data" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "pipeline_data_lifecycle" {
-  bucket = aws_s3_bucket.pipeline_data.id
-
-  rule {
-    id     = "cleanup-old-data"
-    status = "Enabled"
-
-    expiration {
-      days = 60
-    }
-
-    filter {
-      prefix = "input/"
-    }
-  }
-
-  rule {
-    id     = "archive-outputs"
-    status = "Enabled"
-
-    transition {
-      days          = 60
-      storage_class = "GLACIER"
-    }
-
-    filter {
-      prefix = "output/"
-    }
-  }
-}
-
 resource "aws_cloudwatch_log_group" "pipeline" {
   name              = "/ecs/serve-analyze-${var.environment}"
   retention_in_days = 30
