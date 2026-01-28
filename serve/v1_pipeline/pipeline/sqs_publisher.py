@@ -49,10 +49,12 @@ class SQSEventPublisher:
         self.top_n = config.get('publish_top_n', 3)
         self.min_respondents = config.get('min_unique_respondents', 1)
         self.s3_bucket = config.get('s3_bucket', os.getenv('S3_OUTPUT_BUCKET', ''))
+        self.s3_output_path = config.get('s3_output_path', os.getenv('S3_OUTPUT_PATH', ''))
 
         logger.info("Event Publisher initialized")
         logger.info(f"  Output directory: {self.output_dir}")
         logger.info(f"  S3 bucket: {self.s3_bucket}")
+        logger.info(f"  S3 output path: {self.s3_output_path}")
         logger.info(f"  Top N clusters: {self.top_n}")
         logger.info(f"  Min unique respondents: {self.min_respondents}")
 
@@ -65,10 +67,13 @@ class SQSEventPublisher:
         total_complete_events = 0
         all_events = []
 
-        # Build S3 responses location (relative path - consumer uses its own bucket config)
         responses_location = ""
-        if campaign_name:
-            responses_location = f"serve/v1_pipeline/output/consolidated/{campaign_name}_all_cluster_analysis.json"
+        if campaign_name and self.s3_output_path:
+            if self.s3_output_path.startswith("s3://"):
+                s3_prefix = "/".join(self.s3_output_path.split("/")[3:]).rstrip("/")
+            else:
+                s3_prefix = self.s3_output_path.rstrip("/")
+            responses_location = f"{s3_prefix}/consolidated/{campaign_name}_all_cluster_analysis.json"
 
         for poll_id, records in polls.items():
             poll_issues = []
