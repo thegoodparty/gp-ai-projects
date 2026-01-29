@@ -8,7 +8,6 @@ Handles cluster analysis for multiple cluster counts efficiently.
 import asyncio
 import os
 import random
-import time
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -64,7 +63,6 @@ class MultiClusterAnalyzer:
         self.save_example_messages = analysis_config.get('save_example_messages', 5)
 
         self.chunk_size = 5
-        self.delay_between_runs = 5.0
         self.delay_between_clusters = 0.2
         self.delay_between_chunks = 1.0
 
@@ -106,11 +104,6 @@ class MultiClusterAnalyzer:
             clustered_messages = result['clustered_messages']
 
             logger.info(f"Analyzing themes for {cluster_count} clusters ({len(clustered_messages)} messages)...")
-
-            # Add delay between cluster count runs to prevent API overload
-            if i > 0:
-                logger.debug(f"Waiting {self.delay_between_runs}s between cluster configurations...")
-                time.sleep(self.delay_between_runs)
 
             try:
                 # Analyze this cluster configuration (returns tuple with merger stats)

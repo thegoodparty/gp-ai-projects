@@ -223,10 +223,12 @@ class EmbeddingGenerator:
         embedded_messages = []
 
         for atomic_message in atomic_messages:
-            # Handle opt-out/non-substantive messages - pass through without embeddings
-            is_opt_out = getattr(atomic_message, 'is_opt_out', False) or getattr(atomic_message, 'was_filtered', False)
+            # Separate concepts: "skip embedding" vs "is actual opt-out request"
+            actual_is_opt_out = getattr(atomic_message, 'is_opt_out', False)
+            was_filtered = getattr(atomic_message, 'was_filtered', False)
+            skip_embedding = actual_is_opt_out or was_filtered
 
-            if is_opt_out:
+            if skip_embedding:
                 embedding_data = EmbeddingData(
                     embedding_3072d=None,
                     embedding_model="none",
@@ -243,7 +245,7 @@ class EmbeddingGenerator:
                     embeddings=embedding_data,
                     campaign_source=atomic_message.campaign_source,
                     metadata=atomic_message.metadata,
-                    is_opt_out=is_opt_out,
+                    is_opt_out=actual_is_opt_out,
                     created_at=datetime.now()
                 )
                 embedded_messages.append(embedded_message)

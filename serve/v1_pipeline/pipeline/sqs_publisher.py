@@ -48,12 +48,10 @@ class SQSEventPublisher:
         # Common configuration
         self.top_n = config.get('publish_top_n', 3)
         self.min_respondents = config.get('min_unique_respondents', 1)
-        self.s3_bucket = config.get('s3_bucket', os.getenv('S3_OUTPUT_BUCKET', ''))
         self.s3_output_path = config.get('s3_output_path', os.getenv('S3_OUTPUT_PATH', ''))
 
         logger.info("Event Publisher initialized")
         logger.info(f"  Output directory: {self.output_dir}")
-        logger.info(f"  S3 bucket: {self.s3_bucket}")
         logger.info(f"  S3 output path: {self.s3_output_path}")
         logger.info(f"  Top N clusters: {self.top_n}")
         logger.info(f"  Min unique respondents: {self.min_respondents}")
