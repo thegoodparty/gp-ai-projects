@@ -31,7 +31,8 @@ async def generate_dendrograms_and_visualizations(consolidated_result, timestamp
         embeddings = []
         for msg in clustered_messages:
             if hasattr(msg, 'embeddings') and hasattr(msg.embeddings, 'embedding_3072d'):
-                embeddings.append(msg.embeddings.embedding_3072d)
+                if msg.embeddings.embedding_3072d is not None:
+                    embeddings.append(msg.embeddings.embedding_3072d)
 
         if not embeddings:
             logger.warning(f"No embeddings found for {cluster_count} clusters")

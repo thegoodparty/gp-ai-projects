@@ -690,3 +690,92 @@ class TestNoneTokenCounts:
 
         assert client.total_prompt_tokens == 100
         assert client.total_completion_tokens == 0
+
+
+class TestCallTimeout:
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_default_timeout_is_120s(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+        assert client.call_timeout == 120.0
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_custom_timeout_stored(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", call_timeout=60.0)
+        assert client.call_timeout == 60.0
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_timeout_none_is_stored(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", call_timeout=None)
+        assert client.call_timeout is None
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_fast_call_succeeds(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", call_timeout=5.0)
+
+        mock_response = Mock()
+        mock_response.text = "Success"
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        result = client.generate_content(prompt="Test")
+        assert result == "Success"
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_httpx_read_timeout_is_raised_after_retries_exhausted(self, _mock_genai):
+        import httpx
+        client = Gemini3Client(api_key="test-key", call_timeout=1.0, max_retries=1)
+
+        client.client.models.generate_content = Mock(
+            side_effect=httpx.ReadTimeout("Connection timed out")
+        )
+
+        with pytest.raises(httpx.ReadTimeout):
+            client.generate_content(prompt="Test")
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_retries_on_httpx_timeout_then_succeeds(self, _mock_genai):
+        import httpx
+        client = Gemini3Client(api_key="test-key", call_timeout=1.0, max_retries=3, base_delay=0.01)
+
+        mock_response = Mock()
+        mock_response.text = "Success after retry"
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        client.client.models.generate_content = Mock(
+            side_effect=[
+                httpx.ReadTimeout("First timeout"),
+                httpx.ReadTimeout("Second timeout"),
+                mock_response
+            ]
+        )
+
+        result = client.generate_content(prompt="Test")
+        assert result == "Success after retry"
+        assert client.client.models.generate_content.call_count == 3
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_config_includes_http_options_timeout(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", call_timeout=60.0)
+        config = client._build_config(GeminiModelType.FLASH_3)
+        assert config.http_options is not None
+        assert config.http_options.timeout == 60000  # milliseconds
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_normal_call_with_timeout_configured(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", call_timeout=30.0)
+
+        mock_response = Mock()
+        mock_response.text = "Success"
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        result = client.generate_content(prompt="Test")
+        assert result == "Success"
