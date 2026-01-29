@@ -17,7 +17,7 @@ from .stages.ai_message_processor import ai_message_processor_stage
 from .stages.embedding_generator import embedding_generator_stage_sync
 from .stages.dimensionality_reducer import dimensionality_reduction_stage
 from .stages.hierarchical_cluster_engine import hierarchical_cluster_engine_stage
-from .stages.multi_cluster_analyzer import multi_cluster_analyzer_stage
+from .stages.cluster_analyzer import cluster_analyzer_stage
 from .stages.visualization_generator import visualization_generator_stage
 
 from .utils import (
@@ -190,11 +190,16 @@ class HierarchicalDiscoveryOrchestrator:
             logger.info(f"Using {embedding_source} embeddings for optimal k selection: {embeddings_array.shape}")
 
         # Count substantive messages (those with embeddings) for optimal k
-        # Opt-out messages don't participate in clustering, so don't count them
-        substantive_count = len([m for m in embedded_messages if not getattr(m, 'is_opt_out', False)])
-        opt_out_count = len(embedded_messages) - substantive_count
-        if opt_out_count > 0:
-            logger.info(f"Dataset: {substantive_count} substantive messages + {opt_out_count} opt-out (pass-through)")
+        # Messages without embeddings (opt-outs OR filtered) don't participate in clustering
+        def has_embeddings(msg):
+            return (hasattr(msg.embeddings, 'embedding_3072d') and
+                    msg.embeddings.embedding_3072d is not None)
+
+        substantive_count = len([m for m in embedded_messages
+                                if not getattr(m, 'is_opt_out', False) and has_embeddings(m)])
+        non_clusterable_count = len(embedded_messages) - substantive_count
+        if non_clusterable_count > 0:
+            logger.info(f"Dataset: {substantive_count} substantive + {non_clusterable_count} non-clusterable (pass-through)")
 
         # Handle case where ALL messages are opt-outs
         if substantive_count == 0:
@@ -239,22 +244,22 @@ class HierarchicalDiscoveryOrchestrator:
 
         # Run cluster theme analysis
         logger.info(f"🎯 Running cluster theme analysis...")
-        multi_analysis_result = await multi_cluster_analyzer_stage(cluster_results, self.config)
+        analysis_result = await cluster_analyzer_stage(cluster_results, self.config)
 
         # Extract cost data and merger stats from cluster analysis
         merger_stats_dict = {}
-        if isinstance(multi_analysis_result, dict) and 'cost' in multi_analysis_result:
-            stage_cost = multi_analysis_result.get("cost", 0)
-            usage_stats = multi_analysis_result.get("usage_stats", {})
-            merger_stats_dict = multi_analysis_result.get("merger_stats", {})
+        if isinstance(analysis_result, dict) and 'cost' in analysis_result:
+            stage_cost = analysis_result.get("cost", 0)
+            usage_stats = analysis_result.get("usage_stats", {})
+            merger_stats_dict = analysis_result.get("merger_stats", {})
             self.pipeline_state.total_cost += stage_cost
             self.pipeline_state.stage_costs["cluster_analysis"] = stage_cost
             self.pipeline_state.gemini_usage["cluster_analysis"] = usage_stats
 
             logger.info(f"💰 Cluster Analysis Cost: ${stage_cost:.4f} (Total: ${self.pipeline_state.total_cost:.4f})")
-            analyzed_results = multi_analysis_result["analyses"]
+            analyzed_results = analysis_result["analyses"]
         else:
-            analyzed_results = multi_analysis_result
+            analyzed_results = analysis_result
 
         # Combine clustering and analysis results
         cluster_key = str(n_clusters)

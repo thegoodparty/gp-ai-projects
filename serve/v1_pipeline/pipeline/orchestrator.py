@@ -720,34 +720,6 @@ class V1PipelineOrchestrator:
 
         csv_rows = []
         for record in unified_records:
-            # Opt-out messages: minimal cluster data with descriptive theme
-            if record.is_opt_out:
-                row = {
-                    'atomicId': record.atomic_id,
-                    'phoneNumber': record.phone_number,
-                    'receivedAt': record.sent_at.isoformat() if record.sent_at else '',
-                    'originalMessage': record.original_message or record.message_text,
-                    'atomicMessage': record.atomic_message if record.atomic_message else record.message_text,
-                    'pollId': record.poll_id or record.campaign_id,
-                    'clusterId': '',
-                    'theme': 'Opt Out Request',
-                    'category': '',
-                    'summary': '',
-                    'sentiment': '',
-                    'isOptOut': True,
-                }
-                csv_rows.append(row)
-                continue
-
-            # Substantive messages: include cluster data
-            cluster_data = {}
-            if record.multi_cluster_data:
-                first_key = next(iter(record.multi_cluster_data.keys()), None)
-                if first_key:
-                    cluster_data = record.multi_cluster_data[first_key]
-
-            cluster_id = cluster_data.get('cluster_id', -1)
-
             row = {
                 'atomicId': record.atomic_id,
                 'phoneNumber': record.phone_number,
@@ -755,13 +727,29 @@ class V1PipelineOrchestrator:
                 'originalMessage': record.original_message or record.message_text,
                 'atomicMessage': record.atomic_message if record.atomic_message else record.message_text,
                 'pollId': record.poll_id or record.campaign_id,
-                'clusterId': cluster_id if cluster_id != -1 else '',
-                'theme': cluster_data.get('cluster_theme', ''),
-                'category': cluster_data.get('cluster_category', ''),
-                'summary': cluster_data.get('issues_summary', ''),
-                'sentiment': cluster_data.get('cluster_sentiment', ''),
-                'isOptOut': False,
+                'clusterId': '',
+                'theme': '',
+                'category': '',
+                'summary': '',
+                'sentiment': '',
+                'isOptOut': record.is_opt_out,
             }
+
+            if record.is_opt_out:
+                row['theme'] = 'Opt Out Request'
+            else:
+                cluster_data = {}
+                if record.multi_cluster_data:
+                    first_key = next(iter(record.multi_cluster_data.keys()), None)
+                    if first_key:
+                        cluster_data = record.multi_cluster_data[first_key]
+
+                cluster_id = cluster_data.get('cluster_id', -1)
+                row['clusterId'] = cluster_id if cluster_id != -1 else ''
+                row['theme'] = cluster_data.get('cluster_theme', '')
+                row['category'] = cluster_data.get('cluster_category', '')
+                row['summary'] = cluster_data.get('issues_summary', '')
+                row['sentiment'] = cluster_data.get('cluster_sentiment', '')
 
             csv_rows.append(row)
 

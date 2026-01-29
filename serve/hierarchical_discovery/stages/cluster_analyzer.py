@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Multi-cluster analyzer stage for hierarchical clustering pipeline.
-Handles cluster analysis for multiple cluster counts efficiently.
+Cluster analyzer stage for hierarchical clustering pipeline.
+Handles cluster analysis using LLM-based theme extraction.
 """
 
 import asyncio
@@ -39,8 +39,8 @@ class VerbatimQuotesResponse(BaseModel):
 class ActionItemsResponse(BaseModel):
     action_items: List[str] = Field(default_factory=list, description="3-5 specific, actionable items that local government or campaigns can implement")
 
-class MultiClusterAnalyzer:
-    """Efficient multi-cluster analysis with proper API management"""
+class ClusterAnalyzer:
+    """Cluster analysis with LLM-based theme extraction"""
 
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -675,19 +675,19 @@ REQUIREMENTS:
         return {}
 
 
-async def multi_cluster_analyzer_stage(multi_cluster_results: Dict[str, Dict], config: PipelineConfig) -> Dict[str, Any]:
+async def cluster_analyzer_stage(cluster_results: Dict[str, Dict], config: PipelineConfig) -> Dict[str, Any]:
     """
-    Main entry point for multi-cluster analysis stage
+    Main entry point for cluster analysis stage
 
     Args:
-        multi_cluster_results: Dict with cluster count as key and clustered messages
+        cluster_results: Dict with cluster count as key and clustered messages
         config: Pipeline configuration
 
     Returns:
         Dict with analyzed clusters, merger stats, and cost information
     """
-    analyzer = MultiClusterAnalyzer(config)
-    analysis_result = await analyzer.analyze_multi_cluster(multi_cluster_results)
+    analyzer = ClusterAnalyzer(config)
+    analysis_result = await analyzer.analyze_multi_cluster(cluster_results)
 
     # Get usage statistics
     usage_stats = analyzer.get_usage_stats()

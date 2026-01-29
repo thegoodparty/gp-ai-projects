@@ -37,17 +37,23 @@ class HierarchicalClusterEngine:
             logger.warning("No embedded messages provided for clustering")
             return []
 
-        # Separate opt-out/non-substantive messages from clusterable messages
-        opt_out_messages = [m for m in embedded_messages if getattr(m, 'is_opt_out', False)]
-        clusterable_messages = [m for m in embedded_messages if not getattr(m, 'is_opt_out', False)]
+        # Separate non-clusterable messages (opt-outs OR missing embeddings) from clusterable
+        def has_embeddings(msg):
+            return (hasattr(msg.embeddings, 'embedding_3072d') and
+                    msg.embeddings.embedding_3072d is not None)
+
+        non_clusterable = [m for m in embedded_messages
+                          if getattr(m, 'is_opt_out', False) or not has_embeddings(m)]
+        clusterable_messages = [m for m in embedded_messages
+                               if not getattr(m, 'is_opt_out', False) and has_embeddings(m)]
 
         logger.info(f"Starting clustering on {len(clusterable_messages)} substantive messages "
-                   f"({len(opt_out_messages)} non-substantive will pass through)")
+                   f"({len(non_clusterable)} non-clusterable will pass through)")
 
         clustered_messages = []
 
-        # Create pass-through ClusteredMessages for opt-out messages (no cluster assignment)
-        for opt_out_msg in opt_out_messages:
+        # Create pass-through ClusteredMessages for non-clusterable messages (no cluster assignment)
+        for opt_out_msg in non_clusterable:
             cluster_assignment = ClusterAssignment(
                 cluster_id=-1,
                 cluster_confidence=0.0,
