@@ -55,7 +55,6 @@ async def run_agent(config: AgentConfig) -> dict:
     prompt = build_task_prompt(config)
 
     result_text = ""
-    total_cost = 0.0
     session_id = None
 
     message_count = 0

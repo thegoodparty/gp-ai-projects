@@ -66,6 +66,6 @@ aws lambda update-function-code --function-name clickup-bot --zip-file fileb://h
 
 1. Go to ClickUp Settings → Integrations → Webhooks
 2. Create webhook with:
-   - Endpoint: `https://your-alb-domain/clickup/webhook`
+   - Endpoint: `https://ai.goodparty.org/clickup/webhook`
    - Events: `taskTagUpdated`
    - Space: Your engineering space

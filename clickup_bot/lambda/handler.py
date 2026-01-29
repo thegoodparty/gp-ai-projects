@@ -81,7 +81,7 @@ If you're unsure about the solution or the impact is too broad, post a comment e
 your findings and recommend a human handle the implementation.
 
 Branch naming: `<custom_id>/gp-bot_<description-slug>` (use the task's custom_id like ENG-1234, not the internal ID)
-PR title format: `[GP-Bot] <description>`
+PR title format: `[GP-Bot] <custom_id> <description>`
 
 Post the PR link to ClickUp when done.
 """
@@ -102,7 +102,7 @@ def clickup_request(method: str, endpoint: str, data: dict | None = None) -> dic
     body = json.dumps(data).encode() if data else None
     req = Request(url, data=body, headers=headers, method=method)
 
-    with urlopen(req) as response:
+    with urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode())
 
 
@@ -192,7 +192,7 @@ def handler(event: dict, context: Any) -> dict:
         return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
 
     config = TAG_CONFIG[matched_tag]
-    instruction = config["instruction"].format(task_id=task_id)
+    instruction = config["instruction"]
 
     if os.environ.get("ENABLE_FARGATE") == "true":
         return trigger_fargate_task(task_id, instruction, config["label"], config["model"])
@@ -272,8 +272,8 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
             print(f"ERROR: {error_msg}")
             try:
                 post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
-            except HTTPError:
-                pass
+            except HTTPError as comment_err:
+                print(f"Failed to post failure comment to ClickUp: {comment_err}")
             return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
         if not tasks:
@@ -281,8 +281,8 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
             print(f"ERROR: {error_msg}")
             try:
                 post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
-            except HTTPError:
-                pass
+            except HTTPError as comment_err:
+                print(f"Failed to post failure comment to ClickUp: {comment_err}")
             return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
         task_arn = tasks[0]["taskArn"]
@@ -302,7 +302,7 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
         print(f"Failed to start Fargate task: {e}")
         try:
             post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {str(e)}")
-        except HTTPError:
-            pass
+        except HTTPError as comment_err:
+            print(f"Failed to post failure comment to ClickUp: {comment_err}")
         return {"statusCode": 500, "body": json.dumps({"error": f"failed to start task: {str(e)}"})}
 

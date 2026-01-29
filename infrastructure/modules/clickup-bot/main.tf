@@ -123,7 +123,7 @@ resource "aws_iam_role_policy" "clickup_bot_ecs" {
           "ecs:RunTask"
         ]
         Resource = [
-          "arn:aws:ecs:*:*:task-definition/${var.ecs_task_definition_family}:*"
+          "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task-definition/${var.ecs_task_definition_family}:*"
         ]
         Condition = {
           ArnEquals = {
