@@ -27,6 +27,7 @@ from .utils import (
     generate_cost_summary,
     analyze_single_message,
     determine_optimal_k,
+    compute_fallback_k,
     create_multi_cluster_output,
     create_single_message_output,
     export_multi_cluster_results,
@@ -213,7 +214,7 @@ class HierarchicalDiscoveryOrchestrator:
             n_clusters = determine_optimal_k(dataset_size, embeddings_array, self.config, self.output_paths)
         except Exception as e:
             logger.error(f"Optimal k selection failed: {e}")
-            n_clusters = min(15, max(5, dataset_size // 10))
+            n_clusters = compute_fallback_k(dataset_size)
             logger.warning(f"Using fallback k={n_clusters}")
 
         logger.info(f"Selected cluster count: {n_clusters}")

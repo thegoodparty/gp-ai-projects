@@ -41,12 +41,10 @@ class DimensionalityReducer:
             logger.warning("No embedded messages to reduce")
             return []
 
-        # Separate opt-out messages (no embeddings) from substantive messages
         substantive_messages = []
         opt_out_messages = []
-        substantive_indices = []
 
-        for i, msg in enumerate(embedded_messages):
+        for msg in embedded_messages:
             is_opt_out = getattr(msg, 'is_opt_out', False)
             has_embedding = hasattr(msg.embeddings, 'embedding_3072d') and msg.embeddings.embedding_3072d is not None
 
@@ -54,7 +52,6 @@ class DimensionalityReducer:
                 opt_out_messages.append(msg)
             else:
                 substantive_messages.append(msg)
-                substantive_indices.append(i)
 
         if opt_out_messages:
             logger.info(f"Skipping dimensionality reduction for {len(opt_out_messages)} non-substantive messages")

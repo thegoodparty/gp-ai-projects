@@ -47,14 +47,13 @@ class MultiClusterAnalyzer:
         self.config = config
         analysis_config = getattr(config, 'analysis', {})
         llm_config = analysis_config.get('llm_config', {})
-        multi_cluster_config = analysis_config.get('multi_cluster', {})
 
         self.llm_client = Gemini3Client(
             default_model=GeminiModelType.FLASH_3,
             default_temperature=llm_config.get('temperature', 0.0),
             thinking_level=ThinkingLevel.MINIMAL,
-            max_connections=multi_cluster_config.get('max_connections', 25),
-            max_keepalive_connections=multi_cluster_config.get('max_keepalive_connections', 10)
+            max_connections=llm_config.get('max_connections', 25),
+            max_keepalive_connections=llm_config.get('max_keepalive_connections', 10)
         )
 
         environment = os.getenv("ENVIRONMENT", "local")
@@ -64,10 +63,10 @@ class MultiClusterAnalyzer:
         self.max_example_messages = analysis_config.get('max_example_messages', 30)
         self.save_example_messages = analysis_config.get('save_example_messages', 5)
 
-        self.chunk_size = multi_cluster_config.get('chunk_size', 5)
-        self.delay_between_runs = multi_cluster_config.get('delay_between_runs', 5.0)
-        self.delay_between_clusters = multi_cluster_config.get('delay_between_clusters', 0.2)
-        self.delay_between_chunks = multi_cluster_config.get('delay_between_chunks', 1.0)
+        self.chunk_size = 5
+        self.delay_between_runs = 5.0
+        self.delay_between_clusters = 0.2
+        self.delay_between_chunks = 1.0
 
     def __enter__(self):
         return self

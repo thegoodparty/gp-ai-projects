@@ -243,7 +243,7 @@ class EmbeddingGenerator:
                     embeddings=embedding_data,
                     campaign_source=atomic_message.campaign_source,
                     metadata=atomic_message.metadata,
-                    is_opt_out=getattr(atomic_message, 'is_opt_out', False),
+                    is_opt_out=is_opt_out,
                     created_at=datetime.now()
                 )
                 embedded_messages.append(embedded_message)

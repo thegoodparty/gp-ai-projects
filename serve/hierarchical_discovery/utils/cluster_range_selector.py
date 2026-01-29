@@ -6,6 +6,11 @@ from shared.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def compute_fallback_k(dataset_size: int) -> int:
+    """Compute fallback cluster count when optimal k selection fails."""
+    return min(15, max(5, dataset_size // 10))
+
 def determine_optimal_k(
     dataset_size: int,
     embeddings: np.ndarray,
@@ -90,8 +95,7 @@ def determine_optimal_k(
 
     if not optimal_k:
         logger.error("Optimal k finder failed to find valid k value!")
-        # Fallback to a reasonable default
-        optimal_k = min(15, max(5, dataset_size // 10))
+        optimal_k = compute_fallback_k(dataset_size)
         logger.warning(f"Using fallback k={optimal_k}")
 
     logger.info("=" * 60)
