@@ -1,18 +1,17 @@
-name: Build and Push DDHQ Matcher
+name: Build and Push Engineer Agent
 
 on:
   push:
     branches:
-      - main
       - develop
       - qa
-    tags:
-      - 'v*'
+      - prod
     paths:
-      - 'hubspot_ddhq_match/**'
+      - 'engineer_agent/**'
       - 'shared/**'
       - 'pyproject.toml'
       - 'uv.lock'
+      - '.github/workflows/build-engineer-agent.yml'
   workflow_dispatch:
     inputs:
       environment:
@@ -53,22 +52,19 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             ENV="${{ github.event.inputs.environment }}"
-            TAG="ddhq-matcher-${ENV}"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAG="ddhq-matcher-${GITHUB_REF#refs/tags/}"
-            ENV="prod"
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            TAG="ddhq-matcher-prod"
+            TAG="engineer-agent-${ENV}"
+          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
+            TAG="engineer-agent-prod"
             ENV="prod"
           elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
-            TAG="ddhq-matcher-qa"
+            TAG="engineer-agent-qa"
             ENV="qa"
           elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
-            TAG="ddhq-matcher-dev"
+            TAG="engineer-agent-dev"
             ENV="dev"
           else
-            TAG="ddhq-matcher-${GITHUB_SHA::8}"
-            ENV="dev"
+            echo "ERROR: Workflow triggered from unexpected branch: ${{ github.ref }}"
+            exit 1
           fi
 
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
@@ -89,21 +85,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./hubspot_ddhq_match/deployment/Dockerfile
+          file: ./engineer_agent/Dockerfile
           platforms: linux/arm64
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:ddhq-matcher-latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:engineer-agent-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
 
       - name: Image digest
-        run: echo "Image pushed with tags ${{ steps.env.outputs.tag }} and ddhq-matcher-latest"
-
-      - name: Update ECS task definition (optional)
-        if: steps.env.outputs.environment == 'dev'
-        run: |
-          echo "Optionally trigger ECS task definition update here"
-          echo "Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}"
+        run: echo "Image pushed with tags ${{ steps.env.outputs.tag }} and engineer-agent-latest"
