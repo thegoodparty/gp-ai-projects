@@ -18,6 +18,7 @@ from serve.v1_pipeline.models.events import (
     PollAnalysisCompleteData,
     PollAnalysisCompleteEvent,
     PollIssueAnalysisData,
+    PollIssueAnalysisEvent,
 )
 from serve.v1_pipeline.models.unified_record import UnifiedCampaignRecord
 from shared.logger import get_logger
@@ -102,18 +103,24 @@ class SQSEventPublisher:
             unique_respondents = len(set(record.phone_number for record in records))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
-            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues, responses_location)
+            # Add individual issue events first
+            for issue_data in poll_issues:
+                issue_event = PollIssueAnalysisEvent(data=issue_data)
+                all_events.append(issue_event.to_json())
+
+            # Then add the completion event
+            complete_event = self._build_complete_event(poll_id, unique_respondents, responses_location)
             all_events.append(complete_event.to_json())
 
             if self.publish_to_sqs:
                 try:
-                    self._send_to_sqs(complete_event)
-                    logger.info("  ✅ Completion event - sent to SQS + saved locally")
+                    self._send_to_sqs(all_events, poll_id)
+                    logger.info("  ✅ Events sent to SQS + saved locally")
                 except Exception as e:
                     logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
-                    logger.info("  ✅ Completion event - saved locally only")
+                    logger.info("  ✅ Events saved locally only")
             else:
-                logger.info("  ✅ Completion event - saved locally")
+                logger.info("  ✅ Events saved locally")
 
             total_complete_events += 1
 
@@ -184,14 +191,13 @@ class SQSEventPublisher:
 
         return ranked[:self.top_n]
 
-    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData], responses_location: str = "") -> PollAnalysisCompleteEvent:
+    def _build_complete_event(self, poll_id: str, total_responses: int, responses_location: str = "") -> PollAnalysisCompleteEvent:
         return PollAnalysisCompleteEvent(
             type='pollAnalysisComplete',
             data=PollAnalysisCompleteData(
                 pollId=poll_id,
                 totalResponses=total_responses,
                 responsesLocation=responses_location,
-                issues=issues
             )
         )
 
@@ -202,12 +208,12 @@ class SQSEventPublisher:
         """
         logger.info(f"Publishing empty poll completion event for poll_id: {poll_id}")
 
-        complete_event = self._build_complete_event(poll_id, total_responses=0, issues=[])
+        complete_event = self._build_complete_event(poll_id, total_responses=0)
         events = [complete_event.to_json()]
 
         if self.publish_to_sqs:
             try:
-                self._send_to_sqs(complete_event)
+                self._send_to_sqs(events, poll_id)
                 logger.info("  ✅ Empty poll completion event - sent to SQS + saved locally")
             except Exception as e:
                 logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
@@ -244,23 +250,23 @@ class SQSEventPublisher:
             logger.error(f"Failed to save events locally: {e}", exc_info=True)
             raise
 
-    def _send_to_sqs(self, event: PollAnalysisCompleteEvent) -> None:
-        """Send event to SQS FIFO queue with proper MessageGroupId"""
+    def _send_to_sqs(self, events: list[dict], poll_id: str) -> None:
+        """Send events array to SQS FIFO queue with proper MessageGroupId"""
         if not self.publish_to_sqs or not self.sqs_client:
             logger.warning("SQS publishing disabled but _send_to_sqs called")
             return
         import uuid
 
-        message_body = json.dumps(event.to_json())
+        message_body = json.dumps(events)
 
         try:
             response = self.sqs_client.send_message(
                 QueueUrl=self.queue_url,
                 MessageBody=message_body,
-                MessageGroupId=f"gp-queue-polls-{event.data.pollId}",
+                MessageGroupId=f"gp-queue-polls-{poll_id}",
                 MessageDeduplicationId=str(uuid.uuid4())  # Unique per message
             )
-            logger.debug(f"Sent {event.type} to SQS: MessageId={response['MessageId']}")
+            logger.debug(f"Sent {len(events)} events to SQS: MessageId={response['MessageId']}")
         except Exception as e:
-            logger.error(f"Failed to send {event.type} to SQS: {e}", exc_info=True)
+            logger.error(f"Failed to send events to SQS: {e}", exc_info=True)
             raise
