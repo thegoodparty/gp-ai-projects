@@ -42,7 +42,8 @@ class Gemini3Client:
         max_connections: int = 100,
         max_keepalive_connections: int = 20,
         max_retries: int = 3,
-        base_delay: float = 1.0
+        base_delay: float = 1.0,
+        call_timeout: Optional[float] = 120.0
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
@@ -54,6 +55,7 @@ class Gemini3Client:
         self.include_thoughts = include_thoughts
         self.max_retries = max_retries
         self.base_delay = base_delay
+        self.call_timeout = call_timeout
 
         http_options = types.HttpOptions(
             client_args={
@@ -80,7 +82,7 @@ class Gemini3Client:
         self.total_cost = 0.0
         self.api_call_count = 0
 
-        self.logger.info(f"Gemini3Client initialized: model={default_model.value}, thinking={thinking_level.value}, connections={max_connections}")
+        self.logger.info(f"Gemini3Client initialized: model={default_model.value}, thinking={thinking_level.value}, connections={max_connections}, timeout={call_timeout}s")
 
     def _build_config(
         self,
@@ -102,12 +104,14 @@ class Gemini3Client:
             ThinkingLevel.HIGH: types.ThinkingLevel.HIGH,
         }
 
+        timeout_ms = int((self.call_timeout or 120.0) * 1000)
         return types.GenerateContentConfig(
             temperature=temperature if temperature is not None else self.default_temperature,
             thinking_config=types.ThinkingConfig(
                 thinkingLevel=level_map[level],
                 includeThoughts=thoughts
-            )
+            ),
+            http_options=types.HttpOptions(timeout=timeout_ms)
         )
 
     def _calculate_cost(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> float:

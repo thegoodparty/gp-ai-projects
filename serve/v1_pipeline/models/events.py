@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 class PollIssueAnalysisData:
     pollId: str
     rank: int
+    clusterId: int
     theme: str
     summary: str
     analysis: str
@@ -17,6 +18,7 @@ class PollIssueAnalysisData:
 class PollAnalysisCompleteData:
     pollId: str
     totalResponses: int
+    responsesLocation: str
     issues: list[PollIssueAnalysisData]
 
 @dataclass

@@ -11,7 +11,7 @@ project_root = Path(__file__).resolve().parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -195,10 +195,12 @@ async def recommend_top_clusters_via_llm(unified_records, config: dict[str, Any]
 
     prompt = _create_evaluation_prompt(filtered_summary)
 
-    llm_client = GeminiClient(
-        default_model=GeminiModelType.FLASH if llm_model.lower() == 'flash' else GeminiModelType.PRO,
+    model = GeminiModelType.FLASH_3 if llm_model.lower() == 'flash' else GeminiModelType.PRO_3
+    thinking_level = ThinkingLevel.MINIMAL if model == GeminiModelType.FLASH_3 else ThinkingLevel.LOW
+    llm_client = Gemini3Client(
+        default_model=model,
         default_temperature=temperature,
-        thinking_budget=0
+        thinking_level=thinking_level
     )
 
     try:

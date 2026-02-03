@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 sys.path.append(str(Path(__file__).parent.parent.parent.parent))
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from serve.analyze_texts.models import MessageRecord, FilterStats
 
 logger = get_logger(__name__)
@@ -42,10 +42,10 @@ class MessageFilter:
         llm_config = llm_config or {}
         max_connections = llm_config.get("max_connections", 400)
 
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=llm_config.get("temperature", 0.0),
-            thinking_budget=llm_config.get("thinking_budget", 0),
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=max_connections,
             max_keepalive_connections=max_connections // 4
         )

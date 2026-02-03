@@ -48,13 +48,15 @@ class SQSEventPublisher:
         # Common configuration
         self.top_n = config.get('publish_top_n', 3)
         self.min_respondents = config.get('min_unique_respondents', 1)
+        self.s3_output_path = config.get('s3_output_path', os.getenv('S3_OUTPUT_PATH', ''))
 
         logger.info("Event Publisher initialized")
         logger.info(f"  Output directory: {self.output_dir}")
+        logger.info(f"  S3 output path: {self.s3_output_path}")
         logger.info(f"  Top N clusters: {self.top_n}")
         logger.info(f"  Min unique respondents: {self.min_respondents}")
 
-    async def publish_events(self, unified_records: list[UnifiedCampaignRecord]) -> dict[str, Any]:
+    async def publish_events(self, unified_records: list[UnifiedCampaignRecord], campaign_name: str = "") -> dict[str, Any]:
         polls = defaultdict(list)
         for record in unified_records:
             if record.poll_id:
@@ -62,6 +64,14 @@ class SQSEventPublisher:
 
         total_complete_events = 0
         all_events = []
+
+        responses_location = ""
+        if campaign_name and self.s3_output_path:
+            if self.s3_output_path.startswith("s3://"):
+                s3_prefix = "/".join(self.s3_output_path.split("/")[3:]).rstrip("/")
+            else:
+                s3_prefix = self.s3_output_path.rstrip("/")
+            responses_location = f"{s3_prefix}/consolidated/{campaign_name}_all_cluster_analysis.json"
 
         for poll_id, records in polls.items():
             poll_issues = []
@@ -78,6 +88,7 @@ class SQSEventPublisher:
                     PollIssueAnalysisData(
                         pollId=poll_id,
                         rank=rank,
+                        clusterId=cluster_data['cluster_id'],
                         theme=cluster_data['theme'],
                         summary=cluster_data['summary'],
                         analysis=cluster_data['analysis'],
@@ -91,12 +102,16 @@ class SQSEventPublisher:
             unique_respondents = len(set(record.phone_number for record in records))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
-            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues)
+            complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues, responses_location)
             all_events.append(complete_event.to_json())
 
             if self.publish_to_sqs:
-                self._send_to_sqs(complete_event)
-                logger.info("  ✅ Completion event - sent to SQS + saved locally")
+                try:
+                    self._send_to_sqs(complete_event)
+                    logger.info("  ✅ Completion event - sent to SQS + saved locally")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
+                    logger.info("  ✅ Completion event - saved locally only")
             else:
                 logger.info("  ✅ Completion event - saved locally")
 
@@ -169,12 +184,13 @@ class SQSEventPublisher:
 
         return ranked[:self.top_n]
 
-    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData]) -> PollAnalysisCompleteEvent:
+    def _build_complete_event(self, poll_id: str, total_responses: int, issues: list[PollIssueAnalysisData], responses_location: str = "") -> PollAnalysisCompleteEvent:
         return PollAnalysisCompleteEvent(
             type='pollAnalysisComplete',
             data=PollAnalysisCompleteData(
                 pollId=poll_id,
                 totalResponses=total_responses,
+                responsesLocation=responses_location,
                 issues=issues
             )
         )
@@ -190,8 +206,12 @@ class SQSEventPublisher:
         events = [complete_event.to_json()]
 
         if self.publish_to_sqs:
-            self._send_to_sqs(complete_event)
-            logger.info("  ✅ Empty poll completion event - sent to SQS + saved locally")
+            try:
+                self._send_to_sqs(complete_event)
+                logger.info("  ✅ Empty poll completion event - sent to SQS + saved locally")
+            except Exception as e:
+                logger.warning(f"  ⚠️ SQS send failed (continuing): {e}")
+                logger.info("  ✅ Empty poll completion event - saved locally only")
         else:
             logger.info("  ✅ Empty poll completion event - saved locally")
 

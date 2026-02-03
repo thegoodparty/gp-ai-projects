@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from ..models import FilteredMessage, AtomicMessage, PipelineConfig
 
 logger = get_logger(__name__)
@@ -36,10 +36,10 @@ class AIMessageProcessor:
         self.ai_config = config.ai_processing
 
         # High-throughput LLM client configuration
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=0.0,
-            thinking_budget=0,
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=self.ai_config.get("llm_batch_size", 50),
             max_keepalive_connections=25
         )
@@ -126,9 +126,26 @@ INSTRUCTIONS:
     async def process_message_async(self, filtered_message: FilteredMessage, index: int) -> List[AtomicMessage]:
         """Process a single message with AI using structured outputs"""
         try:
-            # Skip if already filtered out
+            # Handle non-substantive messages (opt-out, emoji, too-long) - pass through without AI processing
             if not filtered_message.filter_result.passed:
-                return []
+                filter_reasons = filtered_message.filter_result.reasons
+                is_opt_out = any("STOP" in r or "opt-out" in r for r in filter_reasons)
+
+                return [AtomicMessage(
+                    id=str(uuid.uuid4()),
+                    parent_message_id=filtered_message.original_message_id,
+                    csv_file=filtered_message.csv_file,
+                    csv_row_index=filtered_message.csv_row_index,
+                    atomic_text=filtered_message.original_text,
+                    processed_text=filtered_message.original_text,
+                    original_text=filtered_message.original_text,
+                    campaign_source=filtered_message.campaign_source,
+                    metadata=filtered_message.metadata,
+                    is_opt_out=is_opt_out,
+                    was_filtered=True,
+                    filter_reasons=filter_reasons,
+                    created_at=datetime.now()
+                )]
 
             message_text = filtered_message.filtered_text
             if not message_text or not message_text.strip():
@@ -231,16 +248,14 @@ INSTRUCTIONS:
 
         logger.info(f"Starting AI processing of {len(filtered_messages)} messages")
 
-        # Filter to only passed messages
-        passed_messages = [msg for msg in filtered_messages if msg.filter_result.passed]
-        logger.info(f"Processing {len(passed_messages)} messages that passed content filtering")
+        # Process ALL messages - non-substantive ones pass through with flags
+        passed_count = sum(1 for msg in filtered_messages if msg.filter_result.passed)
+        non_substantive_count = len(filtered_messages) - passed_count
+        logger.info(f"Processing {passed_count} substantive messages + {non_substantive_count} non-substantive (pass-through)")
 
-        if not passed_messages:
-            return []
-
-        # Create individual task for every message
+        # Create individual task for every message (both passed and non-passed)
         all_tasks = []
-        for idx, message in enumerate(passed_messages):
+        for idx, message in enumerate(filtered_messages):
             task = self.process_message_async(message, idx)
             all_tasks.append(task)
 

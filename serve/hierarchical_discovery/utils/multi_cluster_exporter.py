@@ -27,7 +27,8 @@ async def export_multi_cluster_results(consolidated_result, output_paths):
             'sent_at': msg['sent_at'],
             'original_text': msg['original_text'],
             'processed_text': msg['processed_text'],
-            'campaign_source': msg['campaign_source']
+            'campaign_source': msg['campaign_source'],
+            'is_opt_out': msg.get('is_opt_out', False)
         }
 
         for cluster_count in consolidated_result['cluster_ranges']:
