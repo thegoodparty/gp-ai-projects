@@ -32,6 +32,7 @@ class PollAnalysisCompleteData:
     pollId: str
     totalResponses: int
     responsesLocation: str
+    issues: list[PollIssueAnalysisData]
 
 
 @dataclass
