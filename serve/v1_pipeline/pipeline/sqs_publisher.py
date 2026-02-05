@@ -99,7 +99,7 @@ class SQSEventPublisher:
 
                 logger.info(f"  ✅ Rank {rank}: {cluster_data['theme']} ({cluster_data['responseCount']} respondents) - saved locally")
 
-            unique_respondents = len(set(record.phone_number for record in records))
+            unique_respondents = len(set(record.phone_number for record in records if not record.is_opt_out))
             logger.info(f"  Total unique respondents: {unique_respondents} (from {len(records)} atomic messages)")
 
             complete_event = self._build_complete_event(poll_id, unique_respondents, poll_issues, responses_location)
