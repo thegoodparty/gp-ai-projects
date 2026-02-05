@@ -95,15 +95,6 @@ phone_number,message_text
 | `campaign_name` | `Campaign Name` | No | Campaign display name |
 | `carrier` | `Carrier` | No | Mobile carrier |
 
-**Optional Demographics:**
-- `voters_age`, `age_group`, `location`, `ward`
-- `voters_gender`, `voting_performance_category`
-- `residence_addresses_city` (→ `residence_city`)
-- `homeowner_status`, `business_owner`
-- `has_children_under_18`, `education_level`, `income_level`
-
-All demographic fields default to "Unknown" if not provided.
-
 ### Example CSV
 
 ```csv
@@ -123,8 +114,6 @@ serve/v1_pipeline/
 │       ├── discovery_reports/                        # Hierarchical discovery analysis
 │       │   ├── separation_first_optimal_k_*.md      # Optimal k selection report
 │       │   └── k_comparison_table_*.csv             # K-value comparison table
-│       ├── dynamodb_preview/                         # CSV exports with quotes
-│       │   └── berkley_dynamodb_records_*.csv       # ⭐ Includes quotes field
 │       └── events/                                   # 🎯 Primary output for API
 │           └── events_*.json                         # SQS/API event payloads
 └── logs/
@@ -170,18 +159,7 @@ Ready for SQS publishing or API consumption:
 ]
 ```
 
-**2. DynamoDB Records CSV**
-
-Preview/analysis CSV with all fields including quotes:
-
-```csv
-"campaign_id","poll_id","record_id","phone_number","message","atomic_message","theme","summary","analysis","quotes","category","sentiment",...
-"berkley","berkley-R1","discover#2485619334#uuid","2485619334","Side streets...","Side streets in the local area are in horrible shape.","Roads & Street Maintenance","Citizens express...","Detailed analysis...","Side streets... [2485619334]; My street... [2487211260]","Infrastructure","frustrated"
-```
-
-**Recent Improvement:** ✨ Quotes field now included with phone attribution
-
-**3. Comprehensive Cluster Analysis CSV**
+**2. Comprehensive Cluster Analysis CSV**
 
 All atomic messages with multi-cluster assignments (k=5 through k=50):
 - Used for analysis and comparison
@@ -212,8 +190,7 @@ All atomic messages with multi-cluster assignments (k=5 through k=50):
 🔗 Stage 3: Data Merging (0.1s)
      ├─ Match clustering by atomic_id (342 matches)
      ├─ Create UnifiedCampaignRecord objects
-     ├─ Export comprehensive cluster analysis CSV
-     └─ Export dynamodb_preview CSV with quotes
+     └─ Export comprehensive cluster analysis CSV
      ↓
 🏆 Stage 3.5: LLM Cluster Recommendations (4s, optional)
      ├─ Aggregate cluster statistics
@@ -351,7 +328,6 @@ ENVIRONMENT=development ./serve/v1_pipeline/local_dev.sh berkley
 
 # Check outputs
 cat serve/v1_pipeline/output/consolidated/events/events_*.json
-head serve/v1_pipeline/output/consolidated/dynamodb_preview/berkley_*.csv
 ```
 
 ### Docker Compose
@@ -417,8 +393,6 @@ grep "PIPELINE RESULTS" serve/v1_pipeline/logs/pipeline.log
 ## Recent Updates
 
 ### v1.1 (October 2025)
-- ✨ Added quotes field to DynamoDB preview CSV with phone attribution
-- ✨ Improved CSV quoting (QUOTE_ALL) for proper parsing
 - ✨ Enhanced metrics reporting with message expansion tracking
 - ✨ Fixed output path resolution for local development
 - 📊 Clarified success rate calculation (output/atomic vs output/input)

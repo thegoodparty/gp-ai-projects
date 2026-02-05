@@ -7,7 +7,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from ..models import ClusteredMessage, ClusterTheme, PipelineConfig
 from pydantic import BaseModel, Field
 
@@ -41,10 +41,10 @@ class ClusterMerger:
         self.similarity_threshold = self.merger_config.get('similarity_threshold', 0.8)
         self.max_workers = self.merger_config.get('max_workers', 10)
 
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=0.0,
-            thinking_budget=0,
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=self.max_workers,
             max_keepalive_connections=max(1, self.max_workers // 4)
         )

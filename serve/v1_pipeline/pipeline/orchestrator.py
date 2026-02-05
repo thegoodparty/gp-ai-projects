@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +22,6 @@ from serve.v1_pipeline.adapters.clustering_adapter import ClusteringAdapter
 
 # Import models
 from serve.v1_pipeline.models.unified_record import (
-    ClusteringResult,
     ConsolidatedMessage,
     PipelineResult,
     UnifiedCampaignRecord,
@@ -190,25 +190,6 @@ class V1PipelineOrchestrator:
             logger.error(f"Failed to initialize components: {e}", exc_info=True)
             raise
 
-    def _normalize_phone_number(self, phone: str) -> str:
-        """Normalize phone number to digits only (remove formatting)"""
-        import re
-        original = str(phone)
-        normalized = re.sub(r'[^0-9]', '', original)
-        if len(normalized) == 11 and normalized.startswith('1'):
-            normalized = normalized[1:]
-
-        if not normalized:
-            raise ValueError(f"Phone number cannot be empty after normalization: '{original}'")
-
-        if len(normalized) != 10:
-            raise ValueError(f"Invalid phone number length ({len(normalized)} digits): '{original}' → '{normalized}'")
-
-        if original != normalized and normalized:
-            logger.debug(f"Phone normalized: '{original}' → '{normalized}'")
-
-        return normalized
-
     def _convert_to_consolidated_messages(self, df: pd.DataFrame, campaign_name: str, poll_id: str | None = None) -> list[ConsolidatedMessage]:
         """
         Convert consolidated DataFrame to ConsolidatedMessage objects
@@ -220,7 +201,7 @@ class V1PipelineOrchestrator:
         for _, row in df.iterrows():
             try:
                 sent_at_raw = row.get('sent_at', row.get('Sent At', None))
-                sent_at = datetime.utcnow()
+                sent_at = datetime.now(timezone.utc)
 
                 if pd.notna(sent_at_raw) and sent_at_raw:
                     try:
@@ -231,8 +212,7 @@ class V1PipelineOrchestrator:
                         pass
 
                 # Handle both old format (Contact Phone Number) and new format (phone_number)
-                phone_number_raw = str(row.get('phone_number', row.get('Contact Phone Number', '')))
-                phone_number = self._normalize_phone_number(phone_number_raw)
+                phone_number = str(row.get('phone_number', row.get('Contact Phone Number', ''))).strip()
 
                 # Required: message_text
                 message_text = str(row.get('message_text', row.get('Message Text', '')))
@@ -252,38 +232,11 @@ class V1PipelineOrchestrator:
                 # Optional: round (default to 'R1' if missing)
                 round_val = str(row.get('round', 'R1'))
 
-                # Demographics - all optional
-                age = None
-                if pd.notna(row.get('voters_age')):
-                    try:
-                        age = int(row['voters_age'])
-                    except (ValueError, TypeError):
-                        age = None
-
                 message = ConsolidatedMessage(
-                    # Required fields
                     phone_number=phone_number,
                     message_text=message_text,
                     sent_at=sent_at,
                     round=round_val,
-
-                    # Demographics (all optional with defaults)
-                    age=age,
-                    age_group=str(row.get('age_group', 'Unknown')),
-                    location=str(row.get('location', 'Unknown')),
-                    ward=str(row.get('ward')) if pd.notna(row.get('ward')) else None,
-                    voters_gender=str(row.get('voters_gender')) if pd.notna(row.get('voters_gender')) else None,
-                    voting_performance_category=str(row.get('voting_performance_category', 'Unknown')),
-                    residence_city=str(row.get('residence_addresses_city', 'Unknown')),
-
-                    # Placeholders (all optional with defaults)
-                    homeowner_status=str(row.get('homeowner_status', 'Unknown')),
-                    business_owner=str(row.get('business_owner', 'Unknown')),
-                    has_children_under_18=str(row.get('has_children_under_18', 'Unknown')),
-                    education_level=str(row.get('education_level', 'Unknown')),
-                    income_level=str(row.get('income_level', 'Unknown')),
-
-                    # Message metadata (all optional)
                     campaign_id=campaign_name,
                     campaign_name=str(row.get('Campaign Name', campaign_name)),
                     carrier=str(row.get('Carrier')) if pd.notna(row.get('Carrier')) else None,
@@ -479,10 +432,6 @@ class V1PipelineOrchestrator:
                     if not self.config.get('top_clusters', {}).get('skip_on_error', True):
                         raise
 
-            # Stage 3.75: Export DynamoDB Records to CSV
-            logger.info("📤 Stage 3.75: Export DynamoDB Records Preview")
-            self._export_dynamodb_records_csv(unified_records, campaign_name)
-
             # At this point, all stages completed successfully
             # Stage 4: Event Saving to S3 (validation mode - only runs on successful pipeline completion)
             sqs_result = {}
@@ -511,7 +460,7 @@ class V1PipelineOrchestrator:
                     }
                 else:
                     # Normal flow - publish events from unified records
-                    sqs_stats = await self.sqs_publisher.publish_events(unified_records)
+                    sqs_stats = await self.sqs_publisher.publish_events(unified_records, campaign_name)
 
                 sqs_time = time.time() - sqs_start
 
@@ -760,8 +709,8 @@ class V1PipelineOrchestrator:
 
     def _export_comprehensive_csv(self, unified_records: list[UnifiedCampaignRecord], csv_file_path: Path) -> None:
         """
-        Export comprehensive CSV with all cluster configurations
-        One row per atomic message with cluster data for all k values
+        Export CSV with atomic messages and cluster data
+        One row per atomic message with single cluster assignment
         """
         import csv
 
@@ -769,124 +718,56 @@ class V1PipelineOrchestrator:
             logger.warning("No unified records to export")
             return
 
-        all_cluster_counts: set[str] = set()
-        for record in unified_records:
-            if record.multi_cluster_data:
-                all_cluster_counts.update(record.multi_cluster_data.keys())
-
-        cluster_counts = sorted(all_cluster_counts, key=lambda x: int(x) if x.isdigit() else float('inf'))
-        logger.info(f"Cluster configurations in export: {cluster_counts}")
-
         csv_rows = []
         for record in unified_records:
             row = {
-                'atomic_id': record.atomic_id,
-                'phone_number': record.phone_number,
-                'original_message': record.original_message if record.original_message else record.message_text,
-                'atomic_message': record.atomic_message if record.atomic_message else record.message_text,
-                'poll_id': record.poll_id or record.campaign_id,
-                'round': record.round,
-                'age': record.age or '',
-                'location': record.location or '',
-                'ward': record.ward or '',
-                'gender': record.voters_gender or '',
-                'voting_performance': record.voting_performance_category or '',
-                'homeowner': record.homeowner_status or '',
-                'income': record.income_level or '',
-                'education': record.education_level or '',
+                'atomicId': record.atomic_id,
+                'phoneNumber': record.phone_number,
+                'receivedAt': record.sent_at.isoformat() if record.sent_at else '',
+                'originalMessage': record.original_message or record.message_text,
+                'atomicMessage': record.atomic_message if record.atomic_message else record.message_text,
+                'pollId': record.poll_id or record.campaign_id,
+                'clusterId': '',
+                'theme': '',
+                'category': '',
+                'summary': '',
+                'sentiment': '',
+                'isOptOut': record.is_opt_out,
             }
 
-            for cluster_count in cluster_counts:
-                cluster_data = record.multi_cluster_data.get(cluster_count, {}) if record.multi_cluster_data else {}
+            if record.is_opt_out:
+                row['theme'] = 'Opt Out Request'
+            else:
+                cluster_data = {}
+                if record.multi_cluster_data:
+                    first_key = next(iter(record.multi_cluster_data.keys()), None)
+                    if first_key:
+                        cluster_data = record.multi_cluster_data[first_key]
 
                 cluster_id = cluster_data.get('cluster_id', -1)
-                row[f'k{cluster_count}_cluster_id'] = cluster_id if cluster_id != -1 else ''
-                row[f'k{cluster_count}_theme'] = cluster_data.get('cluster_theme', '')
-                row[f'k{cluster_count}_category'] = cluster_data.get('cluster_category', '')
-                row[f'k{cluster_count}_summary'] = cluster_data.get('issues_summary', '')
-                row[f'k{cluster_count}_sentiment'] = cluster_data.get('cluster_sentiment', '')
+                row['clusterId'] = cluster_id if cluster_id != -1 else ''
+                row['theme'] = cluster_data.get('cluster_theme', '')
+                row['category'] = cluster_data.get('cluster_category', '')
+                row['summary'] = cluster_data.get('issues_summary', '')
+                row['sentiment'] = cluster_data.get('cluster_sentiment', '')
 
             csv_rows.append(row)
 
         if csv_rows:
-            fieldnames = list(csv_rows[0].keys())
+            fieldnames = ['atomicId', 'phoneNumber', 'receivedAt', 'originalMessage', 'atomicMessage', 'pollId', 'clusterId', 'theme', 'category', 'summary', 'sentiment', 'isOptOut']
             with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(csv_rows)
 
-            logger.info(f"Exported {len(csv_rows)} atomic messages with {len(cluster_counts)} cluster configurations")
+            json_file_path = csv_file_path.with_suffix('.json')
+            with open(json_file_path, 'w', encoding='utf-8') as f:
+                json.dump(csv_rows, f, indent=2)
+
+            logger.info(f"Exported {len(csv_rows)} atomic messages (CSV + JSON)")
         else:
             logger.warning("No CSV rows to write")
 
-    def _export_dynamodb_records_csv(self, unified_records: list[UnifiedCampaignRecord], campaign_name: str) -> None:
-        """Export DynamoDB records as CSV for inspection before upload"""
-        import csv
-        from datetime import datetime
-
-        try:
-            if not self.output_dir:
-                raise ValueError("Output directory not configured")
-            output_dir = Path(self.output_dir) / "dynamodb_preview"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            csv_file = output_dir / f"{campaign_name}_dynamodb_records_{timestamp}.csv"
-
-            if not unified_records:
-                logger.warning("No unified records to export")
-                return
-
-            rows = []
-            for record in unified_records:
-                cluster_data = {}
-                if record.multi_cluster_data:
-                    cluster_data = next(iter(record.multi_cluster_data.values()))
-
-                quotes_list = cluster_data.get('quotes', [])
-                quotes_formatted = '; '.join([
-                    f"{q.get('quote', '')} [{q.get('phone_number', '')}]"
-                    for q in quotes_list
-                ]) if quotes_list else ''
-
-                row = {
-                    'campaign_id': record.campaign_id,
-                    'poll_id': record.poll_id or record.campaign_id,
-                    'record_id': f"discover#{record.phone_number}#{record.atomic_id}",
-                    'record_type': 'discover',
-                    'phone_number': record.phone_number,
-                    'atomic_id': record.atomic_id,
-                    'message': record.original_message if record.original_message else record.message_text,
-                    'atomic_message': record.atomic_message if record.atomic_message else record.message_text,
-                    'theme': cluster_data.get('cluster_theme', ''),
-                    'summary': cluster_data.get('issues_summary', ''),
-                    'analysis': cluster_data.get('detailed_analysis', ''),
-                    'quotes': quotes_formatted,
-                    'category': cluster_data.get('cluster_category', ''),
-                    'sentiment': cluster_data.get('cluster_sentiment', ''),
-                    'age': record.age or '',
-                    'location': record.location or 'Unknown',
-                    'income': record.income_level or 'Unknown',
-                    'homeowner': record.homeowner_status or 'Unknown',
-                    'business_owner': record.business_owner or 'Unknown',
-                    'families_with_children': record.has_children_under_18 or 'Unknown',
-                    'education_level': record.education_level or 'Unknown',
-                }
-                rows.append(row)
-
-            if rows:
-                fieldnames = list(rows[0].keys())
-                with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-                    writer.writeheader()
-                    writer.writerows(rows)
-
-                logger.info(f"💾 Exported {len(rows)} DynamoDB records to: {csv_file}")
-            else:
-                logger.warning("No rows to export to DynamoDB preview CSV")
-
-        except Exception as e:
-            logger.warning(f"Failed to export DynamoDB records CSV: {e}")
 
 # Convenience function
 async def run_campaign_pipeline(campaign_name: str, config_path: str | None = None) -> PipelineResult:

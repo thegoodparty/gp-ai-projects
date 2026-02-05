@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
-from shared.llm_gemini import GeminiModelType
+from shared.llm_gemini_3 import GeminiModelType
 from shared.logger import get_logger
 
 from .models import EnrichedMessage, SmartCategorization
@@ -26,7 +26,7 @@ class BatchProcessingConfig:
     retry_delay: float = 0.1  # Faster retries
     enable_validation: bool = False  # Disable validation for speed
     checkpoint_interval: int = 500
-    model_type: GeminiModelType = GeminiModelType.FLASH
+    model_type: GeminiModelType = GeminiModelType.FLASH_3
     temperature: float = 0.0
     ultra_fast_mode: bool = True  # Enable all speed optimizations
     target_concurrency: int = 100  # Configurable LLM concurrency

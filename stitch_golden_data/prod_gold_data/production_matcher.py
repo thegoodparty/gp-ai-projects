@@ -5,20 +5,21 @@ This matcher is optimized for maximum throughput with Google's 10,000 RPM rate l
 Aggressive parallelization settings can achieve 50-100+ calls/second.
 
 USAGE EXAMPLES:
-# Standard aggressive processing (recommended)
-uv run stitch_golden_data/prod_gold_data/production_matcher.py --state CA --max-workers 150
+# Standard high-throughput processing (recommended)
+uv run stitch_golden_data/prod_gold_data/production_matcher.py --state CA --max-workers 1500
 
-# Maximum speed mode (use with caution - may hit rate limits)
-uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --max-workers 200 --max-concurrent-states 2
+# Maximum speed mode for all states
+uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --max-workers 1500 --max-concurrent-states 2
 
 # Conservative mode (if experiencing rate limiting)
-uv run stitch_golden_data/prod_gold_data/production_matcher.py --state DE --max-workers 50
+uv run stitch_golden_data/prod_gold_data/production_matcher.py --state DE --max-workers 150
 
 PERFORMANCE OPTIMIZATIONS:
-- 200-thread ThreadPoolExecutor for true concurrent API calls
-- Ultra-low embedding delays (0.02s vs 1.0s default)  
+- 1500-thread ThreadPoolExecutor for maximum concurrent API calls
+- 1200 max HTTP connections to Gemini API (300 keepalive)
+- Ultra-low embedding delays (0.02s vs 1.0s default)
 - 15 concurrent embedding batches vs 2 default
-- 100-150 concurrent record processing vs 10 default
+- 100-200 concurrent record processing vs 10 default
 - Optimized retry logic for faster failure handling
 """
 
@@ -31,7 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from shared.databricks_client import DatabricksClient
-from shared.llm_gemini import GeminiClient, GeminiModelType, GeminiEmbeddingClient
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
+from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
 from tqdm.asyncio import tqdm
 import time
@@ -69,11 +71,22 @@ class MatchingStats:
 class ProductionMatcher:
     """Production-ready matcher using pre-built vector stores for all states"""
     
-    def __init__(self, catalog="goodparty_data_catalog", br_schema="dbt", br_table="int__enhanced_position", max_workers=150):
+    def __init__(self, catalog="goodparty_data_catalog", br_schema="dbt", br_table="int__enhanced_position", max_workers=1500):
         self.logger = get_logger(__name__)
         self.databricks = DatabricksClient()
-        self.llm = GeminiClient()
-        self.embedding_client = GeminiEmbeddingClient(max_retries=9, base_delay=1.0)
+
+        # Configure LLM client with high concurrency matching DDHQ matcher
+        target_concurrency = 1200
+        self.llm = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
+            default_temperature=0.0,
+            thinking_level=ThinkingLevel.MINIMAL,
+            max_connections=target_concurrency,
+            max_keepalive_connections=target_concurrency // 4,  # 300 keepalive
+            max_retries=11,
+            base_delay=1.0
+        )
+        self.embedding_client = GeminiEmbeddingClient(max_retries=11, base_delay=1.0)
         self.max_workers = max_workers
         
         self.catalog = catalog
@@ -237,25 +250,30 @@ class ProductionMatcher:
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
     async def get_embeddings_for_queries(self, queries: List[str]) -> List[np.ndarray]:
-        """Get embeddings for multiple queries using optimized parallel processing"""
+        """Get embeddings for multiple queries - process individually to ensure consistency
+
+        CRITICAL: Gemini API returns different embeddings when batching queries together
+        vs sending them individually. To ensure consistency with the vector store
+        (which was built with batched embeddings), we process each query individually.
+        """
         if not queries:
             return []
-        
-        # Use aggressive parallel processing with dedicated thread pool
-        # With 10,000 RPM limit, we can be much more aggressive
-        embeddings = await asyncio.get_event_loop().run_in_executor(
-            self.thread_pool,
-            lambda: self.embedding_client.create_embeddings(
-                queries,
-                parallel=True,  # Always use parallel for better throughput
-                batch_size=25,  # Smaller batches for even faster response
-                max_concurrent_batches=15,  # Increased from 2 to 15
-                rate_limit_delay=0.02  # Ultra-low delay (50x faster than original)
+
+        # Process each query individually to avoid batch-dependent embedding variations
+        # This ensures consistent results with the vector store embeddings
+        embeddings = []
+        for query in queries:
+            embedding_result = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool,
+                lambda q=query: self.embedding_client.create_embeddings(
+                    [q],  # Single query at a time
+                    parallel=False,
+                    batch_size=1
+                )
             )
-        )
-        
-        # Return list of individual embedding arrays
-        return [embeddings[i] for i in range(len(queries))]
+            embeddings.append(embedding_result[0])
+
+        return embeddings
 
     async def get_top_embedding_matches(self, br_name: str, state: str, top_k: int = 13) -> List[EmbeddingDistrict]:
         """Get top embedding matches using race name and insert generic state search as 11th result"""
@@ -396,42 +414,24 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             },
             "required": ["selected_candidate_number", "selection_confidence", "reasoning"]
         }
-        
-        # Enhanced retry logic for data accuracy - retry 9 times  
-        max_retries = 9
-        base_delay = 1.0
-        
-        for attempt in range(max_retries):
-            try:
-                # Use dedicated thread pool for maximum LLM concurrency
-                response = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, 
-                    lambda: self.llm.generate_structured_content(
-                        prompt=prompt,
-                        response_schema=response_schema,
-                        model=GeminiModelType.FLASH,
-                        thinking_budget=200,
-                        temperature=0.0,
-                    )
+
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                self.thread_pool,
+                lambda: self.llm.generate_structured_content(
+                    prompt=prompt,
+                    response_schema=response_schema
                 )
-                break  # Success, exit retry loop
-                
-            except Exception as e:
-                # For transient errors, retry with exponential backoff
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    self.logger.warning(f"LLM attempt {attempt + 1}/{max_retries} failed for {br_name}: {e}. Retrying in {delay:.1f}s")
-                    await asyncio.sleep(delay)
-                else:
-                    # Final attempt failed
-                    self.logger.error(f"LLM failed after {max_retries} attempts for {br_name}: {e}")
-                    return LLMSelection(
-                        selected_district_name="LLM_ERROR",
-                        selected_district_type="LLM_ERROR",
-                        selection_confidence=0.0,
-                        selection_reasoning=f"LLM generation failed after {max_retries} attempts: {str(e)}",
-                        alternative_matches=None
-                    )
+            )
+        except Exception as e:
+            self.logger.error(f"LLM failed for {br_name}: {e}")
+            return LLMSelection(
+                selected_district_name="LLM_ERROR",
+                selected_district_type="LLM_ERROR",
+                selection_confidence=0.0,
+                selection_reasoning=f"LLM generation failed: {str(e)}",
+                alternative_matches=None
+            )
         
         # Handle potential float or invalid response
         try:
@@ -582,8 +582,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         # This enables aggressive concurrency within each batch
         start_time = time.time()
         
-        # Process in smaller groups to enable faster quota exhaustion detection
-        group_size = min(self.max_workers, 100)  # Optimized for 10,000 RPM throughput
+        # Process in larger groups for maximum throughput (matching DDHQ matcher)
+        group_size = min(self.max_workers, 200)  # Optimized for 10,000 RPM throughput
         results = []
         
         for i in range(0, len(tasks), group_size):
@@ -675,7 +675,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         self.stats.llm_cost = llm_stats['total_cost']
         self.stats.total_cost = self.stats.embedding_cost + self.stats.llm_cost
 
-    async def run_production_matching(self, states: Optional[List[str]] = None, limit: Optional[int] = None, batch_size: int = 100, output_filename: str = "production_matching_results.tsv") -> str:
+    async def run_production_matching(self, states: Optional[List[str]] = None, limit: Optional[int] = None, batch_size: int = 1000, output_filename: str = "production_matching_results.tsv") -> str:
         """Run production matching on BR database"""
         
         self.logger.info(f"\n{'='*80}")
@@ -911,7 +911,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             'tsv': tsv_path
         }
 
-    async def run_all_states_individual(self, batch_size: int = 100, output_prefix: str = "state_matching", max_concurrent_states: int = 3) -> Dict[str, str]:
+    async def run_all_states_individual(self, batch_size: int = 1000, output_prefix: str = "state_matching", max_concurrent_states: int = 3) -> Dict[str, str]:
         """Run production matching for all available states with controlled concurrent processing"""
         
         self.logger.info(f"\n{'='*80}")
@@ -932,7 +932,14 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         async def process_state_with_semaphore(state: str) -> Dict[str, Any]:
             async with semaphore:
                 try:
-                    return await self.process_single_state(state, batch_size, output_prefix)
+                    # Add 2-hour timeout per state to prevent indefinite hangs
+                    return await asyncio.wait_for(
+                        self.process_single_state(state, batch_size, output_prefix),
+                        timeout=3600 * 2  # 2 hours
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.error(f"⏱️ TIMEOUT: {state} exceeded 2 hours processing time - skipping")
+                    raise RuntimeError(f"State {state} processing timeout after 2 hours")
                 except Exception as e:
                     # Check for quota exhaustion - re-raise to stop all processing
                     error_str = str(e).lower()
@@ -1232,14 +1239,14 @@ async def main():
                        help='Process a single state (e.g., DE, CA, NY)')
     parser.add_argument('--states', nargs='+', type=str,
                        help='Process multiple states (e.g., --states HI DE DC)')
-    parser.add_argument('--batch-size', '-b', type=int, default=100,
-                       help='Batch size for processing (default: 100)')
+    parser.add_argument('--batch-size', '-b', type=int, default=1000,
+                       help='Batch size for processing (default: 1000)')
     parser.add_argument('--limit', '-l', type=int,
                        help='Limit number of records to process')
     parser.add_argument('--max-concurrent-states', '-c', type=int, default=3,
                        help='Maximum concurrent states to process (default: 3)')
-    parser.add_argument('--max-workers', '-w', type=int, default=150,
-                       help='Maximum parallel workers (default: 150)')
+    parser.add_argument('--max-workers', '-w', type=int, default=1500,
+                       help='Maximum parallel workers (default: 1500)')
     
     args = parser.parse_args()
     matcher = ProductionMatcher(max_workers=args.max_workers)
@@ -1330,14 +1337,14 @@ async def main():
         print(f"   print(df[['name', 'state', 'embedding_queried_term', 'l2_district_name', 'is_matched', 'confidence']].head())")
         
         print(f"\n💡 Usage examples:")
-        print(f"   # Process Delaware only:")
+        print(f"   # Process Delaware only (high throughput):")
         print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py --state DE")
         print(f"   # Process all states with 2 concurrent states:")
         print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --max-concurrent-states 2")
         print(f"   # Process Delaware with custom batch size:")
-        print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py --state DE --batch-size 150")
-        print(f"   # Process all states with optimized settings:")
-        print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --batch-size 150 --max-concurrent-states 3")
+        print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py --state DE --batch-size 1000")
+        print(f"   # Process all states with maximum throughput:")
+        print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --batch-size 1000 --max-concurrent-states 2 --max-workers 1500")
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -41,13 +41,26 @@ class DimensionalityReducer:
             logger.warning("No embedded messages to reduce")
             return []
 
-        embeddings_3072d = []
-        for msg in embedded_messages:
-            if hasattr(msg.embeddings, 'embedding_3072d') and msg.embeddings.embedding_3072d is not None:
-                embeddings_3072d.append(msg.embeddings.embedding_3072d)
-            else:
-                raise ValueError(f"Message {msg.id} missing 3072d embedding")
+        substantive_messages = []
+        opt_out_messages = []
 
+        for msg in embedded_messages:
+            is_opt_out = getattr(msg, 'is_opt_out', False)
+            has_embedding = hasattr(msg.embeddings, 'embedding_3072d') and msg.embeddings.embedding_3072d is not None
+
+            if is_opt_out or not has_embedding:
+                opt_out_messages.append(msg)
+            else:
+                substantive_messages.append(msg)
+
+        if opt_out_messages:
+            logger.info(f"Skipping dimensionality reduction for {len(opt_out_messages)} non-substantive messages")
+
+        if not substantive_messages:
+            logger.warning("No substantive messages to reduce")
+            return embedded_messages
+
+        embeddings_3072d = [msg.embeddings.embedding_3072d for msg in substantive_messages]
         embeddings_array = np.array(embeddings_3072d)
         logger.info(f"Starting reduction on {embeddings_array.shape[0]} embeddings (3072d)")
 
@@ -61,12 +74,13 @@ class DimensionalityReducer:
         embeddings_umap_3d = None
 
         if self.umap_enabled:
-            embeddings_umap = self._apply_umap(embeddings_pca, len(embedded_messages), target_dims=self.umap_dimensions)
+            embeddings_umap = self._apply_umap(embeddings_pca, len(substantive_messages), target_dims=self.umap_dimensions)
 
         if self.umap_3d_visualization:
-            embeddings_umap_3d = self._apply_umap(embeddings_pca, len(embedded_messages), target_dims=3)
+            embeddings_umap_3d = self._apply_umap(embeddings_pca, len(substantive_messages), target_dims=3)
 
-        for i, msg in enumerate(embedded_messages):
+        # Apply reduced embeddings only to substantive messages
+        for i, msg in enumerate(substantive_messages):
             if embeddings_pca is not None and self.pca_dimensions == 50:
                 msg.embeddings.embedding_50d = embeddings_pca[i]
 

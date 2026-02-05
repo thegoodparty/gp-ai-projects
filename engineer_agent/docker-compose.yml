@@ -1,0 +1,48 @@
+services:
+  engineer-agent:
+    build:
+      context: ..
+      dockerfile: engineer_agent/Dockerfile
+    image: engineer-agent:dev
+    container_name: engineer-agent-local
+
+    environment:
+      # Required API keys
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CLICKUP_API_KEY: ${CLICKUP_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+
+      # Task config
+      CLICKUP_TASK_ID: ${CLICKUP_TASK_ID}
+      INSTRUCTION: ${INSTRUCTION}
+      AGENT_MODEL: ${AGENT_MODEL:-opus}
+
+      # Runtime config
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      WORKSPACE_DIR: /workspace
+
+      # AWS credentials for CloudWatch logs (read-only)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+
+      # Optional: Databricks (for query_db.py)
+      DATABRICKS_API_KEY: ${DATABRICKS_API_KEY:-}
+      DATABRICKS_SERVER_HOSTNAME: ${DATABRICKS_SERVER_HOSTNAME:-}
+      DATABRICKS_HTTP_PATH: ${DATABRICKS_HTTP_PATH:-}
+
+      # Optional: Slack (for reading threads)
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+
+    volumes:
+      # Persist workspace between runs
+      - engineer-workspace:/workspace
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+volumes:
+  engineer-workspace:

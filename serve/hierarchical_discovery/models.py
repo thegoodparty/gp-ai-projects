@@ -83,6 +83,7 @@ class AtomicMessage:
     original_atomic_text: str = ""  # Text before AI summarization
     was_filtered: bool = False  # Whether this message was filtered out
     filter_reasons: List[str] = field(default_factory=list)  # Why it was filtered
+    is_opt_out: bool = False  # True if message is STOP/unsubscribe (passes through but not clustered)
 
 @dataclass
 class EmbeddingData:
@@ -106,6 +107,7 @@ class EmbeddedMessage:
     embeddings: EmbeddingData
     metadata: Dict[str, Any] = field(default_factory=dict)  # CSV metadata including phone number
     created_at: datetime = field(default_factory=datetime.now)
+    is_opt_out: bool = False  # True if message is STOP/unsubscribe (passes through but not clustered)
 
 @dataclass
 class ClusterAssignment:
@@ -134,6 +136,7 @@ class ClusteredMessage:
     embeddings: EmbeddingData
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
+    is_opt_out: bool = False  # True if message is STOP/unsubscribe (passes through but not clustered)
 
 @dataclass
 class ClusterTheme:

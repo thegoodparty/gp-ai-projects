@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import copy
 import json
 import numpy as np
 from pathlib import Path
@@ -16,7 +17,7 @@ from .stages.ai_message_processor import ai_message_processor_stage
 from .stages.embedding_generator import embedding_generator_stage_sync
 from .stages.dimensionality_reducer import dimensionality_reduction_stage
 from .stages.hierarchical_cluster_engine import hierarchical_cluster_engine_stage
-from .stages.multi_cluster_analyzer import multi_cluster_analyzer_stage
+from .stages.cluster_analyzer import cluster_analyzer_stage
 from .stages.visualization_generator import visualization_generator_stage
 
 from .utils import (
@@ -25,7 +26,8 @@ from .utils import (
     setup_output_directories,
     generate_cost_summary,
     analyze_single_message,
-    determine_cluster_ranges,
+    determine_optimal_k,
+    compute_fallback_k,
     create_multi_cluster_output,
     create_single_message_output,
     export_multi_cluster_results,
@@ -111,28 +113,17 @@ class HierarchicalDiscoveryOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to save checkpoint: {e}")
 
-    async def run_multi_cluster_pipeline(self, disable_optimization: bool = False, return_data: bool = False, in_memory_messages: Optional[List] = None) -> Dict[str, Any]:
-        """Run pipeline with multiple cluster counts
+    async def run_pipeline(self, disable_optimization: bool = False, return_data: bool = False, in_memory_messages: Optional[List] = None) -> Dict[str, Any]:
+        """Run the hierarchical clustering discovery pipeline
 
         Args:
             disable_optimization: Whether to disable optimizations
             return_data: Whether to return data objects instead of writing files
             in_memory_messages: Optional list of RawMessage objects to process (skips CSV loading)
         """
-        logger.debug("Entering run_multi_cluster_pipeline method")
+        logger.debug("Entering run_pipeline method")
 
-        # Get cluster ranges from config
-        hierarchical_config = getattr(self.config, 'hierarchical', {})
-        cluster_ranges_config = hierarchical_config.get('cluster_ranges', 'auto')
-        multi_cluster_enabled = hierarchical_config.get('multi_cluster_analysis', False)
-
-        logger.debug(f"Multi-cluster analysis enabled: {multi_cluster_enabled}")
-
-        if not multi_cluster_enabled:
-            logger.info("Multi-cluster analysis disabled, falling back to single cluster run")
-            return await self.run_pipeline(disable_optimization, return_data, in_memory_messages)
-
-        logger.info(f"🚀 STARTING MULTI-CLUSTER HIERARCHICAL DISCOVERY PIPELINE")
+        logger.info(f"🚀 STARTING HIERARCHICAL DISCOVERY PIPELINE")
         logger.info("=" * 60)
 
         # Run common pipeline stages once (data loading through embedding)
@@ -147,7 +138,6 @@ class HierarchicalDiscoveryOrchestrator:
                 'cluster_results': {},
                 'pipeline_state': self.pipeline_state,
                 'dataset_name': self.config.data_source,
-                'cluster_ranges': [],
                 'total_messages': 0
             }
 
@@ -199,68 +189,96 @@ class HierarchicalDiscoveryOrchestrator:
         if embeddings_array is not None:
             logger.info(f"Using {embedding_source} embeddings for optimal k selection: {embeddings_array.shape}")
 
-        cluster_ranges = determine_cluster_ranges(
-            cluster_ranges_config, len(embedded_messages), embeddings_array, self.config, self.output_paths
-        )
-        logger.info(f"Cluster ranges: {cluster_ranges}")
+        # Count substantive messages (those with embeddings) for optimal k
+        # Messages without embeddings (opt-outs OR filtered) don't participate in clustering
+        def has_embeddings(msg):
+            return (hasattr(msg.embeddings, 'embedding_3072d') and
+                    msg.embeddings.embedding_3072d is not None)
+
+        substantive_count = len([m for m in embedded_messages
+                                if not getattr(m, 'is_opt_out', False) and has_embeddings(m)])
+        non_clusterable_count = len(embedded_messages) - substantive_count
+        if non_clusterable_count > 0:
+            logger.info(f"Dataset: {substantive_count} substantive + {non_clusterable_count} non-clusterable (pass-through)")
+
+        # Handle case where ALL messages are opt-outs
+        if substantive_count == 0:
+            logger.warning("All messages are non-substantive (opt-out) - skipping clustering")
+            # Return all messages as pass-through with no cluster assignments
+            consolidated_result = create_multi_cluster_output(
+                {},  # No cluster results
+                embedded_messages,
+                self.pipeline_state,
+                self.config.data_source
+            )
+            return consolidated_result
+
+        # Determine optimal number of clusters
+        dataset_size = substantive_count
+        try:
+            n_clusters = determine_optimal_k(dataset_size, embeddings_array, self.config, self.output_paths)
+        except Exception as e:
+            logger.error(f"Optimal k selection failed: {e}")
+            n_clusters = compute_fallback_k(dataset_size)
+            logger.warning(f"Using fallback k={n_clusters}")
+
+        logger.info(f"Selected cluster count: {n_clusters}")
         logger.info("=" * 60)
 
-        # Run clustering for each cluster count (clustering only, no analysis yet)
-        multi_cluster_results = {}
-        for n_clusters in cluster_ranges:
-            logger.info(f"🔄 Running hierarchical clustering with {n_clusters} clusters...")
+        # Run hierarchical clustering
+        logger.info(f"🔄 Running hierarchical clustering with {n_clusters} clusters...")
+        temp_config = copy.deepcopy(self.config)
+        temp_config.hierarchical['n_clusters'] = n_clusters
+        temp_config.hierarchical['distance_threshold'] = None
 
-            # Create a copy of config for this cluster count to avoid conflicts
-            import copy
-            temp_config = copy.deepcopy(self.config)
-            temp_config.hierarchical['n_clusters'] = n_clusters
-            temp_config.hierarchical['distance_threshold'] = None
+        clustered_messages = hierarchical_cluster_engine_stage(embedded_messages, temp_config)
+        actual_cluster_count = len(set(msg.cluster_assignment.cluster_id for msg in clustered_messages))
 
-            # Run clustering only (no analysis)
-            clustered_messages = hierarchical_cluster_engine_stage(embedded_messages, temp_config)
-
-            multi_cluster_results[str(n_clusters)] = {
+        cluster_results = {
+            str(n_clusters): {
                 'clustered_messages': clustered_messages,
                 'n_clusters': n_clusters,
-                'cluster_count': len(set(msg.cluster_assignment.cluster_id for msg in clustered_messages))
+                'cluster_count': actual_cluster_count
             }
+        }
 
-        # Run multi-cluster analysis on all cluster configurations
-        logger.info(f"🎯 Running multi-cluster theme analysis for {len(cluster_ranges)} configurations...")
-        multi_analysis_result = await multi_cluster_analyzer_stage(multi_cluster_results, self.config)
+        # Run cluster theme analysis
+        logger.info(f"🎯 Running cluster theme analysis...")
+        analysis_result = await cluster_analyzer_stage(cluster_results, self.config)
 
-        # Extract cost data and merger stats from multi-cluster analysis
+        # Extract cost data and merger stats from cluster analysis
         merger_stats_dict = {}
-        if isinstance(multi_analysis_result, dict) and 'cost' in multi_analysis_result:
-            stage_cost = multi_analysis_result.get("cost", 0)
-            usage_stats = multi_analysis_result.get("usage_stats", {})
-            merger_stats_dict = multi_analysis_result.get("merger_stats", {})
+        if isinstance(analysis_result, dict) and 'cost' in analysis_result:
+            stage_cost = analysis_result.get("cost", 0)
+            usage_stats = analysis_result.get("usage_stats", {})
+            merger_stats_dict = analysis_result.get("merger_stats", {})
             self.pipeline_state.total_cost += stage_cost
-            self.pipeline_state.stage_costs["multi_cluster_analysis"] = stage_cost
-            self.pipeline_state.gemini_usage["multi_cluster_analysis"] = usage_stats
+            self.pipeline_state.stage_costs["cluster_analysis"] = stage_cost
+            self.pipeline_state.gemini_usage["cluster_analysis"] = usage_stats
 
-            logger.info(f"💰 Multi-Cluster Analysis Cost: ${stage_cost:.4f} (Total: ${self.pipeline_state.total_cost:.4f})")
-            analyzed_multi_results = multi_analysis_result["analyses"]
+            logger.info(f"💰 Cluster Analysis Cost: ${stage_cost:.4f} (Total: ${self.pipeline_state.total_cost:.4f})")
+            analyzed_results = analysis_result["analyses"]
         else:
-            analyzed_multi_results = multi_analysis_result
+            analyzed_results = analysis_result
 
         # Combine clustering and analysis results
-        multi_results = {}
-        for cluster_count_str in multi_cluster_results.keys():
-            multi_results[cluster_count_str] = {
-                'clustered_messages': multi_cluster_results[cluster_count_str]['clustered_messages'],
-                'analyzed_clusters': analyzed_multi_results.get(cluster_count_str, []),
-                'n_clusters': multi_cluster_results[cluster_count_str]['n_clusters'],
-                'cluster_count': multi_cluster_results[cluster_count_str]['cluster_count'],
-                'merger_stats': merger_stats_dict.get(cluster_count_str, {'pre_merge_count': 0, 'post_merge_count': 0})
+        cluster_key = str(n_clusters)
+        final_results = {
+            cluster_key: {
+                'clustered_messages': clustered_messages,
+                'analyzed_clusters': analyzed_results.get(cluster_key, []),
+                'n_clusters': n_clusters,
+                'cluster_count': actual_cluster_count,
+                'merger_stats': merger_stats_dict.get(cluster_key, {'pre_merge_count': 0, 'post_merge_count': 0})
             }
+        }
 
         consolidated_result = create_multi_cluster_output(
-            multi_results, embedded_messages, self.pipeline_state, self.config.data_source
+            final_results, embedded_messages, self.pipeline_state, self.config.data_source
         )
 
         if not return_data:
-            logger.info("🚀 About to call export_multi_cluster_results...")
+            logger.info("🚀 Exporting results...")
 
             await export_multi_cluster_results(consolidated_result, self.output_paths)
 
@@ -270,11 +288,11 @@ class HierarchicalDiscoveryOrchestrator:
             )
             await generate_multi_cluster_report(consolidated_result, timestamp, self.output_paths)
 
-            logger.info("✅ Completed multi-cluster exports")
+            logger.info("✅ Completed exports")
         else:
             logger.info("🔄 Skipping CSV export and visualizations (return_data=True)")
 
-        logger.info("🎯 Multi-cluster pipeline completed successfully")
+        logger.info("🎯 Pipeline completed successfully")
 
         return consolidated_result
 
@@ -389,17 +407,7 @@ def run_hierarchical_discovery_pipeline(config_path: str = "serve/hierarchical_d
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    hierarchical_config = getattr(orchestrator.config, 'hierarchical', {})
-    multi_cluster_enabled = hierarchical_config.get('multi_cluster_analysis', False)
-
-    logger.debug(f"Multi-cluster analysis enabled: {multi_cluster_enabled}")
-
-    if multi_cluster_enabled:
-        logger.debug("Calling run_multi_cluster_pipeline")
-        return loop.run_until_complete(orchestrator.run_multi_cluster_pipeline(disable_optimization=disable_optimization, return_data=return_data))
-    else:
-        logger.debug("Calling run_pipeline (single cluster mode)")
-        return loop.run_until_complete(orchestrator.run_pipeline(disable_optimization=disable_optimization, return_data=return_data))
+    return loop.run_until_complete(orchestrator.run_pipeline(disable_optimization=disable_optimization, return_data=return_data))
 
 if __name__ == "__main__":
     import sys

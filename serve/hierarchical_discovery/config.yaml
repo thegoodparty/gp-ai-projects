@@ -41,15 +41,10 @@ hierarchical:
   # Core parameters (deterministic hierarchical clustering)
   linkage: "complete"                # Options: "ward", "complete", "average", "single"
   affinity: "cosine"                 # Options: "euclidean", "manhattan", "cosine"
-  n_clusters: 15                     # Fixed number of clusters
   distance_threshold: null           # Alternative to n_clusters (set one or the other)
   compute_distances: true            # Required for dendrogram generation
 
-  # Multi-clustering configuration
-  multi_cluster_analysis: true       # Enable to use optimal_k mode (returns single optimal k)
-  cluster_ranges: "optimal_k"        # "optimal_k" for data-driven selection, "auto" for adaptive, or list like [10, 20, 30, 40]
-
-  # Optimal k selection configuration (used when cluster_ranges: "optimal_k")
+  # Optimal k selection configuration (automatically finds best number of clusters)
   optimal_k_config:
     enabled: true
     min_k: 5                         # Minimum number of clusters to test
@@ -88,18 +83,8 @@ analysis:
   llm_config:
     model: "flash"
     temperature: 0.0
-    thinking_budget: 0
     max_connections: 100
     max_keepalive_connections: 25
-
-  # Multi-cluster analysis settings
-  multi_cluster:
-    max_connections: 25              # Reduced for multi-cluster to avoid API overload
-    max_keepalive_connections: 10    # Connection pool size
-    chunk_size: 5                    # Clusters processed per batch
-    delay_between_runs: 5.0          # Seconds between different cluster counts
-    delay_between_clusters: 0.2      # Seconds between individual cluster analyses
-    delay_between_chunks: 1.0        # Seconds between batches
 
 # Cluster merger configuration (post-processing to merge similar clusters)
 cluster_merger:

@@ -1,0 +1,13 @@
+[project]
+name = "gp-engineer-agent"
+version = "0.1.0"
+description = "Claude Agent SDK powered engineer for analyzing and fixing production bugs"
+requires-python = ">=3.11"
+dependencies = [
+    "gp-shared",
+    "claude-agent-sdk>=0.1.19",
+    "boto3>=1.40.50",
+]
+
+[tool.uv.sources]
+gp-shared = { workspace = true }
