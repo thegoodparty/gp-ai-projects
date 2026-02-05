@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from ..models import ClusterTheme, ClusterAssignment
 
 logger = get_logger(__name__)
@@ -9,10 +9,10 @@ logger = get_logger(__name__)
 async def analyze_single_message(message, pipeline_state):
     logger.info("Analyzing single message with LLM...")
 
-    llm_client = GeminiClient(
-        default_model=GeminiModelType.FLASH,
+    llm_client = Gemini3Client(
+        default_model=GeminiModelType.FLASH_3,
         default_temperature=0.0,
-        thinking_budget=0
+        thinking_level=ThinkingLevel.MINIMAL
     )
 
     # Handle both AtomicMessage and EmbeddedMessage

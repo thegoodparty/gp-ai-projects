@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from shared.logger import get_logger
 
 from .models import (
@@ -22,7 +22,7 @@ class WorldClassClassifier:
     World-class multi-pass classification system based on manual review insights
     """
 
-    def __init__(self, model_type: GeminiModelType = GeminiModelType.FLASH, temperature: float = 0.0, target_concurrency: int = 1200):
+    def __init__(self, model_type: GeminiModelType = GeminiModelType.FLASH_3, temperature: float = 0.0, target_concurrency: int = 1200):
         self.logger = get_logger(__name__)
 
         # PRODUCTION PATTERN: ThreadPoolExecutor for maximum LLM concurrency
@@ -30,10 +30,10 @@ class WorldClassClassifier:
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
 
         # PRODUCTION-LEVEL LLM client configuration (1200 concurrent connections)
-        self.llm_client = GeminiClient(
+        self.llm_client = Gemini3Client(
             default_model=model_type,
             default_temperature=temperature,
-            thinking_budget=0,  # Disable thinking for cost efficiency (~$0.075/1M tokens)
+            thinking_level=ThinkingLevel.MINIMAL,
             max_connections=target_concurrency,
             max_keepalive_connections=target_concurrency // 4  # 300 keepalive
         )

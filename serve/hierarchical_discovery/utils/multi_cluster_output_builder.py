@@ -95,6 +95,7 @@ def create_multi_cluster_output(multi_results, embedded_messages, pipeline_state
             'original_text': embedded_msg.original_text,
             'processed_text': embedded_msg.text,
             'campaign_source': embedded_msg.campaign_source,
+            'is_opt_out': getattr(embedded_msg, 'is_opt_out', False),
             'cluster_assignments': {},
             'cluster_themes': {},
             'cluster_categories': {},

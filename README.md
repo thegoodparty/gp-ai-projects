@@ -1,169 +1,168 @@
 # GP AI Projects
 
-This repository contains AI-powered tools for political campaign planning, data analysis, and voter data matching.
+AI-powered tools for political campaign planning, message analysis, and voter data matching at GoodParty.org.
 
 ## Projects Overview
 
-### 1. AI Generated Campaign Plan (`ai_generated_campaign_plan/`)
-Generates comprehensive political campaign plans using Gemini LLM with automatic cost tracking, web search integration, and parallel section generation.
+### 1. Serve Pipeline (`serve/`)
+Production message analysis system deployed on AWS ECS Fargate with Step Functions orchestration.
 
-**Key Features:**
-- Complete campaign plan orchestration with 6 sections
+- **`v1_pipeline/`** - Complete pipeline: message consolidation, classification, clustering, DynamoDB upload
+- **`hierarchical_discovery/`** - Multi-cluster analysis with Gemini AI, verbatim quote extraction, action items
+- **`classify/`** - High-throughput civic message classification
+
+### 2. HubSpot-DDHQ Matcher (`hubspot_ddhq_match/`)
+High-performance semantic matching system linking HubSpot candidates to DDHQ election races.
+
+- City-contextualized embeddings with FAISS indices
+- LLM-based federal/state/local race classification
+- 10K+ matches/minute with 1500 concurrent workers
+
+### 3. AI Campaign Plan Generator (`ai_generated_campaign_plan/`)
+Generates comprehensive political campaign plans using Gemini LLM.
+
+- 6-section campaign plan orchestration
 - Web search integration via Tavily API
 - Parallel processing with cost tracking
-- PDF generation and structured data models
 
-### 2. Data Stitching & Analysis (`stitch_golden_data/`)
-Data analysis and matching tools for political district matching and voter data processing.
-
-**Key Features:**
-- Production-grade matching algorithms in `prod_gold_data/`
-- Vector embeddings and similarity search
-- Comprehensive data exploration and analysis
-- Batch processing with parallel execution
-- Output generation in multiple formats
+### 4. Infrastructure (`infrastructure/`)
+Terraform modules for AWS deployment (ECS Fargate, Step Functions, Lambda triggers, Secrets Manager).
 
 ## Setup
 
 ### Prerequisites
-Make sure you have `uv` installed for Python package management:
-
 ```bash
-# Install uv if you haven't already
+# Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ### Environment Setup
 ```bash
-# Set up Python environment
 uv sync
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 ```
 
 ### Required API Keys
-Create a `.env` file in the project root:
-
+Create a `.env` file:
 ```bash
-# Primary LLM Provider (Required)
 GEMINI_API_KEY=your_gemini_api_key
-
-# Secondary LLM Provider (Optional - fallback)
-GEMINI_API_KEY2=your_second_gemini_key_optional
-
-# Web Search (Required for campaign planning)
 TAVILY_API_KEY=your_tavily_api_key
-
-# Databricks (Required for data analysis)
 DATABRICKS_API_KEY=your_databricks_api_key
 DATABRICKS_SERVER_HOSTNAME=your-workspace.cloud.databricks.com
 DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/your-warehouse-id
+BRAINTRUST_API_KEY=your_braintrust_api_key  # For LLM tracing
 ```
 
 ## Running the Projects
 
-### 🎯 Campaign Plan Generation
-
-**Test individual sections:**
+### Serve Pipeline
 ```bash
-uv run ai_generated_campaign_plan/sections/one_overview.py
-uv run ai_generated_campaign_plan/sections/five_know_your_community.py
+# V1 pipeline with test mode
+uv run serve/v1_pipeline/scripts/run_pipeline.py --campaign berkley --test
+
+# Debug mode
+ENVIRONMENT=development uv run serve/v1_pipeline/scripts/run_pipeline.py --campaign berkley --test
 ```
 
-**Generate complete campaign plan:**
+### HubSpot-DDHQ Matching
 ```bash
+cd hubspot_ddhq_match/google_sheets_matcher
+
+# Generate embeddings
+ENVIRONMENT=production BATCH_SIZE=150 MAX_WORKERS=400 uv run generate_embeddings.py
+
+# Run matching
+ENVIRONMENT=production BATCH_SIZE=1000 MAX_WORKERS=1500 uv run parallel_production_matcher.py
+```
+
+### Campaign Plan Generation
+```bash
+# Test individual sections
+uv run ai_generated_campaign_plan/sections/one_overview.py
+
+# Generate complete plan
 uv run ai_generated_campaign_plan/orchestrator.py
 ```
 
-### 🔗 Data Analysis & Matching
+## Workspace Structure (Monorepo)
 
-**Run production matching:**
-```bash
-uv run stitch_golden_data/prod_gold_data/production_matcher.py
+This is a **uv workspace** with multiple packages optimized for minimal Docker image sizes:
+
+```
+gp-ai-projects/
+├── pyproject.toml                 # Root: ALL deps for local development
+├── shared/
+│   └── pyproject.toml             # gp-shared: core utilities
+├── serve/v1_pipeline/
+│   └── pyproject.toml             # gp-v1-pipeline: pipeline-specific deps
+└── hubspot_ddhq_match/
+    └── pyproject.toml             # gp-ddhq-matcher: matcher-specific deps
 ```
 
-**Explore data:**
-```bash
-uv run stitch_golden_data/merge_all_states.py
-```
+**Adding dependencies:**
+- Shared utilities (llm, logger, braintrust) → `shared/pyproject.toml`
+- Pipeline-specific (matplotlib, scipy) → `serve/v1_pipeline/pyproject.toml`
+- Matcher-specific (faiss, pyarrow) → `hubspot_ddhq_match/pyproject.toml`
 
-**Output:** Results saved to `stitch_golden_data/output/` and `stitch_golden_data/prod_gold_data/output/`
-
-## Debug Mode & Logging
-
-### Enable Debug Logging
-Set the `ENVIRONMENT` variable to see detailed debug logs:
-
-```bash
-# Enable debug logging for any script
- ENVIRONMENT=development   uv run stitch_golden_data/prod_gold_data/production_matcher.py  all_states --batch-size 150 --max-concurrent-states 1   
- ENVIRONMENT=development uv run ai_generated_campaign_plan/orchestrator.py
-```
-
-### Log Levels
-- **Production** (default): INFO level and above
-- **Development** (`ENVIRONMENT=development`): DEBUG level with colored output and detailed tracing
+Docker builds use `uv sync --package <name>` to install only required dependencies.
 
 ## Project Structure
 
 ```
 gp-ai-projects/
-├── ai_generated_campaign_plan/     # Campaign planning system
-│   ├── orchestrator.py            # Main orchestrator
-│   ├── sections/                  # Individual plan sections
-│   ├── schema/                    # Data models
-│   └── utils/                     # Campaign utilities
-├── stitch_golden_data/            # Data analysis & matching
-│   ├── prod_gold_data/            # Production matching algorithms
-│   ├── merge_all_states.py        # State data merging
-│   ├── offline_data/              # Cached data files
-│   ├── vector_store/              # Embedding storage
-│   └── output/                    # Generated results
-├── shared/                        # Shared libraries
-│   ├── llm.py                     # LLM client with fallback
-│   ├── llm_gemini.py             # Gemini-specific client
-│   ├── logger.py                  # Environment-aware logging
-│   ├── tavily_client.py          # Web search integration
-│   └── databricks_client.py      # Databricks connector
-└── README.md                      # This file
+├── serve/                         # Message analysis pipelines
+│   ├── v1_pipeline/              # Main pipeline (Docker-deployed)
+│   ├── hierarchical_discovery/   # Multi-cluster analysis
+│   ├── classify/                 # Message classification
+│   └── input/                    # Input data files
+├── hubspot_ddhq_match/           # Race matching system
+│   └── google_sheets_matcher/    # Production matcher
+├── ai_generated_campaign_plan/   # Campaign planning
+│   ├── orchestrator.py           # Main orchestrator
+│   ├── sections/                 # Plan section generators
+│   └── schema/                   # Pydantic models
+├── shared/                       # Shared libraries
+│   ├── llm_gemini.py            # Gemini client (primary)
+│   ├── braintrust.py            # LLM tracing integration
+│   ├── logger.py                # Environment-aware logging
+│   └── databricks_client.py     # Databricks connector
+├── infrastructure/               # Terraform modules
+│   ├── environments/            # dev/qa/prod configs
+│   └── modules/                 # Reusable modules
+└── stitch_golden_data/          # Legacy data matching (archived)
 ```
 
-## Key Dependencies
+## Key Libraries
 
-**Core Libraries:**
-- **LLM Integration**: `google-genai`, `openai`
-- **Data Processing**: `pandas`, `pyarrow`, `numpy`
-- **Database**: `databricks-sql-connector`
-- **Web Search**: `tavily-python`
-- **Async Processing**: `asyncio`, `httpx`
-- **Vector Embeddings**: `google-genai` embeddings
+| Library | Purpose |
+|---------|---------|
+| `google-genai` | Gemini LLM completions and embeddings |
+| `braintrust` | LLM call tracing and monitoring |
+| `pandas`, `pyarrow` | Data processing |
+| `faiss-cpu` | Vector similarity search |
+| `tavily-python` | Web search integration |
+| `boto3` | AWS services (S3, DynamoDB) |
 
-### Package Management
+## Debug Mode
+
+Enable detailed logging:
 ```bash
-# Add new dependencies
-uv add package-name
-
-# Add development dependencies  
-uv add --dev package-name
-
-# Remove dependencies
-uv remove package-name
-
-# Update all dependencies
-uv sync
+ENVIRONMENT=development uv run <script>
 ```
 
-## Cost Tracking
+## Deployment
 
-All projects include comprehensive cost tracking:
-- **Token usage** across LLM providers
-- **Embedding generation** costs
-- **API call** summaries
-- **Per-operation** breakdowns
+Docker images are built for ARM64 (Graviton) and deployed via:
+- **ECS Fargate** - Container execution
+- **Step Functions** - Pipeline orchestration with retry logic
+- **Lambda** - S3 trigger for automatic pipeline execution
+- **Secrets Manager** - API key management
 
-Cost summaries are automatically logged and included in output files.
+See `infrastructure/` for Terraform configurations.
 
 ## Important Notes
 
-- **Databricks Access**: All database operations are READ-ONLY (SELECT queries only)
-- **API Key Rotation**: Supports multiple Gemini API keys for rate limit management
-- **Batch Processing**: Optimized for large-scale data processing with parallel execution
+- **Databricks**: READ-ONLY access (SELECT queries only)
+- **LLM Client**: Use `shared/llm_gemini.py` (not deprecated `llm.py`)
+- **Tracing**: Braintrust integration for production LLM monitoring
+- **Cost Tracking**: Built-in token usage and API cost tracking

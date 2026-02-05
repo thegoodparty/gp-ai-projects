@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -13,24 +13,6 @@ class ConsolidatedMessage:
     message_text: str
     sent_at: datetime
     round: str  # R1, R2, R3
-
-    # Demographics (from results file)
-    age: int | None = None
-    age_group: str = "Unknown"
-    location: str = "Unknown"
-    ward: str | None = None
-    voters_gender: str | None = None
-    voting_performance_category: str = "Unknown"
-    residence_city: str = "Unknown"
-
-    # Placeholders for future demographics
-    homeowner_status: str = "Unknown"
-    business_owner: str = "Unknown"
-    has_children_under_18: str = "Unknown"
-    education_level: str = "Unknown"
-    income_level: str = "Unknown"
-
-    # Message metadata
     campaign_id: str | None = None
     campaign_name: str | None = None
     carrier: str | None = None
@@ -60,7 +42,7 @@ class ClusteringResult:
 
 @dataclass
 class UnifiedCampaignRecord:
-    """Unified record combining all data sources for DynamoDB upload"""
+    """Unified record combining all data sources"""
 
     # Identity
     campaign_id: str
@@ -72,20 +54,6 @@ class UnifiedCampaignRecord:
     message_text: str
     sent_at: datetime
     round: str  # R1, R2, R3
-
-    # Demographics (from consolidation)
-    age: int | None = None
-    age_group: str = "Unknown"
-    location: str = "Unknown"
-    ward: str | None = None
-    voters_gender: str | None = None
-    voting_performance_category: str = "Unknown"
-    residence_city: str = "Unknown"
-    homeowner_status: str = "Unknown"
-    business_owner: str = "Unknown"
-    has_children_under_18: str = "Unknown"
-    education_level: str = "Unknown"
-    income_level: str = "Unknown"
 
     # Multi-cluster data (from hierarchical pipeline)
     multi_cluster_data: dict[str, dict[str, Any]] | None = None
@@ -104,34 +72,18 @@ class UnifiedCampaignRecord:
     updated_at: datetime | None = None
     processing_version: str = "v1.0"
 
+    # Non-substantive message flag
+    is_opt_out: bool = False  # True if STOP/unsubscribe message (passed through but not clustered)
+
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = datetime.utcnow()
+            self.created_at = datetime.now(timezone.utc)
         if self.updated_at is None:
-            self.updated_at = datetime.utcnow()
+            self.updated_at = datetime.now(timezone.utc)
         if not self.record_id:
             self.record_id = str(uuid.uuid4())
         if not self.atomic_id:
             self.atomic_id = str(uuid.uuid4())
-
-    def to_dynamodb_item(self) -> dict[str, Any]:
-        """Convert to DynamoDB format for Lambda upload"""
-        # Convert to dict and handle datetime serialization
-        item_dict = asdict(self)
-
-        # Convert datetime objects to ISO strings
-        if isinstance(item_dict.get('sent_at'), datetime):
-            item_dict['sent_at'] = self.sent_at.isoformat()
-        if isinstance(item_dict.get('created_at'), datetime) and self.created_at:
-            item_dict['created_at'] = self.created_at.isoformat()
-        if isinstance(item_dict.get('updated_at'), datetime) and self.updated_at:
-            item_dict['updated_at'] = self.updated_at.isoformat()
-
-        # Ensure all required fields are present
-        item_dict.setdefault('campaign_id', self.campaign_id)
-        item_dict.setdefault('record_id', self.record_id)
-
-        return item_dict
 
     @classmethod
     def from_consolidated_message(cls,
@@ -145,12 +97,14 @@ class UnifiedCampaignRecord:
         original_message = None
         atomic_message = None
         atomic_id = None
+        is_opt_out = False
         if clustering_result and isinstance(clustering_result, dict):
             if 'cluster_data' in clustering_result:
                 multi_cluster_data = clustering_result['cluster_data']
             original_message = clustering_result.get('message')
             atomic_message = clustering_result.get('atomic_message')
             atomic_id = clustering_result.get('atomic_id')
+            is_opt_out = clustering_result.get('is_opt_out', False)
 
         # Generate atomic_id if not provided (for backward compatibility)
         if not atomic_id:
@@ -168,20 +122,6 @@ class UnifiedCampaignRecord:
             sent_at=consolidated.sent_at,
             round=consolidated.round,
 
-            # Demographics
-            age=consolidated.age,
-            age_group=consolidated.age_group,
-            location=consolidated.location,
-            ward=consolidated.ward,
-            voters_gender=consolidated.voters_gender,
-            voting_performance_category=consolidated.voting_performance_category,
-            residence_city=consolidated.residence_city,
-            homeowner_status=consolidated.homeowner_status,
-            business_owner=consolidated.business_owner,
-            has_children_under_18=consolidated.has_children_under_18,
-            education_level=consolidated.education_level,
-            income_level=consolidated.income_level,
-
             # Message metadata
             campaign_name=consolidated.campaign_name,
             carrier=consolidated.carrier,
@@ -190,7 +130,10 @@ class UnifiedCampaignRecord:
             # Multi-cluster data
             multi_cluster_data=multi_cluster_data,
             original_message=original_message,
-            atomic_message=atomic_message
+            atomic_message=atomic_message,
+
+            # Non-substantive flag
+            is_opt_out=is_opt_out
         )
 
 

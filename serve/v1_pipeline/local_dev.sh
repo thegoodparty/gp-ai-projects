@@ -127,7 +127,6 @@ echo ""
 # Create output directories
 mkdir -p "$PROJECT_ROOT/serve/v1_pipeline/output/consolidated"
 mkdir -p "$PROJECT_ROOT/serve/v1_pipeline/output/discovery_reports"
-mkdir -p "$PROJECT_ROOT/serve/v1_pipeline/output/dynamodb_preview"
 mkdir -p "$PROJECT_ROOT/serve/v1_pipeline/output/events"
 mkdir -p "$PROJECT_ROOT/serve/v1_pipeline/logs"
 
@@ -149,7 +148,6 @@ if [ $PIPELINE_EXIT_CODE -eq 0 ]; then
     echo "📁 Output files:"
     echo "  Consolidated: $PROJECT_ROOT/serve/v1_pipeline/output/consolidated/"
     echo "  Discovery Reports: $PROJECT_ROOT/serve/v1_pipeline/output/discovery_reports/"
-    echo "  DynamoDB Preview: $PROJECT_ROOT/serve/v1_pipeline/output/dynamodb_preview/"
     echo "  Events: $PROJECT_ROOT/serve/v1_pipeline/output/events/"
     echo ""
     echo "View files:"

@@ -75,37 +75,6 @@ resource "aws_s3_bucket_public_access_block" "pipeline_data" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "pipeline_data_lifecycle" {
-  bucket = aws_s3_bucket.pipeline_data.id
-
-  rule {
-    id     = "cleanup-old-data"
-    status = "Enabled"
-
-    expiration {
-      days = 30
-    }
-
-    filter {
-      prefix = "input/"
-    }
-  }
-
-  rule {
-    id     = "archive-outputs"
-    status = "Enabled"
-
-    transition {
-      days          = 7
-      storage_class = "GLACIER"
-    }
-
-    filter {
-      prefix = "output/"
-    }
-  }
-}
-
 resource "aws_cloudwatch_log_group" "pipeline" {
   name              = "/ecs/serve-analyze-${var.environment}"
   retention_in_days = 30
@@ -282,6 +251,10 @@ resource "aws_ecs_task_definition" "pipeline" {
         {
           name      = "SLACK_WEBHOOK_URL"
           valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:SLACK_WEBHOOK_URL::"
+        },
+        {
+          name      = "BRAINTRUST_API_KEY"
+          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:BRAINTRUST_API_KEY::"
         }
       ]
 
@@ -369,6 +342,7 @@ resource "aws_lambda_function" "pipeline_trigger" {
       SECURITY_GROUP_ID    = aws_security_group.ecs_tasks.id
       S3_OUTPUT_BUCKET     = aws_s3_bucket.pipeline_data.id
       SNS_TOPIC_ARN        = aws_sns_topic.pipeline_failures.arn
+      ENVIRONMENT          = var.environment
     }
   }
 
@@ -477,6 +451,25 @@ resource "aws_cloudwatch_event_rule" "ecs_task_failed" {
   }
 }
 
+resource "aws_cloudwatch_event_rule" "ecs_task_failed_to_start" {
+  name        = "serve-analyze-task-failed-to-start-${var.environment}"
+  description = "Capture ECS task startup failures (image pull, resource issues, etc.)"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ecs"]
+    detail-type = ["ECS Task State Change"]
+    detail = {
+      clusterArn = [aws_ecs_cluster.pipeline.arn]
+      lastStatus = ["STOPPED"]
+      stopCode   = ["TaskFailedToStart"]
+    }
+  })
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
 resource "aws_cloudwatch_event_target" "send_to_sns" {
   rule      = aws_cloudwatch_event_rule.ecs_task_failed.name
   target_id = "SendToSNS"
@@ -504,6 +497,38 @@ resource "aws_cloudwatch_event_target" "send_to_sns" {
   "logs": "https://console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#logsV2:log-groups/log-group/$252Fecs$252Fserve-analyze-${var.environment}",
   "s3_bucket": "${aws_s3_bucket.pipeline_data.id}",
   "description": "Serve-Analyze pipeline failed during execution. Check CloudWatch logs for detailed error information."
+}
+EOF
+  }
+}
+
+resource "aws_cloudwatch_event_target" "send_startup_failure_to_sns" {
+  rule      = aws_cloudwatch_event_rule.ecs_task_failed_to_start.name
+  target_id = "SendToSNS"
+  arn       = aws_sns_topic.pipeline_failures.arn
+
+  input_transformer {
+    input_paths = {
+      taskArn       = "$.detail.taskArn"
+      stoppedReason = "$.detail.stoppedReason"
+      stopCode      = "$.detail.stopCode"
+      clusterArn    = "$.detail.clusterArn"
+      time          = "$.time"
+    }
+
+    input_template = <<EOF
+{
+  "alarm": "🔴 Serve-Analyze Task Failed to Start - ${var.environment}",
+  "pipeline": "Campaign Message Analysis",
+  "environment": "${var.environment}",
+  "cluster": <clusterArn>,
+  "taskArn": <taskArn>,
+  "stoppedReason": <stoppedReason>,
+  "stopCode": <stopCode>,
+  "time": <time>,
+  "logs": "https://console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#logsV2:log-groups/log-group/$252Fecs$252Fserve-analyze-${var.environment}",
+  "s3_bucket": "${aws_s3_bucket.pipeline_data.id}",
+  "description": "Serve-Analyze task failed to start. Common causes: image pull failure, resource constraints, or configuration issues."
 }
 EOF
   }

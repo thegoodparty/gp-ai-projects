@@ -187,8 +187,22 @@ class EmbeddingGenerator:
         if not atomic_messages:
             return {}
 
+        # Filter out opt-out/non-substantive messages - they don't need embeddings
+        substantive_messages = [
+            msg for msg in atomic_messages
+            if not getattr(msg, 'is_opt_out', False) and not getattr(msg, 'was_filtered', False)
+        ]
+
+        non_substantive_count = len(atomic_messages) - len(substantive_messages)
+        if non_substantive_count > 0:
+            logger.info(f"Skipping embedding for {non_substantive_count} non-substantive messages")
+
+        if not substantive_messages:
+            logger.warning("No substantive messages to embed")
+            return {}
+
         logger.debug("Generating 3072d embeddings (no prefix)...")
-        texts = [msg.atomic_text for msg in atomic_messages]
+        texts = [msg.atomic_text for msg in substantive_messages]
 
         logger.info(f"EMBEDDING CHECK - First 3 texts being embedded:")
         for i, text in enumerate(texts[:3]):
@@ -198,7 +212,7 @@ class EmbeddingGenerator:
         embeddings_3072d = np.array(embeddings_3072d_list)
 
         embeddings_by_text = {}
-        for i, msg in enumerate(atomic_messages):
+        for i, msg in enumerate(substantive_messages):
             embeddings_by_text[msg.atomic_text] = embeddings_3072d[i]
 
         return embeddings_by_text
@@ -209,6 +223,34 @@ class EmbeddingGenerator:
         embedded_messages = []
 
         for atomic_message in atomic_messages:
+            # Separate concepts: "skip embedding" vs "is actual opt-out request"
+            actual_is_opt_out = getattr(atomic_message, 'is_opt_out', False)
+            was_filtered = getattr(atomic_message, 'was_filtered', False)
+            skip_embedding = actual_is_opt_out or was_filtered
+
+            if skip_embedding:
+                embedding_data = EmbeddingData(
+                    embedding_3072d=None,
+                    embedding_model="none",
+                    generation_timestamp=datetime.now()
+                )
+
+                embedded_message = EmbeddedMessage(
+                    id=str(uuid.uuid4()),
+                    atomic_message_id=atomic_message.id,
+                    csv_file=atomic_message.csv_file,
+                    csv_row_index=atomic_message.csv_row_index,
+                    text=atomic_message.atomic_text,
+                    original_text=atomic_message.original_text,
+                    embeddings=embedding_data,
+                    campaign_source=atomic_message.campaign_source,
+                    metadata=atomic_message.metadata,
+                    is_opt_out=actual_is_opt_out,
+                    created_at=datetime.now()
+                )
+                embedded_messages.append(embedded_message)
+                continue
+
             text = atomic_message.atomic_text
 
             if text not in embeddings_by_text:
@@ -231,6 +273,7 @@ class EmbeddingGenerator:
                 embeddings=embedding_data,
                 campaign_source=atomic_message.campaign_source,
                 metadata=atomic_message.metadata,
+                is_opt_out=False,
                 created_at=datetime.now()
             )
 

@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 
 """
-Multi-cluster analyzer stage for hierarchical clustering pipeline.
-Handles cluster analysis for multiple cluster counts efficiently.
+Cluster analyzer stage for hierarchical clustering pipeline.
+Handles cluster analysis using LLM-based theme extraction.
 """
 
 import asyncio
+import os
 import random
-import time
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pydantic import BaseModel, Field
 
 from shared.logger import get_logger
-from shared.llm_gemini import GeminiClient, GeminiModelType
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
+from shared.braintrust import init_braintrust, flush_logs, load_prompt_from_braintrust
 from ..models import PipelineConfig, ClusterAnalysis, ClusterTheme, ClusteredMessage
 from .cluster_merger import cluster_merger_stage
 from .cluster_merger_analysis import analyze_cluster_merger
@@ -38,30 +39,32 @@ class VerbatimQuotesResponse(BaseModel):
 class ActionItemsResponse(BaseModel):
     action_items: List[str] = Field(default_factory=list, description="3-5 specific, actionable items that local government or campaigns can implement")
 
-class MultiClusterAnalyzer:
-    """Efficient multi-cluster analysis with proper API management"""
+class ClusterAnalyzer:
+    """Cluster analysis with LLM-based theme extraction"""
 
     def __init__(self, config: PipelineConfig):
         self.config = config
         analysis_config = getattr(config, 'analysis', {})
         llm_config = analysis_config.get('llm_config', {})
-        multi_cluster_config = analysis_config.get('multi_cluster', {})
 
-        self.llm_client = GeminiClient(
-            default_model=GeminiModelType.FLASH,
+        self.llm_client = Gemini3Client(
+            default_model=GeminiModelType.FLASH_3,
             default_temperature=llm_config.get('temperature', 0.0),
-            thinking_budget=llm_config.get('thinking_budget', 0),
-            max_connections=multi_cluster_config.get('max_connections', 25),
-            max_keepalive_connections=multi_cluster_config.get('max_keepalive_connections', 10)
+            thinking_level=ThinkingLevel.MINIMAL,
+            max_connections=llm_config.get('max_connections', 25),
+            max_keepalive_connections=llm_config.get('max_keepalive_connections', 10)
         )
+
+        environment = os.getenv("ENVIRONMENT", "local")
+        logger.info(f"Braintrust environment: {environment}")
+        init_braintrust(project="hierarchical-discovery")
 
         self.max_example_messages = analysis_config.get('max_example_messages', 30)
         self.save_example_messages = analysis_config.get('save_example_messages', 5)
 
-        self.chunk_size = multi_cluster_config.get('chunk_size', 5)
-        self.delay_between_runs = multi_cluster_config.get('delay_between_runs', 5.0)
-        self.delay_between_clusters = multi_cluster_config.get('delay_between_clusters', 0.2)
-        self.delay_between_chunks = multi_cluster_config.get('delay_between_chunks', 1.0)
+        self.chunk_size = 5
+        self.delay_between_clusters = 0.2
+        self.delay_between_chunks = 1.0
 
     def __enter__(self):
         return self
@@ -71,6 +74,7 @@ class MultiClusterAnalyzer:
         return False
 
     def cleanup(self):
+        flush_logs()
         if hasattr(self, 'llm_client') and hasattr(self.llm_client, 'close'):
             try:
                 self.llm_client.close()
@@ -100,11 +104,6 @@ class MultiClusterAnalyzer:
             clustered_messages = result['clustered_messages']
 
             logger.info(f"Analyzing themes for {cluster_count} clusters ({len(clustered_messages)} messages)...")
-
-            # Add delay between cluster count runs to prevent API overload
-            if i > 0:
-                logger.debug(f"Waiting {self.delay_between_runs}s between cluster configurations...")
-                time.sleep(self.delay_between_runs)
 
             try:
                 # Analyze this cluster configuration (returns tuple with merger stats)
@@ -318,13 +317,13 @@ class MultiClusterAnalyzer:
         prompt = self._create_analysis_prompt(cluster_id, example_texts, len(messages), total_clusters, person_metrics)
 
         try:
-            # Generate theme analysis with structured output
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.llm_client.generate_structured_content(
                     prompt=prompt,
                     response_schema=ClusterAnalysisResponse,
-                    system_instruction="You are an expert civic message analyst. Analyze citizen messages and identify themes, issues, and actionable items."
+                    system_instruction="You are an expert civic message analyst. Analyze citizen messages and identify themes, issues, and actionable items.",
+                    trace_name="cluster_analysis"
                 )
             )
 
@@ -378,21 +377,30 @@ class MultiClusterAnalyzer:
                               total_clusters: int, person_metrics: Dict[str, Any]) -> str:
         """Create analysis prompt for cluster theme generation with person-level context"""
 
-        examples_text = "\n".join([f"- {text}" for text in example_texts[:10]])  # Limit to 10 examples in prompt
+        examples_text = "\n".join([f"- {text}" for text in example_texts[:10]])
 
-        # Include person-level context in the prompt
         unique_respondents = person_metrics.get('unique_respondents', cluster_size)
         avg_mentions = person_metrics.get('avg_mentions_per_respondent', 1.0)
         coverage_pct = person_metrics.get('respondent_coverage_pct', 0.0)
 
-        prompt = f"""Analyze this cluster of civic engagement messages from political campaigns.
+        variables = {
+            "cluster_id": cluster_id,
+            "cluster_size": cluster_size,
+            "unique_respondents": unique_respondents,
+            "avg_mentions": f"{avg_mentions:.1f}",
+            "coverage_pct": f"{coverage_pct:.1f}",
+            "total_clusters": total_clusters,
+            "examples_text": examples_text
+        }
+
+        fallback_prompt = """Analyze this cluster of civic engagement messages from political campaigns.
 
 CLUSTER INFO:
 - Cluster ID: {cluster_id}
 - Total Messages: {cluster_size} messages
 - Unique Citizens: {unique_respondents} different people
-- Average Mentions per Citizen: {avg_mentions:.1f}
-- Respondent Coverage: {coverage_pct:.1f}% of all survey respondents
+- Average Mentions per Citizen: {avg_mentions}
+- Respondent Coverage: {coverage_pct}% of all survey respondents
 - Part of {total_clusters} total clusters
 
 ATOMIC MESSAGES (focused civic concerns after preprocessing and splitting):
@@ -428,7 +436,11 @@ Focus on:
 - Direct citizen voices through clean verbatim quotes
 - How this relates to local governance and community engagement"""
 
-        return prompt
+        return load_prompt_from_braintrust(
+            prompt_name="cluster-analysis",
+            fallback_prompt=fallback_prompt,
+            variables=variables
+        )
 
     def _calculate_person_level_metrics(self, clustered_messages: List[ClusteredMessage],
                                       total_respondents: int) -> Dict[str, Any]:
@@ -541,7 +553,8 @@ Extract 1 quote from each message: ["Ridiculous property taxes", "Can't afford t
                 lambda: self.llm_client.generate_structured_content(
                     prompt=prompt,
                     response_schema=VerbatimQuotesResponse,
-                    system_instruction="Extract verbatim quotes from citizen messages that represent the cluster theme. Keep quotes SHORT (max 15 words) and directly related to the theme."
+                    system_instruction="Extract verbatim quotes from citizen messages that represent the cluster theme. Keep quotes SHORT (max 15 words) and directly related to the theme.",
+                    trace_name="verbatim_quote_extraction"
                 )
             )
 
@@ -620,7 +633,8 @@ REQUIREMENTS:
                 lambda: self.llm_client.generate_structured_content(
                     prompt=prompt,
                     response_schema=ActionItemsResponse,
-                    system_instruction="Generate specific, actionable items that local government or campaigns can implement to address citizen concerns."
+                    system_instruction="Generate specific, actionable items that local government or campaigns can implement to address citizen concerns.",
+                    trace_name="action_items_generation"
                 )
             )
 
@@ -661,19 +675,19 @@ REQUIREMENTS:
         return {}
 
 
-async def multi_cluster_analyzer_stage(multi_cluster_results: Dict[str, Dict], config: PipelineConfig) -> Dict[str, Any]:
+async def cluster_analyzer_stage(cluster_results: Dict[str, Dict], config: PipelineConfig) -> Dict[str, Any]:
     """
-    Main entry point for multi-cluster analysis stage
+    Main entry point for cluster analysis stage
 
     Args:
-        multi_cluster_results: Dict with cluster count as key and clustered messages
+        cluster_results: Dict with cluster count as key and clustered messages
         config: Pipeline configuration
 
     Returns:
         Dict with analyzed clusters, merger stats, and cost information
     """
-    analyzer = MultiClusterAnalyzer(config)
-    analysis_result = await analyzer.analyze_multi_cluster(multi_cluster_results)
+    analyzer = ClusterAnalyzer(config)
+    analysis_result = await analyzer.analyze_multi_cluster(cluster_results)
 
     # Get usage statistics
     usage_stats = analyzer.get_usage_stats()
