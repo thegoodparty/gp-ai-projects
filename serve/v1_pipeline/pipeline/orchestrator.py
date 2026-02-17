@@ -566,13 +566,18 @@ class V1PipelineOrchestrator:
                     continue
 
                 logger.info(f"Loading: {csv_file.name} (poll_id: {poll_id})")
-                df = pd.read_csv(csv_file)
+                try:
+                    df = pd.read_csv(csv_file)
+                except pd.errors.EmptyDataError:
+                    logger.warning(f"Skipping unparseable file (no columns): {csv_file.name}")
+                    skipped_files.append({"filename": csv_file.name, "poll_id": poll_id, "status": "skipped_empty"})
+                    continue
                 df = self._normalize_csv_columns(df)
                 dfs.append(df)
                 loaded_files.append({"filename": csv_file.name, "poll_id": poll_id})
 
             if not dfs:
-                logger.warning("All CSV files were empty (0 bytes)")
+                logger.warning("All CSV files were empty or unparseable")
                 analysis = {
                     "mode": "filename_based_loading",
                     "file_count": len(csv_files),
