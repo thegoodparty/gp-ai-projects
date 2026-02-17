@@ -136,7 +136,8 @@ async def single_request(
     ttfb = None
 
     if stream:
-        tokens = 0
+        chunk_count = 0
+        usage_tokens = None
         async with client.stream(
             "POST", f"{config.base_url}/chat/completions", json=body, headers=config.headers, timeout=300
         ) as resp:
@@ -146,14 +147,17 @@ async def single_request(
                 if line.startswith("data: {"):
                     try:
                         chunk = json.loads(line[6:])
+                        if "usage" in chunk:
+                            usage_tokens = chunk["usage"].get("completion_tokens")
                         delta = chunk["choices"][0]["delta"]
                         if delta.get("content"):
-                            tokens += 1
+                            chunk_count += 1
                         if delta.get("reasoning_content"):
-                            tokens += 1
+                            chunk_count += 1
                     except (json.JSONDecodeError, KeyError, IndexError):
                         pass
         end = time.perf_counter()
+        tokens = usage_tokens if usage_tokens is not None else chunk_count
         return {
             "name": prompt["name"],
             "tokens": tokens,
@@ -163,6 +167,7 @@ async def single_request(
         }
     else:
         resp = await client.post(f"{config.base_url}/chat/completions", json=body, headers=config.headers, timeout=300)
+        resp.raise_for_status()
         end = time.perf_counter()
         data = resp.json()
         usage = data.get("usage", {})
@@ -265,11 +270,11 @@ async def main():
     all_results["sequential"] = seq_results
     print()
 
-    stream_results = await run_sequential(config, stream=True)
-    all_results["streaming"] = stream_results
-    print()
-
     if not args.quick:
+        stream_results = await run_sequential(config, stream=True)
+        all_results["streaming"] = stream_results
+        print()
+
         for c in args.concurrency:
             print()
             conc_results = await run_concurrent(config, c, prompt_idx=2)

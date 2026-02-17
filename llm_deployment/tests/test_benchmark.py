@@ -91,6 +91,14 @@ class TestSingleRequestNonStream:
         assert result["completion_tokens"] == 0
         assert result["prompt_tokens"] == 0
 
+    async def test_http_error_raises(self, bench_config):
+        async def handler(request):
+            return httpx.Response(401, text="Unauthorized")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await single_request(client, PROMPTS[0], bench_config, stream=False)
+
 
 class TestSingleRequestStream:
     async def test_counts_content_tokens(self, bench_config):
@@ -134,6 +142,23 @@ class TestSingleRequestStream:
             result = await single_request(client, PROMPTS[0], bench_config, stream=True)
 
         assert result["tokens"] == 0
+
+    async def test_uses_usage_from_final_chunk(self, bench_config):
+        lines = [
+            'data: {"choices": [{"delta": {"content": "Hello"}}]}',
+            'data: {"choices": [{"delta": {"content": " world"}}]}',
+            'data: {"choices": [{"delta": {}}], "usage": {"prompt_tokens": 5, "completion_tokens": 12}}',
+            "data: [DONE]",
+        ]
+        body = "\n".join(lines)
+
+        async def handler(request):
+            return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await single_request(client, PROMPTS[0], bench_config, stream=True)
+
+        assert result["tokens"] == 12
 
     async def test_malformed_json_skipped(self, bench_config):
         lines = [

@@ -212,13 +212,14 @@ def cmd_wait(
             try:
                 resp = client.get(url, headers=vllm_headers(config), timeout=5)
                 if resp.status_code == 200:
+                    data = resp.json()
                     print()
                     print("vLLM is ready!")
-                    print(json.dumps(resp.json(), indent=2))
+                    print(json.dumps(data, indent=2))
                     print()
                     print(f"Endpoint: {base_url(pod_id, config)}")
                     return
-            except (httpx.RequestError, httpx.TimeoutException):
+            except (httpx.RequestError, httpx.TimeoutException, json.JSONDecodeError):
                 pass
 
             print(f"\r  Attempt {attempt}/{max_attempts}...", end="", flush=True)

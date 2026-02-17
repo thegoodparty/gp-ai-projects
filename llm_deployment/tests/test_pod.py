@@ -186,6 +186,22 @@ class TestCmdWait:
         assert len(sleeps) == 2
         assert call_count == 3
 
+    def test_non_json_200_retries(self, config):
+        save_pod_id("pod123", config)
+        call_count = 0
+
+        def handler(request):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                return httpx.Response(200, text="<html>loading</html>", headers={"content-type": "text/html"})
+            return httpx.Response(200, json={"data": [{"id": "model-1"}]})
+
+        sleeps = []
+        cmd_wait(config, client=_mock_client(handler), sleep_fn=sleeps.append, max_attempts=3)
+        assert call_count == 2
+        assert len(sleeps) == 1
+
     def test_timeout_raises(self, config):
         save_pod_id("pod123", config)
 
