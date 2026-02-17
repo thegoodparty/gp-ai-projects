@@ -555,19 +555,21 @@ class V1PipelineOrchestrator:
             logger.info(f"Found {len(csv_files)} CSV file(s) for campaign '{campaign_name}' in {input_dir}")
 
             dfs = []
-            poll_ids = []
+            loaded_files = []
+            skipped_files = []
             for csv_file in csv_files:
                 poll_id = csv_file.stem
-                poll_ids.append(poll_id)
 
                 if csv_file.stat().st_size == 0:
                     logger.warning(f"Skipping empty file (0 bytes): {csv_file.name}")
+                    skipped_files.append({"filename": csv_file.name, "poll_id": poll_id, "status": "skipped_empty"})
                     continue
 
                 logger.info(f"Loading: {csv_file.name} (poll_id: {poll_id})")
                 df = pd.read_csv(csv_file)
                 df = self._normalize_csv_columns(df)
                 dfs.append(df)
+                loaded_files.append({"filename": csv_file.name, "poll_id": poll_id})
 
             if not dfs:
                 logger.warning("All CSV files were empty (0 bytes)")
@@ -575,7 +577,7 @@ class V1PipelineOrchestrator:
                     "mode": "filename_based_loading",
                     "file_count": len(csv_files),
                     "total_rows": 0,
-                    "files": [{"filename": f.name, "poll_id": f.stem} for f in csv_files]
+                    "files": skipped_files
                 }
                 return pd.DataFrame(), analysis
 
@@ -606,14 +608,17 @@ class V1PipelineOrchestrator:
                     f"Found columns: {list(combined_df.columns)}"
                 )
 
+            poll_ids = [f["poll_id"] for f in loaded_files]
             analysis = {
                 "mode": "filename_based_loading",
                 "file_count": len(csv_files),
                 "total_rows": len(combined_df),
-                "files": [{"filename": f.name, "poll_id": poll_id} for f, poll_id in zip(csv_files, poll_ids)]
+                "files": loaded_files + skipped_files
             }
 
-            logger.info(f"Loaded {len(combined_df)} rows from {len(csv_files)} file(s)")
+            logger.info(f"Loaded {len(combined_df)} rows from {len(loaded_files)} file(s)")
+            if skipped_files:
+                logger.warning(f"Skipped {len(skipped_files)} empty file(s)")
             logger.info(f"Poll IDs: {poll_ids}")
             return combined_df, analysis
 
