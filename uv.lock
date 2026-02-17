@@ -1157,7 +1157,6 @@ dev = [
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
-    { name = "pytest-asyncio" },
     { name = "types-pyyaml" },
 ]
 
@@ -1211,7 +1210,6 @@ provides-extras = ["dev"]
 dev = [
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pytest", specifier = ">=8.4.2" },
-    { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
 ]
 
