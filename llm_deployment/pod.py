@@ -24,7 +24,7 @@ class PodError(Exception):
 class PodConfig:
     runpod_api_key: str = ""
     hf_token: str = ""
-    model_name: str = "Qwen/Qwen3-Coder-Next-FP8"
+    model_name: str = "nvidia/Kimi-K2.5-NVFP4"
     gpu_type_id: str = "NVIDIA H200 NVL"
     gpu_count: int = 1
     volume_size_gb: int = 200
@@ -56,7 +56,7 @@ class PodConfig:
         return cls(
             runpod_api_key=os.environ.get("RUNPOD_API_KEY", ""),
             hf_token=os.environ.get("HF_TOKEN", ""),
-            model_name=os.environ.get("MODEL_NAME", "Qwen/Qwen3-Coder-Next-FP8"),
+            model_name=os.environ.get("MODEL_NAME", "nvidia/Kimi-K2.5-NVFP4"),
             gpu_type_id=os.environ.get("GPU_TYPE_ID", "NVIDIA H200 NVL"),
             gpu_count=safe_int("GPU_COUNT", 1),
             volume_size_gb=safe_int("VOLUME_SIZE_GB", 200),

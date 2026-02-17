@@ -31,6 +31,11 @@ def bench_config_no_key() -> BenchmarkConfig:
 
 
 class TestBenchmarkConfig:
+    def test_default_model_matches_pod_config(self):
+        from llm_deployment.pod import PodConfig
+
+        assert BenchmarkConfig.model_name == PodConfig.model_name
+
     def test_base_url(self, bench_config):
         assert bench_config.base_url == "https://test-pod-123-8000.proxy.runpod.net/v1"
 

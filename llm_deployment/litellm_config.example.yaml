@@ -7,8 +7,8 @@ model_list:
   - model_name: glm-4.7
     litellm_params:
       model: openai/glm-4.7-flash
-      api_base: http://192.168.4.112:30000/v1
-      api_key: your-ppv2-api-key
+      api_base: http://<your-server-ip>:30000/v1
+      api_key: your-api-key
 
 litellm_settings:
   drop_params: true
