@@ -560,10 +560,24 @@ class V1PipelineOrchestrator:
                 poll_id = csv_file.stem
                 poll_ids.append(poll_id)
 
+                if csv_file.stat().st_size == 0:
+                    logger.warning(f"Skipping empty file (0 bytes): {csv_file.name}")
+                    continue
+
                 logger.info(f"Loading: {csv_file.name} (poll_id: {poll_id})")
                 df = pd.read_csv(csv_file)
                 df = self._normalize_csv_columns(df)
                 dfs.append(df)
+
+            if not dfs:
+                logger.warning("All CSV files were empty (0 bytes)")
+                analysis = {
+                    "mode": "filename_based_loading",
+                    "file_count": len(csv_files),
+                    "total_rows": 0,
+                    "files": [{"filename": f.name, "poll_id": f.stem} for f in csv_files]
+                }
+                return pd.DataFrame(), analysis
 
             combined_df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
 
