@@ -92,9 +92,13 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.3.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=0.24.0",
     "types-pyyaml>=6.0.12.20250915",
 ]
