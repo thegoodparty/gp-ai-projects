@@ -4,11 +4,6 @@ model_list:
       model: openai/nvidia/Kimi-K2.5-NVFP4
       api_base: https://<pod-id>-8000.proxy.runpod.net/v1
       api_key: your-vllm-api-key
-  - model_name: glm-4.7
-    litellm_params:
-      model: openai/glm-4.7-flash
-      api_base: http://<your-server-ip>:30000/v1
-      api_key: your-api-key
 
 litellm_settings:
   drop_params: true

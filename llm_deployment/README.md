@@ -1,6 +1,8 @@
-# RunPod Deployment: Qwen3-Coder-Next-FP8
+# RunPod vLLM Deployment
 
-Deploy Qwen3-Coder-Next-FP8 (80B MoE, FP8) on RunPod with vLLM serving an OpenAI-compatible API.
+Deploy any vLLM-compatible model on RunPod GPUs with an OpenAI-compatible API. Model, GPU type, and GPU count are all configurable via `.env`.
+
+Default: **Kimi K2.5 NVFP4** (1T MoE, NVFP4 quantized) on **4x NVIDIA B200**.
 
 ## Quick Start
 
@@ -9,7 +11,7 @@ Deploy Qwen3-Coder-Next-FP8 (80B MoE, FP8) on RunPod with vLLM serving an OpenAI
 cp llm_deployment/.env.example llm_deployment/.env
 # Edit .env — RUNPOD_API_KEY is required, VLLM_API_KEY recommended
 
-# 2. Launch pod and wait for vLLM to be ready (~10 min first time)
+# 2. Launch pod and wait for vLLM to be ready (~16 min first time)
 uv run llm_deployment/pod.py launch --wait
 
 # 3. Test it
@@ -40,12 +42,12 @@ uv run llm_deployment/pod.py destroy           # terminate pod and delete volume
 
 ### First-time setup
 ```bash
-uv run llm_deployment/pod.py launch --wait   # ~10 min (image pull + model download + warmup)
+uv run llm_deployment/pod.py launch --wait   # ~16 min (image pull + pip install + model download + warmup)
 ```
 
 ### Daily workflow
 ```bash
-# Morning: resume pod (~5 min, model cached on volume, needs warmup)
+# Morning: resume pod (~10 min, model cached on volume, needs warmup)
 uv run llm_deployment/pod.py start
 uv run llm_deployment/pod.py wait
 
@@ -60,13 +62,56 @@ uv run llm_deployment/pod.py stop
 uv run llm_deployment/pod.py destroy   # deletes pod + volume, prompts for confirmation
 ```
 
-### Cost breakdown
+### Cost (Kimi K2.5 default config: 4x B200)
 
 | State | Cost | What you pay for |
 |-------|------|------------------|
-| **Running** | ~$5.02/hr (B200) | GPU compute |
-| **Stopped** | ~$0.10/GB/month (~$20/mo for 200GB) | Volume storage only |
+| **Running** | ~$20/hr | GPU compute (4x B200 @ $4.99/hr) |
+| **Stopped** | ~$0.10/GB/month (~$70/mo for 700GB) | Volume storage only |
 | **Destroyed** | $0 | Nothing |
+
+## Environment Variables
+
+All model and hardware settings are configurable via `.env`:
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `RUNPOD_API_KEY` | Yes | — | RunPod account API key |
+| `HF_TOKEN` | No | — | HuggingFace token (for gated models) |
+| `MODEL_NAME` | No | `nvidia/Kimi-K2.5-NVFP4` | Model to serve |
+| `GPU_TYPE_ID` | No | `NVIDIA B200` | GPU type (see GPU options below) |
+| `GPU_COUNT` | No | `4` | Number of GPUs (sets `--tensor-parallel-size`) |
+| `VOLUME_SIZE_GB` | No | `700` | Persistent volume size |
+| `VLLM_PORT` | No | `8000` | vLLM server port |
+| `VLLM_API_KEY` | No | — | Bearer token for vLLM API auth |
+
+## GPU Options
+
+Configurable via `GPU_TYPE_ID` and `GPU_COUNT` in `.env`.
+
+| GPU ID | VRAM | Price/hr | Notes |
+|--------|------|----------|-------|
+| `NVIDIA B200` | 180GB | ~$4.99 | Default. Native NVFP4 on Blackwell. |
+| `NVIDIA H200` (SXM) | 141GB | ~$3.59 | NVFP4 via Marlin W4A16 fallback — same quality, lower throughput. |
+| `NVIDIA H200 NVL` | 143GB | ~$3.39 | Same as H200 SXM. Secure cloud only. |
+| `NVIDIA H100 80GB HBM3` | 80GB | ~$2.69 | Marlin fallback. Need 8+ GPUs for large models. |
+
+For Kimi K2.5 NVFP4 (~600GB on disk):
+- **4x B200** (720GB VRAM) — recommended, native FP4
+- **8x H200** (1128GB VRAM) — fallback, Marlin W4A16 dequant at runtime
+
+Availability varies. The script uses `cloudType: ALL` to search both secure and community clouds.
+
+## Hardware (Kimi K2.5 default)
+
+| Resource | Spec |
+|----------|------|
+| GPU | 4x NVIDIA B200 (720GB total VRAM) |
+| Model size | ~119 safetensor shards, NVFP4 quantized |
+| KV cache dtype | FP8 (e4m3) — auto-selected |
+| Attention backend | FlashInfer MLA (with TensorRT-LLM kernels) |
+| MoE backend | FLASHINFER_TRTLLM |
+| Volume | 700GB (model checkpoint ~600GB on disk) |
 
 ## SSH Access
 
@@ -85,34 +130,14 @@ ps aux | grep vllm            # check if vLLM is running
 cat /proc/1/fd/1 | tail -50   # view vLLM container logs
 tail -f /tmp/vllm.log         # follow logs (if started with nohup redirect)
 
-# Restart vLLM with different args (e.g., add API key)
+# Restart vLLM with different args (faster than destroy + launch)
 pkill -f vllm
-nohup vllm serve Qwen/Qwen3-Coder-Next-FP8 \
-  --dtype auto --max-model-len 32768 --trust-remote-code \
-  --enable-prefix-caching --gpu-memory-utilization 0.92 \
-  --api-key YOUR_KEY --port 8000 > /tmp/vllm.log 2>&1 &
+FLASHINFER_DISABLE_VERSION_CHECK=1 nohup python3 -m vllm.entrypoints.openai.api_server \
+  --model nvidia/Kimi-K2.5-NVFP4 --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 --max-model-len 131072 \
+  --enable-auto-tool-choice --tool-call-parser kimi_k2 --reasoning-parser kimi_k2 \
+  --trust-remote-code --api-key YOUR_KEY > /tmp/vllm.log 2>&1 &
 ```
-
-## Hardware
-
-| Resource | Spec |
-|----------|------|
-| GPU | 1x NVIDIA B200 (180GB HBM3e) |
-| Model size | ~75GB (FP8, 80B MoE) |
-| Free VRAM for KV cache | ~83GB |
-| KV cache capacity | 911K tokens (~100 concurrent 32k requests) |
-| Volume | 200GB persistent (model cache survives stop/start) |
-
-### GPU options (configurable via `GPU_TYPE_ID` in .env)
-
-| GPU ID | VRAM | Price/hr | Notes |
-|--------|------|----------|-------|
-| `NVIDIA B200` | 180GB | ~$5.02 | Current default. Plenty of headroom. |
-| `NVIDIA H200 NVL` | 143GB | ~$3.39 | Good balance. ~60GB for KV cache. |
-| `NVIDIA H200` (SXM) | 141GB | ~$3.59 | Similar to NVL. |
-| `NVIDIA H100 80GB HBM3` | 80GB | ~$2.69 | Too tight — model fills VRAM, minimal KV cache. |
-
-Availability varies. The script uses `cloudType: ALL` to search both secure and community clouds.
 
 ## API Usage
 
@@ -134,7 +159,7 @@ curl $BASE_URL/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $VLLM_API_KEY" \
   -d '{
-    "model": "Qwen/Qwen3-Coder-Next-FP8",
+    "model": "nvidia/Kimi-K2.5-NVFP4",
     "messages": [{"role": "user", "content": "Write a Python fibonacci function"}],
     "max_tokens": 500
   }'
@@ -151,7 +176,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen3-Coder-Next-FP8",
+    model="nvidia/Kimi-K2.5-NVFP4",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
@@ -166,7 +191,7 @@ resp = httpx.post(
     "https://<pod-id>-8000.proxy.runpod.net/v1/chat/completions",
     headers={"Authorization": "Bearer your-vllm-api-key"},
     json={
-        "model": "Qwen/Qwen3-Coder-Next-FP8",
+        "model": "nvidia/Kimi-K2.5-NVFP4",
         "messages": [{"role": "user", "content": "Hello!"}],
         "max_tokens": 200,
     },
@@ -175,69 +200,10 @@ resp = httpx.post(
 print(resp.json()["choices"][0]["message"]["content"])
 ```
 
-## vLLM Configuration
-
-| Flag | Value | Purpose |
-|------|-------|---------|
-| `--model` | Qwen/Qwen3-Coder-Next-FP8 | Model to serve |
-| `--dtype` | auto | Auto-detect dtype (FP8) |
-| `--max-model-len` | 32768 | Max context length |
-| `--trust-remote-code` | — | Required for Qwen models |
-| `--enable-prefix-caching` | — | Cache common prefixes for speed |
-| `--gpu-memory-utilization` | 0.92 | Use 92% of VRAM |
-| `--api-key` | from `VLLM_API_KEY` | Bearer token auth (optional) |
-
-These are configured in `pod.py` `cmd_launch()` and passed as `dockerArgs` to RunPod.
-
-## Startup Timeline
-
-What happens when a pod launches (first boot):
-
-| Phase | Duration | What happens |
-|-------|----------|--------------|
-| Image pull | ~1 min | Pulls `vllm/vllm-openai:latest` |
-| Model download | ~2 min | Downloads ~80GB from HuggingFace to volume |
-| Weight loading | ~1 min | Loads FP8 weights into GPU memory |
-| torch.compile | ~1.5 min | Compiles optimized CUDA kernels |
-| DeepGEMM warmup | ~3 min | Warms up 1304 MoE GEMM kernels |
-| FlashInfer autotune | ~5 sec | Autotunes attention kernels |
-| CUDA graph capture | ~12 sec | Captures 51 execution graphs |
-| **Total** | **~8-10 min** | |
-
-Subsequent starts (after `stop` → `start`) skip the model download (~2 min faster) since it's cached on the volume. Warmup steps still run.
-
-## Environment Variables
-
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `RUNPOD_API_KEY` | Yes | — | RunPod account API key |
-| `HF_TOKEN` | No | — | HuggingFace token (for gated models) |
-| `MODEL_NAME` | No | `Qwen/Qwen3-Coder-Next-FP8` | Model to serve |
-| `GPU_TYPE_ID` | No | `NVIDIA H200 NVL` | GPU type (see GPU options above) |
-| `GPU_COUNT` | No | `1` | Number of GPUs |
-| `VOLUME_SIZE_GB` | No | `200` | Persistent volume size |
-| `VLLM_PORT` | No | `8000` | vLLM server port |
-| `VLLM_API_KEY` | No | — | Bearer token for vLLM API auth |
-
 ## Using with Claude Code (LiteLLM Proxy)
 
-Claude Code speaks the Anthropic Messages API (`/v1/messages`), but vLLM speaks the OpenAI Chat Completions API (`/v1/chat/completions`). LiteLLM proxy translates between them.
+Claude Code speaks the Anthropic Messages API (`/v1/messages`), but vLLM speaks the OpenAI Chat Completions API (`/v1/chat/completions`). LiteLLM proxy sits in between and translates the formats.
 
-### Start the proxy
-```bash
-# Install litellm if needed
-pip install litellm
-
-# Start proxy (translates Anthropic → OpenAI format)
-litellm --config llm_deployment/litellm_config.yaml --port 4001
-```
-
-### Run Claude Code with Qwen3-Coder
-```bash
-ANTHROPIC_BASE_URL=http://localhost:4001 ANTHROPIC_MODEL=qwen3-coder ANTHROPIC_AUTH_TOKEN=fake-key claude
-```
-
-### How it works
 ```
 Claude Code (Anthropic Messages API)
     ↓ POST /v1/messages
@@ -250,56 +216,62 @@ LiteLLM Proxy
 Claude Code
 ```
 
-## Kimi K2.5 NVFP4 on B200 (4x GPU)
+### Step 1: Install LiteLLM
 
-### The Problem
-
-Running Kimi-K2.5-NVFP4 on RunPod B200s requires vLLM 0.15.1+ (for model support), but:
-- Standard vLLM Docker images (`vllm/vllm-openai:v0.15.x`) fail with **Error 803** on RunPod B200 due to CUDA driver mismatch (images use CUDA 12.8, RunPod has driver 580.x / CUDA 13.1)
-- The NVIDIA NGC container (`nvcr.io/nvidia/vllm:26.01-py3`) ships vLLM 0.13.0 (too old for Kimi K2.5)
-
-### The Solution
-
-Use the NGC container as the base (it has CUDA forward compatibility for Blackwell), then upgrade vLLM in-place with two critical fixes:
-
-1. **`pip install vllm==0.15.1`** — upgrades vLLM but also downgrades PyTorch from NVIDIA's 2.10.0a0 (CUDA 13.1) to standard 2.9.1 (CUDA 12.8)
-2. **`pip uninstall flash-attn -y`** — the pre-installed `flash_attn_2_cuda.so` was compiled against the old PyTorch, causing ABI mismatch (`undefined symbol: _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb`). Blackwell uses FlashInfer MLA, not flash-attn, so removing it is safe.
-3. **`FLASHINFER_DISABLE_VERSION_CHECK=1`** — vLLM 0.15.1 pulls in `flashinfer-python` 0.6.1, but the NGC container has `flashinfer-cubin` 0.6.0 (NVIDIA custom build for CUDA 13.1). This env var bypasses the version check. The minor version difference (0.6.0 → 0.6.1) is compatible.
-
-The startup command in `pod.py`:
 ```bash
-pip install vllm==0.15.1 && \
-pip uninstall flash-attn -y && \
-FLASHINFER_DISABLE_VERSION_CHECK=1 \
-python3 -m vllm.entrypoints.openai.api_server \
-  --model nvidia/Kimi-K2.5-NVFP4 \
-  --tensor-parallel-size 4 \
-  --max-model-len 32768 \
-  --enable-auto-tool-choice --tool-call-parser kimi_k2 --reasoning-parser kimi_k2 \
-  --trust-remote-code
+pip install litellm
 ```
 
-### .env config for Kimi K2.5
+### Step 2: Update litellm config with your pod ID
 
+After launching a pod, update `litellm_config.yaml` with the pod ID and your vLLM API key:
+
+```bash
+# Get your pod ID
+cat llm_deployment/.pod_id
+
+# Edit litellm_config.yaml — replace <pod-id> with the actual pod ID
+# and set your VLLM_API_KEY
 ```
-MODEL_NAME=nvidia/Kimi-K2.5-NVFP4
-GPU_TYPE_ID=NVIDIA B200
-GPU_COUNT=4
-VOLUME_SIZE_GB=700
+
+The config should look like:
+```yaml
+model_list:
+  - model_name: kimi-k2.5
+    litellm_params:
+      model: openai/nvidia/Kimi-K2.5-NVFP4
+      api_base: https://YOUR_POD_ID-8000.proxy.runpod.net/v1
+      api_key: your-vllm-api-key
+
+litellm_settings:
+  drop_params: true
 ```
 
-### Hardware requirements
+### Step 3: Start the proxy
 
-| Resource | Spec |
-|----------|------|
-| GPU | 4x NVIDIA B200 (720GB total VRAM) |
-| Model size | ~119 safetensor shards, NVFP4 quantized |
-| KV cache dtype | FP8 (e4m3) — auto-selected |
-| Attention backend | FlashInfer MLA (with TensorRT-LLM kernels) |
-| MoE backend | FLASHINFER_TRTLLM |
-| Volume | 700GB (model checkpoint ~600GB on disk) |
+```bash
+litellm --config llm_deployment/litellm_config.yaml --port 4001
+```
 
-### Startup timeline (first boot)
+Leave this running in a terminal. It will log all requests being proxied.
+
+### Step 4: Run Claude Code against the self-hosted model
+
+In a new terminal:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:4001 ANTHROPIC_AUTH_TOKEN=fake-key claude --model kimi-k2.5
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_BASE_URL` | Points Claude Code at LiteLLM instead of Anthropic's API |
+| `ANTHROPIC_AUTH_TOKEN` | Any non-empty string (LiteLLM doesn't validate it unless you set a master key) |
+| `--model` | Must match the `model_name` in `litellm_config.yaml` |
+
+Claude Code will now use Kimi K2.5 on your RunPod pod for all completions instead of Anthropic's API.
+
+## Startup Timeline
 
 | Phase | Duration |
 |-------|----------|
@@ -311,7 +283,7 @@ VOLUME_SIZE_GB=700
 | **Total first boot** | **~16 min** (observed) |
 | **Subsequent boots (stop→start)** | **~10 min** (model cached on volume, pip install still runs) |
 
-### Benchmark results (4x B200, NVFP4, FP8 KV cache)
+## Benchmark Results (4x B200, Kimi K2.5 NVFP4)
 
 Sequential (single request):
 
@@ -340,35 +312,29 @@ Concurrent throughput scaling:
 
 Run benchmarks: `uv run llm_deployment/benchmark.py --concurrency 2 4 8 16`
 
-### Cost
+## B200 Blackwell Workarounds
 
-| State | Cost |
-|-------|------|
-| Running | ~$20/hr (4x B200) |
-| Stopped | ~$0.10/GB/month (~$70/mo for 700GB volume) |
+Running on RunPod B200s requires the NGC container because standard vLLM Docker images fail with Error 803 (CUDA driver mismatch — images use CUDA 12.8, RunPod has driver 580.x / CUDA 13.1).
 
-## Known RunPod Limitations (as of Feb 2026)
+The startup command in `pod.py` uses this workaround:
 
-### B200 GPUs: standard vLLM images don't work
-
-RunPod's B200 (Blackwell) machines run host driver **580.x / CUDA runtime 13.1**. Standard vLLM Docker images fail with Error 803. **Workaround:** Use the NGC container (`nvcr.io/nvidia/vllm:26.01-py3`) which has CUDA forward compatibility, then upgrade vLLM in-place (see Kimi K2.5 section above).
+1. **`nvcr.io/nvidia/vllm:26.01-py3`** as the base image (has CUDA forward compatibility for Blackwell)
+2. **`pip install vllm==0.15.1`** — upgrades vLLM (also downgrades PyTorch from NVIDIA's 2.10.0a0 to standard 2.9.1)
+3. **`pip uninstall flash-attn -y`** — removes flash_attn which has ABI mismatch after the PyTorch downgrade. Blackwell uses FlashInfer MLA, not flash-attn, so this is safe.
+4. **`FLASHINFER_DISABLE_VERSION_CHECK=1`** — bypasses minor version mismatch between flashinfer-python 0.6.1 and NGC's flashinfer-cubin 0.6.0
 
 **Images that fail on RunPod B200:**
 - `vllm/vllm-openai:latest`, `v0.15.0`, `v0.15.1`, `v0.15.1-cu130`, `nightly`
 
 See [vllm#33447](https://github.com/vllm-project/vllm/issues/33447).
 
-### H200 GPUs: availability
-
-H200 NVL and H200 SXM are frequently out of stock on RunPod.
-
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `pod.py` | Pod lifecycle management (launch, wait, status, stop, start, destroy, test, url) |
+| `benchmark.py` | Performance benchmarking (sequential, streaming, concurrent) |
 | `litellm_config.yaml` | LiteLLM proxy config pointing at RunPod vLLM |
 | `.env.example` | Template for env vars |
 | `.env` | Your config with secrets (gitignored) |
 | `.pod_id` | Auto-created — tracks active pod ID (gitignored) |
-| `README.md` | This file |
