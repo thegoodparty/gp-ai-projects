@@ -280,30 +280,15 @@ class V1PipelineOrchestrator:
                 logger.warning(f"⚠️ No messages found for campaign: {campaign_name}")
                 logger.info("✅ Pipeline completed with 0 messages to process")
 
-                # Publish completion events for all poll_ids with 0 responses
                 sqs_result: dict[str, Any] = {}
                 if self.sqs_publisher and self.config.get('sqs_events', {}).get('enabled', False):
-                    logger.info("💾 Publishing empty poll completion events")
-
-                    # Extract all poll_ids from consolidation analysis
-                    poll_ids = [file_info['poll_id'] for file_info in consolidation_analysis.get('files', [])]
-
+                    poll_ids = [f['poll_id'] for f in consolidation_analysis.get('files', [])]
                     if poll_ids:
-                        total_complete_events = 0
-                        for poll_id in poll_ids:
-                            try:
-                                stats = await self.sqs_publisher.publish_empty_poll_event(poll_id)
-                                total_complete_events += stats.get('complete_events_sent', 0)
-                            except Exception as e:
-                                logger.error(f"Failed to publish empty poll event for {poll_id}: {e}", exc_info=True)
-
-                        sqs_result = {
-                            'success': True,
-                            'complete_events_sent': total_complete_events
-                        }
-                        logger.info(f"✅ Published {total_complete_events} empty poll completion events")
-                    else:
-                        logger.warning("⚠️ No poll_ids found in consolidation analysis")
+                        sqs_result = await self.sqs_publisher.publish_poll_completion(
+                            poll_ids=poll_ids, unified_records=[], campaign_name=campaign_name
+                        )
+                        sqs_result['success'] = True
+                        logger.info(f"Published {len(poll_ids)} empty poll completion events")
 
                 processing_time = time.time() - start_time
                 return PipelineResult(
@@ -436,36 +421,18 @@ class V1PipelineOrchestrator:
             # Stage 4: Event Saving to S3 (validation mode - only runs on successful pipeline completion)
             sqs_result = {}
             if self.sqs_publisher and self.config.get('sqs_events', {}).get('enabled', False):
-                logger.info("💾 Stage 4: Event Saving to S3 (Validation Mode)")
+                logger.info("💾 Stage 4: Event Publishing")
                 sqs_start = time.time()
 
-                # Check if all messages were filtered out (had CSV data but 0 unified records)
-                if not unified_records and total_messages > 0:
-                    logger.warning(f"⚠️ All {total_messages} messages were filtered out - publishing empty poll completion events")
-
-                    # Extract poll_ids from consolidation analysis
-                    poll_ids = [file_info['poll_id'] for file_info in consolidation_analysis.get('files', [])]
-
-                    total_complete_events = 0
-                    for poll_id in poll_ids:
-                        try:
-                            stats = await self.sqs_publisher.publish_empty_poll_event(poll_id)
-                            total_complete_events += stats.get('complete_events_sent', 0)
-                        except Exception as e:
-                            logger.error(f"Failed to publish empty poll event for {poll_id}: {e}", exc_info=True)
-
-                    sqs_stats = {
-                        'polls_processed': len(poll_ids),
-                        'complete_events_sent': total_complete_events
-                    }
-                else:
-                    # Normal flow - publish events from unified records
-                    sqs_stats = await self.sqs_publisher.publish_events(unified_records, campaign_name)
+                poll_ids = [f['poll_id'] for f in consolidation_analysis.get('files', [])]
+                sqs_stats = await self.sqs_publisher.publish_poll_completion(
+                    poll_ids=poll_ids, unified_records=unified_records, campaign_name=campaign_name
+                )
 
                 sqs_time = time.time() - sqs_start
 
-                logger.info(f"✅ Event saving completed in {sqs_time:.2f}s")
-                logger.info(f"   Saved {sqs_stats['complete_events_sent']} complete events")
+                logger.info(f"Event publishing completed in {sqs_time:.2f}s")
+                logger.info(f"   Published {sqs_stats['complete_events_sent']} events")
 
                 sqs_result = {
                     'success': True,
@@ -554,18 +521,41 @@ class V1PipelineOrchestrator:
 
             logger.info(f"Found {len(csv_files)} CSV file(s) for campaign '{campaign_name}' in {input_dir}")
 
-            dfs = []
-            poll_ids = []
+            loaded_dfs = []
+            loaded_files = []
+            skipped_files = []
             for csv_file in csv_files:
                 poll_id = csv_file.stem
-                poll_ids.append(poll_id)
+
+                if csv_file.stat().st_size == 0:
+                    logger.warning(f"Skipping zero-byte CSV: {csv_file.name} (poll_id: {poll_id})")
+                    skipped_files.append({"filename": csv_file.name, "poll_id": poll_id})
+                    continue
 
                 logger.info(f"Loading: {csv_file.name} (poll_id: {poll_id})")
-                df = pd.read_csv(csv_file)
-                df = self._normalize_csv_columns(df)
-                dfs.append(df)
+                try:
+                    df = pd.read_csv(csv_file)
+                except pd.errors.EmptyDataError:
+                    logger.warning(f"EmptyDataError reading {csv_file.name} (poll_id: {poll_id}), treating as empty")
+                    skipped_files.append({"filename": csv_file.name, "poll_id": poll_id})
+                    continue
 
-            combined_df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+                df = self._normalize_csv_columns(df)
+                loaded_dfs.append(df)
+                loaded_files.append({"filename": csv_file.name, "poll_id": poll_id})
+
+            all_file_entries = loaded_files + skipped_files
+
+            if not loaded_dfs:
+                analysis = {
+                    "mode": "filename_based_loading",
+                    "file_count": len(csv_files),
+                    "total_rows": 0,
+                    "files": all_file_entries,
+                }
+                return pd.DataFrame(), analysis
+
+            combined_df = pd.concat(loaded_dfs, ignore_index=True) if len(loaded_dfs) > 1 else loaded_dfs[0]
 
             # Validate required columns (case-insensitive)
             columns_lower = [col.lower() for col in combined_df.columns]
@@ -596,11 +586,11 @@ class V1PipelineOrchestrator:
                 "mode": "filename_based_loading",
                 "file_count": len(csv_files),
                 "total_rows": len(combined_df),
-                "files": [{"filename": f.name, "poll_id": poll_id} for f, poll_id in zip(csv_files, poll_ids)]
+                "files": all_file_entries,
             }
 
-            logger.info(f"Loaded {len(combined_df)} rows from {len(csv_files)} file(s)")
-            logger.info(f"Poll IDs: {poll_ids}")
+            logger.info(f"Loaded {len(combined_df)} rows from {len(loaded_files)} file(s), skipped {len(skipped_files)}")
+            logger.info(f"Poll IDs: {[f['poll_id'] for f in all_file_entries]}")
             return combined_df, analysis
 
         except Exception as e:
