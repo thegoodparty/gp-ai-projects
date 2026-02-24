@@ -474,7 +474,8 @@ output "security_group_id" {
 }
 
 resource "aws_sns_topic" "matcher_failures" {
-  name = "ddhq-matcher-failures-${var.environment}"
+  name              = "ddhq-matcher-failures-${var.environment}"
+  kms_master_key_id = "alias/aws/sns"
 
   tags = {
     Name        = "DDHQ Matcher Failures"

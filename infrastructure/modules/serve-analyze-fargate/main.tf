@@ -444,7 +444,8 @@ output "security_group_id" {
 }
 
 resource "aws_sns_topic" "pipeline_failures" {
-  name = "serve-analyze-pipeline-failures-${var.environment}"
+  name              = "serve-analyze-pipeline-failures-${var.environment}"
+  kms_master_key_id = "alias/aws/sns"
 
   tags = {
     Name        = "Pipeline Failures"
