@@ -35,6 +35,7 @@ from shared.databricks_client import DatabricksClient
 from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 from shared.llm_gemini import GeminiEmbeddingClient
 from shared.logger import get_logger
+from shared.braintrust import init_braintrust, cache_prompt, build_cached_prompt, flush_logs
 from tqdm.asyncio import tqdm
 import time
 
@@ -111,6 +112,17 @@ class ProductionMatcher:
         
         # Create ThreadPoolExecutor for maximum concurrency
         self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
+
+        init_braintrust(project="stitch-golden-data")
+        self._init_prompt_cache()
+
+    def _init_prompt_cache(self):
+        self._prompt_name = "stitch-golden-data-matcher"
+        prompt_obj = cache_prompt(self._prompt_name)
+        if prompt_obj is not None:
+            self.logger.info("Braintrust prompt cached for stitch-golden-data-matcher")
+        else:
+            self.logger.warning("Braintrust prompt not available, using fallback")
 
     def get_available_states(self) -> List[str]:
         """Get list of states with available vector stores"""
@@ -370,36 +382,46 @@ class ProductionMatcher:
         
         districts_text = "\n".join(district_descriptions)
         state = districts[0].state if districts else "Unknown"
-        
-        prompt = f"""
+        num_districts = str(len(districts))
+
+        variables = {
+            "br_name": br_name,
+            "state": state,
+            "districts_text": districts_text,
+            "num_districts": num_districts,
+        }
+
+        fallback_prompt = f"""
 You are analyzing a political position to find the best L2 district match from candidate districts.
 
 BR Position Details:
 - Name: "{br_name}"
 - State: {state}
 
-Top {len(districts)} District Candidates:
+Top {num_districts} District Candidates:
 {districts_text}
 
 Analyze the BR position and select the BEST matching candidate. Consider:
 - Geographic alignment (city/county matching)
 - Office type and district type compatibility
-- Specific identifiers or numbers in names 
+- Specific identifiers or numbers in names
 - Functional role alignment (e.g., School Board → School Board districts)
 - Ignore seats and positions
 - if the office is greater than the state level, match to the state level
 
 Return JSON with:
-• selected_candidate_number: Number (1-{len(districts)}) of your choice, or 0 if no good match
+• selected_candidate_number: Number (1-{num_districts}) of your choice, or 0 if no good match
 • selection_confidence: Confidence level (0-100)
 • reasoning: Detailed explanation of your selection or rejection
 • close_alternatives: Array of candidate numbers that were very close (only if multiple options were neck-and-neck)
 
-IMPORTANT: Return 0 if no candidate represents a reasonable match. 
-There is a real probability that the match does not exist so return 0 if there is no clear match. 
+IMPORTANT: Return 0 if no candidate represents a reasonable match.
+There is a real probability that the match does not exist so return 0 if there is no clear match.
 
-Base decisions on semantic meaning, geography, and functional appropriateness. 
+Base decisions on semantic meaning, geography, and functional appropriateness.
 """
+
+        prompt = build_cached_prompt(self._prompt_name, variables, fallback_prompt=fallback_prompt)
         
         response_schema = {
             "type": "object",
@@ -420,7 +442,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 self.thread_pool,
                 lambda: self.llm.generate_structured_content(
                     prompt=prompt,
-                    response_schema=response_schema
+                    response_schema=response_schema,
+                    trace_name="stitch-match-selection"
                 )
             )
         except Exception as e:
@@ -1346,5 +1369,10 @@ async def main():
         print(f"   # Process all states with maximum throughput:")
         print(f"   uv run stitch_golden_data/prod_gold_data/production_matcher.py all_states --batch-size 1000 --max-concurrent-states 2 --max-workers 1500")
 
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        flush_logs()
