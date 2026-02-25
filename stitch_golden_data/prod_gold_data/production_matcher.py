@@ -422,6 +422,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
 """
 
         prompt = build_cached_prompt(self._prompt_name, variables, fallback_prompt=fallback_prompt)
+        if not prompt:
+            prompt = fallback_prompt
         
         response_schema = {
             "type": "object",
