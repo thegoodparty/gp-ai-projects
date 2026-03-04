@@ -55,6 +55,7 @@ class LLMSelection:
     selection_confidence: float
     selection_reasoning: str
     alternative_matches: Optional[List[Dict]] = None
+    is_exact_district_match: bool = False
 
 @dataclass
 class MatchingStats:
@@ -207,7 +208,11 @@ class ProductionMatcher:
         if os.path.exists(cache_path):
             try:
                 self.logger.info(f"📁 Loading BR data from cache: {cache_filename}")
-                return pd.read_parquet(cache_path)
+                df = pd.read_parquet(cache_path)
+                if limit:
+                    self.logger.info(f"📏 Applying limit: {limit} records (from {len(df)})")
+                    df = df.head(limit)
+                return df
             except Exception as e:
                 self.logger.warning(f"⚠️ Cache read failed, will query fresh: {e}")
         
@@ -414,6 +419,7 @@ Return JSON with:
 • selection_confidence: Confidence level (0-100)
 • reasoning: Detailed explanation of your selection or rejection
 • close_alternatives: Array of candidate numbers that were very close (only if multiple options were neck-and-neck)
+• is_exact_district_match: Boolean indicating whether the selected candidate matches the BR position at the same specificity level. Set true if the selected L2 candidate is at the same district specificity as the BR position (e.g., "City Council District 3" matched to a district-level L2 entry). Set false if the BR position specifies a sub-district (Ward, District, Place + number) but the selected L2 candidate is a parent-level type (City, County, Township, Borough, Village, Town_District). Set false if selected_candidate_number is 0.
 
 IMPORTANT: Return 0 if no candidate represents a reasonable match.
 There is a real probability that the match does not exist so return 0 if there is no clear match.
@@ -434,9 +440,10 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 "close_alternatives": {
                     "type": "array",
                     "items": {"type": "number", "minimum": 0, "maximum": len(districts)}
-                }
+                },
+                "is_exact_district_match": {"type": "boolean"}
             },
-            "required": ["selected_candidate_number", "selection_confidence", "reasoning"]
+            "required": ["selected_candidate_number", "selection_confidence", "reasoning", "is_exact_district_match"]
         }
 
         try:
@@ -455,7 +462,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 selected_district_type="LLM_ERROR",
                 selection_confidence=0.0,
                 selection_reasoning=f"LLM generation failed: {str(e)}",
-                alternative_matches=None
+                alternative_matches=None,
+                is_exact_district_match=False
             )
         
         # Handle potential float or invalid response
@@ -475,7 +483,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 selected_district_type="NOT_MATCHED",
                 selection_confidence=response["selection_confidence"],
                 selection_reasoning=response["reasoning"],
-                alternative_matches=None
+                alternative_matches=None,
+                is_exact_district_match=False
             )
         
         # Get selected district
@@ -505,7 +514,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             selected_district_type=selected_district.l2_district_type,
             selection_confidence=response["selection_confidence"],
             selection_reasoning=response["reasoning"],
-            alternative_matches=alternative_matches
+            alternative_matches=alternative_matches,
+            is_exact_district_match=response.get("is_exact_district_match", False)
         )
 
     async def match_single_record(self, row: pd.Series) -> pd.Series:
@@ -534,6 +544,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 result_row['top_embedding_score'] = 0.0
                 result_row['embeddings'] = 'NO_VECTOR_STORE'
                 result_row['alternative_matches'] = ''
+                result_row['is_exact_district_match'] = False
                 return result_row
             
             # Step 2: LLM selection
@@ -555,6 +566,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 result_row['top_embedding_score'] = embedding_districts[0].similarity_score
                 result_row['embeddings'] = embeddings_str
                 result_row['alternative_matches'] = ''
+                result_row['is_exact_district_match'] = False
                 return result_row
             
             # Format alternative matches
@@ -575,7 +587,8 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             result_row['top_embedding_score'] = embedding_districts[0].similarity_score
             result_row['embeddings'] = embeddings_str
             result_row['alternative_matches'] = alt_matches_str
-            
+            result_row['is_exact_district_match'] = llm_selection.is_exact_district_match
+
             return result_row
             
         except Exception as e:
@@ -589,6 +602,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             result_row['top_embedding_score'] = 0.0
             result_row['embeddings'] = 'ERROR'
             result_row['alternative_matches'] = ''
+            result_row['is_exact_district_match'] = False
             return result_row
 
     async def process_batch(self, batch_df: pd.DataFrame, batch_num: int, total_batches: int, state: str = None) -> pd.DataFrame:
@@ -634,6 +648,7 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
                 row['top_embedding_score'] = 0.0
                 row['embeddings'] = 'BATCH_ERROR'
                 row['alternative_matches'] = ''
+                row['is_exact_district_match'] = False
                 processed_rows.append(row)
                 self.stats.errors += 1
             else:
@@ -891,23 +906,23 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         desired_columns = [
             # BR columns
             'name', 'id', 'br_database_id', 'state',
-            # L2 columns  
+            # L2 columns
             'l2_district_name', 'l2_district_type',
             # LLM columns
-            'is_matched', 'llm_reason', 'confidence', 'embeddings', 'top_embedding_score'
+            'is_matched', 'is_exact_district_match', 'llm_reason', 'confidence', 'embeddings', 'top_embedding_score'
         ]
-        
+
         # Filter to only include desired columns that exist in the DataFrame
         available_columns = [col for col in desired_columns if col in results_df.columns]
         filtered_df = results_df[available_columns]
-        
+
         # Save parquet (primary format with filtered data)
         filtered_df.to_parquet(parquet_path, index=False)
         self.logger.info(f"💾 Parquet results saved: {parquet_path} ({len(available_columns)} columns)")
-        
+
         # Save TSV with metadata comments
         filtered_df.to_csv(tsv_path, index=False, sep='\t')
-        
+
         # Append metadata to TSV
         metadata = [
             f"\n# PRODUCTION MATCHING METADATA",
@@ -925,12 +940,12 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
             f"# Success Rate: {(stats.successful_matches / max(1, stats.total_processed) * 100):.1f}%",
             f"# Columns: {', '.join(available_columns)}"
         ]
-        
+
         with open(tsv_path, 'a') as f:
             f.write('\n'.join(metadata))
-        
+
         self.logger.info(f"💾 TSV results saved: {tsv_path} ({len(available_columns)} columns)")
-        
+
         return {
             'parquet': parquet_path,
             'tsv': tsv_path
@@ -1149,23 +1164,23 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         desired_columns = [
             # BR columns
             'name', 'id', 'br_database_id', 'state',
-            # L2 columns  
+            # L2 columns
             'l2_district_name', 'l2_district_type',
             # LLM columns
-            'is_matched', 'llm_reason', 'confidence', 'embeddings', 'top_embedding_score'
+            'is_matched', 'is_exact_district_match', 'llm_reason', 'confidence', 'embeddings', 'top_embedding_score'
         ]
-        
+
         # Filter to only include desired columns that exist in the DataFrame
         available_columns = [col for col in desired_columns if col in results_df.columns]
         filtered_df = results_df[available_columns]
-        
+
         # Save parquet (primary format with filtered data)
         filtered_df.to_parquet(parquet_path, index=False)
         self.logger.info(f"💾 Parquet results saved: {parquet_path} ({len(available_columns)} columns)")
-        
+
         # Save TSV with metadata comments
         filtered_df.to_csv(tsv_path, index=False, sep='\t')
-        
+
         # Append metadata to TSV
         metadata = [
             f"\n# PRODUCTION MATCHING METADATA",
@@ -1247,7 +1262,16 @@ Base decisions on semantic meaning, geography, and functional appropriateness.
         self.logger.info(f"Total Cost: ${self.stats.total_cost:.6f}")
         self.logger.info(f"  - Embedding Cost: ${self.stats.embedding_cost:.6f}")
         self.logger.info(f"  - LLM Cost: ${self.stats.llm_cost:.6f}")
-        
+
+        llm_stats = self.llm.get_usage_stats()
+        self.logger.info(f"\n🧠 LLM TOKEN BREAKDOWN")
+        self.logger.info(f"  - Prompt tokens: {llm_stats['prompt_tokens']:,}")
+        self.logger.info(f"  - Completion tokens: {llm_stats['completion_tokens']:,}")
+        self.logger.info(f"  - Thinking tokens: {llm_stats['thinking_tokens']:,}")
+        if llm_stats['completion_tokens'] + llm_stats['thinking_tokens'] > 0:
+            thinking_pct = llm_stats['thinking_tokens'] / (llm_stats['completion_tokens'] + llm_stats['thinking_tokens']) * 100
+            self.logger.info(f"  - Thinking ratio: {thinking_pct:.1f}% of output tokens")
+
         if self.stats.total_processed > 0:
             cost_per_record = self.stats.total_cost / self.stats.total_processed
             self.logger.info(f"Average Cost per Record: ${cost_per_record:.6f}")
