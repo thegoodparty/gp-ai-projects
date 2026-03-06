@@ -79,6 +79,7 @@ class Gemini3Client:
 
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.total_thinking_tokens = 0
         self.total_cost = 0.0
         self.api_call_count = 0
 
@@ -125,10 +126,12 @@ class Gemini3Client:
             usage = response.usage_metadata
             prompt_tokens = getattr(usage, 'prompt_token_count', 0) or 0
             completion_tokens = getattr(usage, 'candidates_token_count', 0) or 0
+            thinking_tokens = getattr(usage, 'thoughts_token_count', 0) or 0
 
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
-            self.total_cost += self._calculate_cost(model_name, prompt_tokens, completion_tokens)
+            self.total_thinking_tokens += thinking_tokens
+            self.total_cost += self._calculate_cost(model_name, prompt_tokens, completion_tokens + thinking_tokens)
 
         self.api_call_count += 1
 
@@ -271,6 +274,7 @@ class Gemini3Client:
             "api_calls": self.api_call_count,
             "prompt_tokens": self.total_prompt_tokens,
             "completion_tokens": self.total_completion_tokens,
+            "thinking_tokens": self.total_thinking_tokens,
             "total_cost": self.total_cost
         }
 
