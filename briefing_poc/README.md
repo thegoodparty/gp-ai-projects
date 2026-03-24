@@ -57,17 +57,31 @@ briefing_poc/
 └── docs/                  # Design docs and research notes
 ```
 
-## Prerequisites
+## Setup
 
-**API Keys** (set in `.env`):
-- `GEMINI_API_KEY` — Google AI Studio (required for LLM analysis)
-- `TAVILY_API_KEY` — tavily.com (optional, fallback for news search)
+**Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/)
 
-**Databricks** (for constituent data):
-- `DATABRICKS_API_KEY`
-- `DATABRICKS_SERVER_HOSTNAME`
-- `DATABRICKS_HTTP_PATH`
-- `AWS_PROFILE=work`
+```bash
+# Install dependencies (from the gp-ai-projects root)
+uv sync
+```
+
+**Environment variables** — create a `.env` file in the project root:
+
+```bash
+# Required for LLM analysis (scripts 04, 05, 06b, 08)
+GEMINI_API_KEY=your_key_here
+
+# Optional — fallback for news search (script 08)
+TAVILY_API_KEY=your_key_here
+
+# Required for constituent data (script 06)
+DATABRICKS_API_KEY=your_key_here
+DATABRICKS_SERVER_HOSTNAME=your_host_here
+DATABRICKS_HTTP_PATH=your_path_here
+```
+
+Scripts 01-03 (data collection and PDF extraction) don't require any API keys.
 
 ## Running the Pipeline
 
@@ -106,6 +120,8 @@ uv run python briefing_poc/scripts/05_assemble_briefing.py --city charlotte
 ```
 
 Each script is **resumable** — it checks for existing output and skips completed work. Safe to re-run.
+
+**Output:** The final briefing lands in `cities/{slug}/data/briefing/{city}_briefing.md`. All intermediate data (legislative records, analysis passes, constituent data) is saved in `cities/{slug}/data/`.
 
 ## Adding a New City
 
