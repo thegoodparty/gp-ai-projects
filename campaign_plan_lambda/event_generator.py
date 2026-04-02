@@ -98,7 +98,10 @@ COMMUNITY EVENTS DATA:
         system_instruction="Select community events and return them as structured data. Dates must be YYYY-MM-DD format.",
         temperature=0.0,
     )
-    assert isinstance(raw_response, LlmEventResultList)
+    if not isinstance(raw_response, LlmEventResultList):
+        raise TypeError(
+            f"Expected LlmEventResultList, got {type(raw_response).__name__}"
+        )
 
     tasks: List[CampaignEventTask] = []
     for event in raw_response.events:

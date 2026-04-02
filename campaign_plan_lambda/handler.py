@@ -56,7 +56,7 @@ class SqsMessageBody(BaseModel):
         return v
 
 
-# Throws an error via Pydantic if a key is mising.
+# Throws an error via Pydantic if a key is missing.
 def _load_secrets() -> Secrets:
     global _secrets_cache
     if _secrets_cache is not None:

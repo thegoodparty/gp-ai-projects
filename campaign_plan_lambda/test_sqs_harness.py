@@ -96,9 +96,9 @@ def main():
     import campaign_plan_lambda.handler as handler_module
     import campaign_plan_lambda.output as output_module
 
-    handler_module._secrets_cache = {
-        "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY", ""),
-    }
+    handler_module._secrets_cache = handler_module.Secrets(
+        GEMINI_API_KEY=os.environ.get("GEMINI_API_KEY", ""),
+    )
 
     output_module._s3_client = mock_s3_client
     output_module._sqs_client = mock_sqs_client

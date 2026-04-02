@@ -273,6 +273,16 @@ resource "aws_sns_topic_subscription" "shared_slack_notifier" {
   endpoint  = var.shared_slack_notifier_lambda_arn
 }
 
+# Allow SNS to invoke the shared Slack notifier Lambda
+resource "aws_lambda_permission" "shared_slack_notifier_from_failures_sns" {
+  count         = var.shared_slack_notifier_lambda_arn != "" ? 1 : 0
+  statement_id  = "AllowExecutionFromCampaignPlanFailuresSns"
+  action        = "lambda:InvokeFunction"
+  function_name = var.shared_slack_notifier_lambda_arn
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.failures.arn
+}
+
 # DLQ depth alarm — fires when any message lands in the DLQ
 resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
   alarm_name          = "campaign-plan-dlq-messages-${var.environment}"

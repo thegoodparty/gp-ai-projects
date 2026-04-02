@@ -9,7 +9,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import TypedDict, Optional
+from typing import TypedDict
 
 from shared.logger import get_logger
 
