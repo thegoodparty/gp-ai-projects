@@ -9,6 +9,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from typing import TypedDict, Optional
 
 from shared.logger import get_logger
 
@@ -16,6 +17,41 @@ logger = get_logger(__name__)
 
 _s3_client = None
 _sqs_client = None
+
+
+class CompletionData(TypedDict):
+    campaignId: int
+    status: str
+    s3Key: str
+    taskCount: int
+    generationTimestamp: str
+
+
+class ErrorData(TypedDict):
+    campaignId: int
+    status: str
+    error: str
+
+
+class SqsMessage(TypedDict):
+    type: str
+    data: CompletionData | ErrorData
+
+
+class TaskDict(TypedDict):
+    title: str
+    description: str
+    cta: str
+    flowType: str
+    week: int
+    date: str
+
+
+class CampaignPlanResult(TypedDict):
+    campaignId: int
+    tasks: list[TaskDict]
+    taskCount: int
+    generationTimestamp: str
 
 
 def _get_s3():
@@ -36,7 +72,7 @@ def _get_sqs():
     return _sqs_client
 
 
-def _send_to_sqs(campaign_id: int, message: dict):
+def _send_to_sqs(campaign_id: int, message: SqsMessage) -> None:
     """Send a message to gp-api's SQS FIFO queue."""
     queue_url = os.environ["OUTPUT_SQS_QUEUE_URL"]
     _get_sqs().send_message(
@@ -47,7 +83,7 @@ def _send_to_sqs(campaign_id: int, message: dict):
     )
 
 
-def write_result_to_s3(campaign_id: int, result: dict) -> str:
+def write_result_to_s3(campaign_id: int, result: CampaignPlanResult) -> str:
     """
     Write campaign plan result JSON to S3.
 
@@ -71,9 +107,9 @@ def write_result_to_s3(campaign_id: int, result: dict) -> str:
 
 def send_completion_message(
     campaign_id: int, s3_key: str, task_count: int, timestamp: str
-):
+) -> None:
     """Send success completion message to gp-api's SQS FIFO queue."""
-    message = {
+    message: SqsMessage = {
         "type": "campaignPlanComplete",
         "data": {
             "campaignId": campaign_id,
@@ -88,9 +124,9 @@ def send_completion_message(
     logger.info(f"Sent completion message for campaign {campaign_id}")
 
 
-def send_error_message(campaign_id: int, error: str):
+def send_error_message(campaign_id: int, error: str) -> None:
     """Send error message to gp-api's SQS FIFO queue."""
-    message = {
+    message: SqsMessage = {
         "type": "campaignPlanComplete",
         "data": {
             "campaignId": campaign_id,

@@ -13,11 +13,33 @@ from datetime import date, datetime, timezone
 
 from pydantic import BaseModel, ValidationError, field_validator
 
+from typing import TypedDict, Optional
+
 from shared.logger import get_logger
+from campaign_plan_lambda.output import CampaignPlanResult
 
 logger = get_logger(__name__)
 
-_secrets_cache = None
+
+class SqsAttributes(TypedDict, total=False):
+    ApproximateReceiveCount: str
+
+
+class SqsRecord(TypedDict):
+    body: str
+    messageId: str
+    attributes: SqsAttributes
+
+
+class LambdaEvent(TypedDict):
+    Records: list[SqsRecord]
+
+
+class Secrets(BaseModel):
+    GEMINI_API_KEY: str
+
+
+_secrets_cache: Optional[Secrets] = None
 MAX_RECEIVE_COUNT = 3
 
 
@@ -34,7 +56,8 @@ class SqsMessageBody(BaseModel):
         return v
 
 
-def _load_secrets():
+# Throws an error via Pydantic if a key is mising.
+def _load_secrets() -> Secrets:
     global _secrets_cache
     if _secrets_cache is not None:
         return _secrets_cache
@@ -46,20 +69,17 @@ def _load_secrets():
 
     client = boto3.client("secretsmanager")
     response = client.get_secret_value(SecretId=secret_id)
-    _secrets_cache = json.loads(response["SecretString"])
+    _secrets_cache = Secrets(**json.loads(response["SecretString"]))
     logger.info(f"Loaded secrets from {secret_id}")
     return _secrets_cache
 
 
-def _inject_secrets():
+def _inject_secrets() -> None:
     secrets = _load_secrets()
-    gemini_key = secrets.get("GEMINI_API_KEY")
-    if not gemini_key:
-        raise RuntimeError("GEMINI_API_KEY not found in secrets")
-    os.environ["GEMINI_API_KEY"] = gemini_key
+    os.environ["GEMINI_API_KEY"] = secrets.GEMINI_API_KEY
 
 
-def handler(event, context):
+def handler(event: LambdaEvent, context=None) -> None:
     _inject_secrets()
     os.environ.setdefault("ENVIRONMENT", "dev")
 
@@ -100,7 +120,7 @@ def handler(event, context):
             raise
 
 
-async def _generate(campaign_id: int, msg: SqsMessageBody):
+async def _generate(campaign_id: int, msg: SqsMessageBody) -> CampaignPlanResult:
     from campaign_plan_lambda.event_generator import generate_event_tasks
     from campaign_plan_lambda.output import write_result_to_s3, send_completion_message
 
@@ -113,9 +133,23 @@ async def _generate(campaign_id: int, msg: SqsMessageBody):
 
     generation_timestamp = datetime.now(timezone.utc).isoformat()
 
-    result = {
+    from campaign_plan_lambda.output import TaskDict
+
+    task_dicts: list[TaskDict] = [
+        {
+            "title": task.title,
+            "description": task.description,
+            "cta": task.cta,
+            "flowType": task.flowType,
+            "week": task.week,
+            "date": task.date,
+        }
+        for task in event_tasks
+    ]
+
+    result: CampaignPlanResult = {
         "campaignId": campaign_id,
-        "tasks": event_tasks,
+        "tasks": task_dicts,
         "taskCount": len(event_tasks),
         "generationTimestamp": generation_timestamp,
     }

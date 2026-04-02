@@ -7,7 +7,7 @@ Generates community event tasks using Gemini Google Search grounding.
 """
 
 from datetime import date
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -17,22 +17,33 @@ from shared.logger import get_logger
 logger = get_logger(__name__)
 
 
-class EventTask(BaseModel):
+class LlmEventResult(BaseModel):
+    """Schema for Gemini structured output — what the LLM returns."""
     title: str = Field(..., description="Event name")
     description: str = Field(..., description="Why this event matters for the campaign")
     date: str = Field(..., description="Event date in YYYY-MM-DD format")
 
 
-class EventTaskList(BaseModel):
-    events: List[EventTask]
+class LlmEventResultList(BaseModel):
+    events: List[LlmEventResult]
+
+
+class CampaignEventTask(BaseModel):
+    """Final task shape matching gp-api's CampaignTask schema."""
+    title: str
+    description: str
+    cta: str
+    flowType: str
+    week: int
+    date: str
 
 
 async def generate_event_tasks(
     election_date: date,
     city: str,
     state: str,
-    llm_client: Gemini3Client = None,
-) -> List[dict]:
+    llm_client: Optional[Gemini3Client] = None,
+) -> List[CampaignEventTask]:
     llm_client = llm_client or Gemini3Client()
 
     logger.info(f"Generating events for {city}, {state} (election: {election_date})")
@@ -62,7 +73,7 @@ async def _filter_and_structure_events(
     state: str,
     election_date: date,
     raw_events: str,
-) -> List[dict]:
+) -> List[CampaignEventTask]:
     logger.info("Filtering and structuring events as tasks")
 
     today = date.today()
@@ -80,15 +91,16 @@ RULES:
 COMMUNITY EVENTS DATA:
 {raw_events}"""
 
-    response = llm_client.generate_structured_content(
+    raw_response = llm_client.generate_structured_content(
         prompt=prompt,
-        response_schema=EventTaskList,
+        response_schema=LlmEventResultList,
         system_instruction="Select community events and return them as structured data. Dates must be YYYY-MM-DD format.",
         temperature=0.0,
     )
+    assert isinstance(raw_response, LlmEventResultList)
 
-    tasks = []
-    for event in response.events:
+    tasks: List[CampaignEventTask] = []
+    for event in raw_response.events:
         try:
             event_date = date.fromisoformat(event.date)
         except ValueError:
@@ -102,14 +114,14 @@ COMMUNITY EVENTS DATA:
         # Countdown convention: week 1 = election week, higher = further out
         week = max(1, ((election_date - event_date).days // 7) + 1)
 
-        tasks.append({
-            "title": event.title,
-            "description": event.description,
-            "cta": "Attend event",
-            "flowType": "events",
-            "week": week,
-            "date": event.date,
-        })
+        tasks.append(CampaignEventTask(
+            title=event.title,
+            description=event.description,
+            cta="Attend event",
+            flowType="events",
+            week=week,
+            date=event.date,
+        ))
 
-    tasks.sort(key=lambda t: t["date"])
+    tasks.sort(key=lambda t: t.date)
     return tasks
