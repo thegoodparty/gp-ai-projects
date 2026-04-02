@@ -11,7 +11,7 @@ import os
 import time
 from datetime import date, datetime, timezone
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from shared.logger import get_logger
 
@@ -26,6 +26,12 @@ class SqsMessageBody(BaseModel):
     election_date: str
     city: str
     state: str
+
+    @field_validator("election_date")
+    @classmethod
+    def validate_election_date(cls, v: str) -> str:
+        date.fromisoformat(v)
+        return v
 
 
 def _load_secrets():
@@ -47,7 +53,10 @@ def _load_secrets():
 
 def _inject_secrets():
     secrets = _load_secrets()
-    os.environ["GEMINI_API_KEY"] = secrets.get("GEMINI_API_KEY", "")
+    gemini_key = secrets.get("GEMINI_API_KEY")
+    if not gemini_key:
+        raise RuntimeError("GEMINI_API_KEY not found in secrets")
+    os.environ["GEMINI_API_KEY"] = gemini_key
 
 
 def handler(event, context):

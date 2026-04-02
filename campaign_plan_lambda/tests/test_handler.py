@@ -69,6 +69,10 @@ class TestInputValidation:
         with pytest.raises(Exception):
             SqsMessageBody(**{"campaignId": "not-a-number", "election_date": "2026-11-04", "city": "Boston", "state": "MA"})
 
+    def test_invalid_election_date_rejected(self):
+        with pytest.raises(Exception):
+            SqsMessageBody(**{"campaignId": 123, "election_date": "not-a-date", "city": "Boston", "state": "MA"})
+
     def test_invalid_json_skipped(self):
         event = {
             "Records": [

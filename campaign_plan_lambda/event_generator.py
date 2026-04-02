@@ -99,6 +99,7 @@ COMMUNITY EVENTS DATA:
             logger.warning(f"Skipping out-of-range event: {event.title} ({event.date})")
             continue
 
+        # Countdown convention: week 1 = election week, higher = further out
         week = max(1, ((election_date - event_date).days // 7) + 1)
 
         tasks.append({
