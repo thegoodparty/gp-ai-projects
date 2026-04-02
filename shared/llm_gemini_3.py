@@ -1,7 +1,9 @@
 import os
 import json
 import time
-from typing import Optional, Type, Union, List, Dict, Any
+from typing import Optional, Type, TypeVar, Union, Callable, List, Dict, Any
+
+T = TypeVar('T')
 from enum import Enum
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -29,6 +31,17 @@ class ThinkingLevel(Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class SearchSource(BaseModel):
+    title: str
+    uri: str
+
+
+class SearchResult(BaseModel):
+    text: str
+    search_queries: List[str] = []
+    sources: List[SearchSource] = []
 
 
 class Gemini3Client:
@@ -139,11 +152,11 @@ class Gemini3Client:
         self,
         trace_name: Optional[str],
         prompt: str,
-        llm_fn,
+        llm_fn: Callable[[], T],
         model_name: str,
         default_trace_name: str,
         temperature: Optional[float] = None
-    ):
+    ) -> T:
         if not braintrust_enabled():
             return llm_fn()
 
@@ -277,7 +290,7 @@ class Gemini3Client:
         thinking_level: Optional[ThinkingLevel] = None,
         system_instruction: Optional[str] = None,
         trace_name: Optional[str] = None
-    ):
+    ) -> SearchResult:
         effective_model = model or self.default_model
         model_name = effective_model.value
         config = self._build_config(effective_model, temperature, thinking_level)
@@ -300,11 +313,8 @@ class Gemini3Client:
                     if not response.text:
                         raise ValueError("Empty response from API")
 
-                    result = {
-                        "text": response.text,
-                        "search_queries": [],
-                        "sources": []
-                    }
+                    search_queries = []
+                    sources = []
 
                     if hasattr(response, 'candidates') and response.candidates:
                         candidate = response.candidates[0]
@@ -312,18 +322,22 @@ class Gemini3Client:
                             metadata = candidate.grounding_metadata
 
                             if hasattr(metadata, 'web_search_queries') and metadata.web_search_queries:
-                                result["search_queries"] = metadata.web_search_queries
+                                search_queries = metadata.web_search_queries
 
                             if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks:
                                 for chunk in metadata.grounding_chunks:
                                     web = getattr(chunk, 'web', None)
                                     if web:
-                                        result["sources"].append({
-                                            "title": web.title or "Unknown",
-                                            "uri": web.uri or "Unknown"
-                                        })
+                                        sources.append(SearchSource(
+                                            title=web.title or "Unknown",
+                                            uri=web.uri or "Unknown"
+                                        ))
 
-                    return result
+                    return SearchResult(
+                        text=response.text,
+                        search_queries=search_queries,
+                        sources=sources
+                    )
 
                 except Exception as e:
                     if attempt < self.max_retries - 1:
@@ -454,11 +468,11 @@ if __name__ == "__main__":
         result = client.generate_with_search(
             prompt="Find community events happening in Boston, MA in 2026"
         )
-        print(f"   Text length: {len(result['text'])} chars")
-        print(f"   Sources found: {len(result['sources'])}")
-        for source in result['sources'][:3]:
-            print(f"      - {source['title']}: {source['uri']}")
-        assert result['text'], "Expected non-empty text response"
+        print(f"   Text length: {len(result.text)} chars")
+        print(f"   Sources found: {len(result.sources)}")
+        for source in result.sources[:3]:
+            print(f"      - {source.title}: {source.uri}")
+        assert result.text, "Expected non-empty text response"
         print("   PASSED")
     except Exception as e:
         print(f"   FAILED: {e}")
