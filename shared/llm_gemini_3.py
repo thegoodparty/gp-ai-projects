@@ -44,6 +44,10 @@ class SearchResult(BaseModel):
     sources: List[SearchSource] = []
 
 
+class _BlockedResponseError(Exception):
+    pass
+
+
 class Gemini3Client:
     def __init__(
         self,
@@ -310,6 +314,14 @@ class Gemini3Client:
                     )
                     self._update_usage(model_name, response)
 
+                    if hasattr(response, 'candidates') and response.candidates:
+                        finish_reason = getattr(response.candidates[0], 'finish_reason', None)
+                        # STOP means the model finished successfully. Anything else
+                        # (SAFETY, PROHIBITED_CONTENT, etc.) means the response was
+                        # blocked and retrying won't help.
+                        if finish_reason is not None and finish_reason != "STOP":
+                            raise _BlockedResponseError(f"Response blocked: {finish_reason}")
+
                     if not response.text:
                         raise ValueError("Empty response from API")
 
@@ -339,6 +351,9 @@ class Gemini3Client:
                         sources=sources
                     )
 
+                except _BlockedResponseError as e:
+                    self.logger.warning(f"Search response blocked (not retrying): {e}")
+                    raise
                 except Exception as e:
                     if attempt < self.max_retries - 1:
                         delay = self.base_delay * (2 ** attempt)

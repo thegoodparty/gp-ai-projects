@@ -843,6 +843,7 @@ class TestGenerateWithSearch:
             mock_metadata.grounding_chunks = [mock_chunk]
 
             mock_candidate = Mock()
+            mock_candidate.finish_reason = "STOP"
             mock_candidate.grounding_metadata = mock_metadata
             mock_response.candidates = [mock_candidate]
         else:
@@ -950,3 +951,25 @@ class TestGenerateWithSearch:
         result = client.generate_with_search(prompt="Find events")
 
         assert result.sources == []
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_blocked_response_does_not_retry(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", max_retries=3)
+
+        mock_response = Mock()
+        mock_response.text = None
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 50
+        mock_response.usage_metadata.candidates_token_count = 0
+        mock_response.usage_metadata.thoughts_token_count = 0
+
+        mock_candidate = Mock()
+        mock_candidate.finish_reason = "SAFETY"
+        mock_response.candidates = [mock_candidate]
+
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        with pytest.raises(Exception, match="Response blocked: SAFETY"):
+            client.generate_with_search(prompt="blocked prompt")
+
+        assert client.client.models.generate_content.call_count == 1
