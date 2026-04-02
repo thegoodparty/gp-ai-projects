@@ -51,7 +51,8 @@ async def generate_event_tasks(
     raw_events = await _search_community_events(llm_client, city, state, election_date)
     event_tasks = await _filter_and_structure_events(llm_client, city, state, election_date, raw_events)
 
-    logger.info(f"Generated {len(event_tasks)} event tasks")
+    stats = llm_client.get_usage_stats()
+    logger.info(f"Generated {len(event_tasks)} event tasks | Gemini: {stats['api_calls']} calls, ${stats['total_cost']:.4f}")
     return event_tasks
 
 
