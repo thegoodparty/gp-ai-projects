@@ -88,6 +88,14 @@ def handler(event: LambdaEvent, context=None) -> None:
             message_body = SqsMessageBody(**json.loads(record["body"]))
         except (json.JSONDecodeError, ValidationError) as e:
             logger.error(f"Invalid SQS message: {e}", exc_info=True)
+            # Try to notify gp-api if we can extract a campaignId
+            try:
+                raw = json.loads(record.get("body", "{}"))
+                if isinstance(raw, dict) and "campaignId" in raw:
+                    from campaign_plan_lambda.output import send_error_message
+                    send_error_message(int(raw["campaignId"]), "Invalid message format")
+            except Exception:
+                pass
             continue
 
         campaign_id = message_body.campaignId

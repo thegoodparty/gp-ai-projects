@@ -86,6 +86,57 @@ class TestInputValidation:
             handler(event, None)
 
 
+class TestInvalidMessageErrorNotification:
+    @patch("campaign_plan_lambda.handler._inject_secrets")
+    def test_sends_error_when_validation_fails_but_campaign_id_present(self, _mock_secrets):
+        event = _make_sqs_event({
+            "campaignId": 456,
+            "election_date": "not-a-date",
+            "city": "Boston",
+            "state": "MA",
+        })
+
+        with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
+            handler(event, None)
+            mock_send.assert_called_once_with(456, "Invalid message format")
+
+    @patch("campaign_plan_lambda.handler._inject_secrets")
+    def test_sends_error_when_missing_fields_but_campaign_id_present(self, _mock_secrets):
+        event = _make_sqs_event({
+            "campaignId": 789,
+        })
+
+        with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
+            handler(event, None)
+            mock_send.assert_called_once_with(789, "Invalid message format")
+
+    @patch("campaign_plan_lambda.handler._inject_secrets")
+    def test_no_error_sent_when_campaign_id_missing(self, _mock_secrets):
+        event = _make_sqs_event({
+            "election_date": "2026-11-04",
+            "city": "Boston",
+        })
+
+        with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
+            handler(event, None)
+            mock_send.assert_not_called()
+
+    @patch("campaign_plan_lambda.handler._inject_secrets")
+    def test_no_error_sent_when_json_unparseable(self, _mock_secrets):
+        event = {
+            "Records": [
+                {
+                    "body": "not json{{{",
+                    "attributes": {"ApproximateReceiveCount": "1"},
+                }
+            ]
+        }
+
+        with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
+            handler(event, None)
+            mock_send.assert_not_called()
+
+
 class TestRetryLogic:
     @patch("campaign_plan_lambda.handler._inject_secrets")
     @patch("campaign_plan_lambda.handler.asyncio")

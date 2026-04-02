@@ -161,6 +161,25 @@ aws s3 ls s3://campaign-plan-results-dev/results/99999/ --region us-west-2 --pro
 }
 ```
 
+## Error handling
+
+gp-api should expect three possible outcomes after sending a message to the input queue:
+
+**Success:** gp-api receives a `campaignPlanComplete` message with `status: "completed"`, an S3 key pointing to the result JSON, and a task count. Typical time: 30-40 seconds.
+
+**Generation failure:** If the Gemini API is down or returns an error, the Lambda retries up to 3 times (with ~16 minute gaps between retries). Only on the final failed attempt does gp-api receive a `campaignPlanComplete` message with `status: "error"` and `error: "Campaign plan generation failed"`. If all retries fail, the message also goes to the dead letter queue and a Slack alert fires.
+
+**Invalid message:** If the input message is malformed (bad JSON, missing fields, invalid date format), the Lambda does not retry — the message is consumed immediately. If a `campaignId` can be extracted from the malformed message, gp-api receives an error message with `error: "Invalid message format"`. If the message is completely unparseable, gp-api receives nothing — check CloudWatch logs for the error.
+
+**No response at all:** If gp-api sends a message and never receives a completion or error message, possible causes are:
+- The Lambda crashed before it could send anything (check CloudWatch logs)
+- The SQS message is still being retried (check the input queue's "messages in flight")
+- The message landed in the DLQ after exhausting retries (Slack alert should have fired)
+
+**Error message values gp-api may receive in the `error` field:**
+- `"Campaign plan generation failed"` — Gemini API or Google Search failed after all retries
+- `"Invalid message format"` — the input message was malformed
+
 ## Architecture
 
 - **Input queue:** `campaign-plan-input-{env}.fifo` (FIFO, batch size 1)
