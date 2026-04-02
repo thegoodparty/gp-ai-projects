@@ -269,6 +269,80 @@ class Gemini3Client:
             temperature=temperature
         )
 
+    def generate_with_search(
+        self,
+        prompt: str,
+        model: Optional[GeminiModelType] = None,
+        temperature: Optional[float] = None,
+        thinking_level: Optional[ThinkingLevel] = None,
+        system_instruction: Optional[str] = None,
+        trace_name: Optional[str] = None
+    ):
+        effective_model = model or self.default_model
+        model_name = effective_model.value
+        config = self._build_config(effective_model, temperature, thinking_level)
+
+        if system_instruction:
+            config.system_instruction = system_instruction
+
+        config.tools = [types.Tool(google_search=types.GoogleSearch())]
+
+        def _execute_call():
+            for attempt in range(self.max_retries):
+                try:
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=config
+                    )
+                    self._update_usage(model_name, response)
+
+                    if not response.text:
+                        raise ValueError("Empty response from API")
+
+                    result = {
+                        "text": response.text,
+                        "search_queries": [],
+                        "sources": []
+                    }
+
+                    if hasattr(response, 'candidates') and response.candidates:
+                        candidate = response.candidates[0]
+                        if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                            metadata = candidate.grounding_metadata
+
+                            if hasattr(metadata, 'web_search_queries') and metadata.web_search_queries:
+                                result["search_queries"] = metadata.web_search_queries
+
+                            if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks:
+                                for chunk in metadata.grounding_chunks:
+                                    web = getattr(chunk, 'web', None)
+                                    if web:
+                                        result["sources"].append({
+                                            "title": web.title or "Unknown",
+                                            "uri": web.uri or "Unknown"
+                                        })
+
+                    return result
+
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        delay = self.base_delay * (2 ** attempt)
+                        self.logger.warning(f"Search attempt {attempt + 1} failed: {e}. Retrying in {delay}s")
+                        time.sleep(delay)
+                    else:
+                        self.logger.error(f"All {self.max_retries} search attempts failed: {e}")
+                        raise
+
+        return self._traced_call(
+            trace_name=trace_name,
+            prompt=prompt,
+            llm_fn=_execute_call,
+            model_name=model_name,
+            default_trace_name="generate_with_search",
+            temperature=temperature
+        )
+
     def get_usage_stats(self) -> Dict[str, Any]:
         return {
             "api_calls": self.api_call_count,
@@ -371,6 +445,20 @@ if __name__ == "__main__":
         )
         print(f"   Response: {result}")
         assert "paris" in result.lower(), "Expected 'Paris' in response"
+        print("   PASSED")
+    except Exception as e:
+        print(f"   FAILED: {e}")
+
+    print("\n7. Testing generate_with_search (Google Search grounding)...")
+    try:
+        result = client.generate_with_search(
+            prompt="Find community events happening in Boston, MA in 2026"
+        )
+        print(f"   Text length: {len(result['text'])} chars")
+        print(f"   Sources found: {len(result['sources'])}")
+        for source in result['sources'][:3]:
+            print(f"      - {source['title']}: {source['uri']}")
+        assert result['text'], "Expected non-empty text response"
         print("   PASSED")
     except Exception as e:
         print(f"   FAILED: {e}")
