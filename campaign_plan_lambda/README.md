@@ -1,15 +1,14 @@
 # Campaign Plan Lambda
 
-AWS Lambda service that generates campaign plans and extracts community event tasks for political candidates. Triggered by SQS, writes results to S3, and notifies gp-api via SQS.
+AWS Lambda that finds community events for political candidates using Gemini 3 with Google Search grounding. Triggered by SQS, writes results to S3, and notifies gp-api via SQS.
 
 ## What it does
 
-1. Receives campaign info from gp-api via SQS FIFO queue
-2. Uses Gemini with Google Search grounding to find real community events
-3. Generates a campaign timeline and voter contact plan
-4. Extracts event tasks from the timeline
-5. Writes the full result JSON to S3
-6. Sends a completion message to gp-api's SQS queue
+1. Receives campaign ID, election date, city, and state from gp-api via SQS
+2. Uses Gemini 3 with Google Search grounding to find real community events
+3. Filters and structures the best 5-8 events as tasks
+4. Writes the result JSON to S3
+5. Sends a completion message to gp-api's SQS queue
 
 ## Local testing
 
@@ -29,9 +28,9 @@ source .venv/bin/activate
 python campaign_plan_lambda/test_sqs_harness.py
 ```
 
-This takes ~60-90 seconds and outputs:
+This takes ~30-40 seconds and outputs:
 - `campaign_plan_lambda/test_sqs_output.json` — the full result JSON (gitignored)
-- Console output showing the SQS completion message and task counts
+- Console output showing the SQS completion message and task list
 
 ### Run unit tests
 
@@ -49,7 +48,7 @@ cd /gp-ai-projects
 bash campaign_plan_lambda/build.sh
 ```
 
-This creates `campaign_plan_lambda/lambda.zip` (~30MB zipped, ~94MB unzipped).
+This creates `campaign_plan_lambda/lambda.zip` (~9MB zipped, ~28MB unzipped).
 
 ### Upload to Lambda (dev)
 
@@ -80,7 +79,7 @@ terraform apply tfplan
 ```bash
 aws sqs send-message \
   --queue-url https://sqs.us-west-2.amazonaws.com/333022194791/campaign-plan-input-dev.fifo \
-  --message-body '{"campaignId":99999,"campaignInfo":{"candidate_name":"Test McTestface","election_date":"2026-11-04","office_and_jurisdiction":"City Council District 3 Boston MA","race_type":"Nonpartisan","incumbent_status":"N/A","seats_available":1,"number_of_opponents":3,"win_number":10000,"total_likely_voters":40000,"available_cell_phones":10000,"available_landlines":10000}}' \
+  --message-body '{"campaignId":99999,"election_date":"2026-11-04","city":"Boston","state":"MA"}' \
   --message-group-id "test-$(uuidgen)" \
   --message-deduplication-id "$(uuidgen)" \
   --region us-west-2 \
@@ -101,16 +100,6 @@ aws logs tail /aws/lambda/campaign-plan-dev --follow --region us-west-2 --profil
 aws s3 ls s3://campaign-plan-results-dev/results/99999/ --region us-west-2 --profile gp-readonly
 ```
 
-### Check queue status
-
-```bash
-aws sqs get-queue-attributes \
-  --queue-url https://sqs.us-west-2.amazonaws.com/333022194791/campaign-plan-input-dev.fifo \
-  --attribute-names All \
-  --region us-west-2 \
-  --profile gp-readonly
-```
-
 ## SQS message format
 
 ### Input (from gp-api)
@@ -118,21 +107,9 @@ aws sqs get-queue-attributes \
 ```json
 {
   "campaignId": 12345,
-  "campaignInfo": {
-    "candidate_name": "Jane Rivera",
-    "election_date": "2026-11-04",
-    "office_and_jurisdiction": "City Council District 3 Boston MA",
-    "race_type": "Nonpartisan",
-    "incumbent_status": "N/A",
-    "seats_available": 1,
-    "number_of_opponents": 2,
-    "win_number": 8000,
-    "total_likely_voters": 30000,
-    "available_cell_phones": 9000,
-    "available_landlines": 5000,
-    "primary_date": null,
-    "additional_race_context": null
-  }
+  "election_date": "2026-11-04",
+  "city": "Boston",
+  "state": "MA"
 }
 ```
 
@@ -144,9 +121,9 @@ aws sqs get-queue-attributes \
   "data": {
     "campaignId": 12345,
     "status": "completed",
-    "s3Key": "results/12345/2026-03-31T02:05:04-abc12345.json",
-    "taskCount": 9,
-    "generationTimestamp": "2026-03-31T02:05:04.529431+00:00"
+    "s3Key": "results/12345/2026-04-02T15:30:00-abc12345.json",
+    "taskCount": 7,
+    "generationTimestamp": "2026-04-02T15:30:00.000000+00:00"
   }
 }
 ```
@@ -164,11 +141,32 @@ aws sqs get-queue-attributes \
 }
 ```
 
+### S3 result JSON
+
+```json
+{
+  "campaignId": 12345,
+  "tasks": [
+    {
+      "title": "Boston Pride Festival and Parade",
+      "description": "Large celebration offering engagement with diverse voters.",
+      "cta": "Attend event",
+      "flowType": "events",
+      "week": 22,
+      "date": "2026-06-06"
+    }
+  ],
+  "taskCount": 7,
+  "generationTimestamp": "2026-04-02T15:30:00.000000+00:00"
+}
+```
+
 ## Architecture
 
-- **Input queue:** `campaign-plan-input-dev.fifo` (FIFO, batch size 1)
-- **Dead letter queue:** `campaign-plan-dlq-dev.fifo` (after 3 failed attempts)
-- **S3 bucket:** `campaign-plan-results-dev` (12-month retention)
-- **Output queue:** gp-api's `develop-Queue.fifo` (shared with other services)
+- **Input queue:** `campaign-plan-input-{env}.fifo` (FIFO, batch size 1)
+- **Dead letter queue:** `campaign-plan-dlq-{env}.fifo` (after 3 failed attempts)
+- **S3 bucket:** `campaign-plan-results-{env}` (12-month retention)
+- **Output queue:** gp-api's existing `{env}-Queue.fifo` (shared with other services)
 - **Alerts:** DLQ alarm → SNS → shared Slack notifier
 - **Runtime:** Python 3.12, 1GB memory, 15-minute timeout
+- **AI:** Gemini 3 Flash with Google Search grounding (2 API calls per invocation)
