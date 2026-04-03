@@ -84,24 +84,27 @@ def handler(event: LambdaEvent, context=None) -> None:
     os.environ.setdefault("ENVIRONMENT", "dev")
 
     for record in event.get("Records", []):
+        receive_count = int(
+            record.get("attributes", {}).get("ApproximateReceiveCount", "1")
+        )
+
         try:
             message_body = SqsMessageBody(**json.loads(record["body"]))
         except (json.JSONDecodeError, ValidationError) as e:
             logger.error(f"Invalid SQS message: {e}", exc_info=True)
-            # Try to notify gp-api if we can extract a campaignId
-            try:
-                raw = json.loads(record.get("body", "{}"))
-                if isinstance(raw, dict) and "campaignId" in raw:
-                    from campaign_plan_lambda.output import send_error_message
-                    send_error_message(int(raw["campaignId"]), "Invalid message format")
-            except Exception:
-                pass
-            continue
+            # On final retry, try to notify gp-api if we can extract a campaignId
+            if receive_count >= MAX_RECEIVE_COUNT:
+                try:
+                    raw = json.loads(record.get("body", "{}"))
+                    if isinstance(raw, dict) and "campaignId" in raw:
+                        from campaign_plan_lambda.output import send_error_message
+                        send_error_message(int(raw["campaignId"]), "Invalid message format")
+                except Exception:
+                    pass
+            # Raise so the message goes to DLQ and Slack alarm fires
+            raise
 
         campaign_id = message_body.campaignId
-        receive_count = int(
-            record.get("attributes", {}).get("ApproximateReceiveCount", "1")
-        )
 
         logger.info(f"Processing campaign {campaign_id} (attempt {receive_count}/{MAX_RECEIVE_COUNT})")
         start_time = time.time()

@@ -5,6 +5,7 @@ import uuid
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from campaign_plan_lambda.handler import (
     handler,
@@ -73,7 +74,7 @@ class TestInputValidation:
         with pytest.raises(Exception):
             SqsMessageBody(**{"campaignId": 123, "election_date": "not-a-date", "city": "Boston", "state": "MA"})
 
-    def test_invalid_json_skipped(self):
+    def test_invalid_json_raises(self):
         event = {
             "Records": [
                 {
@@ -83,31 +84,48 @@ class TestInputValidation:
             ]
         }
         with patch("campaign_plan_lambda.handler._inject_secrets"):
-            handler(event, None)
+            with pytest.raises(json.JSONDecodeError):
+                handler(event, None)
 
 
 class TestInvalidMessageErrorNotification:
     @patch("campaign_plan_lambda.handler._inject_secrets")
-    def test_sends_error_when_validation_fails_but_campaign_id_present(self, _mock_secrets):
+    def test_no_error_sent_on_first_attempt(self, _mock_secrets):
         event = _make_sqs_event({
             "campaignId": 456,
             "election_date": "not-a-date",
             "city": "Boston",
             "state": "MA",
-        })
+        }, receive_count=1)
 
         with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
-            handler(event, None)
+            with pytest.raises(ValidationError):
+                handler(event, None)
+            mock_send.assert_not_called()
+
+    @patch("campaign_plan_lambda.handler._inject_secrets")
+    def test_sends_error_on_final_attempt_when_campaign_id_present(self, _mock_secrets):
+        event = _make_sqs_event({
+            "campaignId": 456,
+            "election_date": "not-a-date",
+            "city": "Boston",
+            "state": "MA",
+        }, receive_count=MAX_RECEIVE_COUNT)
+
+        with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
+            with pytest.raises(ValidationError):
+                handler(event, None)
             mock_send.assert_called_once_with(456, "Invalid message format")
 
     @patch("campaign_plan_lambda.handler._inject_secrets")
-    def test_sends_error_when_missing_fields_but_campaign_id_present(self, _mock_secrets):
+    def test_sends_error_on_final_attempt_when_missing_fields(self, _mock_secrets):
         event = _make_sqs_event({
             "campaignId": 789,
-        })
+        }, receive_count=MAX_RECEIVE_COUNT)
 
         with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
-            handler(event, None)
+            with pytest.raises(ValidationError):
+                handler(event, None)
             mock_send.assert_called_once_with(789, "Invalid message format")
 
     @patch("campaign_plan_lambda.handler._inject_secrets")
@@ -115,25 +133,27 @@ class TestInvalidMessageErrorNotification:
         event = _make_sqs_event({
             "election_date": "2026-11-04",
             "city": "Boston",
-        })
+        }, receive_count=MAX_RECEIVE_COUNT)
 
         with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
-            handler(event, None)
+            with pytest.raises(ValidationError):
+                handler(event, None)
             mock_send.assert_not_called()
 
     @patch("campaign_plan_lambda.handler._inject_secrets")
-    def test_no_error_sent_when_json_unparseable(self, _mock_secrets):
+    def test_raises_when_json_unparseable(self, _mock_secrets):
         event = {
             "Records": [
                 {
                     "body": "not json{{{",
-                    "attributes": {"ApproximateReceiveCount": "1"},
+                    "attributes": {"ApproximateReceiveCount": str(MAX_RECEIVE_COUNT)},
                 }
             ]
         }
 
         with patch("campaign_plan_lambda.output.send_error_message") as mock_send:
-            handler(event, None)
+            with pytest.raises(json.JSONDecodeError):
+                handler(event, None)
             mock_send.assert_not_called()
 
 
