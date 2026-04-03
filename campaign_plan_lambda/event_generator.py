@@ -127,5 +127,13 @@ COMMUNITY EVENTS DATA:
             date=event.date,
         ))
 
+    # If the LLM returned events but none survived validation, that's a quality
+    # issue worth retrying. If the LLM returned nothing, the area genuinely has
+    # no events — return empty as success.
+    if raw_response.events and not tasks:
+        raise RuntimeError(
+            f"LLM returned {len(raw_response.events)} events but none had valid dates"
+        )
+
     tasks.sort(key=lambda t: t.date)
     return tasks
