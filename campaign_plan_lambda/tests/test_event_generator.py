@@ -1,7 +1,7 @@
 """Tests for event_generator — date validation and task construction."""
 
 from datetime import date
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,8 +15,7 @@ from campaign_plan_lambda.event_generator import (
 
 class TestFilterAndStructureEvents:
     @pytest.mark.asyncio
-    @patch("campaign_plan_lambda.event_generator.Gemini3Client")
-    async def test_raises_when_llm_returns_events_but_all_dates_invalid(self, _mock_cls):
+    async def test_raises_when_llm_returns_events_but_all_dates_invalid(self):
         mock_client = Mock()
         mock_client.generate_structured_content.return_value = LlmEventResultList(
             events=[
@@ -31,8 +30,7 @@ class TestFilterAndStructureEvents:
             )
 
     @pytest.mark.asyncio
-    @patch("campaign_plan_lambda.event_generator.Gemini3Client")
-    async def test_raises_when_all_events_out_of_range(self, _mock_cls):
+    async def test_raises_when_all_events_out_of_range(self):
         mock_client = Mock()
         mock_client.generate_structured_content.return_value = LlmEventResultList(
             events=[
@@ -47,8 +45,7 @@ class TestFilterAndStructureEvents:
             )
 
     @pytest.mark.asyncio
-    @patch("campaign_plan_lambda.event_generator.Gemini3Client")
-    async def test_returns_empty_when_llm_returns_no_events(self, _mock_cls):
+    async def test_returns_empty_when_llm_returns_no_events(self):
         mock_client = Mock()
         mock_client.generate_structured_content.return_value = LlmEventResultList(
             events=[]
@@ -61,8 +58,7 @@ class TestFilterAndStructureEvents:
         assert result == []
 
     @pytest.mark.asyncio
-    @patch("campaign_plan_lambda.event_generator.Gemini3Client")
-    async def test_filters_invalid_dates_keeps_valid(self, _mock_cls):
+    async def test_filters_invalid_dates_keeps_valid(self):
         mock_client = Mock()
         mock_client.generate_structured_content.return_value = LlmEventResultList(
             events=[
@@ -82,8 +78,7 @@ class TestFilterAndStructureEvents:
         assert result[0].cta == "Attend event"
 
     @pytest.mark.asyncio
-    @patch("campaign_plan_lambda.event_generator.Gemini3Client")
-    async def test_week_countdown_calculation(self, _mock_cls):
+    async def test_week_countdown_calculation(self):
         mock_client = Mock()
         mock_client.generate_structured_content.return_value = LlmEventResultList(
             events=[

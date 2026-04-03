@@ -99,8 +99,8 @@ def handler(event: LambdaEvent, context=None) -> None:
                     if isinstance(raw, dict) and "campaignId" in raw:
                         from campaign_plan_lambda.output import send_error_message
                         send_error_message(int(raw["campaignId"]), "Invalid message format")
-                except Exception:
-                    pass
+                except Exception as notify_err:
+                    logger.warning(f"Failed to send error notification: {notify_err}")
             # Raise so the message goes to DLQ and Slack alarm fires
             raise
 
