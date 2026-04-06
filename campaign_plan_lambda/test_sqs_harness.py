@@ -98,6 +98,7 @@ def main():
 
     handler_module._secrets_cache = handler_module.Secrets(
         GEMINI_API_KEY=os.environ.get("GEMINI_API_KEY", ""),
+        BRAINTRUST_API_KEY=os.environ.get("BRAINTRUST_API_KEY", ""),
     )
 
     output_module._s3_client = mock_s3_client

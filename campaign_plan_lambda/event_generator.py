@@ -4,6 +4,8 @@ Generates community event tasks using Gemini Google Search grounding.
 2 AI calls:
 1. Google Search: find real community events in the candidate's area
 2. Filter, rank, and structure events as tasks
+
+Prompts are loaded from Braintrust (with hardcoded fallbacks if unavailable).
 """
 
 from datetime import date
@@ -12,9 +14,28 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from shared.llm_gemini_3 import Gemini3Client
+from shared.braintrust import load_prompt_from_braintrust
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+SEARCH_PROMPT_FALLBACK = """Find community events where a political candidate can connect with voters.
+
+Location: {city}, {state}
+Date range: {today} to {election_date}"""
+
+FILTER_PROMPT_FALLBACK = """Select the best 5-8 community events from the data below for a candidate in {city}, {state}.
+
+RULES:
+- Only events between {today} and {election_date}
+- Prioritize events where the candidate can speak to or meet voters
+- Include a mix of formal meetings and community events
+- Dates must be in YYYY-MM-DD format
+- Title should be the event name
+- Description should explain why this event helps the campaign (one sentence)
+
+COMMUNITY EVENTS DATA:
+{raw_events}"""
 
 
 class LlmEventResult(BaseModel):
@@ -59,10 +80,16 @@ async def generate_event_tasks(
 async def _search_community_events(llm_client: Gemini3Client, city: str, state: str, election_date: date) -> str:
     logger.info(f"Searching for community events in {city}, {state}")
 
-    prompt = f"""Find community events where a political candidate can connect with voters.
-
-Location: {city}, {state}
-Date range: {date.today()} to {election_date}"""
+    prompt = load_prompt_from_braintrust(
+        prompt_name="search-community-events",
+        fallback_prompt=SEARCH_PROMPT_FALLBACK,
+        variables={
+            "city": city,
+            "state": state,
+            "today": str(date.today()),
+            "election_date": str(election_date),
+        },
+    )
 
     response = llm_client.generate_with_search(prompt)
     return response.text
@@ -79,18 +106,17 @@ async def _filter_and_structure_events(
 
     today = date.today()
 
-    prompt = f"""Select the best 5-8 community events from the data below for a candidate in {city}, {state}.
-
-RULES:
-- Only events between {today} and {election_date}
-- Prioritize events where the candidate can speak to or meet voters
-- Include a mix of formal meetings and community events
-- Dates must be in YYYY-MM-DD format
-- Title should be the event name
-- Description should explain why this event helps the campaign (one sentence)
-
-COMMUNITY EVENTS DATA:
-{raw_events}"""
+    prompt = load_prompt_from_braintrust(
+        prompt_name="filter-and-structure-events",
+        fallback_prompt=FILTER_PROMPT_FALLBACK,
+        variables={
+            "city": city,
+            "state": state,
+            "today": str(today),
+            "election_date": str(election_date),
+            "raw_events": raw_events,
+        },
+    )
 
     raw_response = llm_client.generate_structured_content(
         prompt=prompt,
