@@ -110,6 +110,26 @@ resource "aws_iam_role_policy" "github_actions_ecr_push" {
   })
 }
 
+# Policy for Lambda deploy access (used by Lambda deploy workflows)
+resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
+  name = "lambda-deploy-policy"
+  role = aws_iam_role.github_actions_ecr_push.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:UpdateFunctionCode",
+          "lambda:GetFunction"
+        ]
+        Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
+      }
+    ]
+  })
+}
+
 # Output the role ARN for use in GitHub Actions
 output "github_actions_role_arn" {
   value       = aws_iam_role.github_actions_ecr_push.arn
