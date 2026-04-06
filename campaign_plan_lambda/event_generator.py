@@ -67,17 +67,18 @@ async def generate_event_tasks(
 ) -> List[CampaignEventTask]:
     llm_client = llm_client or Gemini3Client()
 
+    today = date.today()
     logger.info(f"Generating events for {city}, {state} (election: {election_date})")
 
-    raw_events = await _search_community_events(llm_client, city, state, election_date)
-    event_tasks = await _filter_and_structure_events(llm_client, city, state, election_date, raw_events)
+    raw_events = await _search_community_events(llm_client, city, state, election_date, today)
+    event_tasks = await _filter_and_structure_events(llm_client, city, state, election_date, today, raw_events)
 
     stats = llm_client.get_usage_stats()
     logger.info(f"Generated {len(event_tasks)} event tasks | Gemini: {stats['api_calls']} calls, ${stats['total_cost']:.4f}")
     return event_tasks
 
 
-async def _search_community_events(llm_client: Gemini3Client, city: str, state: str, election_date: date) -> str:
+async def _search_community_events(llm_client: Gemini3Client, city: str, state: str, election_date: date, today: date) -> str:
     logger.info(f"Searching for community events in {city}, {state}")
 
     prompt = load_prompt_from_braintrust(
@@ -86,7 +87,7 @@ async def _search_community_events(llm_client: Gemini3Client, city: str, state: 
         variables={
             "city": city,
             "state": state,
-            "today": str(date.today()),
+            "today": str(today),
             "election_date": str(election_date),
         },
     )
@@ -100,11 +101,10 @@ async def _filter_and_structure_events(
     city: str,
     state: str,
     election_date: date,
+    today: date,
     raw_events: str,
 ) -> List[CampaignEventTask]:
     logger.info("Filtering and structuring events as tasks")
-
-    today = date.today()
 
     prompt = load_prompt_from_braintrust(
         prompt_name="filter-and-structure-events",
