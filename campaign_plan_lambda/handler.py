@@ -37,7 +37,7 @@ class LambdaEvent(TypedDict):
 
 class Secrets(BaseModel):
     GEMINI_API_KEY: str
-    BRAINTRUST_API_KEY: str
+    BRAINTRUST_API_KEY: Optional[str] = None
 
 
 _secrets_cache: Optional[Secrets] = None
@@ -78,7 +78,8 @@ def _load_secrets() -> Secrets:
 def _inject_secrets() -> None:
     secrets = _load_secrets()
     os.environ["GEMINI_API_KEY"] = secrets.GEMINI_API_KEY
-    os.environ["BRAINTRUST_API_KEY"] = secrets.BRAINTRUST_API_KEY
+    if secrets.BRAINTRUST_API_KEY:
+        os.environ["BRAINTRUST_API_KEY"] = secrets.BRAINTRUST_API_KEY
 
 
 def handler(event: LambdaEvent, context=None) -> None:
