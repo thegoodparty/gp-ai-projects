@@ -102,3 +102,7 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "types-pyyaml>=6.0.12.20250915",
 ]
+campaign-plan-lambda = [
+    "google-genai>=1.56.0",
+    "braintrust>=0.3.10",
+]

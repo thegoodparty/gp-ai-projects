@@ -26,7 +26,7 @@ class TestFilterAndStructureEvents:
 
         with pytest.raises(RuntimeError, match="none had valid dates"):
             await _filter_and_structure_events(
-                mock_client, "Boston", "MA", date(2026, 11, 4), "raw events text"
+                mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
             )
 
     @pytest.mark.asyncio
@@ -41,7 +41,7 @@ class TestFilterAndStructureEvents:
 
         with pytest.raises(RuntimeError, match="none had valid dates"):
             await _filter_and_structure_events(
-                mock_client, "Boston", "MA", date(2026, 11, 4), "raw events text"
+                mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
             )
 
     @pytest.mark.asyncio
@@ -52,7 +52,7 @@ class TestFilterAndStructureEvents:
         )
 
         result = await _filter_and_structure_events(
-            mock_client, "Boston", "MA", date(2026, 11, 4), "raw events text"
+            mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
         )
 
         assert result == []
@@ -69,7 +69,7 @@ class TestFilterAndStructureEvents:
         )
 
         result = await _filter_and_structure_events(
-            mock_client, "Boston", "MA", date(2026, 11, 4), "raw events text"
+            mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
         )
 
         assert len(result) == 1
@@ -88,7 +88,7 @@ class TestFilterAndStructureEvents:
         )
 
         result = await _filter_and_structure_events(
-            mock_client, "Boston", "MA", date(2026, 11, 4), "raw events text"
+            mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
         )
 
         assert len(result) == 2
