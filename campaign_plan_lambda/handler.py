@@ -84,7 +84,6 @@ def _inject_secrets() -> None:
 
 def handler(event: LambdaEvent, context=None) -> None:
     _inject_secrets()
-    os.environ.setdefault("ENVIRONMENT", "dev")
 
     from shared.braintrust import init_braintrust
     init_braintrust(project="campaign-plan")
