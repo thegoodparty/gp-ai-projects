@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,11 +16,12 @@ mkdir -p "$BUILD_DIR"
 
 # Install Python dependencies into build dir
 echo "Installing dependencies..."
-uv pip install \
+uv export --only-group campaign-plan-lambda --no-hashes --no-header --no-emit-project --frozen \
+    | uv pip install \
     --target "$BUILD_DIR" \
     --python-platform x86_64-unknown-linux-gnu \
     --python-version 3.12 \
-    -r "$SCRIPT_DIR/requirements.txt" \
+    -r - \
     --quiet
 
 # Copy campaign_plan_lambda package
