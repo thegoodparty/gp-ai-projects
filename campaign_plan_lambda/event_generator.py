@@ -11,7 +11,7 @@ Prompts are loaded from Braintrust (with hardcoded fallbacks if unavailable).
 from datetime import date
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from shared.llm_gemini_3 import Gemini3Client
 from shared.braintrust import load_prompt_from_braintrust
@@ -22,7 +22,9 @@ logger = get_logger(__name__)
 SEARCH_PROMPT_FALLBACK = """Find community events where a political candidate can connect with voters.
 
 Location: {city}, {state}
-Date range: {today} to {election_date}"""
+Date range: {today} to {election_date}
+
+For each event, include the direct URL to the event page if available."""
 
 FILTER_PROMPT_FALLBACK = """Select the best 5-8 community events from the data below for a candidate in {city}, {state}.
 
@@ -33,6 +35,7 @@ RULES:
 - Dates must be in YYYY-MM-DD format
 - Title should be the event name
 - Description should explain why this event helps the campaign (one sentence)
+- Include the direct URL to the event page if one is present in the data
 
 COMMUNITY EVENTS DATA:
 {raw_events}"""
@@ -43,6 +46,15 @@ class LlmEventResult(BaseModel):
     title: str = Field(..., description="Event name")
     description: str = Field(..., description="Why this event matters for the campaign")
     date: str = Field(..., description="Event date in YYYY-MM-DD format")
+    url: Optional[str] = Field(None, description="Direct URL to the event page")
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def validate_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.startswith(("https://", "http://")):
+            logger.warning(f"Dropping invalid URL (not http/https): {v}")
+            return None
+        return v or None
 
 
 class LlmEventResultList(BaseModel):
@@ -57,6 +69,7 @@ class CampaignEventTask(BaseModel):
     flowType: str
     week: int
     date: str
+    url: Optional[str] = None
 
 
 async def generate_event_tasks(
@@ -151,6 +164,7 @@ async def _filter_and_structure_events(
             flowType="events",
             week=week,
             date=event.date,
+            url=event.url,
         ))
 
     # If the LLM returned events but none survived validation, that's a quality
