@@ -1157,9 +1157,6 @@ dev = [
 campaign-plan-lambda = [
     { name = "braintrust" },
     { name = "google-genai" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "python-dotenv" },
 ]
 dev = [
     { name = "pre-commit" },
@@ -1218,9 +1215,6 @@ provides-extras = ["dev"]
 campaign-plan-lambda = [
     { name = "braintrust", specifier = ">=0.3.10" },
     { name = "google-genai", specifier = ">=1.56.0" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "python-dotenv", specifier = ">=1.1.1" },
 ]
 dev = [
     { name = "pre-commit", specifier = ">=4.3.0" },
