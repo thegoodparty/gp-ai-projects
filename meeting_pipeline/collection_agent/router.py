@@ -1,0 +1,436 @@
+"""
+router.py — Platform dispatcher: routes each city to the correct collector.
+
+Reads source.json via the storage backend, extracts the platform, and calls
+the appropriate collector function. Falls back to misc/replay then misc/reason
+for unknown platforms.
+
+Platform map:
+    legistar   → collect_legistar
+    civicplus  → collect_civicplus
+    civicclerk → collect_civicclerk
+    granicus   → collect_granicus (auto-detects classic vs swagit from URL)
+    swagit     → collect_granicus (NEW_SWAGIT)
+    diligent   → misc/reason (Playwright required)
+    escribe    → collect_escribe
+    boarddocs  → collect_boarddocs
+    novus      → misc (no dedicated collector yet)
+    municode   → misc (no dedicated collector yet)
+    generic    → misc/replay → misc/reason
+    unknown    → misc/replay → misc/reason
+    unknown_spa→ misc/reason (Playwright required)
+"""
+
+import sys
+from urllib.parse import urlparse, parse_qs
+
+_BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_BRIEFING_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BRIEFING_ROOT))
+
+from .models import CollectionResult
+from .storage import StorageBackend
+from .config import AgentConfig, city_to_slug, find_city_slug
+from . import notification_log
+from .misc.replay import collect_with_replay, ReplayFailed
+from .misc.reason import collect_with_reason, ReasonFailed
+
+
+# ── Dedicated collector adapters ──────────────────────────────────────────────
+
+async def _collect_legistar(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.legistar import LegistarConfig, collect_legistar
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    legistar_slug = best.get("config", {}).get("legistar_slug", "")
+    if not legistar_slug:
+        # Try to extract from URL: https://webapi.legistar.com/v1/{slug}/events
+        url = best.get("url", "")
+        parts = urlparse(url).path.strip("/").split("/")
+        legistar_slug = parts[1] if len(parts) > 1 else ""
+
+    if not legistar_slug:
+        return CollectionResult.error_result(city, state, "legistar", "Could not determine Legistar slug")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/legistar"
+
+    legistar_cfg = LegistarConfig(
+        base_url=f"https://webapi.legistar.com/v1/{legistar_slug}",
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+    )
+
+    result = await collect_legistar(legistar_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="legistar",
+        events_found=result.events_count,
+        pdfs_downloaded=result.pdf_count,
+        events=[],
+    )
+
+
+async def _collect_civicplus(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.civicplus_scraper import CivicPlusConfig, collect_civicplus
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    url = best.get("url", "")
+    domain = best.get("config", {}).get("domain", "")
+    if not domain:
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace("www.", "")
+
+    if not domain:
+        return CollectionResult.error_result(city, state, "civicplus", "Could not determine CivicPlus domain")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/civicplus"
+
+    council_category_id = best.get("config", {}).get("council_category_id")
+    civicplus_cfg = CivicPlusConfig(
+        domain=domain,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        download_pdfs=cfg.download_pdfs,
+        council_category_id=council_category_id,
+    )
+
+    result = await collect_civicplus(civicplus_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="civicplus",
+        events_found=result.meetings_found,
+        pdfs_downloaded=result.pdfs_downloaded,
+        events=[],
+    )
+
+
+async def _collect_civicclerk(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.civicclerk import CivicClerkConfig, collect_civicclerk
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    url = best.get("config", {}).get("civicclerk_url") or best.get("url", "")
+    # Extract tenant from https://{tenant}.portal.civicclerk.com
+    host = urlparse(url).netloc  # e.g. "claytonnc.portal.civicclerk.com"
+    tenant = host.split(".")[0] if host else ""
+
+    if not tenant:
+        return CollectionResult.error_result(city, state, "civicclerk", "Could not determine CivicClerk tenant")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/civicclerk"
+
+    council_categories = best.get("config", {}).get("council_categories")
+    cc_cfg = CivicClerkConfig(
+        tenant=tenant,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+        download_pdfs=cfg.download_pdfs,
+        **({"council_categories": council_categories} if council_categories else {}),
+    )
+
+    result = await collect_civicclerk(cc_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="civicclerk",
+        events_found=result.council_events,
+        pdfs_downloaded=result.pdfs_downloaded,
+        events=[],
+    )
+
+
+async def _collect_granicus(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.granicus_scraper import (
+        GranicusConfig, collect_granicus, CLASSIC_GRANICUS, NEW_SWAGIT
+    )
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    url = best.get("config", {}).get("granicus_url") or best.get("url", "")
+    parsed = urlparse(url)
+    host = parsed.netloc  # e.g. "greenville.granicus.com" or "beaumonttx.new.swagit.com"
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/granicus"
+
+    if "new.swagit.com" in host:
+        # New Swagit: subdomain from host
+        subdomain = host.split(".")[0]
+        granicus_cfg = GranicusConfig(
+            platform=NEW_SWAGIT,
+            subdomain=subdomain,
+            city_name=city,
+            output_prefix=output_prefix,
+            storage=storage,
+            lookback_days=cfg.lookback_days,
+            download_pdfs=cfg.download_pdfs,
+        )
+    else:
+        # Classic Granicus: extract subdomain and view_id from URL
+        subdomain = host.split(".")[0]  # e.g. "greenville"
+        qs = parse_qs(parsed.query)
+        view_id = int(qs.get("view_id", ["1"])[0])
+
+        granicus_cfg = GranicusConfig(
+            platform=CLASSIC_GRANICUS,
+            subdomain=subdomain,
+            city_name=city,
+            output_prefix=output_prefix,
+            storage=storage,
+            view_id=view_id,
+            lookback_days=cfg.lookback_days,
+            download_pdfs=cfg.download_pdfs,
+        )
+
+    result = await collect_granicus(granicus_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="granicus",
+        events_found=result.council_events,
+        pdfs_downloaded=result.pdfs_downloaded,
+        events=[],
+    )
+
+
+async def _collect_escribe(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.escribemeetings import EscribeConfig, collect_escribemeetings
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+    url = best.get("url", "")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/escribemeetings"
+
+    escribe_cfg = EscribeConfig(
+        base_url=url,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+    )
+
+    result = await collect_escribemeetings(escribe_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="escribe",
+        events_found=result.events_count,
+        pdfs_downloaded=result.pdf_count,
+        events=[],
+    )
+
+
+async def _collect_boarddocs(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.boarddocs import BoardDocsConfig, collect_boarddocs
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+    url = best.get("url", "")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/boarddocs"
+
+    bd_cfg = BoardDocsConfig(
+        base_url=url,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+        download_pdfs=cfg.download_pdfs,
+    )
+
+    result = await collect_boarddocs(bd_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="boarddocs",
+        events_found=result.events_count,
+        pdfs_downloaded=result.pdf_count,
+        events=[],
+    )
+
+
+# ── Platform → collector function map ────────────────────────────────────────
+
+# Platforms that have dedicated Lambda-safe collectors
+DEDICATED_COLLECTORS = {
+    "legistar":   _collect_legistar,
+    "civicplus":  _collect_civicplus,
+    "civicclerk": _collect_civicclerk,
+    "granicus":   _collect_granicus,
+    "swagit":     _collect_granicus,   # same collector, detects from URL
+    "escribe":    _collect_escribe,
+    "boarddocs":  _collect_boarddocs,
+}
+
+# Platforms that skip replay and go straight to reason (Playwright required)
+REASON_ONLY_PLATFORMS = {"diligent", "unknown_spa"}
+
+# Platforms that route through misc (replay → reason)
+MISC_PLATFORMS = {"generic", "unknown", "novus", "municode", "destinyhosted"}
+
+
+# ── Main dispatch function ────────────────────────────────────────────────────
+
+async def route_city(
+    event: dict,
+    storage: StorageBackend,
+    cfg: AgentConfig,
+) -> CollectionResult:
+    """
+    Route a city to the appropriate collector based on source.json platform.
+
+    Fallback chain:
+        dedicated collector → misc/replay → misc/reason → COLLECTION_FAILED
+
+    Args:
+        event:   {"city": "...", "state": "..."}
+        storage: Storage backend
+        cfg:     Agent configuration
+    """
+    city = event["city"]
+    state = event["state"]
+
+    # Load source.json
+    city_slug = find_city_slug(city, state, cfg, storage)
+    if not city_slug:
+        msg = f"No source.json found for {city}, {state}"
+        notification_log.log_event(
+            notification_log.NO_PORTAL, city, state,
+            storage=storage, logs_prefix=cfg.logs_prefix, error=msg,
+        )
+        return CollectionResult.error_result(city, state, "unknown", msg)
+
+    source_key = f"{cfg.sources_prefix}/{city_slug}/source.json"
+    try:
+        source = storage.read_json(source_key)
+    except Exception as e:
+        return CollectionResult.error_result(city, state, "unknown", f"Could not read source.json: {e}")
+
+    platform = source.get("best_source", {}).get("platform", "unknown")
+
+    # ── Step 1: Dedicated collector (Lambda-safe) ─────────────────────────────
+    if platform in DEDICATED_COLLECTORS:
+        try:
+            result = await DEDICATED_COLLECTORS[platform](event, source, storage, cfg)
+            if result.error is None:
+                notification_log.log_event(
+                    notification_log.COLLECTION_SUCCESS, city, state,
+                    storage=storage, logs_prefix=cfg.logs_prefix,
+                    platform=platform, events_found=result.events_found,
+                    pdfs_downloaded=result.pdfs_downloaded,
+                )
+                return result
+            print(f"[router] Dedicated collector for {city} failed: {result.error}, trying misc fallback")
+        except Exception as e:
+            print(f"[router] Dedicated collector for {city} raised: {e}, trying misc fallback")
+        # Fall through to misc fallback below
+
+    # ── Step 1b: Reason-only platforms (Playwright, no replay fallback) ───────
+    elif platform in REASON_ONLY_PLATFORMS:
+        try:
+            result = await collect_with_reason(event, source, storage, cfg)
+            notification_log.log_event(
+                notification_log.COLLECTION_SUCCESS, city, state,
+                storage=storage, logs_prefix=cfg.logs_prefix,
+                platform="playwright_llm", events_found=result.events_found,
+                pdfs_downloaded=result.pdfs_downloaded,
+            )
+            return result
+        except ReasonFailed as e:
+            error_msg = str(e)
+            notification_log.log_event(
+                notification_log.COLLECTION_FAILED, city, state,
+                storage=storage, logs_prefix=cfg.logs_prefix,
+                platform=platform, error=error_msg,
+            )
+            return CollectionResult.error_result(city, state, platform, error_msg)
+
+    # ── Step 2 & 3: Misc fallback — replay → reason ───────────────────────────
+    # Reaches here when:
+    #   - platform is a misc/unknown platform (no dedicated collector), OR
+    #   - a dedicated collector failed and fell through above
+    if True:
+        # Step 1: Try replay if nav_config exists
+        has_nav_config = bool(source.get("best_source", {}).get("nav_config"))
+        if has_nav_config:
+            try:
+                result = await collect_with_replay(event, source, storage, cfg)
+                notification_log.log_event(
+                    notification_log.COLLECTION_SUCCESS, city, state,
+                    storage=storage, logs_prefix=cfg.logs_prefix,
+                    platform="replay", events_found=result.events_found,
+                    pdfs_downloaded=result.pdfs_downloaded,
+                )
+                return result
+            except (ReplayFailed, ValueError) as e:
+                print(f"[router] Replay failed for {city}: {e}, escalating to reason")
+
+        # Step 2: Reason mode (Playwright + LLM)
+        notification_log.log_event(
+            notification_log.COLLECTOR_NEEDED, city, state,
+            storage=storage, logs_prefix=cfg.logs_prefix,
+            platform=platform, has_nav_config=has_nav_config,
+        )
+        try:
+            result = await collect_with_reason(event, source, storage, cfg)
+            notification_log.log_event(
+                notification_log.COLLECTION_SUCCESS, city, state,
+                storage=storage, logs_prefix=cfg.logs_prefix,
+                platform="playwright_llm", events_found=result.events_found,
+                pdfs_downloaded=result.pdfs_downloaded,
+            )
+            return result
+        except ReasonFailed as e:
+            error_msg = str(e)
+            notification_log.log_event(
+                notification_log.COLLECTION_FAILED, city, state,
+                storage=storage, logs_prefix=cfg.logs_prefix,
+                platform=platform, error=error_msg,
+            )
+            return CollectionResult.error_result(city, state, platform, error_msg)
+
+    # Should not reach here
+    return CollectionResult.error_result(city, state, platform, f"No handler for platform '{platform}'")

@@ -1,0 +1,15 @@
+# All pipeline data lives in S3 (meeting-pipeline-dev bucket), not git
+sources/
+output/
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[oc]
+.env
