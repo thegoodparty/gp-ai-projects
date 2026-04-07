@@ -211,12 +211,12 @@ def normalize_meeting(
             "agenda_files": agenda_files,
         },
         "agenda": {
-            "total_items": extraction.total_items,
+            "total_items": len(items),
             "items": items,
             "extraction_notes": extraction.extraction_notes,
         },
         "summary": {
-            "total_items": extraction.total_items,
+            "total_items": len(items),
             "public_hearings": sum(1 for i in items if i.get("is_public_hearing")),
             "consent_items": sum(1 for i in items if i.get("section") == "consent"),
             "action_items": sum(1 for i in items if i.get("section") == "action"),
