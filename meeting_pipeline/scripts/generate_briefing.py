@@ -266,13 +266,15 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None) 
         constituent_context=constituent_context,
     )
 
-    max_tok = max(16000, len(items) * 250)
+    # Disable thinking for small agendas — categorizing a short list is straightforward
+    # pattern-matching that doesn't benefit from reasoning. For large agendas, thinking
+    # produces better holistic prioritization and avoids structured output truncation.
+    use_thinking = len(items) >= 25
     result = gemini.generate_structured_content(
         prompt=prompt,
         response_schema=AgendaCategorization,
         temperature=0.1,
-        thinking_budget=0,
-        max_tokens=max_tok,
+        thinking_budget=None if use_thinking else 0,
     )
 
     if isinstance(result, dict):
@@ -662,8 +664,8 @@ def generate_briefing_for_meeting(
 
     # Cost
     stats = gemini.get_usage_stats()
-    cost = stats.get("estimated_cost_usd", 0)
-    calls = stats.get("api_calls", 0)
+    cost = stats.get("total_cost", 0)
+    calls = stats.get("api_call_count", 0)
     briefing["generationCostUsd"] = round(cost, 6)
     print(f"  Cost: ${cost:.4f} ({calls} API calls)")
 
@@ -703,7 +705,11 @@ def main():
         target_keys = [matches[-1]]
     else:
         all_keys = storage.list_keys(normalized_prefix)
-        target_keys = sorted(k for k in all_keys if k.endswith(".json"))
+        # Only match {city-slug}_{YYYY-MM-DD}.json — skip combined dumps like normalized_meetings.json
+        target_keys = sorted(
+            k for k in all_keys
+            if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
+        )
         if not target_keys:
             print(f"No normalized meeting files found in {normalized_prefix}")
             sys.exit(1)
@@ -712,7 +718,11 @@ def main():
     for key in target_keys:
         filename = key.split("/")[-1]
         print(f"\nProcessing: {filename}")
-        result = generate_briefing_for_meeting(key, storage, cfg, dry_run=args.dry_run)
+        try:
+            result = generate_briefing_for_meeting(key, storage, cfg, dry_run=args.dry_run)
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+            result = {"status": "error", "error": str(e), "cost": 0}
         result["file"] = filename
         results.append(result)
 

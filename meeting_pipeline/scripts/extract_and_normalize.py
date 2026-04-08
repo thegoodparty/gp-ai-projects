@@ -328,7 +328,7 @@ def main():
         print(f"  Errors:     {len(errors)}")
         for e in errors:
             print(f"    {e['label']}: {e['error']}")
-        print(f"  LLM cost:   ${stats.get('estimated_cost_usd', 0):.4f} ({stats.get('api_calls', 0)} calls)")
+        print(f"  LLM cost:   ${stats.get('total_cost', 0):.4f} ({stats.get('api_call_count', 0)} calls)")
         print(f"\nOutput: {normalized_prefix}/")
 
 
