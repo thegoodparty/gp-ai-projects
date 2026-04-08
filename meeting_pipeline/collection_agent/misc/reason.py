@@ -130,7 +130,7 @@ async def _collect_with_agent(
     # JSON schema mode, fixing the "items" structured output validation errors
     # that occurred with the langchain-google-genai approach.
     llm = ChatGoogle(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash-lite",
         temperature=0.0,
     )
 

@@ -18,14 +18,11 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
 from meeting_pipeline.prompts.extraction import build_extraction_prompt
@@ -124,30 +121,20 @@ def find_best_pdf(city_slug: str, date: str, platform: str, storage, sources_pre
 
 # ── LLM extraction ────────────────────────────────────────────────────────────
 
-def extract_with_gemini(text: str, city: str, state: str, date: str, max_retries: int = 3) -> MeetingExtraction:
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
+def extract_with_gemini(text: str, city: str, state: str, date: str, gemini) -> MeetingExtraction:
     large_agenda = len(text.split()) > 8000
     prompt = build_extraction_prompt(text, city, state, date, large_agenda=large_agenda)
 
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=MeetingExtraction,
-                    temperature=0.1 + (attempt * 0.05),
-                ),
-            )
-            return MeetingExtraction.model_validate_json(response.text)
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                print(f"  ⚠ Attempt {attempt + 1} failed ({e}), retrying...")
-    raise last_error
+    result = gemini.generate_structured_content(
+        prompt=prompt,
+        response_schema=MeetingExtraction,
+        temperature=0.1,
+        trace_name="extract_agenda",
+    )
+
+    if isinstance(result, MeetingExtraction):
+        return result
+    return MeetingExtraction.model_validate(result)
 
 
 # ── Normalization ─────────────────────────────────────────────────────────────
@@ -236,8 +223,11 @@ def main():
     parser.add_argument("--force", action="store_true", help="Re-extract even if normalized file already exists")
     args = parser.parse_args()
 
+    from shared.llm_gemini import GeminiClient, GeminiModelType  # lazy — shared has heavy deps
+
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
+    gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 
     queue_key = f"{cfg.output_prefix}/meeting_queue.json"
     if not storage.exists(queue_key):
@@ -301,8 +291,8 @@ def main():
 
             # LLM extraction
             try:
-                extraction = extract_with_gemini(text, official["city"], official["state"], date)
-                print(f"  Extracted {extraction.total_items} agenda items, {len(extraction.items)} detailed")
+                extraction = extract_with_gemini(text, official["city"], official["state"], date, gemini)
+                print(f"  Extracted {len(extraction.items)} agenda items")
             except Exception as e:
                 print(f"  ✗ LLM extraction failed: {e}")
                 errors.append({"label": label, "error": str(e)})
@@ -330,6 +320,7 @@ def main():
             "meetings": all_normalized,
         })
 
+        stats = gemini.get_usage_stats()
         print(f"\n{'='*60}")
         print(f"EXTRACTION SUMMARY")
         print(f"{'='*60}")
@@ -337,6 +328,7 @@ def main():
         print(f"  Errors:     {len(errors)}")
         for e in errors:
             print(f"    {e['label']}: {e['error']}")
+        print(f"  LLM cost:   ${stats.get('estimated_cost_usd', 0):.4f} ({stats.get('api_calls', 0)} calls)")
         print(f"\nOutput: {normalized_prefix}/")
 
 
