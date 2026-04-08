@@ -128,3 +128,11 @@ class TestFilterAndStructureEvents:
     def test_http_url_allowed(self):
         event = LlmEventResult(title="HTTP", description="Test", date="2026-07-04", url="http://example.com")
         assert event.url == "http://example.com"
+
+    def test_non_string_url_dropped(self):
+        event = LlmEventResult(title="Bool URL", description="Test", date="2026-07-04", url=True)
+        assert event.url is None
+
+    def test_whitespace_url_dropped(self):
+        event = LlmEventResult(title="Spaces", description="Test", date="2026-07-04", url="   ")
+        assert event.url is None

@@ -51,10 +51,18 @@ class LlmEventResult(BaseModel):
     @field_validator("url", mode="before")
     @classmethod
     def validate_url(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.startswith(("https://", "http://")):
-            logger.warning(f"Dropping invalid URL (not http/https): {v}")
+        if not v:
             return None
-        return v or None
+        if not isinstance(v, str):
+            logger.warning(f"Dropping invalid URL (not a string): {repr(v)}")
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if not v.startswith(("https://", "http://")):
+            logger.warning(f"Dropping invalid URL (not http/https): {repr(v)}")
+            return None
+        return v
 
 
 class LlmEventResultList(BaseModel):
