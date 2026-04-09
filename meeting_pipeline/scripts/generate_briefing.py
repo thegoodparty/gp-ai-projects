@@ -198,7 +198,7 @@ class AgendaCategorization(BaseModel):
 class PriorityIssueCard(BaseModel):
     agendaItemTitle: str = Field(description="Title of the underlying agenda item")
     slug: str = Field(description="URL-safe slug (e.g. 'public-safety-camera-expansion')")
-    headline: str = Field(description="Attention-grabbing headline that explains why this matters (1-2 sentences, plain language, no jargon)")
+    headline: str = Field(description="One punchy sentence, max 15 words. What's at stake for constituents and what this meeting means — in a single breath. No scores, percentages, or numeric rankings.")
     whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for")
     askThisInTheRoom: str = Field(description="A specific question the council member could ask during the meeting")
     tryThis: Optional[str] = Field(None, description="Optional: a suggested statement or talking point the council member could use")
@@ -697,7 +697,11 @@ def main():
         target_keys = [args.file]
     elif args.city:
         all_keys = storage.list_keys(normalized_prefix)
-        matches = sorted(k for k in all_keys if f"/{args.city}_" in k and k.endswith(".json"))
+        city_slug = args.city.lower().replace(" ", "-")
+        matches = sorted(
+            k for k in all_keys
+            if k.split("/")[-1].lower().startswith(city_slug) and k.endswith(".json")
+        )
         if not matches:
             print(f"No normalized files found for city: {args.city}")
             print(f"  Looked in: {normalized_prefix}")

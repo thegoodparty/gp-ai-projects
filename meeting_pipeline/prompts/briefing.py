@@ -148,8 +148,9 @@ def build_pass2_prompt(
     if constituent_context:
         constituent_block = (
             f"\n{constituent_context}\n\n"
-            "IMPORTANT: Use the constituent scores above to connect agenda items to what voters care about. "
-            "Reference specific scores in headlines (e.g. 'Public safety scores 77 out of 100 among your constituents'). "
+            "IMPORTANT: Use the constituent scores above to inform your framing and prioritization — "
+            "but do NOT cite scores or percentages in headlines. Instead, weave constituent priorities "
+            "into the headline naturally (e.g. 'Public safety is your constituents' top concern. Monday's vote puts cameras on the map.'). "
             "Frame 'what you need to do' around constituent priorities."
         )
 
@@ -159,7 +160,7 @@ Below are candidate priority items, ranked by importance score. SELECT THE 2-4 M
 
 For each selected item, write:
 
-1. **headline**: 1-2 sentences telling the official WHY this matters and what is at stake. Lead with the consequence, not the procedure. Use "you" / "your" voice.
+1. **headline**: One punchy sentence, max 15 words. Captures what's at stake for constituents and what this meeting means — in a single breath. Examples: "Monday's vote puts public safety cameras on the map — your constituents are watching." / "What you say Monday shapes the city budget before the numbers are locked." Do NOT include constituent scores, percentages, or numeric rankings.
 
 2. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote Monday, but what you say sets the direction on X." / "This is informational — no vote — but the implicit decision is X." For vote_required items, describe what specifically is being approved and what the official should review or confirm beforehand. For direction_setting, name what gets locked in based on what's said. Be specific about what to do before the meeting. The first sentence must be scannable standalone.
 

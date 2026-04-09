@@ -47,11 +47,11 @@ async def main_async(args: argparse.Namespace) -> None:
             print(f"ERROR: --city must be in 'City Name ST' format (e.g. 'Durham NC')")
             sys.exit(1)
         city_name, state = parts[0].strip(), parts[1].upper()
-        cities = [c for c in PILOT_CITIES
+        cities = [c for c in cities
                   if c["city"].lower() == city_name.lower() and c["state"] == state]
         if not cities:
-            print(f"ERROR: '{args.city}' not found in PILOT_CITIES registry")
-            sys.exit(1)
+            # Not in registry — run ad-hoc for this city
+            cities = [{"city": city_name, "state": state}]
 
     print(f"\n{'='*60}")
     print(f"PILOT COLLECTION — {len(cities)} cities")

@@ -10,7 +10,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
 from .storage import StorageBackend, LocalStorageBackend, S3StorageBackend
+
+# Auto-load .env from the meeting_pipeline directory
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 @dataclass
