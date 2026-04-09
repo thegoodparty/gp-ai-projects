@@ -43,21 +43,39 @@ from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_s
 # ============================================================================
 
 ISSUE_SCORES = {
-    "hs_affordable_housing_gov_has_role": "Affordable Housing (Gov Role)",
-    "hs_gentrification_oppose": "Anti-Gentrification Sentiment",
+    # Public safety
     "hs_most_important_policy_keep_safe": "Public Safety Priority",
     "hs_violent_crime_very_worried": "Violent Crime Concern",
     "hs_police_trust_yes": "Police Trust",
+    # Housing & development
+    "hs_affordable_housing_gov_has_role": "Affordable Housing (Gov Role)",
+    "hs_gentrification_oppose": "Anti-Gentrification Sentiment",
+    # Infrastructure & transportation
     "hs_infrastructure_funding_fund_more": "Infrastructure Funding Support",
     "hs_public_transit_support": "Public Transit Support",
+    "hs_gas_tax_support": "Gas Tax Support",
+    # Environment
     "hs_most_important_policy_item_environment": "Environment Priority",
     "hs_climate_change_believer": "Climate Change Believer",
+    # Education
     "hs_school_funding_more": "School Funding Support",
     "hs_school_choice_support": "School Choice Support",
+    "hs_charter_schools_support": "Charter Schools Support",
+    "hs_community_college_free_support": "Free Community College Support",
+    # Economy & labor
     "hs_most_important_policy_item_economics": "Economic Development Priority",
     "hs_tax_cuts_support": "Tax Cut Support",
-    "hs_stadium_public_financing_approve": "Stadium Public Financing Support",
+    "hs_min_wage_15_increase_support": "Minimum Wage Increase Support",
+    "hs_income_inequality_serious": "Income Inequality Concern",
+    "hs_unions_beneficial": "Unions Beneficial",
+    "hs_econ_anxiety_very_worried": "Economic Anxiety",
+    # Public health
+    "hs_opioid_crisis_treat": "Opioid: Treatment-first Approach",
+    "hs_marijuana_legal_support": "Cannabis Legalization Support",
+    # Community priorities
     "hs_most_important_policy_item_help_people": "Helping People Priority",
+    "hs_stadium_public_financing_approve": "Stadium Public Financing Support",
+    "hs_rank_choice_voting_support": "Ranked Choice Voting Support",
 }
 
 CONTEXT_SCORES = {
