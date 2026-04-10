@@ -96,3 +96,43 @@ class TestFilterAndStructureEvents:
         one_week_task = next(t for t in result if t.title == "One Week Before")
         assert election_week_task.week == 1
         assert one_week_task.week == 2
+
+    @pytest.mark.asyncio
+    async def test_url_passed_through_when_present(self):
+        mock_client = Mock()
+        mock_client.generate_structured_content.return_value = LlmEventResultList(
+            events=[
+                LlmEventResult(title="Event With URL", description="Test", date="2026-07-04", url="https://example.com/event"),
+                LlmEventResult(title="Event Without URL", description="Test", date="2026-07-05"),
+            ]
+        )
+
+        result = await _filter_and_structure_events(
+            mock_client, "Boston", "MA", date(2026, 11, 4), date(2026, 1, 1), "raw events text"
+        )
+
+        assert len(result) == 2
+        with_url = next(t for t in result if t.title == "Event With URL")
+        without_url = next(t for t in result if t.title == "Event Without URL")
+        assert with_url.url == "https://example.com/event"
+        assert without_url.url is None
+
+    def test_invalid_url_dropped(self):
+        event = LlmEventResult(title="Bad URL", description="Test", date="2026-07-04", url="javascript:alert(1)")
+        assert event.url is None
+
+    def test_empty_url_dropped(self):
+        event = LlmEventResult(title="Empty URL", description="Test", date="2026-07-04", url="")
+        assert event.url is None
+
+    def test_http_url_allowed(self):
+        event = LlmEventResult(title="HTTP", description="Test", date="2026-07-04", url="http://example.com")
+        assert event.url == "http://example.com"
+
+    def test_non_string_url_dropped(self):
+        event = LlmEventResult(title="Bool URL", description="Test", date="2026-07-04", url=True)
+        assert event.url is None
+
+    def test_whitespace_url_dropped(self):
+        event = LlmEventResult(title="Spaces", description="Test", date="2026-07-04", url="   ")
+        assert event.url is None

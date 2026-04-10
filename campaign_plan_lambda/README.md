@@ -1,6 +1,6 @@
 # Campaign Plan Lambda
 
-AWS Lambda that finds community events for political candidates using Gemini 3 with Google Search grounding. Triggered by SQS, writes results to S3, and notifies gp-api via SQS.
+AWS Lambda that finds community events for political candidates using Gemini 3 with Google Search grounding. Triggered by SQS, writes results to S3, and notifies gp-api via SQS. Prompts are managed in Braintrust (project: "campaign-plan") with hardcoded fallbacks.
 
 ## What it does
 
@@ -16,7 +16,7 @@ AWS Lambda that finds community events for political candidates using Gemini 3 w
 
 - Python 3.12+
 - Project venv activated: `source .venv/bin/activate` (from the `gp-ai-projects` root)
-- `GEMINI_API_KEY` set in `.env` at the project root
+- `GEMINI_API_KEY` and `BRAINTRUST_API_KEY` set in `.env` at the project root
 
 ### Run the SQS harness
 
@@ -48,7 +48,7 @@ cd /gp-ai-projects
 bash campaign_plan_lambda/build.sh
 ```
 
-This creates `campaign_plan_lambda/lambda.zip` (~9MB zipped, ~28MB unzipped).
+This creates `campaign_plan_lambda/lambda.zip` (~11MB zipped, ~33MB unzipped).
 
 ### Upload to Lambda (dev)
 
@@ -153,13 +153,16 @@ aws s3 ls s3://campaign-plan-results-dev/results/99999/ --region us-west-2 --pro
       "cta": "Attend event",
       "flowType": "events",
       "week": 22,
-      "date": "2026-06-06"
+      "date": "2026-06-06",
+      "url": "https://www.bostonprideforthepeople.org"
     }
   ],
   "taskCount": 7,
   "generationTimestamp": "2026-04-02T15:30:00.000000+00:00"
 }
 ```
+
+The `url` field is optional — it is omitted when no direct event link is available.
 
 ## Error handling
 
