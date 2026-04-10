@@ -43,7 +43,7 @@ def process_request(body: dict) -> None:
     import campaign_plan_lambda.handler as handler_module
 
     handler_module._secrets_cache = handler_module.Secrets(
-        GEMINI_API_KEY=os.environ.get("GEMINI_API_KEY", ""),
+        GEMINI_API_KEY=os.environ["GEMINI_API_KEY"],
         BRAINTRUST_API_KEY=os.environ.get("BRAINTRUST_API_KEY", ""),
     )
 
@@ -71,7 +71,23 @@ def process_request(body: dict) -> None:
 class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid JSON"}).encode())
+            return
+
+        if not isinstance(body, dict):
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "request body must be a JSON object"}).encode())
+            return
 
         print(f"\n{'=' * 60}")
         print(f"Received request:")
@@ -84,7 +100,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"accepted": True}).encode())
 
         # Process in background so the HTTP response returns immediately
-        thread = Thread(target=run_generation, args=(body,))
+        thread = Thread(target=run_generation, args=(body,), daemon=True)
         thread.start()
 
     def log_message(self, format, *args):
@@ -104,11 +120,16 @@ def run_generation(body: dict) -> None:
 
 
 def main():
-    output_queue = os.environ.get("OUTPUT_SQS_QUEUE_URL", "")
+    missing = [v for v in ("GEMINI_API_KEY", "OUTPUT_SQS_QUEUE_URL") if not os.environ.get(v)]
+    if missing:
+        print(f"ERROR: missing required env vars: {', '.join(missing)}", file=sys.stderr)
+        print("Set them in .env before starting the local server.", file=sys.stderr)
+        raise SystemExit(1)
+
     print(f"Campaign Plan Local Server")
     print(f"  Port: {PORT}")
     print(f"  S3 Bucket: {os.environ.get('S3_RESULTS_BUCKET')}")
-    print(f"  Output Queue: {output_queue or '(not set — completion messages will fail)'}")
+    print(f"  Output Queue: {os.environ['OUTPUT_SQS_QUEUE_URL']}")
     print(f"\nSet in gp-api .env:")
     print(f"  CAMPAIGN_PLAN_LOCAL_URL=http://localhost:{PORT}/generate")
     print(f"\nWaiting for requests...\n")
