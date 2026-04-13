@@ -159,6 +159,11 @@ async def collect_novus(config: NovusConfig) -> NovusResult:
                         print(f"  WARN: search failed for range={date_range}: {e}")
 
         print(f"  {config.city_name}: {len(meetings)} meetings found")
+        # Note: some Novus portals show 0 meetings when agendas haven't been posted yet;
+        # this is expected behavior, not a scraper bug. Verified for Cornelius OR,
+        # Hermiston OR, and Union City GA — their Meetings.aspx pages return "No records
+        # to display" because no upcoming meetings have been published. Kyle TX (also
+        # Novus) is covered via Granicus and does not need this collector.
 
         if not meetings:
             config.storage.write_json(f"{config.output_prefix}/meetings.json", [])
