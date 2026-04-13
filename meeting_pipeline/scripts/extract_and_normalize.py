@@ -289,6 +289,12 @@ def main():
             word_count = len(text.split())
             print(f"  Extracted {word_count} words from PDF")
 
+            truncation_warning = None
+            if len(text) > 50_000:
+                truncated_chars = len(text) - 50_000
+                truncation_warning = f"Text truncated: {len(text):,} chars → 50,000 ({truncated_chars:,} chars dropped — tail agenda items may be missing)"
+                print(f"  ⚠ {truncation_warning}")
+
             if len(text.strip()) < 500 and pdf_size > 5000:
                 err = f"PDF appears to be scanned/image-only: {len(text.strip())} chars from {pdf_size // 1024}KB file"
                 print(f"  ✗ {err}")
@@ -324,6 +330,8 @@ def main():
                 city_slug=city_slug,
                 platform=platform,
             )
+            if truncation_warning:
+                normalized.setdefault("agenda", {})["truncation_warning"] = truncation_warning
             all_normalized.append(normalized)
             storage.write_json(out_key, normalized)
             print(f"  ✓ Saved: {out_key}")

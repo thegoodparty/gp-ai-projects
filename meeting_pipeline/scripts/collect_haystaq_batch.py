@@ -240,6 +240,8 @@ def main():
 
             if data is None:
                 print(f"  ⚠ No voters found ({elapsed:.1f}s)")
+                failure_key = f"{cfg.sources_prefix}/{slug}/constituent/haystaq_failure.json"
+                storage.write_json(failure_key, {"slug": slug, "city": name, "state": state, "reason": "no_voters_found"})
                 results.append({"slug": slug, "status": "no_data", "voters": 0, "time": elapsed})
                 continue
 
@@ -256,6 +258,8 @@ def main():
         except Exception as e:
             elapsed = time.time() - start
             print(f"  ✗ Error: {e} [{elapsed:.1f}s]")
+            failure_key = f"{cfg.sources_prefix}/{slug}/constituent/haystaq_failure.json"
+            storage.write_json(failure_key, {"slug": slug, "city": name, "state": state, "reason": "query_error", "error": str(e)})
             results.append({"slug": slug, "status": "error", "voters": 0, "time": elapsed, "error": str(e)})
 
     client.close()

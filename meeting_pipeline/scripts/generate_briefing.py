@@ -130,6 +130,10 @@ def load_constituent_data(city_slug: str, storage, sources_prefix: str) -> Optio
     """Load Haystaq constituent data for a city if available."""
     key = f"{sources_prefix}/{city_slug}/constituent/issue_scores.json"
     if not storage.exists(key):
+        failure_key = f"{sources_prefix}/{city_slug}/constituent/haystaq_failure.json"
+        if storage.exists(failure_key):
+            failure = storage.read_json(failure_key)
+            print(f"  ⚠ Haystaq data missing for {city_slug}: {failure.get('reason')} — {failure.get('error', '')}")
         return None
     data = storage.read_json(key)
     return data if data.get("issues") else None
@@ -480,6 +484,87 @@ def pass3_generate_detail(
 
 
 # ============================================================================
+# PROVENANCE VALIDATOR
+# ============================================================================
+
+# Fields where the prompt requires source-grounded claims only.
+# Any specific name, dollar amount, or statistic should be prefixed "Inferred:"
+# if it doesn't appear in the source text.
+_INFERRED_PATTERN = re.compile(
+    r'\b(?:typically|generally|usually|historically|often|commonly|tends to|in most cases)\b',
+    re.IGNORECASE,
+)
+_GROUNDED_FIELDS = ("whoIsPresenting", "supportingContext")
+
+
+def check_provenance(details: list, source_texts: dict[str, str]) -> list[str]:
+    """
+    Check that restricted fields in Pass 3 output don't contain likely-inferred
+    claims without the 'Inferred:' prefix. Returns list of warning strings.
+    """
+    warnings = []
+    for detail in details:
+        title = getattr(detail, "agendaItemTitle", "") if hasattr(detail, "agendaItemTitle") else ""
+        source = source_texts.get(title, "")
+        for field in _GROUNDED_FIELDS:
+            value = getattr(detail, field, None) or ""
+            if not value:
+                continue
+            # Flag sentences with inference language but no Inferred: prefix
+            for sentence in re.split(r'(?<=[.!?])\s+', value):
+                if _INFERRED_PATTERN.search(sentence) and not sentence.strip().startswith("Inferred:"):
+                    warnings.append(
+                        f"{field} may contain untagged inference: \"{sentence.strip()[:120]}\""
+                    )
+    return warnings
+
+
+# ============================================================================
+# FISCAL AMOUNT CROSS-CHECK
+# ============================================================================
+
+_DOLLAR_PATTERN = re.compile(
+    r'\$[\d,]+(?:\.\d+)?(?:\s*(?:million|billion|thousand|M|B|K))?'
+    r'|\b\d[\d,]*(?:\.\d+)?\s*(?:million|billion|thousand)\b',
+    re.IGNORECASE,
+)
+
+
+def _normalize_amount(s: str) -> str:
+    """Strip formatting for loose comparison."""
+    return re.sub(r'[\s,$]', '', s).lower()
+
+
+def check_fiscal_amounts(briefing: dict, meeting: dict) -> list[str]:
+    """
+    Extract all dollar amounts from generated briefing text and check each
+    appears in the normalized agenda source. Returns list of warning strings
+    for amounts that could not be verified.
+    """
+    # Build source corpus from all agenda items
+    source_parts = []
+    for item in meeting.get("data", {}).get("agendaItems", []):
+        for field in ("description", "staffRecommendation", "fiscalAmounts"):
+            val = item.get(field)
+            if val:
+                source_parts.append(str(val))
+    source_text = " ".join(source_parts)
+    source_amounts = {_normalize_amount(m) for m in _DOLLAR_PATTERN.findall(source_text)}
+
+    # Extract amounts from generated briefing text
+    generated_text = json.dumps(briefing.get("data", {}))
+    generated_amounts = _DOLLAR_PATTERN.findall(generated_text)
+
+    warnings = []
+    for amount in generated_amounts:
+        norm = _normalize_amount(amount)
+        if norm and not any(norm in s or s in norm for s in source_amounts):
+            warnings.append(f"Unverified amount in briefing: '{amount}' not found in normalized agenda source")
+
+    return warnings
+
+
+# ============================================================================
 # ASSEMBLE FINAL BRIEFING JSON
 # ============================================================================
 
@@ -697,9 +782,32 @@ def generate_briefing_for_meeting(
             t1 = time.time()
             print(f"  Pass 3.{i+1} done ({t1-t0:.1f}s)")
 
+    # Provenance check
+    source_texts = {}
+    for card in cards.priorityIssues:
+        raw_items = meeting.get("data", {}).get("agendaItems", [])
+        raw_item = next((it for it in raw_items if (it.get("title") or "").lower().strip() == card.agendaItemTitle.lower().strip()), None)
+        if raw_item:
+            source_texts[card.agendaItemTitle] = " ".join(filter(None, [
+                raw_item.get("description"), raw_item.get("staffRecommendation")
+            ]))
+    provenance_warnings = check_provenance(details, source_texts)
+    if provenance_warnings:
+        for w in provenance_warnings:
+            print(f"  ⚠ Provenance: {w}")
+
     # Assemble
     print(f"  Assembling briefing...")
     briefing = assemble_briefing(meeting, categorized, cards, details, constituent=constituent)
+    if provenance_warnings:
+        briefing["provenanceWarnings"] = provenance_warnings
+
+    # Fiscal cross-check
+    fiscal_warnings = check_fiscal_amounts(briefing, meeting)
+    if fiscal_warnings:
+        for w in fiscal_warnings:
+            print(f"  ⚠ {w}")
+        briefing["fiscalWarnings"] = fiscal_warnings
 
     # Cost
     stats = gemini.get_usage_stats()
@@ -714,7 +822,13 @@ def generate_briefing_for_meeting(
     storage.write_json(output_key, briefing)
     print(f"  Saved: {output_key}")
 
-    return {"status": "ok", "output": output_key, "cost": cost}
+    return {
+        "status": "ok",
+        "output": output_key,
+        "cost": cost,
+        "haystaq_available": constituent is not None,
+        "fiscal_warnings": fiscal_warnings,
+    }
 
 
 def main():
@@ -776,10 +890,41 @@ def main():
         for r in results:
             status = r.get("status", "?")
             cost = r.get("cost", 0)
-            print(f"  {r.get('file', '?'):40s} [{status}] ${cost:.4f}")
+            fiscal_warns = len(r.get("fiscal_warnings", []))
+            warn_str = f" ⚠ {fiscal_warns} fiscal" if fiscal_warns else ""
+            print(f"  {r.get('file', '?'):40s} [{status}]{warn_str} ${cost:.4f}")
         total_cost = sum(r.get("cost", 0) for r in results)
         ok_count = sum(1 for r in results if r.get("status") == "ok")
-        print(f"\n  Total: {ok_count}/{len(results)} generated, ${total_cost:.4f}")
+        error_count = sum(1 for r in results if r.get("status") == "error")
+        skipped_count = sum(1 for r in results if r.get("status") in ("skipped", "dry_run"))
+        haystaq_missing = sum(1 for r in results if not r.get("haystaq_available", True))
+        print(f"\n  Total: {ok_count}/{len(results)} generated, {error_count} errors, {skipped_count} skipped, ${total_cost:.4f}")
+        if haystaq_missing:
+            print(f"  Constituent data missing for {haystaq_missing} briefing(s)")
+
+        # Write structured run log to storage
+        run_log = {
+            "run_at": datetime.utcnow().isoformat() + "Z",
+            "total": len(results),
+            "ok": ok_count,
+            "errors": error_count,
+            "skipped": skipped_count,
+            "total_cost_usd": round(total_cost, 6),
+            "haystaq_missing": haystaq_missing,
+            "briefings": [
+                {
+                    "file": r.get("file"),
+                    "status": r.get("status"),
+                    "cost_usd": round(r.get("cost", 0), 6),
+                    "fiscal_warnings": r.get("fiscal_warnings", []),
+                    "error": r.get("error"),
+                }
+                for r in results
+            ],
+        }
+        log_key = f"{cfg.output_prefix}/run_logs/briefing_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        storage.write_json(log_key, run_log)
+        print(f"  Run log: {log_key}")
 
 
 if __name__ == "__main__":
