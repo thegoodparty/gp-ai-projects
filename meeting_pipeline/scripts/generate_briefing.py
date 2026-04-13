@@ -136,12 +136,12 @@ def load_constituent_data(city_slug: str, storage, sources_prefix: str) -> Optio
 
 
 def format_constituent_context(constituent: dict) -> str:
-    """Format constituent data into a text block for LLM prompts."""
+    """Format constituent data into a text block for LLM prompts using tiered prose."""
     issues = constituent.get("issues", [])
     if not issues:
         return ""
 
-    lines = ["CONSTITUENT DATA (Haystaq voter modeling scores, 0-100 scale):"]
+    lines = ["CONSTITUENT PRIORITIES (modeled estimates of resident sentiment — directional, not precise):"]
     voter_count = constituent.get("voter_count_with_scores", 0)
     if voter_count:
         lines.append(f"  Based on {voter_count:,} registered voters")
@@ -151,18 +151,18 @@ def format_constituent_context(constituent: dict) -> str:
         tier = issue.get("tier_label", "Lower")
         tiers.setdefault(tier, []).append(issue)
 
+    tier_prose = {
+        "Critical": "top priorities for residents",
+        "Strong": "strong concern among residents",
+        "Moderate": "moderate concern among residents",
+        "Lower": "lower-priority issues for residents",
+    }
+
     for tier_name in ["Critical", "Strong", "Moderate", "Lower"]:
         tier_issues = tiers.get(tier_name, [])
         if tier_issues:
-            lines.append(f"\n  {tier_name} constituent priorities:")
-            for issue in tier_issues:
-                lines.append(f"    - {issue['name']}: {issue['score']:.0f}/100")
-
-    context = constituent.get("context_scores", {})
-    if context:
-        lines.append(f"\n  Ideological context:")
-        for name, score in context.items():
-            lines.append(f"    - {name}: {score:.0f}/100")
+            issue_names = ", ".join(i["name"] for i in tier_issues)
+            lines.append(f"  - {tier_prose[tier_name]}: {issue_names}")
 
     return "\n".join(lines)
 
@@ -173,7 +173,7 @@ def format_top_constituent_issues(constituent: dict, n: int = 5) -> str:
     if not issues:
         return ""
     top = sorted(issues, key=lambda i: i.get("score", 0), reverse=True)[:n]
-    return ", ".join(f"{i['name']} ({i['score']:.0f}/100)" for i in top)
+    return ", ".join(i["name"] for i in top)
 
 
 # ============================================================================
@@ -370,6 +370,26 @@ def _format_available_docs(docs: Optional[list[dict]], meeting_source_url: Optio
     return "\nAVAILABLE SOURCE DOCUMENTS (use these URLs to populate supportingDocuments):\n" + "\n".join(lines)
 
 
+def _extract_item_passage(pdf_bytes: bytes, item_title: str, context_chars: int = 2000) -> str:
+    """Extract a passage from the raw PDF near the agenda item title."""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        full_text = "\n".join(doc[i].get_text() for i in range(min(len(doc), 60)))
+        title_lower = item_title.lower()
+        idx = full_text.lower().find(title_lower[:40])  # search first 40 chars of title
+        if idx == -1:
+            # fallback: try first 20 chars
+            idx = full_text.lower().find(title_lower[:20])
+        if idx == -1:
+            return ""
+        start = max(0, idx - 200)
+        end = min(len(full_text), idx + context_chars)
+        return full_text[start:end].strip()
+    except Exception:
+        return ""
+
+
 def pass3_generate_detail(
     meeting: dict,
     card: PriorityIssueCard,
@@ -378,6 +398,7 @@ def pass3_generate_detail(
     gemini,
     constituent: Optional[dict] = None,
     available_docs: Optional[list[dict]] = None,
+    storage=None,
 ) -> PriorityIssueDetail:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
@@ -406,6 +427,23 @@ def pass3_generate_detail(
             source_text_parts.append(f"Presenter: {raw_item['presenter']}")
         if raw_item.get("fiscalAmounts"):
             source_text_parts.append(f"Fiscal amounts: {raw_item['fiscalAmounts']}")
+
+    # Inject raw PDF passage as primary source (avoids grounding against lossy LLM intermediate)
+    if storage:
+        agenda_files = meeting.get("sources", {}).get("agendaFiles") or []
+        pdf_storage_key = next(
+            (f.get("url") for f in agenda_files if f.get("type") == "storage_pdf"),
+            None,
+        )
+        if pdf_storage_key:
+            try:
+                pdf_bytes = storage.read_bytes(pdf_storage_key)
+                passage = _extract_item_passage(pdf_bytes, card.agendaItemTitle)
+                if passage:
+                    source_text_parts.append(f"\nRAW AGENDA SOURCE (primary):\n{passage}")
+            except Exception:
+                pass  # fall back to normalized fields only
+
     source_text = "\n".join(source_text_parts) if source_text_parts else "No additional source text available for this item."
 
     constituent_context = format_constituent_context(constituent) if constituent else ""
@@ -653,6 +691,7 @@ def generate_briefing_for_meeting(
                 meeting, card, cat_item, categorized.items, gemini,
                 constituent=constituent,
                 available_docs=meeting.get("agendaFiles"),
+                storage=storage,
             )
             details.append(detail)
             t1 = time.time()

@@ -80,6 +80,101 @@ def load_granicus_meetings(city_slug: str, from_date: str, storage, sources_pref
     return [e for e in events if e.get("date", "") >= from_date]
 
 
+def load_boarddocs_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> tuple[list[dict], str]:
+    """Returns (events_after_date, portal_base_url)."""
+    events_key = f"{sources_prefix}/{city_slug}/data/boarddocs/events.json"
+    if not storage.exists(events_key):
+        return [], ""
+
+    # Get base URL from source.json for the portal link
+    base_url = ""
+    source_key = f"{sources_prefix}/{city_slug}/source.json"
+    if storage.exists(source_key):
+        src = storage.read_json(source_key)
+        base_url = src.get("best_source", {}).get("url", "")
+
+    events = storage.read_json(events_key)
+    future = [e for e in events if e.get("EventDate", "")[:10] >= from_date]
+    return sorted(future, key=lambda e: e.get("EventDate", "")), base_url
+
+
+def load_municode_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
+    """Returns municode meetings after from_date."""
+    meetings_key = f"{sources_prefix}/{city_slug}/data/municode/meetings.json"
+    if not storage.exists(meetings_key):
+        return []
+    meetings = storage.read_json(meetings_key)
+    return [m for m in meetings if m.get("date", "") >= from_date]
+
+
+def load_novus_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
+    """Returns novus meetings after from_date."""
+    meetings_key = f"{sources_prefix}/{city_slug}/data/novus/meetings.json"
+    if not storage.exists(meetings_key):
+        return []
+    meetings = storage.read_json(meetings_key)
+    return [m for m in meetings if m.get("date", "") >= from_date]
+
+
+def format_boarddocs_meeting(e: dict, base_url: str, has_matters: bool) -> dict:
+    portal_url = f"{base_url}/Public" if base_url else ""
+    status = "agenda_ready" if has_matters else "agenda_not_posted"
+    return {
+        "date": e.get("EventDate", "")[:10],
+        "title": e.get("EventComment", "") or e.get("EventBodyName", ""),
+        "body": e.get("EventBodyName", ""),
+        "platform": "boarddocs",
+        "status": status,
+        "source_url": portal_url,
+        "agenda_files": [],
+        "notes": "",
+    }
+
+
+def format_municode_meeting(m: dict) -> dict:
+    agenda_url = m.get("agendaUrl", "")
+    minutes_url = m.get("minutesUrl", "")
+    has_agenda = bool(agenda_url)
+    status = "agenda_ready" if has_agenda else "agenda_not_posted"
+    agenda_files = []
+    if agenda_url:
+        agenda_files.append({"name": "Agenda", "type": "Agenda", "url": agenda_url})
+    if minutes_url:
+        agenda_files.append({"name": "Minutes", "type": "Minutes", "url": minutes_url})
+    return {
+        "date": m.get("date", ""),
+        "title": m.get("title", ""),
+        "body": m.get("title", ""),
+        "platform": "municode",
+        "status": status,
+        "source_url": m.get("sourceUrl", ""),
+        "agenda_files": agenda_files,
+        "notes": "",
+    }
+
+
+def format_novus_meeting(m: dict) -> dict:
+    agenda_url = m.get("agendaUrl", "")
+    minutes_url = m.get("minutesUrl", "")
+    has_agenda = bool(agenda_url)
+    status = "agenda_ready" if has_agenda else "agenda_not_posted"
+    agenda_files = []
+    if agenda_url:
+        agenda_files.append({"name": "Agenda", "type": "Agenda", "url": agenda_url})
+    if minutes_url:
+        agenda_files.append({"name": "Minutes", "type": "Minutes", "url": minutes_url})
+    return {
+        "date": m.get("date", ""),
+        "title": m.get("title", ""),
+        "body": m.get("title", ""),
+        "platform": "novus",
+        "status": status,
+        "source_url": m.get("sourceUrl", ""),
+        "agenda_files": agenda_files,
+        "notes": "",
+    }
+
+
 def format_civicplus_meeting(m: dict) -> dict:
     pdf_url = m.get("packetUrl") or m.get("agendaPdfUrl") or ""
     has_agenda = bool(pdf_url)
@@ -269,6 +364,24 @@ def main():
             raw_events = load_granicus_meetings(city_slug, from_date, storage, cfg.sources_prefix)
             for e in raw_events:
                 meetings.append(format_granicus_meeting(e))
+
+        elif platform == "boarddocs":
+            raw_events, base_url = load_boarddocs_meetings(city_slug, from_date, storage, cfg.sources_prefix)
+            # Use matters.json as a proxy for whether agenda content was collected
+            matters_key = f"{cfg.sources_prefix}/{city_slug}/data/boarddocs/matters.json"
+            has_matters = storage.exists(matters_key) and bool(storage.read_json(matters_key))
+            for e in raw_events:
+                meetings.append(format_boarddocs_meeting(e, base_url, has_matters))
+
+        elif platform == "municode":
+            raw_meetings = load_municode_meetings(city_slug, from_date, storage, cfg.sources_prefix)
+            for m in raw_meetings:
+                meetings.append(format_municode_meeting(m))
+
+        elif platform == "novus":
+            raw_meetings = load_novus_meetings(city_slug, from_date, storage, cfg.sources_prefix)
+            for m in raw_meetings:
+                meetings.append(format_novus_meeting(m))
 
         else:
             skipped.append({**official, "reason": f"platform '{platform}' not yet supported in queue"})

@@ -44,9 +44,14 @@ dependencies = [
     "braintrust>=0.3.10",
     "claude-agent-sdk>=0.1.19",
     "slack-sdk>=3.39.0",
+    "pymupdf>=1.27.2.2",
+    "beautifulsoup4>=4.14.3",
 ]
 
 [project.optional-dependencies]
+discovery = [
+    "exa-py>=2.11.0",
+]
 dev = [
     "mypy>=1.11.0",
     "ruff>=0.6.0",

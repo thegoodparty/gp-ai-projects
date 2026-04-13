@@ -46,10 +46,7 @@ load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 SOURCES_DIR = Path(__file__).resolve().parent.parent / "sources"
-REGISTRY_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "docs/discovery/known-sources-registry.json"
-)
+REGISTRY_S3_KEY = "meeting_pipeline/config/known-sources-registry.json"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TODAY = date.today()
@@ -2487,7 +2484,10 @@ def main() -> None:
         print("ERROR: TAVILY_API_KEY not set in environment / .env")
         sys.exit(1)
 
-    registry = json.loads(REGISTRY_PATH.read_text())
+    from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+    cfg = AgentConfig.from_env()
+    storage = get_storage(cfg)
+    registry = storage.read_json(REGISTRY_S3_KEY)
     tavily = TavilyClient(api_key=api_key)
 
     cities = PILOT_CITIES

@@ -56,6 +56,7 @@ class BoardDocsConfig:
     storage: StorageBackend
     lookback_days: int = 180
     committee_id: str = ""  # Primary committee ID (auto-discovered if empty)
+    download_pdfs: bool = True
     request_timeout: int = 30
     rate_limit_delay: float = 0.3
 

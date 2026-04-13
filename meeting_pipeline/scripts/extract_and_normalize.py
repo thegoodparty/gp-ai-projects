@@ -289,13 +289,29 @@ def main():
             word_count = len(text.split())
             print(f"  Extracted {word_count} words from PDF")
 
-            # LLM extraction
-            try:
-                extraction = extract_with_gemini(text, official["city"], official["state"], date, gemini)
-                print(f"  Extracted {len(extraction.items)} agenda items")
-            except Exception as e:
-                print(f"  ✗ LLM extraction failed: {e}")
-                errors.append({"label": label, "error": str(e)})
+            if len(text.strip()) < 500 and pdf_size > 5000:
+                err = f"PDF appears to be scanned/image-only: {len(text.strip())} chars from {pdf_size // 1024}KB file"
+                print(f"  ✗ {err}")
+                errors.append({"label": label, "error": err})
+                continue
+
+            # LLM extraction with exponential backoff retry
+            import time as _time
+            extraction = None
+            for attempt in range(3):
+                try:
+                    extraction = extract_with_gemini(text, official["city"], official["state"], date, gemini)
+                    print(f"  Extracted {len(extraction.items)} agenda items")
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        wait = 2 ** attempt
+                        print(f"  ✗ LLM extraction attempt {attempt + 1} failed: {e} — retrying in {wait}s")
+                        _time.sleep(wait)
+                    else:
+                        print(f"  ✗ LLM extraction failed after 3 attempts: {e}")
+                        errors.append({"label": label, "error": str(e)})
+            if extraction is None:
                 continue
 
             # Normalize and save

@@ -2,6 +2,12 @@
 sources/
 output/
 
+# Config managed in S3 (s3://meeting-pipeline-dev/meeting_pipeline/config/)
+docs/discovery/known-sources-registry.json
+
+# Generated data files
+serve_users_enriched.csv
+
 # macOS
 .DS_Store
 

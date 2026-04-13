@@ -14,8 +14,8 @@ Platform map:
     diligent   → misc/reason (Playwright required)
     escribe    → collect_escribe
     boarddocs  → collect_boarddocs
-    novus      → misc (no dedicated collector yet)
-    municode   → misc (no dedicated collector yet)
+    novus      → collect_novus
+    municode   → collect_municode
     generic    → misc/replay → misc/reason
     unknown    → misc/replay → misc/reason
     unknown_spa→ misc/reason (Playwright required)
@@ -259,6 +259,80 @@ async def _collect_escribe(
     )
 
 
+async def _collect_municode(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.municode import MunicodeConfig, collect_municode
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    url = best.get("config", {}).get("municode_url") or best.get("url", "")
+    if not url:
+        return CollectionResult.error_result(city, state, "municode", "Could not determine Municode portal URL")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/municode"
+
+    mc_cfg = MunicodeConfig(
+        portal_url=url,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+        download_pdfs=cfg.download_pdfs,
+    )
+
+    result = await collect_municode(mc_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="municode",
+        events_found=result.meetings_found,
+        pdfs_downloaded=result.pdfs_downloaded,
+        events=[],
+    )
+
+
+async def _collect_novus(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    from meeting_pipeline.collectors.novus_scraper import NovusConfig, collect_novus
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+    best = source["best_source"]
+
+    url = best.get("config", {}).get("novus_url") or best.get("url", "")
+    if not url:
+        return CollectionResult.error_result(city, state, "novus", "Could not determine Novus portal URL")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/novus"
+
+    novus_cfg = NovusConfig(
+        portal_url=url,
+        city_name=city,
+        output_prefix=output_prefix,
+        storage=storage,
+        lookback_days=cfg.lookback_days,
+        download_pdfs=cfg.download_pdfs,
+    )
+
+    result = await collect_novus(novus_cfg)
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="novus",
+        events_found=result.meetings_found,
+        pdfs_downloaded=result.pdfs_downloaded,
+        events=[],
+    )
+
+
 async def _collect_boarddocs(
     event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
 ) -> CollectionResult:
@@ -268,7 +342,7 @@ async def _collect_boarddocs(
     state = event["state"]
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
-    url = best.get("url", "")
+    url = best.get("url", "").removesuffix("/Public").removesuffix("/public")
 
     output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/boarddocs"
 
@@ -304,13 +378,15 @@ DEDICATED_COLLECTORS = {
     "swagit":     _collect_granicus,   # same collector, detects from URL
     "escribe":    _collect_escribe,
     "boarddocs":  _collect_boarddocs,
+    "municode":   _collect_municode,
+    "novus":      _collect_novus,
 }
 
 # Platforms that skip replay and go straight to reason (Playwright required)
 REASON_ONLY_PLATFORMS = {"diligent", "unknown_spa"}
 
 # Platforms that route through misc (replay → reason)
-MISC_PLATFORMS = {"generic", "unknown", "novus", "municode", "destinyhosted"}
+MISC_PLATFORMS = {"generic", "unknown", "destinyhosted"}
 
 
 # ── Main dispatch function ────────────────────────────────────────────────────

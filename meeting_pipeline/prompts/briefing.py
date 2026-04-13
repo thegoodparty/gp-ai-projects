@@ -24,7 +24,7 @@ See generate_briefing.py: format_constituent_context() and _format_available_doc
 EDITORIAL_RULES = """
 EDITORIAL RULES — follow these exactly:
 
-Voice: Expert and direct. You have a point of view and you share it. Do not hedge, equivocate, or over-qualify. The official is busy. Say the thing.
+Voice: Informational and clear. Report what the agenda and staff materials say. Do not presume to know the official's relationships, read of the room, or political constraints. Where a directive is warranted, prefer "you may want to consider" over imperative framing.
 
 Person: Always second person ("you," "your constituents," "your district"). Never third person about the official.
 
@@ -32,14 +32,13 @@ Sentence length: Prefer short sentences. If a sentence exceeds 25 words, break i
 
 Progressive disclosure: The first sentence of every section must be scannable standalone. An official should be able to read only the first sentence of each section and have a working understanding of the item.
 
-Numbers: Write constituent scores as "X out of 100" (never "X/100" or "X%"). Write dollar amounts with the unit spelled out under $1 million ($329,000 not $329K). Use M for millions ($6.2 million).
+Numbers: Write dollar amounts with the unit spelled out under $1 million ($329,000 not $329K). Use M for millions ($6.2 million). Write constituent priorities as descriptive tiers (e.g. "strong constituent concern" or "a top priority for residents") — not as raw numeric scores.
 
 NEVER recommend how to vote. Recommendations are about how to show up, what to ask, and how to frame a position. The vote is always the official's decision.
 
 NEVER use these phrases or constructions:
 - Em dashes (use commas or periods instead)
 - "It is worth noting" / "it could be argued" / "as you know" / "it is important to remember"
-- "You might consider" / "it could be worth" (be directive: "do this" and "ask this")
 - AI-sounding language: "delve," "leverage," "utilize," "in order to," "comprehensive," "robust"
 - Meta-references: "we have analyzed," "our data shows," "this briefing covers"
 - The word "briefing" in any generated text
@@ -71,8 +70,8 @@ def build_pass1_prompt(
     constituent_block = ""
     if constituent_context:
         constituent_block = (
-            f"\nTOP CONSTITUENT PRIORITIES (Haystaq voter scores, 0-100): {constituent_context}\n\n"
-            "Weight priority scoring toward items that connect to high-scoring constituent issues. "
+            f"\nCONSTITUENT PRIORITIES (modeled estimates of resident sentiment — directional, not precise):\n{constituent_context}\n\n"
+            "Weight priority scoring toward items that connect to high-concern constituent issues. "
             "Boost scores by 1-2 points for strong constituent alignment."
         )
 
@@ -166,9 +165,7 @@ For each selected item, write:
 
 3. **askThisInTheRoom**: One specific, substantive question the official could ask staff or fellow members during the meeting. Write it as a direct quote they can read verbatim. One question only.
 
-4. **tryThis** (optional): A suggested framing or statement if there is a genuine strategic angle. Only include if warranted.
-
-5. **slug**: URL-safe slug derived from the agenda item title.
+4. **slug**: URL-safe slug derived from the agenda item title.
 
 Also write:
 - **executiveHeadline**: One sentence. States how many priority items need attention and signals the work has been done. Never use the word "briefing." (e.g. "{day_name}'s meeting has [N] items that require your attention.")
@@ -221,11 +218,10 @@ def build_pass3_prompt(
     if constituent_context:
         constituent_block = (
             f"\n{constituent_context}\n\n"
-            "IMPORTANT: In whyItMatters, cite specific constituent scores "
-            "(e.g. 'Your constituents rate public safety at 77 out of 100'). "
-            "Scores are modeled from voter and demographic data, not survey results. "
-            "Connect this agenda item to the issues voters care about most. "
-            "In recommendation, frame your advice around these priorities."
+            "IMPORTANT: These are modeled estimates of constituent sentiment — directional, not precise. "
+            "In whyItMatters, describe constituent priorities using tier language "
+            "(e.g. 'Residents show strong concern for infrastructure investment') rather than citing raw numeric scores. "
+            "Connect this agenda item to the issues voters care about most."
         )
 
     return f"""You are a senior policy advisor writing a detailed page for one agenda item from a {city}, {state} {body} meeting on {day_name}, {date}.
@@ -249,17 +245,15 @@ Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY
 
 3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count.
 
-4. **recommendation** (~40 words, 2-3 sentences): A frame, a position, or an action to take before the meeting. Be directive: "Push for X because Y" or "Ask about Z before committing." Never recommend how to vote. The vote is always the official's decision.
+4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision.
 
 5. **actionItem** (~28 words, 1 sentence): One specific pre-meeting action. Be concrete: "Before {day_name}, review the [document]" or "Call [person] and ask about [specific thing]".
 
 6. **askThis** (~30 words, 1 question): A specific, substantive question to ask in the meeting. Write it as a direct quote they can read verbatim. One question only.
 
-7. **tryThis** (optional, ~30 words): A suggested statement or position if there is a genuine strategic angle worth taking.
+7. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions.
 
-8. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions.
-
-9. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above.
+8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above.
 {constituent_block}
 MEETING CONTEXT:
 Other items on the agenda: {other_items}
