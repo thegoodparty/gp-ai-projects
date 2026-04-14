@@ -33,6 +33,7 @@ from .models import CollectionResult
 from .storage import StorageBackend
 from .config import AgentConfig, city_to_slug, find_city_slug
 from . import notification_log
+from .manifest import load_manifest, validate_against_manifest
 from .misc.replay import collect_with_replay, ReplayFailed
 from .misc.reason import collect_with_reason, ReasonFailed
 
@@ -71,7 +72,7 @@ async def _collect_legistar(
 
     result = await collect_legistar(legistar_cfg)
 
-    return CollectionResult(
+    collection_result = CollectionResult(
         city=city,
         state=state,
         platform="legistar",
@@ -79,6 +80,27 @@ async def _collect_legistar(
         pdfs_downloaded=result.pdf_count,
         events=[],
     )
+
+    # Manifest validation (best-effort)
+    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    if manifest:
+        bodies_key = f"{cfg.sources_prefix}/{city_slug}/data/legistar/bodies.json"
+        try:
+            bodies = storage.read_json(bodies_key)
+            body_names = [b.get("BodyName", "") for b in bodies if b.get("BodyName")]
+            is_valid, reason = validate_against_manifest(manifest, body_names)
+            if not is_valid:
+                print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
+                notification_log.log_event(
+                    notification_log.COLLECTION_FAILED, city, state,
+                    storage=storage, logs_prefix=cfg.logs_prefix,
+                    platform="legistar", error=f"manifest_mismatch: {reason}",
+                )
+                return CollectionResult.error_result(city, state, "legistar", f"manifest_mismatch: {reason}")
+        except Exception:
+            pass  # manifest validation is best-effort
+
+    return collection_result
 
 
 async def _collect_civicplus(
@@ -157,7 +179,7 @@ async def _collect_civicclerk(
 
     result = await collect_civicclerk(cc_cfg)
 
-    return CollectionResult(
+    collection_result = CollectionResult(
         city=city,
         state=state,
         platform="civicclerk",
@@ -165,6 +187,27 @@ async def _collect_civicclerk(
         pdfs_downloaded=result.pdfs_downloaded,
         events=[],
     )
+
+    # Manifest validation (best-effort)
+    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    if manifest:
+        events_key = f"{cfg.sources_prefix}/{city_slug}/data/civicclerk/events.json"
+        try:
+            events = storage.read_json(events_key)
+            categories = list({e.get("categoryName", "") for e in events if e.get("categoryName")})
+            is_valid, reason = validate_against_manifest(manifest, categories)
+            if not is_valid:
+                print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
+                notification_log.log_event(
+                    notification_log.COLLECTION_FAILED, city, state,
+                    storage=storage, logs_prefix=cfg.logs_prefix,
+                    platform="civicclerk", error=f"manifest_mismatch: {reason}",
+                )
+                return CollectionResult.error_result(city, state, "civicclerk", f"manifest_mismatch: {reason}")
+        except Exception:
+            pass  # manifest validation is best-effort
+
+    return collection_result
 
 
 async def _collect_granicus(
@@ -427,6 +470,17 @@ async def route_city(
         return CollectionResult.error_result(city, state, "unknown", f"Could not read source.json: {e}")
 
     platform = source.get("best_source", {}).get("platform", "unknown")
+
+    # ── Freshness gate: block wrong_entity / wrong_city before wasting API calls ─
+    freshness = source.get("best_source", {}).get("freshness", "")
+    if freshness in ("wrong_entity", "wrong_city"):
+        msg = f"Source marked {freshness}: {source.get('best_source', {}).get('notes', '')}"
+        notification_log.log_event(
+            notification_log.COLLECTION_FAILED, city, state,
+            storage=storage, logs_prefix=cfg.logs_prefix,
+            platform=platform, error=msg,
+        )
+        return CollectionResult.error_result(city, state, platform, msg)
 
     # ── Step 1: Dedicated collector (Lambda-safe) ─────────────────────────────
     if platform in DEDICATED_COLLECTORS:
