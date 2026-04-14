@@ -99,9 +99,10 @@ def normalized_to_meeting_dict(normalized: dict) -> dict:
             "attachments": [],  # URLs are in sources.agenda_files, not per-item
         })
 
-    # Build supporting docs from agenda_files (exclude local PDFs)
+    # Build supporting docs from agenda_files
+    # Keep storage_pdf entries (needed by _load_pdf_text) but exclude local_pdf
     agenda_files = [
-        {"name": f.get("name", ""), "url": f.get("url", "")}
+        {"name": f.get("name", ""), "type": f.get("type", ""), "url": f.get("url", "")}
         for f in sources.get("agenda_files", [])
         if f.get("type") != "local_pdf" and f.get("url")
     ]
@@ -387,7 +388,8 @@ def _load_pdf_text(meeting: dict, storage) -> str:
     """
     if not storage:
         return ""
-    agenda_files = meeting.get("sources", {}).get("agendaFiles") or []
+    # agendaFiles is at the top level of the meeting dict (set by normalized_to_meeting_dict)
+    agenda_files = meeting.get("agendaFiles") or []
     pdf_storage_key = next(
         (f.get("url") for f in agenda_files if f.get("type") == "storage_pdf"),
         None,
