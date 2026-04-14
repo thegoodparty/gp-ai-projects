@@ -1,8 +1,7 @@
 """
 notification_log.py — Structured event logging for the collection agent.
 
-All events emit JSON to stdout (→ CloudWatch in Lambda/Fargate) and to a local
-JSONL file when running with LocalStorageBackend.
+All events emit JSON to stderr (→ CloudWatch in Lambda/Fargate).
 
 Event schema:
     {
@@ -19,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from .storage import StorageBackend, LocalStorageBackend
+from .storage import StorageBackend
 
 
 # Valid event types
@@ -47,8 +46,7 @@ def log_event(
     """
     Emit a structured event log entry.
 
-    Always prints to stderr (captured by CloudWatch in cloud deployments).
-    When storage is a LocalStorageBackend, also appends to a JSONL file.
+    Prints to stderr (captured by CloudWatch in cloud deployments).
 
     Returns the payload dict (useful for testing).
     """
@@ -60,15 +58,7 @@ def log_event(
     }
     payload.update(detail)
 
-    # stdout/stderr → CloudWatch in Lambda/Fargate
+    # stderr → CloudWatch in Lambda/Fargate
     print(json.dumps(payload), file=sys.stderr)
-
-    # Local JSONL file for dev/testing
-    if storage is not None and isinstance(storage, LocalStorageBackend):
-        try:
-            log_key = f"{logs_prefix}/collection_agent.jsonl"
-            storage.append_line(log_key, json.dumps(payload))
-        except Exception as e:
-            print(f"[log_event] WARN: could not write log file: {e}", file=sys.stderr)
 
     return payload

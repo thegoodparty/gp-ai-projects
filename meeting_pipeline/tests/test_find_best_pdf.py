@@ -1,4 +1,5 @@
 """Tests for find_best_pdf() in extract_and_normalize.py"""
+import json
 import sys
 from pathlib import Path
 import pytest
@@ -8,11 +9,59 @@ if str(_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(_ROOT.parent))
 
 from meeting_pipeline.scripts.extract_and_normalize import find_best_pdf
-from meeting_pipeline.collection_agent.storage import LocalStorageBackend
 
 
-def make_storage(base: Path) -> LocalStorageBackend:
-    return LocalStorageBackend(base)
+class _FilesystemStorageBackend:
+    """Minimal filesystem-backed StorageBackend for use in tests only."""
+
+    def __init__(self, base_dir: Path):
+        self.base_dir = Path(base_dir).resolve()
+
+    def _path(self, key: str) -> Path:
+        p = (self.base_dir / key).resolve()
+        if not str(p).startswith(str(self.base_dir)):
+            raise ValueError(f"Key '{key}' escapes base_dir")
+        return p
+
+    def read_json(self, key: str) -> dict:
+        with open(self._path(key)) as f:
+            return json.load(f)
+
+    def write_json(self, key: str, data: dict) -> None:
+        p = self._path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def write_bytes(self, key: str, data: bytes) -> None:
+        p = self._path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._path(key).read_bytes()
+
+    def exists(self, key: str) -> bool:
+        return self._path(key).exists()
+
+    def get_size(self, key: str) -> int:
+        return self._path(key).stat().st_size
+
+    def list_keys(self, prefix: str) -> list[str]:
+        base = self._path(prefix)
+        if not base.exists():
+            return []
+        return [str(p.relative_to(self.base_dir)) for p in base.rglob("*") if p.is_file()]
+
+    def append_line(self, key: str, line: str) -> None:
+        p = self._path(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(line + "\n")
+
+
+def make_storage(base: Path) -> _FilesystemStorageBackend:
+    return _FilesystemStorageBackend(base)
 
 
 def test_find_best_pdf_prefers_packet(tmp_path):

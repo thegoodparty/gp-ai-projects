@@ -7,6 +7,7 @@ Phases:
   1. Collection    — parallel async (5 concurrent), one city per task
   2. Queue build   — reads collected data → meeting_queue.json
   3. Normalize     — PDF → Gemini extraction → normalized/{city}_{date}.json
+  3b. Haystaq      — collect constituent scores for any cities missing data (--skip-existing)
   4. Briefing      — normalized JSON → briefing JSON
 
 Run: uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py
@@ -14,6 +15,7 @@ Run: uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py
      uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py --phase collect
      uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py --phase queue
      uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py --phase normalize
+     uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py --phase haystaq
      uv run python meeting_pipeline/scripts/run_serve_users_pipeline.py --phase brief
 """
 
@@ -357,7 +359,7 @@ def print_summary(officials: list[dict], cities: list[dict], cfg: AgentConfig):
 
 def main():
     parser = argparse.ArgumentParser(description="Full pipeline for serve_users.csv briefing-capable officials")
-    parser.add_argument("--phase", choices=["collect", "queue", "normalize", "brief", "summary"],
+    parser.add_argument("--phase", choices=["collect", "queue", "normalize", "haystaq", "brief", "summary"],
                         help="Run only one phase (default: all)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Pass --dry-run to normalize and brief phases")
@@ -397,6 +399,15 @@ def main():
         ok = run_script("extract_and_normalize.py", extra)
         if not ok:
             print("  extract_and_normalize.py failed — check output above")
+
+    # Phase 3b: Haystaq constituent data (collect missing cities before briefing)
+    if run_all or args.phase == "haystaq":
+        print(f"\n{'='*60}")
+        print("PHASE 3b: Haystaq constituent data (missing cities only)")
+        print(f"{'='*60}")
+        ok = run_script("collect_haystaq_batch.py", ["--from-csv", "--skip-existing"])
+        if not ok:
+            print("  collect_haystaq_batch.py failed — check output above")
 
     # Phase 4: Briefings
     if run_all or args.phase == "brief":

@@ -270,13 +270,21 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
             iso_date = ""
             if len(date_str) == 8:
                 iso_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}T00:00:00"
+            meeting_unique = m.get("unique", "")
+            # Build a direct link to the public agenda viewer for this meeting
+            agenda_url = (
+                f"{config.base_url}/goto?open&id={meeting_unique}"
+                if meeting_unique else ""
+            )
             events.append({
                 "EventId": i + 1,
                 "EventDate": iso_date,
                 "EventBodyName": m.get("_committee_name", ""),
                 "EventComment": m.get("name", ""),
-                "_boarddocs_unique": m.get("unique", ""),
+                "EventAgendaFile": agenda_url,  # viewer URL (used by extract_and_normalize fallback)
+                "_boarddocs_unique": meeting_unique,
                 "_boarddocs_committee_id": m.get("_committee_id", ""),
+                "_boarddocs_agenda_url": agenda_url,
             })
         config.storage.write_json(f"{config.output_prefix}/events.json", events)
         result.events_count = len(events)
@@ -346,6 +354,8 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
                 if item.get("unique"):
                     pdf_count = await _download_item_attachments(
                         client, config, item["unique"], matter_id,
+                        committee_id=committee_id,
+                        meeting_date=date_str,
                     )
                     result.pdf_count += pdf_count
                     await asyncio.sleep(config.rate_limit_delay * 0.5)
@@ -395,13 +405,27 @@ async def _download_item_attachments(
     config: BoardDocsConfig,
     item_unique: str,
     matter_id: int,
+    committee_id: str = "",
+    meeting_date: str = "",
 ) -> int:
-    """Download PDF attachments for a single agenda item. Returns count of PDFs saved."""
+    """Download PDF attachments for a single agenda item. Returns count of PDFs saved.
+
+    PDFs are stored under pdfs/ with the meeting date in the filename so that
+    find_best_pdf() in extract_and_normalize.py can locate them by date.
+    Format: pdfs/{date}_{matter_id}_{att_id}.pdf  (date = YYYY-MM-DD)
+    """
     files = await _fetch_files(client, config, {
         **_HEADERS, "Referer": f"{config.base_url}/Public",
-    }, item_unique)
+    }, item_unique, committee_id=committee_id)
     if not files:
         return 0
+
+    # Build a date prefix for the filename so find_best_pdf() can match by date.
+    # meeting_date is in YYYYMMDD format from numberdate; convert to YYYY-MM-DD for readability.
+    if len(meeting_date) == 8:
+        date_prefix = f"{meeting_date[:4]}-{meeting_date[4:6]}-{meeting_date[6:8]}"
+    else:
+        date_prefix = meeting_date or "nodate"
 
     pdf_count = 0
     att_records = []
@@ -411,8 +435,10 @@ async def _download_item_attachments(
         download_url = _resolve_boarddocs_url(config.base_url, href)
 
         filename = f["name"] or f"attachment_{att_id}"
-        local_name = f"{matter_id}_{att_id}.pdf"
-        att_key = f"{config.output_prefix}/attachments/{local_name}"
+        # Include date in filename so find_best_pdf() can match this PDF to a meeting date
+        local_name = f"{date_prefix}_{matter_id}_{att_id}.pdf"
+        # Store under pdfs/ so find_best_pdf()'s broad scan picks it up
+        att_key = f"{config.output_prefix}/pdfs/{local_name}"
 
         if not config.storage.exists(att_key):
             pdf_count += await _try_download_pdf(
@@ -582,12 +608,16 @@ async def _fetch_files(
     config: BoardDocsConfig,
     headers: dict,
     item_unique: str,
+    committee_id: str = "",
 ) -> list[dict]:
     """Fetch attached files for an agenda item via BD-GetPublicFiles."""
     try:
+        post_data = f"id={item_unique}"
+        if committee_id:
+            post_data += f"&current_committee_id={committee_id}"
         resp = await client.post(
             f"{config.base_url}/BD-GetPublicFiles?open",
-            data=f"id={item_unique}",
+            data=post_data,
             headers=headers,
         )
         resp.raise_for_status()

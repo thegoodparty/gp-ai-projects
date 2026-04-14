@@ -10,8 +10,14 @@ Usage:
     # Test with 3 cities (one per state):
     AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/collect_haystaq_batch.py --test
 
-    # Run all cities:
+    # Run all cities (from pilot registry):
     AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/collect_haystaq_batch.py
+
+    # Run all cities from serve_users.csv (used by the serve pipeline):
+    AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/collect_haystaq_batch.py --from-csv
+
+    # Run only cities missing Haystaq data (skips cities with existing issue_scores.json):
+    AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/collect_haystaq_batch.py --from-csv --skip-existing
 
     # Run specific city:
     AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/collect_haystaq_batch.py --city cleveland-OH
@@ -22,6 +28,7 @@ Storage:
 """
 
 import argparse
+import csv
 import json
 import sys
 import time
@@ -35,8 +42,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.databricks_client import DatabricksClient
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_slug
+
+SERVE_CSV = _ROOT / "serve_users.csv"
 
 # ============================================================================
 # UNIVERSAL HAYSTAQ COLUMNS (same across all states)
@@ -106,6 +115,48 @@ def get_pilot_cities() -> list[dict]:
             "slug": make_slug(o["city"], o["state"]),
             "city": o["city"],
             "state": o["state"],
+        })
+    return cities
+
+
+STATE_ABBREVS = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY",
+}
+
+
+def get_serve_csv_cities() -> list[dict]:
+    """Return deduplicated cities from serve_users.csv."""
+    if not SERVE_CSV.exists():
+        print(f"ERROR: {SERVE_CSV} not found")
+        sys.exit(1)
+    seen = set()
+    cities = []
+    for row in csv.DictReader(SERVE_CSV.open()):
+        city = row.get("City", "").strip()
+        state_raw = row.get("State/Region", "").strip()
+        if not city or not state_raw:
+            continue
+        state = STATE_ABBREVS.get(state_raw, state_raw[:2].upper() if len(state_raw) > 2 else state_raw.upper())
+        key = (city, state)
+        if key in seen:
+            continue
+        seen.add(key)
+        cities.append({
+            "slug": city_to_slug(city, state),
+            "city": city,
+            "state": state,
         })
     return cities
 
@@ -191,23 +242,36 @@ def main():
     parser.add_argument("--test", action="store_true", help="Test with 3 cities (one per state)")
     parser.add_argument("--city", type=str, help="Run for a single city slug (e.g. cleveland-OH)")
     parser.add_argument("--dry-run", action="store_true", help="List cities without querying")
+    parser.add_argument("--from-csv", action="store_true", help="Use serve_users.csv city list instead of pilot registry")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip cities that already have issue_scores.json in storage")
     args = parser.parse_args()
 
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
 
-    all_cities = get_pilot_cities()
+    all_cities = get_serve_csv_cities() if args.from_csv else get_pilot_cities()
 
     if args.city:
         cities = [c for c in all_cities if c["slug"] == args.city]
         if not cities:
-            print(f"City '{args.city}' not found in pilot registry")
+            source = "serve_users.csv" if args.from_csv else "pilot registry"
+            print(f"City '{args.city}' not found in {source}")
             sys.exit(1)
     elif args.test:
         test_slugs = ["fayetteville-NC", "cleveland-OH", "austin-TX"]
         cities = [c for c in all_cities if c["slug"] in test_slugs]
     else:
         cities = all_cities
+
+    if args.skip_existing:
+        before = len(cities)
+        cities = [
+            c for c in cities
+            if not storage.exists(f"{cfg.sources_prefix}/{c['slug']}/constituent/issue_scores.json")
+        ]
+        skipped = before - len(cities)
+        if skipped:
+            print(f"  Skipping {skipped} cities with existing issue_scores.json")
 
     print(f"Batch Haystaq Collection: {len(cities)} cities")
     print(f"States: {sorted(set(c['state'] for c in cities))}")

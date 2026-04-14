@@ -279,14 +279,33 @@ async def _download_pdfs(
     """Download agenda PDFs for all meetings. Returns count of PDFs saved."""
     downloaded = 0
     for meeting in meetings:
-        for pdf_type, pdf_url in [
-            ("agenda", meeting.get("agendaUrl", "")),
-            ("minutes", meeting.get("minutesUrl", "")),
-        ]:
+        date = meeting.get("date", "unknown")
+        agenda_url = meeting.get("agendaUrl", "")
+        minutes_url = meeting.get("minutesUrl", "")
+        all_pdfs = meeting.get("allPdfs", [])
+
+        # Build a list of (filename_type, url) for everything to download
+        to_download: list[tuple[str, str]] = []
+        for pdf_url in all_pdfs:
             if not pdf_url:
                 continue
+            fn = pdf_url.split("/")[-1].split("?")[0]
+            if pdf_url == minutes_url or "minutes" in fn.lower() or "MEET-Minutes" in fn:
+                pdf_type = "minutes"
+            elif "packet" in fn.lower() or "MEET-Packet" in fn:
+                pdf_type = "packet"
+            else:
+                pdf_type = "agenda"
+            to_download.append((pdf_type, pdf_url))
 
-            date = meeting.get("date", "unknown")
+        # Fall back to agendaUrl/minutesUrl if allPdfs was empty
+        if not to_download:
+            if agenda_url:
+                to_download.append(("agenda", agenda_url))
+            if minutes_url:
+                to_download.append(("minutes", minutes_url))
+
+        for pdf_type, pdf_url in to_download:
             key = f"{config.output_prefix}/pdfs/{date}_{pdf_type}.pdf"
 
             if config.storage.exists(key):

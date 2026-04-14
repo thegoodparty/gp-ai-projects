@@ -1144,7 +1144,6 @@ dependencies = [
     { name = "braintrust" },
     { name = "claude-agent-sdk" },
     { name = "databricks-sql-connector" },
-    { name = "exa-py" },
     { name = "faiss-cpu" },
     { name = "fastapi" },
     { name = "google-api-python-client" },
@@ -1187,6 +1186,9 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+discovery = [
+    { name = "exa-py" },
+]
 
 [package.dev-dependencies]
 campaign-plan-lambda = [
@@ -1208,7 +1210,7 @@ requires-dist = [
     { name = "braintrust", specifier = ">=0.3.10" },
     { name = "claude-agent-sdk", specifier = ">=0.1.19" },
     { name = "databricks-sql-connector", specifier = ">=4.0.5" },
-    { name = "exa-py", specifier = ">=2.11.0" },
+    { name = "exa-py", marker = "extra == 'discovery'", specifier = ">=2.11.0" },
     { name = "faiss-cpu", specifier = ">=1.12.0" },
     { name = "fastapi", specifier = ">=0.116.0" },
     { name = "google-api-python-client", specifier = ">=2.184.0" },
@@ -1247,7 +1249,7 @@ requires-dist = [
     { name = "umap-learn", specifier = ">=0.5.7" },
     { name = "uvicorn", specifier = ">=0.35.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["discovery", "dev"]
 
 [package.metadata.requires-dev]
 campaign-plan-lambda = [

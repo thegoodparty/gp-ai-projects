@@ -117,8 +117,26 @@ def load_novus_meetings(city_slug: str, from_date: str, storage, sources_prefix:
 
 
 def format_boarddocs_meeting(e: dict, base_url: str, has_matters: bool) -> dict:
-    portal_url = f"{base_url}/Public" if base_url else ""
-    status = "agenda_ready" if has_matters else "agenda_not_posted"
+    # base_url from source.json is the /Public URL; strip it to get the NSF base
+    nsf_url = base_url.removesuffix("/Public").removesuffix("/public") if base_url else ""
+    portal_url = f"{nsf_url}/Public" if nsf_url else ""
+
+    # Build a direct link to the meeting's public agenda page using the BoardDocs goto URL
+    meeting_unique = e.get("_boarddocs_unique", "")
+    agenda_url = f"{nsf_url}/goto?open&id={meeting_unique}" if nsf_url and meeting_unique else ""
+
+    agenda_files = []
+    if agenda_url:
+        agenda_files.append({"name": "Agenda", "type": "Agenda", "url": agenda_url})
+
+    has_agenda = bool(agenda_url)
+    if has_matters and has_agenda:
+        status = "agenda_ready"
+    elif has_matters:
+        status = "agenda_posted_no_files"
+    else:
+        status = "agenda_not_posted"
+
     return {
         "date": e.get("EventDate", "")[:10],
         "title": e.get("EventComment", "") or e.get("EventBodyName", ""),
@@ -126,7 +144,7 @@ def format_boarddocs_meeting(e: dict, base_url: str, has_matters: bool) -> dict:
         "platform": "boarddocs",
         "status": status,
         "source_url": portal_url,
-        "agenda_files": [],
+        "agenda_files": agenda_files,
         "notes": "",
     }
 
@@ -219,24 +237,77 @@ def format_granicus_meeting(e: dict) -> dict:
     }
 
 
+# Legistar: governing body name patterns to prefer (case-insensitive substring match)
+_LEGISTAR_PREFERRED_BODIES = [
+    "city council",
+    "common council",
+    "town council",
+    "village council",
+    "city commission",
+    "town commission",
+    "village commission",
+    "board of aldermen",
+    "board of commissioners",
+    "board of trustees",
+]
+
+# Legistar: body name fragments that indicate advisory/sub bodies to deprioritize
+_LEGISTAR_ADVISORY_FRAGMENTS = [
+    "advisory",
+    "subcommittee",
+    "sub-committee",
+    "task force",
+    "ad hoc",
+]
+
+
+def _is_preferred_legistar_body(body: str) -> bool:
+    """Return True if body name matches a primary governing body."""
+    b = body.lower()
+    return any(pref in b for pref in _LEGISTAR_PREFERRED_BODIES)
+
+
+def _is_advisory_legistar_body(body: str) -> bool:
+    """Return True if body name is clearly an advisory/sub body."""
+    b = body.lower()
+    return any(frag in b for frag in _LEGISTAR_ADVISORY_FRAGMENTS)
+
+
 def load_legistar_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
-    """Returns council events after from_date."""
+    """Returns council events after from_date.
+
+    Preference order:
+      1. Bodies matching _LEGISTAR_PREFERRED_BODIES (City Council, Common Council, etc.)
+      2. If none found: any future event that is NOT an advisory/sub-committee body
+      3. If still none: all future events (full fallback — don't silently drop the city)
+    """
     events_key = f"{sources_prefix}/{city_slug}/data/legistar/events.json"
     if not storage.exists(events_key):
         return []
 
     events = storage.read_json(events_key)
-    future = []
+    future_all = []
     for e in events:
         event_date = e.get("EventDate", "")[:10]
         if event_date < from_date:
             continue
-        body = e.get("EventBodyName", "")
-        if "council" not in body.lower() and "board" not in body.lower():
-            continue
-        future.append(e)
+        future_all.append(e)
 
-    return sorted(future, key=lambda e: e.get("EventDate", ""))
+    if not future_all:
+        return []
+
+    # Tier 1: preferred governing bodies
+    preferred = [e for e in future_all if _is_preferred_legistar_body(e.get("EventBodyName", ""))]
+    if preferred:
+        return sorted(preferred, key=lambda e: e.get("EventDate", ""))
+
+    # Tier 2: exclude obvious advisory/sub-committee bodies
+    non_advisory = [e for e in future_all if not _is_advisory_legistar_body(e.get("EventBodyName", ""))]
+    if non_advisory:
+        return sorted(non_advisory, key=lambda e: e.get("EventDate", ""))
+
+    # Tier 3: full fallback — return everything so the city isn't silently dropped
+    return sorted(future_all, key=lambda e: e.get("EventDate", ""))
 
 
 def format_civicclerk_meeting(m: dict, tenant: str) -> dict:

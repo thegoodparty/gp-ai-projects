@@ -736,7 +736,8 @@ def generate_briefing_for_meeting(
         top = format_top_constituent_issues(constituent)
         print(f"  Haystaq data: {constituent.get('voter_count_with_scores', 0):,} voters — top: {top}")
     else:
-        print(f"  Haystaq data: not available (generic briefing)")
+        print(f"  SKIP: No Haystaq constituent data for {city_slug} — run collect_haystaq_batch.py --from-csv first")
+        return {"status": "skipped", "reason": "no_haystaq"}
 
     if dry_run:
         print(f"  DRY RUN: Would generate briefing for {city} {date}")
@@ -867,6 +868,19 @@ def main():
             k for k in all_keys
             if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
         )
+        # Skip files that already have a briefing (batch mode default)
+        briefing_prefix = f"{cfg.output_prefix}/briefings"
+        existing_briefing_keys = set(storage.list_keys(briefing_prefix))
+        def _has_briefing(norm_key: str) -> bool:
+            fn = norm_key.split("/")[-1]           # e.g. chapel-hill-NC_2026-04-15.json
+            stem = fn[:-5]                          # chapel-hill-NC_2026-04-15
+            city_date = stem                        # same
+            return any(city_date in bk for bk in existing_briefing_keys)
+        before = len(target_keys)
+        target_keys = [k for k in target_keys if not _has_briefing(k)]
+        skipped_existing = before - len(target_keys)
+        if skipped_existing:
+            print(f"Skipping {skipped_existing} files with existing briefings (--force to regenerate all)")
         if not target_keys:
             print(f"No normalized meeting files found in {normalized_prefix}")
             sys.exit(1)
@@ -896,11 +910,11 @@ def main():
         total_cost = sum(r.get("cost", 0) for r in results)
         ok_count = sum(1 for r in results if r.get("status") == "ok")
         error_count = sum(1 for r in results if r.get("status") == "error")
-        skipped_count = sum(1 for r in results if r.get("status") in ("skipped", "dry_run"))
-        haystaq_missing = sum(1 for r in results if not r.get("haystaq_available", True))
+        no_haystaq_count = sum(1 for r in results if r.get("reason") == "no_haystaq")
+        skipped_count = sum(1 for r in results if r.get("status") in ("skipped", "dry_run")) - no_haystaq_count
         print(f"\n  Total: {ok_count}/{len(results)} generated, {error_count} errors, {skipped_count} skipped, ${total_cost:.4f}")
-        if haystaq_missing:
-            print(f"  Constituent data missing for {haystaq_missing} briefing(s)")
+        if no_haystaq_count:
+            print(f"  Skipped (no Haystaq): {no_haystaq_count} — run: collect_haystaq_batch.py --from-csv --skip-existing")
 
         # Write structured run log to storage
         run_log = {
@@ -909,8 +923,8 @@ def main():
             "ok": ok_count,
             "errors": error_count,
             "skipped": skipped_count,
+            "skipped_no_haystaq": no_haystaq_count,
             "total_cost_usd": round(total_cost, 6),
-            "haystaq_missing": haystaq_missing,
             "briefings": [
                 {
                     "file": r.get("file"),

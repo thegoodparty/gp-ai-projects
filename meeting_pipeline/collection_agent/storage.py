@@ -1,21 +1,18 @@
 """
-storage.py — StorageBackend Protocol + LocalStorageBackend + S3StorageBackend.
+storage.py — StorageBackend Protocol + S3StorageBackend.
 
-All file I/O in the collection agent goes through this interface so that
-swapping LocalStorageBackend for S3StorageBackend requires zero changes
-to business logic.
+All file I/O in the collection agent goes through this interface.
+S3 is the only supported storage backend.
 
-Keys are always forward-slash paths relative to the backend root, e.g.:
+Keys are always forward-slash paths relative to the bucket root, e.g.:
     "meeting_pipeline/sources/loveland-OH/source.json"
-    "meeting_pipeline/logs/collection_agent.jsonl"
     "meeting_pipeline/output/loveland-OH/civicplus/events.json"
 
-For S3, keys map directly to S3 object keys within the configured bucket.
+Keys map directly to S3 object keys within the configured bucket.
 Logs are not written to S3 — append_line() is a no-op on S3StorageBackend.
 """
 
 import json
-from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
@@ -31,70 +28,6 @@ class StorageBackend(Protocol):
     def list_keys(self, prefix: str) -> list[str]: ...
     def get_size(self, key: str) -> int: ...
     def append_line(self, key: str, line: str) -> None: ...
-
-
-class LocalStorageBackend:
-    """
-    File-system implementation of StorageBackend.
-
-    base_dir: repo root (e.g. /path/to/gp-ai-projects)
-    All keys are resolved relative to base_dir.
-    """
-
-    def __init__(self, base_dir: Path):
-        self.base_dir = Path(base_dir).resolve()
-
-    def _path(self, key: str) -> Path:
-        # Prevent path traversal attacks
-        p = (self.base_dir / key).resolve()
-        if not str(p).startswith(str(self.base_dir)):
-            raise ValueError(f"Key '{key}' escapes base_dir")
-        return p
-
-    def read_json(self, key: str) -> dict:
-        p = self._path(key)
-        with open(p) as f:
-            return json.load(f)
-
-    def write_json(self, key: str, data: dict) -> None:
-        p = self._path(key)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-    def write_bytes(self, key: str, data: bytes) -> None:
-        p = self._path(key)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
-
-    def read_bytes(self, key: str) -> bytes:
-        return self._path(key).read_bytes()
-
-    def exists(self, key: str) -> bool:
-        return self._path(key).exists()
-
-    def get_size(self, key: str) -> int:
-        return self._path(key).stat().st_size
-
-    def list_keys(self, prefix: str) -> list[str]:
-        base = self._path(prefix)
-        if not base.exists():
-            return []
-        return [
-            str(p.relative_to(self.base_dir))
-            for p in base.rglob("*")
-            if p.is_file()
-        ]
-
-    def append_line(self, key: str, line: str) -> None:
-        p = self._path(key)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            f.write(line + "\n")
-
-    def abs_path(self, key: str) -> Path:
-        """Return the absolute filesystem path for a key (local use only)."""
-        return self._path(key)
 
 
 class S3StorageBackend:

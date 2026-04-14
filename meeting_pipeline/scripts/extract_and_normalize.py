@@ -105,6 +105,11 @@ def find_best_pdf(city_slug: str, date: str, platform: str, storage, sources_pre
                 matching.append((key, size))
 
     if not matching:
+        # Legistar fallback: download EventAgendaFile from events.json
+        if platform == "legistar":
+            legistar_pdf = _download_legistar_agenda_pdf(city_slug, date, storage, sources_prefix)
+            if legistar_pdf:
+                return legistar_pdf, "agenda"
         return None, None
 
     # Sort: primary platform first, then packet > agenda, then largest size
@@ -117,6 +122,48 @@ def find_best_pdf(city_slug: str, date: str, platform: str, storage, sources_pre
     filename = best_key.split("/")[-1]
     label = "packet" if "packet" in filename.lower() else "agenda"
     return best_key, label
+
+
+def _download_legistar_agenda_pdf(city_slug: str, date: str, storage, sources_prefix: str) -> str | None:
+    """
+    For Legistar cities: read events.json, find the event for `date`, download
+    EventAgendaFile, save as legistar/pdfs/{date}_agenda.pdf, return storage key.
+    Already-saved PDFs are reused without re-downloading.
+    """
+    import requests
+
+    save_key = f"{sources_prefix}/{city_slug}/data/legistar/pdfs/{date}_agenda.pdf"
+    if storage.exists(save_key):
+        return save_key
+
+    events_key = f"{sources_prefix}/{city_slug}/data/legistar/events.json"
+    if not storage.exists(events_key):
+        return None
+
+    try:
+        events = storage.read_json(events_key)
+    except Exception:
+        return None
+
+    agenda_url = None
+    for event in events:
+        event_date = (event.get("EventDate") or "")[:10]
+        if event_date == date and event.get("EventAgendaFile"):
+            agenda_url = event["EventAgendaFile"]
+            break
+
+    if not agenda_url:
+        return None
+
+    try:
+        resp = requests.get(agenda_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200 and len(resp.content) > 5000:
+            storage.write_bytes(save_key, resp.content)
+            return save_key
+    except Exception:
+        pass
+
+    return None
 
 
 # ── LLM extraction ────────────────────────────────────────────────────────────

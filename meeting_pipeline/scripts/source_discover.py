@@ -9,13 +9,16 @@ Usage:
     uv run python meeting_pipeline/scripts/source_discover.py --city "Chapel Hill"  # single city
     uv run python meeting_pipeline/scripts/source_discover.py --state NC            # one state
     uv run python meeting_pipeline/scripts/source_discover.py --resume              # skip existing
+    uv run python meeting_pipeline/scripts/source_discover.py --from-csv            # use serve_users.csv
+    uv run python meeting_pipeline/scripts/source_discover.py --from-csv --skip-existing  # CSV, skip done
+    uv run python meeting_pipeline/scripts/source_discover.py --from-csv --city "Tuscaloosa"  # single CSV city
 
 Output:
     meeting_pipeline/sources/{city-slug}-{state}/source.json   per-city records
     meeting_pipeline/sources/discovery-summary.json            batch summary
 
 Algorithm (3-phase with retry loop):
-  Phase 1 — Discover candidates (known sources registry + Tavily + URL probing)
+  Phase 1 — Discover candidates (known sources registry + Exa/Tavily + URL probing)
   Phase 2 — Verify freshness by platform
   Phase 3 — Rank and select best source
   Retry loop — up to 2 retries with escalating strategies
@@ -24,10 +27,15 @@ Algorithm (3-phase with retry loop):
   Phase 5 — Playwright browser rendering — last resort for JS SPAs (CivicClerk,
              PrimeGov) and bot-blocked pages where httpx cannot extract dates.
              Requires: pip install playwright && playwright install chromium
+
+Search backends:
+  Exa   — primary when EXA_API_KEY is set (exa-py package required)
+  Tavily — fallback when EXA_API_KEY is not set (always required for domain discovery)
 """
 
 import argparse
 import asyncio
+import csv
 import json
 import os
 import re
@@ -42,10 +50,32 @@ import httpx
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
-load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+# ── Paths (module-level) ───────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PIPELINE_DIR = _SCRIPT_DIR.parent
+SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+
+# ── State name → abbreviation (mirrors collect_haystaq_batch.py) ──────────────
+STATE_ABBREVS = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY",
+}
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-SOURCES_DIR = Path(__file__).resolve().parent.parent / "sources"
+SOURCES_DIR = _PIPELINE_DIR / "sources"
 REGISTRY_S3_KEY = "meeting_pipeline/config/known-sources-registry.json"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -115,16 +145,31 @@ WRONG_CITY_PATTERNS: dict[str, list[str]] = {
 # Global wrong-entity patterns — apply to ALL cities regardless of name.
 # Any result matching one of these is not a city council agenda source.
 WRONG_ENTITY_PATTERNS = [
-    # School boards / ISDs — extremely common false positives from Tavily
+    # School boards / ISDs — extremely common false positives from Tavily/probes
     " isd public",        # "Duncanville ISD Public View", "Killeen ISD Public"
     "isd board",
     "independent school district",
     "school district board",
     "school board meeting",
-    # Other non-city-council entities
+    "school district",    # catches BoardDocs pages titled "Lima City School District"
+    "unified school district",
+    "community school district",
+    # Other non-city-council entities (also caught on BoardDocs page titles)
     "public library board",
     "library board of trustees",
     "library advisory board",  # e.g. Duncanville Library Advisory Board
+    "fire district",
+    "water district",
+    "park district",
+    "health district",
+]
+
+# Wrong-entity keywords specifically for BoardDocs page-title validation.
+# These appear in the <title> or main header of pages that belong to school
+# districts or other non-city entities that share the same city-name slug.
+BOARDDOCS_WRONG_ENTITY_KEYWORDS = [
+    "school", "school district", "isd", "library", "fire district",
+    "water district", "park district", "health district",
 ]
 
 # Keywords that identify a legislative body (used for Legistar EventBodyName validation)
@@ -275,6 +320,37 @@ PILOT_CITIES = [
     {"city": "Chardon Township", "state": "OH"},
     {"city": "Beavercreek Township", "state": "OH"},
 ]
+
+
+# ── City list helpers ──────────────────────────────────────────────────────────
+
+def get_serve_csv_cities() -> list[dict]:
+    """Return deduplicated cities from serve_users.csv.
+
+    Mirrors the same logic as collect_haystaq_batch.py so both scripts
+    cover the same population.  State/Region column has full state names
+    (e.g. "Ohio"), which are converted to 2-letter abbreviations.
+    """
+    if not SERVE_CSV.exists():
+        print(f"ERROR: {SERVE_CSV} not found")
+        sys.exit(1)
+    seen: set[tuple[str, str]] = set()
+    cities: list[dict] = []
+    for row in csv.DictReader(SERVE_CSV.open()):
+        city = row.get("City", "").strip()
+        state_raw = row.get("State/Region", "").strip()
+        if not city or not state_raw:
+            continue
+        state = STATE_ABBREVS.get(
+            state_raw,
+            state_raw[:2].upper() if len(state_raw) > 2 else state_raw.upper(),
+        )
+        key = (city, state)
+        if key in seen:
+            continue
+        seen.add(key)
+        cities.append({"city": city, "state": state})
+    return cities
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -469,6 +545,17 @@ def is_wrong_city(url: str, title: str, city: str) -> bool:
     return False
 
 
+def is_wrong_entity(text: str) -> bool:
+    """Return True if text matches a global wrong-entity pattern (school, library, etc.).
+
+    Use this to filter candidates from ANY discovery source (probe, known, search).
+    Unlike is_wrong_city() this does NOT require a city name — it only checks the
+    global WRONG_ENTITY_PATTERNS that indicate a non-city-council governing body.
+    """
+    lower = text.lower()
+    return any(pat.lower() in lower for pat in WRONG_ENTITY_PATTERNS)
+
+
 def is_non_agenda_url(url: str) -> bool:
     """Return True if the URL is clearly not an official municipal agenda source."""
     url_lower = url.lower()
@@ -601,8 +688,131 @@ async def discover_from_known_sources(known: dict, http: httpx.AsyncClient) -> l
             continue
         # Exclude hard DNS failures (only keep if server responded or timed out)
         if r["http_status"] not in (-2, -3, -4):
+            # Apply global wrong-entity filter to known-source candidates too.
+            # The registry entry URL itself may point to a school board — check
+            # the URL against WRONG_ENTITY_PATTERNS before accepting.
+            if is_wrong_entity(r["url"]):
+                r["freshness"] = "wrong_entity"
+                r["wrong_entity_reason"] = "url matches wrong-entity pattern"
+                # Still include so it shows in all_candidates output for debugging,
+                # but it will score 0 and never become best_source.
+            # Also check fetched body for BoardDocs candidates — the URL alone
+            # doesn't reveal whether the board is a school district or city council.
+            # verify_freshness will run a deeper check, but pre-flagging here avoids
+            # wrong-entity pages poisoning the has_recognized guard in run_source_discover.
+            elif r.get("platform") == "boarddocs" and r.get("_body"):
+                body_text = r["_body"]
+                title_m = re.search(r"<title[^>]*>([^<]+)</title>", body_text, re.IGNORECASE)
+                page_title = title_m.group(1).strip().lower() if title_m else ""
+                if any(kw in page_title for kw in BOARDDOCS_WRONG_ENTITY_KEYWORDS):
+                    r["freshness"] = "wrong_entity"
+                    r["wrong_entity_reason"] = f"boarddocs page title: '{page_title[:60]}'"
             candidates.append(r)
     return candidates
+
+
+def _search_results_to_candidates(
+    raw_results: list[dict],
+    city: str,
+    source_label: str,
+) -> list[dict]:
+    """Convert a list of {url, title, content} dicts to verified candidate dicts.
+
+    Shared by both Tavily and Exa backends so entity filtering and snippet
+    date extraction happen identically regardless of search provider.
+    """
+    candidates = []
+    for r in raw_results:
+        url = r.get("url", "")
+        title = r.get("title", "")
+        content = r.get("content", "")
+        if not url:
+            continue
+        # Include snippet in wrong-city/entity check — content often names city/state
+        if is_wrong_city(url, f"{title} {content}", city):
+            continue
+        if is_non_agenda_url(url):
+            continue
+        platform = detect_platform(url)
+        url = normalize_platform_url(url, platform)
+
+        # Build note from title + snippet prefix
+        note_parts = [title[:80]]
+        if content:
+            note_parts.append(content[:100])
+        c = make_candidate(
+            url=url, platform=platform, source=source_label,
+            notes=" | ".join(p for p in note_parts if p).strip(" |")[:200],
+        )
+
+        # Pre-populate freshness from snippet text.
+        # Handles JS SPAs and bot-blocked pages where httpx can't fetch dates directly.
+        if content:
+            snippet_dates = extract_dates(content)
+            if snippet_dates:
+                c["_snippet_date"] = snippet_dates[0].isoformat()
+            # Flag migration hints so Phase 4 probes harder for new platform
+            content_lower = content.lower()
+            if any(kw in content_lower for kw in (
+                "moved to", "migrated to", "new portal", "new website",
+                "new system", "now located at", "relocated",
+            )):
+                c["notes"] += " [migration_hint_in_snippet]"
+
+        candidates.append(c)
+    return candidates
+
+
+async def discover_from_exa(
+    city: str,
+    state: str,
+    query: Optional[str] = None,
+) -> tuple[list[dict], str]:
+    """Run one Exa search. Return (candidates, query_used).
+
+    Used as primary search backend when EXA_API_KEY is set.
+    Falls back to empty list (not an error) when Exa is unavailable or key missing.
+    Requires: exa-py package (already in pyproject.toml optional[discovery]).
+    """
+    api_key = os.environ.get("EXA_API_KEY")
+    if not api_key:
+        return [], ""
+
+    if query is None:
+        query = (
+            f"{city} {state} city council agenda minutes "
+            "site:gov OR site:granicus.com OR site:legistar.com"
+        )
+
+    try:
+        from exa_py import Exa  # type: ignore
+        exa = Exa(api_key=api_key)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                exa.search_and_contents,
+                query,
+                num_results=5,
+                use_autoprompt=False,
+                text=True,
+            ),
+            timeout=30.0,
+        )
+        # Map Exa result objects to the uniform {url, title, content} dict format
+        raw: list[dict] = [
+            {
+                "url": r.url,
+                "title": r.title or "",
+                "content": (r.text or "")[:500],
+            }
+            for r in (result.results or [])
+        ]
+    except ImportError:
+        return [], query
+    except Exception:
+        return [], query
+
+    candidates = _search_results_to_candidates(raw, city, "exa")
+    return candidates, query
 
 
 async def discover_from_tavily(
@@ -629,47 +839,15 @@ async def discover_from_tavily(
     except Exception:
         return [], query
 
-    candidates = []
-    for r in result.get("results", []):
-        url = r.get("url", "")
-        title = r.get("title", "")
-        content = r.get("content", "")  # text snippet from the indexed page
-        if not url:
-            continue
-        # Include snippet in wrong-city check — content often names the city/state
-        if is_wrong_city(url, f"{title} {content}", city):
-            continue
-        if is_non_agenda_url(url):
-            continue
-        platform = detect_platform(url)
-        url = normalize_platform_url(url, platform)
-
-        # Build note from title + snippet prefix
-        note_parts = [title[:80]]
-        if content:
-            note_parts.append(content[:100])
-        c = make_candidate(
-            url=url, platform=platform, source="tavily",
-            notes=" | ".join(p for p in note_parts if p).strip(" |")[:200],
-        )
-
-        # Pre-populate freshness from Tavily snippet text.
-        # This is the key gap vs. LLM agents: they read snippet content to get dates;
-        # we were discarding it. Handles JS SPAs and bot-blocked pages where we
-        # can't fetch dates directly from the live URL.
-        if content:
-            snippet_dates = extract_dates(content)
-            if snippet_dates:
-                c["_snippet_date"] = snippet_dates[0].isoformat()
-            # Flag migration hints so Phase 4 probes harder for new platform
-            content_lower = content.lower()
-            if any(kw in content_lower for kw in (
-                "moved to", "migrated to", "new portal", "new website",
-                "new system", "now located at", "relocated",
-            )):
-                c["notes"] += " [migration_hint_in_snippet]"
-
-        candidates.append(c)
+    raw: list[dict] = [
+        {
+            "url": r.get("url", ""),
+            "title": r.get("title", ""),
+            "content": r.get("content", ""),
+        }
+        for r in result.get("results", [])
+    ]
+    candidates = _search_results_to_candidates(raw, city, "tavily")
     return candidates, query
 
 
@@ -1006,6 +1184,34 @@ async def discover_from_probes(
             if api_status not in (200, 401, 403):
                 continue  # dead portal — skip, don't add as candidate
 
+        # BoardDocs: validate the page belongs to a city council, not a school district.
+        # BoardDocs URL slugs are first-come-first-served — lima/oh resolves to Lima City
+        # School District, not Lima city government.  Extract the <title> or first <h1>
+        # from the fetched HTML and reject if it contains school/district/ISD keywords.
+        if platform == "boarddocs" and body:
+            body_lower = body.lower()
+            # Extract page title
+            title_match = re.search(r"<title[^>]*>([^<]+)</title>", body, re.IGNORECASE)
+            page_title = title_match.group(1).strip().lower() if title_match else ""
+            # Also check first h1
+            h1_match = re.search(r"<h1[^>]*>([^<]+)</h1>", body, re.IGNORECASE)
+            page_h1 = h1_match.group(1).strip().lower() if h1_match else ""
+            entity_text = f"{page_title} {page_h1}"
+            wrong_entity_kw = next(
+                (kw for kw in BOARDDOCS_WRONG_ENTITY_KEYWORDS if kw in entity_text),
+                None,
+            )
+            if wrong_entity_kw:
+                # Don't add as a candidate — this BoardDocs URL belongs to a school
+                # district or other non-city entity. Skip silently.
+                continue
+
+        # Apply global wrong-entity filter to all probe candidates.
+        # Previously this filter only ran on Tavily/search results; now it also
+        # covers candidates generated by URL probing.
+        if is_wrong_city(url, "", city):
+            continue
+
         display_url = config.pop("display_url", url)
         c = make_candidate(
             url=url, platform=platform, source="probe",
@@ -1298,6 +1504,29 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient) -> dict:
                 candidate["notes"] = (candidate.get("notes") or "") + " (no_council_category — dates may be advisory-only)"
                 candidate["_no_council_category"] = True
 
+    # BoardDocs: validate that the page belongs to a city council, not a school district.
+    # BoardDocs URL slugs are first-registered wins — go.boarddocs.com/oh/lima → Lima City
+    # School District, not Lima city government.  Check the page <title> and first <h1>
+    # for wrong-entity keywords before accepting the candidate.
+    if platform == "boarddocs" and body:
+        title_m = re.search(r"<title[^>]*>([^<]+)</title>", body, re.IGNORECASE)
+        page_title = title_m.group(1).strip().lower() if title_m else ""
+        h1_m = re.search(r"<h1[^>]*>([^<]+)</h1>", body, re.IGNORECASE)
+        page_h1 = h1_m.group(1).strip().lower() if h1_m else ""
+        entity_text = f"{page_title} {page_h1}"
+        wrong_kw = next(
+            (kw for kw in BOARDDOCS_WRONG_ENTITY_KEYWORDS if kw in entity_text),
+            None,
+        )
+        if wrong_kw:
+            candidate["freshness"] = "wrong_entity"
+            candidate["wrong_entity_reason"] = f"boarddocs page title contains '{wrong_kw}'"
+            candidate["notes"] = (
+                (candidate.get("notes") or "").strip()
+                + f" [rejected: wrong_entity — '{page_title[:60]}']"
+            )
+            return candidate
+
     # BoardDocs: minimal HTML shell is normal — mark unknown_spa if no dates
     if platform == "boarddocs" and (len(body) < 800 or "boarddocs" not in body.lower()):
         candidate["freshness"] = "unknown_spa"
@@ -1363,6 +1592,7 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient) -> dict:
 FRESHNESS_SCORE = {
     "fresh": 100, "unknown_spa": 55, "stale_warning": 35,
     "stale": 15, "unknown": 5, "empty": 0, "blocked": 0,
+    "wrong_entity": 0,  # school district / library / etc — never wins
 }
 # empty and blocked score 0 — they should never win over any real candidate,
 # and a Legistar "unknown" (5 + 20 = 25) beats a CivicClerk "empty" (0 + 12 = 12).
@@ -1940,10 +2170,24 @@ async def run_source_discover(
     known_cands = await discover_from_known_sources(known_sources, http)
     seen_urls: set[str] = {c["url"] for c in known_cands}
 
-    # Strategy B: Tavily basic search (always — catches migrations)
-    tavily_cands, query_used = await discover_from_tavily(city, state, tavily, "basic")
-    tavily_queries.append(query_used)
-    for c in tavily_cands:
+    # Strategy B: Search — Exa (primary) or Tavily (fallback).
+    # When EXA_API_KEY is set, use Exa as primary and skip the initial Tavily call.
+    # Tavily is still used for domain discovery (retry 2) and advanced retry queries.
+    use_exa = bool(os.environ.get("EXA_API_KEY"))
+    if use_exa:
+        exa_cands, exa_query = await discover_from_exa(city, state)
+        if exa_query:
+            tavily_queries.append(f"[exa] {exa_query}")
+        search_cands = exa_cands
+        # If Exa returns nothing (API error, import failure), fall back to Tavily
+        if not search_cands:
+            search_cands, query_used = await discover_from_tavily(city, state, tavily, "basic")
+            tavily_queries.append(query_used)
+    else:
+        search_cands, query_used = await discover_from_tavily(city, state, tavily, "basic")
+        tavily_queries.append(query_used)
+
+    for c in search_cands:
         if c["url"] not in seen_urls:
             seen_urls.add(c["url"])
             known_cands.append(c)
@@ -2303,6 +2547,7 @@ async def process_city(
     tavily: TavilyClient,
     semaphore: asyncio.Semaphore,
     resume: bool = False,
+    skip_existing: bool = False,
     output_dir: Optional[Path] = None,
 ) -> dict:
     city = city_info["city"]
@@ -2311,22 +2556,32 @@ async def process_city(
     base_dir = output_dir if output_dir else SOURCES_DIR
     output_path = base_dir / f"{slug}-{state}" / "source.json"
 
-    if resume and output_path.exists():
+    # --resume: skip any city that has a non-empty source.json (legacy flag)
+    # --skip-existing: skip cities with a valid source (freshness not wrong_entity/stale/empty)
+    #   This mirrors collect_haystaq_batch.py --skip-existing behavior.
+    should_skip_check = (resume or skip_existing) and output_path.exists()
+    if should_skip_check:
         try:
             with open(output_path) as f:
                 existing = json.load(f)
             bs = existing.get("best_source") or {}
             freshness = bs.get("freshness", "")
-            # Re-run cities whose best source is empty — it means we found a
-            # platform URL (e.g. a guessed CivicClerk portal) but the API behind
-            # it is dead. Don't treat that as "done"; keep searching.
-            if freshness == "empty":
-                pass  # fall through to re-run
+            # Re-run if: empty source, or wrong_entity (needs re-discovery), or stale
+            if skip_existing:
+                # --skip-existing: only skip if source is genuinely good
+                rerun_freshnesses = {"empty", "wrong_entity", "stale"}
+                if freshness not in rerun_freshnesses:
+                    print(
+                        f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
+                    )
+                    return existing
             else:
-                print(
-                    f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
-                )
-                return existing
+                # --resume: skip everything except empty
+                if freshness != "empty":
+                    print(
+                        f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
+                    )
+                    return existing
         except (json.JSONDecodeError, OSError):
             pass  # re-run if file is corrupt
 
@@ -2375,18 +2630,23 @@ async def run_batch(
     registry: dict,
     tavily: TavilyClient,
     resume: bool = False,
+    skip_existing: bool = False,
     output_dir: Optional[Path] = None,
 ) -> None:
-    semaphore = asyncio.Semaphore(5)  # max 5 concurrent Tavily searches
+    semaphore = asyncio.Semaphore(5)  # max 5 concurrent Tavily/Exa searches
     total_start = time.monotonic()
 
+    backend = "Exa+Tavily" if os.environ.get("EXA_API_KEY") else "Tavily"
     print(f"{'='*78}")
-    print(f"Source Discover — {len(cities)} cities  (today: {TODAY})")
+    print(f"Source Discover — {len(cities)} cities  (today: {TODAY})  [search: {backend}]")
     print(f"{'='*78}")
     print(f"  {'[+]'} fresh   [~] unknown_spa/stale_warning   [-] stale/empty/blocked/unknown\n")
 
     tasks = [
-        process_city(c, registry, tavily, semaphore, resume=resume, output_dir=output_dir)
+        process_city(
+            c, registry, tavily, semaphore,
+            resume=resume, skip_existing=skip_existing, output_dir=output_dir,
+        )
         for c in cities
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2468,10 +2728,25 @@ def main() -> None:
         description="Source-discover skill — find freshest agenda source for each city"
     )
     parser.add_argument("--city", help="Run for a single city (e.g. 'Chapel Hill')")
-    parser.add_argument("--state", help="Filter by state (NC, OH, or TX)")
+    parser.add_argument("--state", help="Filter by state abbreviation (e.g. NC, OH, TX)")
     parser.add_argument(
         "--resume", action="store_true",
-        help="Skip cities that already have a source.json output file"
+        help="Skip cities that already have a non-empty source.json (re-runs 'empty' results)"
+    )
+    parser.add_argument(
+        "--from-csv", action="store_true",
+        help=(
+            "Use serve_users.csv as the city list instead of the hardcoded PILOT_CITIES. "
+            "CSV State/Region column uses full state names (e.g. 'Ohio')."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help=(
+            "Skip cities that already have a valid source.json "
+            "(freshness not in wrong_entity/stale/empty). "
+            "Use with --from-csv to only process new cities."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -2484,26 +2759,51 @@ def main() -> None:
         print("ERROR: TAVILY_API_KEY not set in environment / .env")
         sys.exit(1)
 
+    exa_key = os.environ.get("EXA_API_KEY")
+    if exa_key:
+        print("  [search backend] Exa (primary) + Tavily (fallback/domain-discovery)")
+    else:
+        print("  [search backend] Tavily (set EXA_API_KEY to enable Exa as primary)")
+
     from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
     registry = storage.read_json(REGISTRY_S3_KEY)
     tavily = TavilyClient(api_key=api_key)
 
-    cities = PILOT_CITIES
+    # City list: --from-csv uses serve_users.csv; otherwise use hardcoded PILOT_CITIES
+    if args.from_csv:
+        all_cities = get_serve_csv_cities()
+        city_source = f"serve_users.csv ({len(all_cities)} cities)"
+    else:
+        all_cities = list(PILOT_CITIES)
+        city_source = f"PILOT_CITIES ({len(all_cities)} cities)"
+
+    # --city filter (works for both sources)
     if args.city:
-        cities = [c for c in cities if c["city"].lower() == args.city.lower()]
-        if not cities:
-            print(f"ERROR: '{args.city}' not found in pilot city list")
+        filtered = [c for c in all_cities if c["city"].lower() == args.city.lower()]
+        if not filtered:
+            print(f"ERROR: '{args.city}' not found in {city_source}")
             sys.exit(1)
-    if args.state:
-        cities = [c for c in cities if c["state"].upper() == args.state.upper()]
-        if not cities:
-            print(f"ERROR: No cities found for state '{args.state}'")
+        cities = filtered
+    elif args.state:
+        filtered = [c for c in all_cities if c["state"].upper() == args.state.upper()]
+        if not filtered:
+            print(f"ERROR: No cities found for state '{args.state}' in {city_source}")
             sys.exit(1)
+        cities = filtered
+    else:
+        cities = all_cities
 
     output_dir = Path(args.output_dir) if args.output_dir else None
-    asyncio.run(run_batch(cities, registry, tavily, resume=args.resume, output_dir=output_dir))
+    asyncio.run(
+        run_batch(
+            cities, registry, tavily,
+            resume=args.resume,
+            skip_existing=args.skip_existing,
+            output_dir=output_dir,
+        )
+    )
 
 
 if __name__ == "__main__":
