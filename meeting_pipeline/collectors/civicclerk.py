@@ -43,9 +43,20 @@ class CivicClerkConfig:
     output_prefix: str
     storage: StorageBackend
     lookback_days: int = 90
+    # Priority patterns for the primary governing body, checked in order.
+    # These are exact substring matches (case-insensitive) against categoryName.
+    # Override per-city via CivicClerkConfig(council_categories=[...]).
     council_categories: list[str] = field(default_factory=lambda: [
-        "city council", "town council", "town board",
-        "board of aldermen", "village council",
+        "city council",
+        "common council",
+        "town council",
+        "village board",
+        "city commission",
+        "board of trustees",
+        "board of aldermen",
+        "board of mayor",
+        "town board",
+        "village council",
     ])
     download_pdfs: bool = True
     request_timeout: int = 30
@@ -146,10 +157,29 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         ]
 
         if not council_events:
-            # Fallback: if no standard council name found, report all categories
-            print(f"     WARNING: No council-type category found in {categories}")
-            print(f"     Using ALL events as fallback")
-            council_events = all_events
+            # Fallback: no primary governing body category found.
+            # Exclude obvious sub-committees/commissions rather than collecting everything.
+            # This prevents collecting planning commissions, fire/police commissions, etc.
+            _EXCLUDE_PATTERNS = [
+                "planning", "zoning", "parks", "fire", "police",
+                "commission", "committee", "library", "water", "utilities",
+                "historic", "ethics", "civil service", "personnel", "housing",
+                "economic development", "redevelopment", "design", "aviation",
+            ]
+            filtered_events = [
+                e for e in all_events
+                if not any(pat in e["categoryName"].lower() for pat in _EXCLUDE_PATTERNS)
+            ]
+            if filtered_events:
+                print(f"     WARNING: No council-type category found in {categories}")
+                print(f"     Falling back to {len(filtered_events)} non-commission events (excluded commission/committee/planning/etc.)")
+                council_events = filtered_events
+            else:
+                # Everything looks like a committee — collect nothing rather than pollute
+                print(f"     WARNING: No council-type category found and all categories look like committees.")
+                print(f"     Categories: {categories}")
+                print(f"     Returning 0 events. Set council_categories explicitly in CivicClerkConfig.")
+                council_events = []
 
         # Filter by date: keep events after cutoff OR in the future
         recent_events = [
