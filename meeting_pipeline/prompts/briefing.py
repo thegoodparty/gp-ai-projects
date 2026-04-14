@@ -55,6 +55,7 @@ def build_pass1_prompt(
     date: str,
     items_text: str,
     constituent_context: str = "",
+    pdf_text: str = "",
 ) -> str:
     """
     Build the Pass 1 prompt: categorize all agenda items and score priorities.
@@ -66,6 +67,9 @@ def build_pass1_prompt(
         items_text: Pre-formatted string with all agenda items (one per block)
         constituent_context: Optional pre-formatted Haystaq constituent context string.
                              Pass "" if no constituent data is available.
+        pdf_text: Optional full text extracted from the agenda PDF. When provided,
+                  the LLM can reference it to produce richer descriptions and more
+                  accurate priority scores.
     """
     constituent_block = ""
     if constituent_context:
@@ -74,6 +78,10 @@ def build_pass1_prompt(
             "Weight priority scoring toward items that connect to high-concern constituent issues. "
             "Boost scores by 1-2 points for strong constituent alignment."
         )
+
+    pdf_block = ""
+    if pdf_text:
+        pdf_block = f"\nFULL AGENDA SOURCE DOCUMENT (use this as the authoritative reference for descriptions, dollar amounts, and fiscal details — prefer this over the structured item list when detail is richer here):\n{pdf_text}\n"
 
     return f"""You are analyzing a city council meeting agenda for {city} {body} on {date}.
 
@@ -112,7 +120,8 @@ Mark at most 6-8 items as priority, even on large agendas. If fewer than 3 items
 Also provide a one-sentence agendaSummary describing the full agenda.
 {constituent_block}
 AGENDA ITEMS:
-{items_text}"""
+{items_text}
+{pdf_block}"""
 
 
 # ============================================================================
@@ -128,6 +137,7 @@ def build_pass2_prompt(
     agenda_summary: str,
     total_items: int,
     constituent_context: str = "",
+    pdf_text: str = "",
 ) -> str:
     """
     Build the Pass 2 prompt: generate headline, whatYouNeedToDo, and askThis cards.
@@ -142,6 +152,7 @@ def build_pass2_prompt(
         total_items: Total number of agenda items (for context sentence)
         constituent_context: Optional pre-formatted Haystaq full constituent context string.
                              Pass "" if no constituent data is available.
+        pdf_text: Optional full text extracted from the agenda PDF, for richer context.
     """
     constituent_block = ""
     if constituent_context:
@@ -152,6 +163,10 @@ def build_pass2_prompt(
             "into the headline naturally (e.g. 'Public safety is your constituents' top concern. Monday's vote puts cameras on the map.'). "
             "Frame 'what you need to do' around constituent priorities."
         )
+
+    pdf_block = ""
+    if pdf_text:
+        pdf_block = f"\nFULL AGENDA SOURCE DOCUMENT (reference this for specific dollar amounts, presenter names, and details when writing card content):\n{pdf_text}\n"
 
     return f"""You are a senior policy advisor preparing a {city} {body} member for their {day_name} meeting on {date}.
 {EDITORIAL_RULES}
@@ -175,7 +190,8 @@ CANDIDATE PRIORITY ITEMS (ranked by score, select the 2-4 most impactful):
 {items_text}
 
 FULL AGENDA CONTEXT:
-The meeting has {total_items} total items. Summary: {agenda_summary}"""
+The meeting has {total_items} total items. Summary: {agenda_summary}
+{pdf_block}"""
 
 
 # ============================================================================
@@ -197,6 +213,7 @@ def build_pass3_prompt(
     other_items: str,
     constituent_context: str = "",
     available_docs: str = "",
+    pdf_text: str = "",
 ) -> str:
     """
     Build the Pass 3 prompt: deep-dive detail page for a single priority issue.
@@ -208,11 +225,14 @@ def build_pass3_prompt(
         description: Plain-language description from Pass 1
         priority_reason: Why this item was flagged as priority
         headline: Card headline from Pass 2
-        source_text: Everything known about this item from the agenda (description,
-                     staff recommendation, presenter, fiscal amounts)
+        source_text: Structured fields extracted for this item (description,
+                     staff recommendation, presenter, fiscal amounts).
         other_items: Comma-separated titles of other agenda items (for context)
         constituent_context: Optional pre-formatted Haystaq full constituent context string.
         available_docs: Optional pre-formatted available source document URLs.
+        pdf_text: Optional full text of the agenda PDF. When provided, this is the
+                  primary source of truth — prefer it over source_text for specific
+                  names, dollar amounts, and supporting details.
     """
     constituent_block = ""
     if constituent_context:
@@ -224,6 +244,13 @@ def build_pass3_prompt(
             "Connect this agenda item to the issues voters care about most."
         )
 
+    pdf_block = ""
+    if pdf_text:
+        pdf_block = f"\nFULL AGENDA DOCUMENT (primary source — use for specific names, dollar amounts, staff reports, and supporting details):\n{pdf_text}\n"
+
+    source_label = "STRUCTURED ITEM DATA (extracted fields for this item)" if pdf_text else "SOURCE TEXT (everything known about this item from the official agenda)"
+    grounding_source = "the FULL AGENDA DOCUMENT and STRUCTURED ITEM DATA above" if pdf_text else "the SOURCE TEXT above"
+
     return f"""You are a senior policy advisor writing a detailed page for one agenda item from a {city}, {state} {body} meeting on {day_name}, {date}.
 {EDITORIAL_RULES}
 AGENDA ITEM: {agenda_item_title}
@@ -232,10 +259,10 @@ Description: {description}
 Priority reason: {priority_reason}
 Card headline: {headline}
 
-SOURCE TEXT (everything known about this item from the official agenda):
+{source_label}:
 {source_text}
-
-GROUNDING RULE: whoIsPresenting and supportingContext must only contain facts that appear in the SOURCE TEXT above or the constituent data below. Do not draw on training knowledge for specific names, dollar amounts, statistics, or historical claims. If the source text does not name a presenter, write "The presenting department was not specified in the agenda" and describe the likely responsible body by type only (e.g. "Public Works" or "City Manager's office"). If there is insufficient source text for supportingContext, omit it.
+{pdf_block}
+GROUNDING RULE: whoIsPresenting and supportingContext must only contain facts that appear in {grounding_source} or the constituent data below. Do not draw on training knowledge for specific names, dollar amounts, statistics, or historical claims. If the source text does not name a presenter, write "The presenting department was not specified in the agenda" and describe the likely responsible body by type only (e.g. "Public Works" or "City Manager's office"). If there is insufficient source text for supportingContext, omit it.
 
 Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY.
 

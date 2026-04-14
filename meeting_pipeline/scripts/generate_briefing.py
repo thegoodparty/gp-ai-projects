@@ -230,7 +230,7 @@ class PriorityIssueDetail(BaseModel):
 # PASS 1: CATEGORIZE AGENDA ITEMS
 # ============================================================================
 
-def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None) -> AgendaCategorization:
+def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> AgendaCategorization:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
     date = meeting.get("date", "")
@@ -268,6 +268,7 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None) 
         date=date,
         items_text="\n".join(items_text),
         constituent_context=constituent_context,
+        pdf_text=pdf_text,
     )
 
     # Disable thinking for small agendas — categorizing a short list is straightforward
@@ -290,7 +291,7 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None) 
 # PASS 2: GENERATE CARD CONTENT FOR PRIORITY ISSUES
 # ============================================================================
 
-def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: Optional[dict] = None) -> BriefingCards:
+def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> BriefingCards:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
     date = meeting.get("date", "")
@@ -342,6 +343,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
         agenda_summary=categorized.agendaSummary,
         total_items=len(categorized.items),
         constituent_context=constituent_context,
+        pdf_text=pdf_text,
     )
 
     result = gemini.generate_structured_content(
@@ -374,6 +376,36 @@ def _format_available_docs(docs: Optional[list[dict]], meeting_source_url: Optio
     return "\nAVAILABLE SOURCE DOCUMENTS (use these URLs to populate supportingDocuments):\n" + "\n".join(lines)
 
 
+_PDF_TEXT_CHAR_LIMIT = 100_000  # ~75K tokens — well within Gemini Flash's 1M context
+
+
+def _load_pdf_text(meeting: dict, storage) -> str:
+    """
+    Load and return the full text of the agenda PDF for this meeting.
+    Returns "" if no PDF is available or extraction fails.
+    Capped at _PDF_TEXT_CHAR_LIMIT characters to stay within context budget.
+    """
+    if not storage:
+        return ""
+    agenda_files = meeting.get("sources", {}).get("agendaFiles") or []
+    pdf_storage_key = next(
+        (f.get("url") for f in agenda_files if f.get("type") == "storage_pdf"),
+        None,
+    )
+    if not pdf_storage_key:
+        return ""
+    try:
+        pdf_bytes = storage.read_bytes(pdf_storage_key)
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = "\n".join(doc[i].get_text() for i in range(min(len(doc), 60)))
+        if len(text) > _PDF_TEXT_CHAR_LIMIT:
+            text = text[:_PDF_TEXT_CHAR_LIMIT]
+        return text.strip()
+    except Exception:
+        return ""
+
+
 def _extract_item_passage(pdf_bytes: bytes, item_title: str, context_chars: int = 2000) -> str:
     """Extract a passage from the raw PDF near the agenda item title."""
     try:
@@ -403,6 +435,7 @@ def pass3_generate_detail(
     constituent: Optional[dict] = None,
     available_docs: Optional[list[dict]] = None,
     storage=None,
+    pdf_text: str = "",
 ) -> PriorityIssueDetail:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
@@ -432,22 +465,6 @@ def pass3_generate_detail(
         if raw_item.get("fiscalAmounts"):
             source_text_parts.append(f"Fiscal amounts: {raw_item['fiscalAmounts']}")
 
-    # Inject raw PDF passage as primary source (avoids grounding against lossy LLM intermediate)
-    if storage:
-        agenda_files = meeting.get("sources", {}).get("agendaFiles") or []
-        pdf_storage_key = next(
-            (f.get("url") for f in agenda_files if f.get("type") == "storage_pdf"),
-            None,
-        )
-        if pdf_storage_key:
-            try:
-                pdf_bytes = storage.read_bytes(pdf_storage_key)
-                passage = _extract_item_passage(pdf_bytes, card.agendaItemTitle)
-                if passage:
-                    source_text_parts.append(f"\nRAW AGENDA SOURCE (primary):\n{passage}")
-            except Exception:
-                pass  # fall back to normalized fields only
-
     source_text = "\n".join(source_text_parts) if source_text_parts else "No additional source text available for this item."
 
     constituent_context = format_constituent_context(constituent) if constituent else ""
@@ -470,6 +487,7 @@ def pass3_generate_detail(
         other_items=other_items,
         constituent_context=constituent_context,
         available_docs=available_docs_str,
+        pdf_text=pdf_text,
     )
 
     result = gemini.generate_structured_content(
@@ -745,10 +763,17 @@ def generate_briefing_for_meeting(
 
     gemini = GeminiClient(default_model=GeminiModelType.FLASH)
 
+    # Load the agenda PDF text once — passed to all three passes as primary source
+    pdf_text = _load_pdf_text(meeting, storage)
+    if pdf_text:
+        print(f"  PDF context: {len(pdf_text.split()):,} words loaded for all passes")
+    else:
+        print(f"  PDF context: not available (will use normalized fields only)")
+
     # Pass 1: Categorize
     print(f"  Pass 1: Categorizing {len(items)} agenda items...")
     t0 = time.time()
-    categorized = pass1_categorize(meeting, gemini, constituent=constituent)
+    categorized = pass1_categorize(meeting, gemini, constituent=constituent, pdf_text=pdf_text)
     t1 = time.time()
     priority_count = sum(1 for item in categorized.items if item.isPriority)
     print(f"  Pass 1 done: {len(categorized.items)} items, {priority_count} priorities ({t1-t0:.1f}s)")
@@ -756,7 +781,7 @@ def generate_briefing_for_meeting(
     # Pass 2: Generate cards
     print(f"  Pass 2: Generating card content...")
     t0 = time.time()
-    cards = pass2_generate_cards(meeting, categorized, gemini, constituent=constituent)
+    cards = pass2_generate_cards(meeting, categorized, gemini, constituent=constituent, pdf_text=pdf_text)
     t1 = time.time()
     print(f"  Pass 2 done: {len(cards.priorityIssues)} priority cards ({t1-t0:.1f}s)")
 
@@ -778,6 +803,7 @@ def generate_briefing_for_meeting(
                 constituent=constituent,
                 available_docs=meeting.get("agendaFiles"),
                 storage=storage,
+                pdf_text=pdf_text,
             )
             details.append(detail)
             t1 = time.time()
