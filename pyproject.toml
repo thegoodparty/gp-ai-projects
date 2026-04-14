@@ -55,7 +55,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent", "browser_service"]
 
 [build-system]
 requires = ["hatchling"]
@@ -96,5 +96,6 @@ ignore_missing_imports = true
 dev = [
     "pre-commit>=4.3.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
     "types-pyyaml>=6.0.12.20250915",
 ]
