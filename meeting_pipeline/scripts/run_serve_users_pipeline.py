@@ -199,7 +199,12 @@ async def phase_collect(cities: list[dict], cfg: AgentConfig) -> list[dict]:
 
 def phase_queue(officials: list[dict], cfg: AgentConfig) -> int:
     storage = get_storage(cfg)
-    from_date = date.today().isoformat()
+    # Look back 30 days so recently-collected PDFs for past meetings are included.
+    # The collector gathers meetings within a lookback window; using today as the
+    # cutoff would silently drop any meeting that occurred before today even if
+    # a PDF was just downloaded for it.
+    from datetime import timedelta
+    from_date = (date.today() - timedelta(days=30)).isoformat()
     print(f"\n{'='*60}")
     print(f"PHASE 2: Queue build — {len(officials)} officials from {from_date}")
     print(f"{'='*60}")
@@ -280,10 +285,16 @@ def phase_queue(officials: list[dict], cfg: AgentConfig) -> int:
         sum(1 for m in e["upcoming_meetings"] if m.get("status") == "agenda_ready")
         for e in queue
     )
+    # Also count agenda_posted_no_files — extract_and_normalize.py will check S3
+    # for PDFs and process those meetings too, so they should not block the pipeline.
+    total_with_content = sum(
+        sum(1 for m in e["upcoming_meetings"] if m.get("status") in ("agenda_ready", "agenda_posted_no_files"))
+        for e in queue
+    )
     print(f"\n  Queue saved: {len(queue)} officials, {total_meetings} meetings, {total_ready} with agendas ready")
     if skipped:
         print(f"  Skipped {len(skipped)} officials (no source data collected yet)")
-    return total_ready
+    return total_with_content
 
 
 # ── Phase 3 & 4: Normalize + Brief (subprocess) ───────────────────────────────
@@ -384,8 +395,8 @@ def main():
     if run_all or args.phase == "queue":
         ready = phase_queue(officials, cfg)
         if ready == 0:
-            print("\n  No meetings with agendas ready — stopping here.")
-            print("  (Collection may not have found any upcoming meetings with PDFs)")
+            print("\n  No meetings with agendas (ready or posted-no-files) — stopping here.")
+            print("  (Collection may not have found any meetings with PDFs in the last 30 days)")
             if run_all:
                 print_summary(officials, cities, cfg)
                 return

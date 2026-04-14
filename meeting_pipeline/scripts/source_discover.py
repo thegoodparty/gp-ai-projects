@@ -2549,6 +2549,8 @@ async def process_city(
     resume: bool = False,
     skip_existing: bool = False,
     output_dir: Optional[Path] = None,
+    storage=None,
+    sources_prefix: str = "meeting_pipeline/sources",
 ) -> dict:
     city = city_info["city"]
     state = city_info["state"]
@@ -2574,6 +2576,13 @@ async def process_city(
                     print(
                         f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
                     )
+                    # Still sync local file to S3 in case S3 is behind local disk.
+                    if storage is not None:
+                        s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
+                        try:
+                            storage.write_json(s3_key, existing)
+                        except Exception as e:
+                            print(f"  [warn] Could not sync source.json to S3 for {city}, {state}: {e}")
                     return existing
             else:
                 # --resume: skip everything except empty
@@ -2581,6 +2590,13 @@ async def process_city(
                     print(
                         f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
                     )
+                    # Still sync local file to S3 in case S3 is behind local disk.
+                    if storage is not None:
+                        s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
+                        try:
+                            storage.write_json(s3_key, existing)
+                        except Exception as e:
+                            print(f"  [warn] Could not sync source.json to S3 for {city}, {state}: {e}")
                     return existing
         except (json.JSONDecodeError, OSError):
             pass  # re-run if file is corrupt
@@ -2608,6 +2624,16 @@ async def process_city(
             with open(output_path, "w") as f:
                 json.dump(result, f, indent=2)
 
+        # Upload to S3 so the router always reads the current platform from S3.
+        # source_discover.py writes locally; without this upload the router would
+        # continue routing to whatever stale platform was previously stored in S3.
+        if storage is not None:
+            s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
+            try:
+                storage.write_json(s3_key, result)
+            except Exception as e:
+                print(f"  [warn] Could not upload source.json to S3 for {city}, {state}: {e}")
+
         bs = result.get("best_source") or {}
         freshness = bs.get("freshness") or "no_source"
         platform = bs.get("platform") or "none"
@@ -2632,6 +2658,8 @@ async def run_batch(
     resume: bool = False,
     skip_existing: bool = False,
     output_dir: Optional[Path] = None,
+    storage=None,
+    sources_prefix: str = "meeting_pipeline/sources",
 ) -> None:
     semaphore = asyncio.Semaphore(5)  # max 5 concurrent Tavily/Exa searches
     total_start = time.monotonic()
@@ -2646,6 +2674,7 @@ async def run_batch(
         process_city(
             c, registry, tavily, semaphore,
             resume=resume, skip_existing=skip_existing, output_dir=output_dir,
+            storage=storage, sources_prefix=sources_prefix,
         )
         for c in cities
     ]
@@ -2802,6 +2831,8 @@ def main() -> None:
             resume=args.resume,
             skip_existing=args.skip_existing,
             output_dir=output_dir,
+            storage=storage,
+            sources_prefix=cfg.sources_prefix,
         )
     )
 

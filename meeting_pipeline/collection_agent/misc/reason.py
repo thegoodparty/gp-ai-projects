@@ -110,8 +110,14 @@ async def _collect_with_agent(
     Raises RuntimeError if the agent errors out or returns unparseable output.
     """
     import os
-    from browser_use import Agent, ChatGoogle
-    from browser_use.browser import BrowserProfile
+    try:
+        from browser_use import Agent, ChatGoogle
+        from browser_use.browser import BrowserProfile
+    except ImportError:
+        raise RuntimeError(
+            "browser_use is not available in this environment "
+            "(optional dependency not installed)"
+        )
 
     # ChatGoogle reads GOOGLE_API_KEY; alias from GEMINI_API_KEY if needed
     if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
@@ -195,11 +201,18 @@ async def _collect_with_vision_fallback(
     """
     Legacy Playwright + Gemini vision fallback for when the agent fails.
     Returns (events, pdfs_downloaded).
+    Raises RuntimeError if the module is not installed or collection fails.
     """
-    from meeting_pipeline.collectors.playwright_llm_scraper import (
-        PlaywrightLLMConfig,
-        collect_with_llm_vision,
-    )
+    try:
+        from meeting_pipeline.collectors.playwright_llm_scraper import (
+            PlaywrightLLMConfig,
+            collect_with_llm_vision,
+        )
+    except ImportError:
+        raise RuntimeError(
+            "playwright_llm_scraper is not available in this environment "
+            "(optional dependency not installed)"
+        )
 
     cfg = PlaywrightLLMConfig(
         url=url,
@@ -309,8 +322,14 @@ async def collect_with_reason(
 
     # Download PDFs if we used the agent (vision fallback already downloads)
     if used_agent and cfg.download_pdfs and valid_events:
-        from meeting_pipeline.collectors.playwright_llm_scraper import _download_agendas
-        pdfs_downloaded = await _download_agendas(valid_events, output_dir)
+        try:
+            from meeting_pipeline.collectors.playwright_llm_scraper import _download_agendas
+            pdfs_downloaded = await _download_agendas(valid_events, output_dir)
+        except ImportError:
+            print(
+                "  [agent] playwright_llm_scraper not available — skipping PDF download "
+                "(install optional dependency to enable)"
+            )
 
     # ── Step 5: Derive and save nav_config for future replay ──────────────────
     nav = _derive_nav_config(valid_events, entry_url)
