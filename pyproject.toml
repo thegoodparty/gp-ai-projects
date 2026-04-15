@@ -55,7 +55,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent", "pmf_engine"]
 
 [build-system]
 requires = ["hatchling"]
@@ -101,6 +101,8 @@ dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=0.24.0",
     "types-pyyaml>=6.0.12.20250915",
+    "moto[s3,sqs]>=5.0.0",
+    "jsonschema>=4.20.0",
 ]
 campaign-plan-lambda = [
     "google-genai>=1.56.0",

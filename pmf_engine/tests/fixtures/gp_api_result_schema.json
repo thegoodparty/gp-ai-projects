@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Source: gp-api/src/queue/queue.types.ts::AgentExperimentResultSchema (Zod). This is a hand-maintained JSON Schema projection of the Zod schema for the agent experiment result envelope forwarded by pmf_engine.callback_handler.format_gp_api_sqs_queue_message to the gp-api results queue. Update process: when queue.types.ts changes, update this file and re-run pmf_engine/tests/test_gp_api_zod_contract.py. The test_snapshot_matches_source test cross-checks the status enum against the source file so drift fails in CI.",
+  "type": "object",
+  "required": ["type", "data"],
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "const": "agentExperimentResult"
+    },
+    "data": {
+      "type": "object",
+      "required": ["experimentId", "runId", "candidateId", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "experimentId": {"type": "string"},
+        "runId": {"type": "string"},
+        "candidateId": {"type": "string"},
+        "status": {
+          "type": "string",
+          "enum": ["success", "failed", "contract_violation"]
+        },
+        "artifactKey": {"type": "string"},
+        "artifactBucket": {"type": "string"},
+        "durationSeconds": {"type": "number"},
+        "error": {"type": "string"}
+      }
+    }
+  }
+}

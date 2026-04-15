@@ -3,6 +3,7 @@
 import os
 import re
 import threading
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, Callable, TypeVar
 
 from dotenv import load_dotenv
@@ -13,6 +14,20 @@ load_dotenv()
 logger = get_logger(__name__)
 
 T = TypeVar('T')
+
+
+class NoOpSpan:
+    def log(self, **kwargs):
+        pass
+
+    def start_span(self, **kwargs):
+        return NoOpSpan()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 class BraintrustClient:
@@ -47,8 +62,8 @@ class BraintrustClient:
         if self._braintrust_logger is not None:
             try:
                 self._braintrust_logger.flush()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Braintrust flush during cleanup failed: {e}")
         self._braintrust_logger = None
         self._braintrust_module = None
         self._enabled = False
@@ -110,26 +125,87 @@ class BraintrustClient:
         if not self._enabled or self._braintrust_logger is None:
             return llm_call_fn()
 
-        result = llm_call_fn()
+        try:
+            span = self._braintrust_logger.start_span(name=name)
+            span.__enter__()
+        except Exception as e:
+            logger.warning(f"Braintrust span creation failed: {e}")
+            return llm_call_fn()
 
         try:
-            with self._braintrust_logger.start_span(name=name) as span:
-                output_data = self._serialize_output(result)
+            try:
+                span.log(input=input_data)
+            except Exception as e:
+                logger.debug(f"Braintrust input log failed: {e}")
 
+            result = llm_call_fn()
+
+            try:
                 log_metadata = metadata.copy() if metadata else {}
                 if prompt:
                     log_metadata["prompt"] = prompt
 
                 span.log(
-                    input=input_data,
-                    output=output_data,
+                    output=self._serialize_output(result),
                     tags=tags or [],
                     metadata=log_metadata
                 )
-        except Exception as e:
-            logger.warning(f"Braintrust logging failed: {e}")
+            except Exception as e:
+                logger.warning(f"Braintrust logging failed: {e}")
 
-        return result
+            try:
+                span.__exit__(None, None, None)
+            except Exception as exit_err:
+                logger.debug(f"Braintrust span exit (success path) failed: {exit_err}")
+
+            return result
+        except Exception as e:
+            try:
+                span.__exit__(type(e), e, e.__traceback__)
+            except Exception as exit_err:
+                logger.debug(f"Braintrust span exit (error path) failed: {exit_err}")
+            raise
+
+    @contextmanager
+    def traced_span(
+        self,
+        name: str,
+        input_data: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[list] = None,
+    ):
+        if not self._enabled or self._braintrust_logger is None:
+            yield NoOpSpan()
+            return
+
+        try:
+            span = self._braintrust_logger.start_span(name=name)
+            span.__enter__()
+        except Exception as e:
+            logger.warning(f"Braintrust traced_span failed: {e}")
+            yield NoOpSpan()
+            return
+
+        try:
+            if input_data is not None or metadata is not None or tags is not None:
+                log_kwargs = {}
+                if input_data is not None:
+                    log_kwargs["input"] = input_data
+                if metadata is not None:
+                    log_kwargs["metadata"] = metadata
+                if tags is not None:
+                    log_kwargs["tags"] = tags
+                span.log(**log_kwargs)
+        except Exception as e:
+            logger.warning(f"Braintrust initial log failed: {e}")
+
+        try:
+            yield span
+        finally:
+            try:
+                span.__exit__(None, None, None)
+            except Exception as exit_err:
+                logger.debug(f"Braintrust traced_span exit failed: {exit_err}")
 
     def _serialize_output(self, result: Any) -> Dict[str, Any]:
         if result is None:
@@ -213,7 +289,7 @@ class BraintrustClient:
             result = re.sub(r'(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})', safe_format, prompt)
             return result
         except Exception as e:
-            logger.debug(f"Prompt template format error (non-critical): {e}")
+            logger.warning(f"Prompt template format error: {e}")
             return prompt
 
     def get_cached_prompt_object(

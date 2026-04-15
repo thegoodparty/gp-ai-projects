@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PMF Engine — Sequence Diagram</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', sans-serif; background: #0a0e1a; color: #e2e8f0; }
+  h1 {
+    text-align: center; padding: 32px 0 8px;
+    font-size: 28px; font-weight: 700;
+    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { text-align: center; color: #475569; font-size: 13px; margin-bottom: 32px; }
+  svg { display: block; margin: 0 auto; }
+</style>
+</head>
+<body>
+<h1>PMF Engine Sequence</h1>
+<p class="subtitle">Timeline of a single experiment run, from trigger to rendered result</p>
+
+<svg width="1400" height="1350" viewBox="0 0 1400 1350">
+  <defs>
+    <marker id="ar-blue" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#60a5fa"/>
+    </marker>
+    <marker id="ar-purple" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#a78bfa"/>
+    </marker>
+    <marker id="ar-yellow" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#fbbf24"/>
+    </marker>
+    <marker id="ar-orange" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#fb923c"/>
+    </marker>
+    <marker id="ar-red" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#f87171"/>
+    </marker>
+    <marker id="ar-green" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#34d399"/>
+    </marker>
+    <marker id="ar-pink" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+      <path d="M0,0 L7,2.5 L0,5" fill="#f472b6"/>
+    </marker>
+  </defs>
+
+  <!-- ═══ PARTICIPANTS (8 columns) ═══ -->
+  <!-- Trigger -->
+  <rect x="40" y="20" width="100" height="40" rx="20" fill="#0f172a" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="90" y="45" text-anchor="middle" fill="#60a5fa" font-size="12" font-weight="600" font-family="Inter">Trigger</text>
+
+  <!-- gp-webapp -->
+  <rect x="190" y="20" width="120" height="40" rx="10" fill="#0f172a" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="250" y="45" text-anchor="middle" fill="#60a5fa" font-size="12" font-weight="600" font-family="Inter">gp-webapp</text>
+
+  <!-- gp-api -->
+  <rect x="370" y="20" width="100" height="40" rx="10" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="420" y="45" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="600" font-family="Inter">gp-api</text>
+
+  <!-- SQS -->
+  <rect x="530" y="20" width="80" height="40" rx="10" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="570" y="45" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="600" font-family="Inter">SQS</text>
+
+  <!-- Dispatch Lambda -->
+  <rect x="670" y="20" width="110" height="40" rx="10" fill="#0f172a" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="725" y="38" text-anchor="middle" fill="#fb923c" font-size="10" font-weight="600" font-family="Inter">Dispatch</text>
+  <text x="725" y="52" text-anchor="middle" fill="#fb923c" font-size="10" font-weight="600" font-family="Inter">Lambda</text>
+
+  <!-- Callback Lambda -->
+  <rect x="840" y="20" width="110" height="40" rx="10" fill="#0f172a" stroke="#f87171" stroke-width="1.5"/>
+  <text x="895" y="38" text-anchor="middle" fill="#f87171" font-size="10" font-weight="600" font-family="Inter">Callback</text>
+  <text x="895" y="52" text-anchor="middle" fill="#f87171" font-size="10" font-weight="600" font-family="Inter">Lambda</text>
+
+  <!-- Agent Runner -->
+  <rect x="1010" y="20" width="120" height="40" rx="10" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+  <text x="1070" y="45" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600" font-family="Inter">Agent Runner</text>
+
+  <!-- S3 -->
+  <rect x="1200" y="20" width="70" height="40" rx="10" fill="#0f172a" stroke="#f472b6" stroke-width="1.5"/>
+  <text x="1235" y="45" text-anchor="middle" fill="#f472b6" font-size="12" font-weight="600" font-family="Inter">S3</text>
+
+  <!-- ═══ LIFELINES ═══ -->
+  <line x1="90"   y1="60" x2="90"   y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="250"  y1="60" x2="250"  y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="420"  y1="60" x2="420"  y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="570"  y1="60" x2="570"  y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="725"  y1="60" x2="725"  y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="895"  y1="60" x2="895"  y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="1070" y1="60" x2="1070" y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+  <line x1="1235" y1="60" x2="1235" y2="1310" stroke="#1e293b" stroke-width="1" stroke-dasharray="4,6"/>
+
+  <!-- ═══ PHASE 1: REQUEST ═══ -->
+  <text x="30" y="100" fill="#334155" font-size="10" font-weight="600" font-family="Inter">PHASE 1: REQUEST</text>
+
+  <!-- Trigger → webapp or api -->
+  <line x1="90" y1="120" x2="413" y2="120" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#ar-purple)"/>
+  <text x="250" y="114" text-anchor="middle" fill="#a78bfa" font-size="10" font-family="Inter">user action, backend event, scheduled job, or preload</text>
+
+  <!-- api internal: validate + build params -->
+  <rect x="380" y="140" width="220" height="72" rx="8" fill="rgba(167,139,250,0.06)" stroke="rgba(167,139,250,0.15)" stroke-width="1"/>
+  <text x="396" y="159" fill="#94a3b8" font-size="10" font-family="Inter">validate eligibility</text>
+  <text x="396" y="175" fill="#94a3b8" font-size="10" font-family="Inter">auto-populate params from data</text>
+  <text x="396" y="191" fill="#94a3b8" font-size="10" font-family="Inter">create ExperimentRun (PENDING)</text>
+  <text x="396" y="207" fill="#94a3b8" font-size="10" font-family="Inter">send SQS message</text>
+
+  <!-- api → SQS: dispatch -->
+  <line x1="420" y1="230" x2="563" y2="230" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#ar-yellow)"/>
+  <text x="492" y="224" text-anchor="middle" fill="#fbbf24" font-size="10" font-family="JetBrains Mono">agent-dispatch.fifo</text>
+
+  <!-- api → webapp: {runId, status: PENDING} -->
+  <line x1="413" y1="260" x2="257" y2="260" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ar-purple)"/>
+  <text x="335" y="254" text-anchor="middle" fill="#64748b" font-size="10" font-family="JetBrains Mono">{runId, status: "PENDING"}</text>
+
+  <!-- ═══ PHASE 2: INPUT SCREENING + DISPATCH ═══ -->
+  <text x="30" y="310" fill="#334155" font-size="10" font-weight="600" font-family="Inter">PHASE 2: INPUT SCREENING + DISPATCH</text>
+
+  <!-- SQS → Dispatch Lambda: trigger -->
+  <line x1="570" y1="335" x2="718" y2="335" stroke="#fb923c" stroke-width="1.5" marker-end="url(#ar-orange)"/>
+  <text x="644" y="329" text-anchor="middle" fill="#fb923c" font-size="10" font-family="Inter">SQS trigger</text>
+
+  <!-- Dispatch Lambda internal -->
+  <rect x="660" y="355" width="220" height="58" rx="8" fill="rgba(251,146,60,0.06)" stroke="rgba(251,146,60,0.15)" stroke-width="1"/>
+  <text x="676" y="374" fill="#94a3b8" font-size="10" font-family="Inter">screen for injection/poisoning</text>
+  <text x="676" y="390" fill="#94a3b8" font-size="10" font-family="Inter">lookup EXPERIMENT_REGISTRY</text>
+  <text x="676" y="406" fill="#94a3b8" font-size="10" font-family="Inter">build container overrides</text>
+
+  <!-- Dispatch Lambda → Agent: ECS RunTask -->
+  <line x1="725" y1="430" x2="1063" y2="430" stroke="#34d399" stroke-width="1.5" marker-end="url(#ar-green)"/>
+  <text x="894" y="424" text-anchor="middle" fill="#34d399" font-size="10" font-family="JetBrains Mono">ecs.RunTask()</text>
+
+  <!-- ═══ PHASE 3: AGENT EXECUTION ═══ -->
+  <text x="30" y="478" fill="#334155" font-size="10" font-weight="600" font-family="Inter">PHASE 3: AGENT EXECUTION (2-10 min)</text>
+
+  <!-- Agent activation bar -->
+  <rect x="1064" y="498" width="12" height="240" rx="4" fill="rgba(52,211,153,0.2)" stroke="#34d399" stroke-width="1"/>
+
+  <!-- Agent internal steps -->
+  <rect x="1085" y="503" width="260" height="230" rx="8" fill="rgba(52,211,153,0.04)" stroke="rgba(52,211,153,0.1)" stroke-width="1"/>
+  <text x="1101" y="526" fill="#34d399" font-size="10" font-weight="600" font-family="Inter">Claude Agent SDK</text>
+  <text x="1101" y="550" fill="#64748b" font-size="10" font-family="Inter">Load instruction + contract schema</text>
+  <text x="1101" y="573" fill="#64748b" font-size="10" font-family="Inter">Turn 1..N: autonomous execution</text>
+  <line x1="1101" y1="588" x2="1325" y2="588" stroke="#1e293b" stroke-width="0.5"/>
+
+  <text x="1101" y="608" fill="#94a3b8" font-size="9" font-family="JetBrains Mono">tools: Bash, Read, Write, Edit,</text>
+  <text x="1101" y="624" fill="#94a3b8" font-size="9" font-family="JetBrains Mono">       Glob, Grep, WebFetch</text>
+  <text x="1101" y="648" fill="#94a3b8" font-size="9" font-family="JetBrains Mono">data sources defined by</text>
+  <text x="1101" y="664" fill="#94a3b8" font-size="9" font-family="JetBrains Mono">experiment instruction</text>
+
+  <line x1="1101" y1="680" x2="1325" y2="680" stroke="#1e293b" stroke-width="0.5"/>
+  <text x="1101" y="700" fill="#34d399" font-size="10" font-family="Inter">Write output artifact</text>
+  <text x="1101" y="718" fill="#34d399" font-size="10" font-family="Inter">Contract validates against schema</text>
+
+  <!-- Polling loop (webapp ↔ api) during execution -->
+  <rect x="130" y="498" width="210" height="80" rx="8" fill="rgba(96,165,250,0.04)" stroke="rgba(96,165,250,0.1)" stroke-width="1"/>
+  <text x="235" y="522" text-anchor="middle" fill="#60a5fa" font-size="10" font-weight="500" font-family="Inter">Polling loop (every 5s)</text>
+  <line x1="250" y1="540" x2="413" y2="540" stroke="#60a5fa" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ar-blue)"/>
+  <text x="332" y="536" text-anchor="middle" fill="#475569" font-size="9" font-family="JetBrains Mono">GET /mine</text>
+  <line x1="413" y1="560" x2="257" y2="560" stroke="#60a5fa" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#ar-blue)"/>
+  <text x="332" y="556" text-anchor="middle" fill="#475569" font-size="9" font-family="JetBrains Mono">status: PENDING</text>
+
+  <!-- ═══ PHASE 4: ARTIFACT + CALLBACK ═══ -->
+  <text x="30" y="775" fill="#334155" font-size="10" font-weight="600" font-family="Inter">PHASE 4: ARTIFACT UPLOAD + CALLBACK</text>
+
+  <!-- Agent → S3: upload -->
+  <line x1="1070" y1="800" x2="1228" y2="800" stroke="#f472b6" stroke-width="1.5" marker-end="url(#ar-pink)"/>
+  <text x="1149" y="794" text-anchor="middle" fill="#f472b6" font-size="10" font-family="JetBrains Mono">PUT artifact</text>
+
+  <!-- Agent → SQS: callback -->
+  <line x1="1063" y1="840" x2="577" y2="840" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#ar-yellow)"/>
+  <text x="820" y="834" text-anchor="middle" fill="#fbbf24" font-size="10" font-family="JetBrains Mono">agent-callback.fifo</text>
+
+  <!-- SQS → Callback Lambda: trigger -->
+  <line x1="570" y1="875" x2="888" y2="875" stroke="#f87171" stroke-width="1.5" marker-end="url(#ar-red)"/>
+  <text x="729" y="869" text-anchor="middle" fill="#f87171" font-size="10" font-family="Inter">SQS trigger</text>
+
+  <!-- Callback Lambda: validate S3 -->
+  <rect x="830" y="895" width="220" height="30" rx="8" fill="rgba(248,113,113,0.06)" stroke="rgba(248,113,113,0.15)" stroke-width="1"/>
+  <text x="846" y="914" fill="#94a3b8" font-size="10" font-family="Inter">validate artifact exists in S3</text>
+
+  <!-- Callback Lambda → SQS: forward to results -->
+  <line x1="888" y1="942" x2="577" y2="942" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#ar-yellow)"/>
+  <text x="733" y="936" text-anchor="middle" fill="#fbbf24" font-size="10" font-family="JetBrains Mono">agent-results.fifo</text>
+
+  <!-- SQS → api: consume -->
+  <line x1="563" y1="975" x2="427" y2="975" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#ar-purple)"/>
+  <text x="495" y="969" text-anchor="middle" fill="#a78bfa" font-size="10" font-family="Inter">consume result</text>
+
+  <!-- api internal: update run -->
+  <rect x="360" y="995" width="200" height="30" rx="8" fill="rgba(167,139,250,0.06)" stroke="rgba(167,139,250,0.15)" stroke-width="1"/>
+  <text x="376" y="1014" fill="#94a3b8" font-size="10" font-family="Inter">update ExperimentRun → SUCCESS</text>
+
+  <!-- ═══ PHASE 5: RENDER RESULTS ═══ -->
+  <text x="30" y="1060" fill="#334155" font-size="10" font-weight="600" font-family="Inter">PHASE 5: RENDER RESULTS</text>
+
+  <!-- webapp → api: poll catches SUCCESS -->
+  <line x1="250" y1="1085" x2="413" y2="1085" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#ar-blue)"/>
+  <text x="332" y="1079" text-anchor="middle" fill="#475569" font-size="9" font-family="JetBrains Mono">GET /mine</text>
+
+  <line x1="413" y1="1110" x2="257" y2="1110" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#ar-blue)"/>
+  <text x="332" y="1104" text-anchor="middle" fill="#60a5fa" font-size="10" font-family="JetBrains Mono">status: SUCCESS</text>
+
+  <!-- webapp → api: get artifact -->
+  <line x1="250" y1="1145" x2="413" y2="1145" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#ar-purple)"/>
+  <text x="332" y="1139" text-anchor="middle" fill="#a78bfa" font-size="9" font-family="JetBrains Mono">GET /artifact/:runId</text>
+
+  <!-- api → S3: fetch -->
+  <line x1="420" y1="1170" x2="1228" y2="1170" stroke="#f472b6" stroke-width="1.5" marker-end="url(#ar-pink)"/>
+  <text x="824" y="1164" text-anchor="middle" fill="#f472b6" font-size="10" font-family="JetBrains Mono">S3.getObject(bucket, key)</text>
+
+  <!-- S3 → api: artifact JSON -->
+  <line x1="1228" y1="1195" x2="427" y2="1195" stroke="#f472b6" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ar-pink)"/>
+  <text x="824" y="1189" text-anchor="middle" fill="#475569" font-size="10" font-family="JetBrains Mono">artifact JSON</text>
+
+  <!-- api → webapp: artifact -->
+  <line x1="413" y1="1220" x2="257" y2="1220" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ar-purple)"/>
+  <text x="335" y="1214" text-anchor="middle" fill="#475569" font-size="10" font-family="JetBrains Mono">artifact data</text>
+
+  <!-- webapp → trigger: render -->
+  <line x1="243" y1="1250" x2="97" y2="1250" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#ar-blue)"/>
+  <text x="170" y="1244" text-anchor="middle" fill="#60a5fa" font-size="10" font-family="Inter">render results UI</text>
+
+  <!-- ═══ TIME ANNOTATIONS ═══ -->
+  <text x="15" y="120" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t=0s</text>
+  <text x="15" y="260" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t≈1s</text>
+  <text x="15" y="430" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t≈3s</text>
+  <text x="15" y="520" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t≈10s</text>
+  <text x="15" y="800" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t≈2-10m</text>
+  <text x="15" y="1085" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">t+5s</text>
+
+</svg>
+</body>
+</html>
