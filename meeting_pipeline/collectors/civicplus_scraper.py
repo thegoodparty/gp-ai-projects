@@ -52,6 +52,7 @@ class CivicPlusConfig:
     download_pdfs: bool = True
     request_timeout: int = 30
     rate_limit_delay: float = 0.5
+    expected_body: str = ""  # e.g. "City Council" — used to override category discovery
 
 
 @dataclass
@@ -529,8 +530,22 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
             print(f"  2. Using provided category ID: {cat_id}")
         else:
             print("  2. Auto-discovering council category...")
-            cat_id, cat_name = await find_council_category(client, config.domain)
-            print(f"     Found: {cat_name} (id={cat_id})")
+            # If expected_body is set, try matching it against available categories first
+            if config.expected_body:
+                raw_categories = await discover_categories(client, config.domain)
+                expected_lower = config.expected_body.lower()
+                matched = [c for c in raw_categories if expected_lower in c["name"].lower()]
+                if matched:
+                    cat_id = matched[0]["id"]
+                    cat_name = matched[0]["name"]
+                    print(f"     [body filter] Matched expected_body={config.expected_body!r} → {cat_name} (id={cat_id})")
+                else:
+                    print(f"     [body filter] No category matched {config.expected_body!r}, falling back to find_council_category()")
+                    cat_id, cat_name = await find_council_category(client, config.domain)
+                    print(f"     Found: {cat_name} (id={cat_id})")
+            else:
+                cat_id, cat_name = await find_council_category(client, config.domain)
+                print(f"     Found: {cat_name} (id={cat_id})")
 
         # Step 3: Discover all categories (for reference)
         categories = await discover_categories(client, config.domain)

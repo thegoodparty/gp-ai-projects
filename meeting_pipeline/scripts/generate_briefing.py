@@ -185,6 +185,11 @@ def format_top_constituent_issues(constituent: dict, n: int = 5) -> str:
 # PYDANTIC MODELS — LLM STRUCTURED OUTPUT
 # ============================================================================
 
+class SourceCitation(BaseModel):
+    field: str = Field(description="The field this citation supports (e.g. 'fiscal_amounts', 'vote_type', 'description', 'whatIsHappening', 'whyItMatters')")
+    quote: str = Field(description="Verbatim sentence or clause from the source document — exact wording, not paraphrased")
+
+
 class CategorizedAgendaItem(BaseModel):
     originalTitle: str = Field(description="Original title from the agenda")
     title: str = Field(description="Clean, readable title (fix ALL CAPS, remove numbering prefixes)")
@@ -193,6 +198,15 @@ class CategorizedAgendaItem(BaseModel):
     isPriority: bool = Field(False, description="True if this item is a genuine policy decision, significant spending, or high public interest")
     priorityScore: int = Field(0, description="0 if not priority. 1-10 if priority: 10=highest impact (major policy/budget), 1=lowest (routine vote). Only score items where isPriority=true.")
     priorityReason: Optional[str] = Field(None, description="If isPriority, brief reason why (e.g. 'Large contract approval', 'Zoning change with public hearing')")
+    source_citations: list[SourceCitation] = Field(
+        default_factory=list,
+        description=(
+            "Verbatim sentences from the PDF that directly support key extracted fields. "
+            "Each entry has a 'field' name ('fiscal_amounts', 'vote_type', or 'description') "
+            "and an exact 'quote' from the source document. "
+            "Only populate for isPriority=true items. Leave empty for procedural/routine items."
+        ),
+    )
 
 
 class AgendaCategorization(BaseModel):
@@ -225,6 +239,15 @@ class PriorityIssueDetail(BaseModel):
     tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
     whoIsPresenting: str = Field(description="50-75 words, 1-2 paragraphs. Who is presenting (department/role if name unknown), political dynamics, expected council reception. Always required.")
     supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
+    source_citations: list[SourceCitation] = Field(
+        default_factory=list,
+        description=(
+            "Verbatim sentences from the FULL AGENDA DOCUMENT that most directly support each detail field. "
+            "Each entry has a 'field' name ('whatIsHappening', 'whatDecision', 'whyItMatters', or 'recommendation') "
+            "and an exact 'quote' from the source document (not paraphrased). "
+            "Omit entries where no direct match exists."
+        ),
+    )
 
 
 # ============================================================================
@@ -609,6 +632,7 @@ def assemble_briefing(
             "title": item.title,
             "description": item.description,
             "category": item.category,
+            "sourceCitations": [c.model_dump() for c in item.source_citations],
         }
         for j, card in enumerate(cards.priorityIssues):
             if card.agendaItemTitle.lower().strip() == item.title.lower().strip():
@@ -640,7 +664,11 @@ def assemble_briefing(
         }
 
         if detail:
-            supporting_docs = list(meeting.get("agendaFiles", []))
+            # Exclude storage_pdf entries (S3 keys, not public URLs)
+            supporting_docs = [
+                f for f in meeting.get("agendaFiles", [])
+                if f.get("type") != "storage_pdf" and f.get("url", "").startswith("http")
+            ]
             if meeting.get("sourceUrl"):
                 supporting_docs.append({"name": "Meeting agenda page", "url": meeting["sourceUrl"]})
 
@@ -655,6 +683,7 @@ def assemble_briefing(
                 "whoIsPresenting": detail.whoIsPresenting,
                 "supportingContext": detail.supportingContext,
                 "supportingDocuments": supporting_docs,
+                "sourceCitations": [c.model_dump() for c in detail.source_citations],
             }
 
         priority_issues.append(issue)
@@ -745,11 +774,16 @@ def generate_briefing_for_meeting(
     date = meeting.get("date", "")
     items = meeting.get("data", {}).get("agendaItems", [])
 
-    print(f"\n  Generating briefing for {city} — {date} ({len(items)} agenda items)")
+    substantive_items = [i for i in items if i.get("section") not in ("procedural",)]
+    print(f"\n  Generating briefing for {city} — {date} ({len(items)} agenda items, {len(substantive_items)} substantive)")
 
     if len(items) < 3:
         print(f"  SKIP: Too few agenda items ({len(items)})")
         return {"status": "skipped", "reason": "too_few_items"}
+
+    if len(substantive_items) < 2:
+        print(f"  SKIP: Too few substantive agenda items ({len(substantive_items)} non-procedural) — agenda likely not posted yet")
+        return {"status": "skipped", "reason": "too_few_substantive_items"}
 
     constituent = load_constituent_data(city_slug, storage, cfg.sources_prefix) if city_slug else None
     if constituent:
@@ -865,7 +899,9 @@ def main():
     parser.add_argument("--file", help="Storage key for a normalized meeting JSON (e.g. meeting_pipeline/output/normalized/johnstown-OH_2026-04-07.json)")
     parser.add_argument("--city", help="City slug (e.g. johnstown-OH) — uses most recent normalized file")
     parser.add_argument("--batch", action="store_true", help="Generate for all normalized meetings")
+    parser.add_argument("--from-date", help="Only process meetings on or after this date (YYYY-MM-DD). Applies to --batch mode.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be generated, no LLM calls")
+    parser.add_argument("--force", action="store_true", help="Regenerate even if a briefing already exists (batch mode)")
     args = parser.parse_args()
 
     if not args.file and not args.city and not args.batch:
@@ -896,7 +932,15 @@ def main():
             k for k in all_keys
             if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
         )
-        # Skip files that already have a briefing (batch mode default)
+        # Filter by --from-date if specified (extracts date from filename)
+        if args.from_date:
+            before_filter = len(target_keys)
+            target_keys = [
+                k for k in target_keys
+                if (m := re.search(r"(\d{4}-\d{2}-\d{2})\.json$", k)) and m.group(1) >= args.from_date
+            ]
+            print(f"Date filter >= {args.from_date}: {len(target_keys)} of {before_filter} files")
+        # Skip files that already have a briefing (batch mode default, bypassed by --force)
         briefing_prefix = f"{cfg.output_prefix}/briefings"
         existing_briefing_keys = set(storage.list_keys(briefing_prefix))
         def _has_briefing(norm_key: str) -> bool:
@@ -904,11 +948,12 @@ def main():
             stem = fn[:-5]                          # chapel-hill-NC_2026-04-15
             city_date = stem                        # same
             return any(city_date in bk for bk in existing_briefing_keys)
-        before = len(target_keys)
-        target_keys = [k for k in target_keys if not _has_briefing(k)]
-        skipped_existing = before - len(target_keys)
-        if skipped_existing:
-            print(f"Skipping {skipped_existing} files with existing briefings (--force to regenerate all)")
+        if not args.force:
+            before = len(target_keys)
+            target_keys = [k for k in target_keys if not _has_briefing(k)]
+            skipped_existing = before - len(target_keys)
+            if skipped_existing:
+                print(f"Skipping {skipped_existing} files with existing briefings (--force to regenerate all)")
         if not target_keys:
             print(f"No normalized meeting files found in {normalized_prefix}")
             sys.exit(1)

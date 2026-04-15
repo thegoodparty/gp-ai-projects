@@ -45,7 +45,10 @@ def _legistar_meeting_url(event: dict) -> str:
 
 
 def load_civicclerk_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> tuple[list[dict], str]:
-    """Returns (meetings_after_date, tenant_slug)."""
+    """Returns (meetings_after_date, tenant_slug).
+
+    Filters by body type using 3-tier logic (preferred → exclude non-council → all).
+    """
     meetings_key = f"{sources_prefix}/{city_slug}/data/civicclerk/meetings.json"
     if not storage.exists(meetings_key):
         return [], ""
@@ -54,21 +57,54 @@ def load_civicclerk_meetings(city_slug: str, from_date: str, storage, sources_pr
     tenant = ""
     if storage.exists(source_key):
         src = storage.read_json(source_key)
-        portal_url = src.get("best_source", {}).get("url", "")
-        tenant = _civicclerk_tenant(portal_url)
+        if src:
+            portal_url = src.get("best_source", {}).get("url", "") if src.get("best_source") else ""
+            tenant = _civicclerk_tenant(portal_url)
 
     meetings = storage.read_json(meetings_key)
     future = [m for m in meetings if m.get("date", "") >= from_date]
-    return future, tenant
+    if not future:
+        return [], tenant
+
+    # Tier 1: preferred governing bodies
+    preferred = [m for m in future if _is_preferred_body(m.get("categoryName", ""))]
+    if preferred:
+        return sorted(preferred, key=lambda m: m.get("date", "")), tenant
+
+    # Tier 2: exclude obvious non-council bodies
+    non_council = [m for m in future if not _is_non_council_body(m.get("categoryName", ""))]
+    if non_council:
+        return sorted(non_council, key=lambda m: m.get("date", "")), tenant
+
+    # Tier 3: full fallback
+    return sorted(future, key=lambda m: m.get("date", "")), tenant
 
 
 def load_civicplus_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
-    """Returns civicplus meetings after from_date."""
+    """Returns civicplus meetings after from_date.
+
+    Filters by body type (categoryName) using 3-tier logic (preferred → exclude non-council → all).
+    """
     meetings_key = f"{sources_prefix}/{city_slug}/data/civicplus/meetings.json"
     if not storage.exists(meetings_key):
         return []
     meetings = storage.read_json(meetings_key)
-    return [m for m in meetings if m.get("date", "") >= from_date]
+    future = [m for m in meetings if m.get("date", "") >= from_date]
+    if not future:
+        return []
+
+    # Tier 1: preferred governing bodies
+    preferred = [m for m in future if _is_preferred_body(m.get("categoryName", ""))]
+    if preferred:
+        return sorted(preferred, key=lambda m: m.get("date", ""))
+
+    # Tier 2: exclude obvious non-council bodies
+    non_council = [m for m in future if not _is_non_council_body(m.get("categoryName", ""))]
+    if non_council:
+        return sorted(non_council, key=lambda m: m.get("date", ""))
+
+    # Tier 3: full fallback
+    return sorted(future, key=lambda m: m.get("date", ""))
 
 
 def load_granicus_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
@@ -237,8 +273,9 @@ def format_granicus_meeting(e: dict) -> dict:
     }
 
 
-# Legistar: governing body name patterns to prefer (case-insensitive substring match)
-_LEGISTAR_PREFERRED_BODIES = [
+# Governing body name patterns to prefer (case-insensitive substring match)
+# Used by Legistar, CivicClerk, and CivicPlus loaders.
+_PREFERRED_BODIES = [
     "city council",
     "common council",
     "town council",
@@ -249,28 +286,62 @@ _LEGISTAR_PREFERRED_BODIES = [
     "board of aldermen",
     "board of commissioners",
     "board of trustees",
+    "town board",
+    "village board",
+    "select board",
 ]
 
-# Legistar: body name fragments that indicate advisory/sub bodies to deprioritize
-_LEGISTAR_ADVISORY_FRAGMENTS = [
+# Body name fragments that indicate non-governing bodies to exclude.
+# Applied as a second-tier filter when no preferred body is found.
+_NON_COUNCIL_FRAGMENTS = [
     "advisory",
     "subcommittee",
     "sub-committee",
     "task force",
     "ad hoc",
+    "school board",
+    "school district",
+    "board of education",
+    "historic preservation",
+    "planning commission",
+    "planning board",
+    "parks and recreation",
+    "parks commission",
+    "library board",
+    "library commission",
+    "zoning board",
+    "board of zoning",
+    "board of adjustment",
+    "economic development",
+    "housing authority",
+    "fire commission",
+    "police commission",
+    "civil service",
+    "ethics commission",
+    "human rights",
+    "environmental",
 ]
 
 
-def _is_preferred_legistar_body(body: str) -> bool:
+def _is_preferred_body(body: str) -> bool:
     """Return True if body name matches a primary governing body."""
     b = body.lower()
-    return any(pref in b for pref in _LEGISTAR_PREFERRED_BODIES)
+    return any(pref in b for pref in _PREFERRED_BODIES)
+
+
+def _is_non_council_body(body: str) -> bool:
+    """Return True if body name is clearly not the city council."""
+    b = body.lower()
+    return any(frag in b for frag in _NON_COUNCIL_FRAGMENTS)
+
+
+# Keep old names as aliases for backward compatibility
+def _is_preferred_legistar_body(body: str) -> bool:
+    return _is_preferred_body(body)
 
 
 def _is_advisory_legistar_body(body: str) -> bool:
-    """Return True if body name is clearly an advisory/sub body."""
-    b = body.lower()
-    return any(frag in b for frag in _LEGISTAR_ADVISORY_FRAGMENTS)
+    return _is_non_council_body(body)
 
 
 def load_legistar_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
@@ -388,9 +459,11 @@ def main():
     source_keys = [k for k in all_keys if k.endswith("/source.json")]
     for source_key in source_keys:
         src = storage.read_json(source_key)
+        if not src:
+            continue
         city = src.get("city", "").lower()
         state = src.get("state", "")
-        platform = src.get("best_source", {}).get("platform", "")
+        platform = src.get("best_source", {}).get("platform", "") if src.get("best_source") else ""
         # Derive slug from key: meeting_pipeline/sources/{slug}/source.json
         parts = source_key.split("/")
         slug = parts[-2] if len(parts) >= 2 else ""

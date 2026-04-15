@@ -12,6 +12,7 @@ Usage:
     uv run python meeting_pipeline/scripts/collect_pilot_batch.py
     uv run python meeting_pipeline/scripts/collect_pilot_batch.py --city "Durham NC"
     uv run python meeting_pipeline/scripts/collect_pilot_batch.py --no-pdfs
+    uv run python meeting_pipeline/scripts/collect_pilot_batch.py --agendas-only
     uv run python meeting_pipeline/scripts/collect_pilot_batch.py --lookback 180
 """
 
@@ -37,6 +38,7 @@ async def main_async(args: argparse.Namespace) -> None:
     cfg = AgentConfig.from_env()
     cfg.lookback_days = args.lookback
     cfg.download_pdfs = not args.no_pdfs
+    cfg.agendas_only = args.agendas_only
     storage = get_storage(cfg)
 
     # Filter to a single city if --city was passed
@@ -110,6 +112,8 @@ def main() -> None:
                         help="Collect one city only, e.g. 'Durham NC'")
     parser.add_argument("--no-pdfs", action="store_true",
                         help="Skip PDF downloads (metadata only)")
+    parser.add_argument("--agendas-only", action="store_true",
+                        help="Legistar only: skip matter histories/attachments, download agenda PDFs only (much faster)")
     parser.add_argument("--lookback", type=int, default=90, metavar="DAYS",
                         help="Lookback window in days (default: 90)")
     args = parser.parse_args()

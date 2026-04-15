@@ -50,6 +50,12 @@ async def _collect_legistar(
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
 
+    # Load manifest before collection so expected_body can guide filtering
+    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    expected_body = (manifest or {}).get("expected_body", "")
+    if expected_body:
+        print(f"  [manifest] expected_body={expected_body!r}")
+
     legistar_slug = best.get("config", {}).get("legistar_slug", "")
     if not legistar_slug:
         # Try to extract from URL: https://webapi.legistar.com/v1/{slug}/events
@@ -68,6 +74,8 @@ async def _collect_legistar(
         output_prefix=output_prefix,
         storage=storage,
         lookback_days=cfg.lookback_days,
+        expected_body=expected_body,
+        agendas_only=cfg.agendas_only,
     )
 
     result = await collect_legistar(legistar_cfg)
@@ -81,8 +89,7 @@ async def _collect_legistar(
         events=[],
     )
 
-    # Manifest validation (best-effort)
-    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    # Manifest validation (best-effort) — reuse manifest loaded above
     if manifest:
         bodies_key = f"{cfg.sources_prefix}/{city_slug}/data/legistar/bodies.json"
         try:
@@ -113,6 +120,12 @@ async def _collect_civicplus(
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
 
+    # Load manifest before collection so expected_body can guide category selection
+    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    expected_body = (manifest or {}).get("expected_body", "")
+    if expected_body:
+        print(f"  [manifest] expected_body={expected_body!r}")
+
     url = best.get("url", "")
     domain = best.get("config", {}).get("domain", "")
     if not domain:
@@ -132,6 +145,7 @@ async def _collect_civicplus(
         storage=storage,
         download_pdfs=cfg.download_pdfs,
         council_category_id=council_category_id,
+        expected_body=expected_body,
     )
 
     result = await collect_civicplus(civicplus_cfg)
@@ -385,6 +399,13 @@ async def _collect_boarddocs(
     state = event["state"]
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
+
+    # Load manifest before collection so expected_body can guide committee filtering
+    manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
+    expected_body = (manifest or {}).get("expected_body", "")
+    if expected_body:
+        print(f"  [manifest] expected_body={expected_body!r}")
+
     url = best.get("url", "").removesuffix("/Public").removesuffix("/public")
 
     output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/boarddocs"
@@ -396,6 +417,7 @@ async def _collect_boarddocs(
         storage=storage,
         lookback_days=cfg.lookback_days,
         download_pdfs=cfg.download_pdfs,
+        expected_body=expected_body,
     )
 
     result = await collect_boarddocs(bd_cfg)

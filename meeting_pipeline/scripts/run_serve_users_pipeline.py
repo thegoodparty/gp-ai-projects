@@ -76,7 +76,7 @@ DEDICATED_PLATFORMS = {
     "escribe", "boarddocs", "municode", "novus",
 }
 FRESHNESS_OK = {"fresh", "stale"}
-CONCURRENCY = 5
+CONCURRENCY = 10
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -127,20 +127,33 @@ def load_briefing_capable_officials() -> tuple[list[dict], list[dict]]:
     seen_slugs: set[str] = set()
     cities = []
 
+    # Support both old format (State/Region full name, First Name/Last Name)
+    # and new format (State abbrev, Name, Role)
+    first_row = rows[0] if rows else {}
+    new_format = "State" in first_row and "State/Region" not in first_row
+
     for row in rows:
         city = row.get("City", "").strip()
-        state_raw = row.get("State/Region", "").strip()
-        if not city or not state_raw:
+        if new_format:
+            state_raw = row.get("State", "").strip()
+            state = state_raw.upper() if len(state_raw) <= 2 else normalize_state(state_raw)
+            name = row.get("Name", "").strip()
+            role = row.get("Role", row.get("Office", "City Council Member")).strip()
+        else:
+            state_raw = row.get("State/Region", "").strip()
+            state = normalize_state(state_raw)
+            name = f"{row.get('First Name', '')} {row.get('Last Name', '')}".strip()
+            role = row.get("Candidate Office", "City Council Member")
+        if not city or not state:
             continue
-        state = normalize_state(state_raw)
         slug = make_slug(city, state)
         if slug not in capable:
             continue
         officials.append({
-            "name": f"{row['First Name']} {row['Last Name']}".strip(),
+            "name": name,
             "city": city,
             "state": state,
-            "role": row.get("Candidate Office", "City Council Member"),
+            "role": role,
         })
         if slug not in seen_slugs:
             seen_slugs.add(slug)
@@ -372,11 +385,20 @@ def main():
     parser = argparse.ArgumentParser(description="Full pipeline for serve_users.csv briefing-capable officials")
     parser.add_argument("--phase", choices=["collect", "queue", "normalize", "haystaq", "brief", "summary"],
                         help="Run only one phase (default: all)")
+    parser.add_argument("--agendas-only", action="store_true",
+                        help="Legistar only: skip matter histories/attachments (much faster)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Pass --dry-run to normalize and brief phases")
+    parser.add_argument("--csv", metavar="PATH",
+                        help="Alternate CSV file (must have City, State, Name, Role columns)")
     args = parser.parse_args()
 
+    if args.csv:
+        global SERVE_CSV
+        SERVE_CSV = Path(args.csv)
+
     cfg = AgentConfig.from_env()
+    cfg.agendas_only = args.agendas_only
     officials, cities = load_briefing_capable_officials()
 
     print(f"Serve users pipeline")

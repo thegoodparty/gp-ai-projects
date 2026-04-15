@@ -59,6 +59,7 @@ class BoardDocsConfig:
     download_pdfs: bool = True
     request_timeout: int = 30
     rate_limit_delay: float = 0.3
+    expected_body: str = ""  # e.g. "City Council" — filters committees to matching name
 
 
 @dataclass
@@ -235,6 +236,16 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
 
         committees = await _fetch_committees(client, config, headers)
         print(f"\nFound {len(committees)} committees/boards")
+
+        # Committee filter: if expected_body is set, restrict to matching committees
+        if config.expected_body:
+            expected_lower = config.expected_body.lower()
+            filtered = [c for c in committees if expected_lower in c["name"].lower()]
+            if filtered:
+                print(f"  [body filter] Filtered to {len(filtered)} committees matching '{config.expected_body}'")
+                committees = filtered
+            else:
+                print(f"  WARNING: No committee matched '{config.expected_body}', collecting all {len(committees)}")
 
         # Save as bodies.json
         bodies = []

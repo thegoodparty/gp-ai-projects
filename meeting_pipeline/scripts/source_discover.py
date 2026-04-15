@@ -56,6 +56,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PIPELINE_DIR = _SCRIPT_DIR.parent
 SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+_DOTGOV_CSV_PATH = _PIPELINE_DIR / "config" / "dotgov.csv"
 
 # ── State name → abbreviation (mirrors collect_haystaq_batch.py) ──────────────
 STATE_ABBREVS = {
@@ -80,6 +81,106 @@ REGISTRY_S3_KEY = "meeting_pipeline/config/known-sources-registry.json"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TODAY = date.today()
+
+# ── DotGov domain index ────────────────────────────────────────────────────────
+#
+# CISA publishes the authoritative list of .gov registrants at:
+#   https://github.com/cisagov/dotgov-data/blob/main/current-full.csv
+#
+# We download it once to config/dotgov.csv and use it as Layer 0 discovery:
+# look up the official .gov domain before any web search so that the domain
+# crawl (probe_domain_for_agendas) always runs against the right site.
+
+# Org-name fragments that identify department sub-sites, not the city hall
+_DEPT_REJECT_KEYWORDS = [
+    "court", "police department", "police dept", "sheriff", "fire department",
+    "fire district", "library", "city marshal", "marshal's", "jail",
+    "district attorney", "prosecutor", "ems ", "utilities", "water district",
+    "sewer", "transit", "parking authority", "permit office", "airport",
+]
+
+# Org-name prefixes that confirm this is the main municipal government
+_CITY_GOV_PREFIXES = (
+    "city of ", "town of ", "village of ", "borough of ",
+    "township of ", "city and county of ",
+)
+
+_DOTGOV_INDEX: dict[tuple[str, str], list[dict]] | None = None
+
+
+def _load_dotgov_index() -> dict[tuple[str, str], list[dict]]:
+    """Load CISA DotGov CSV → (city_lower, state_upper) → [{domain, org}, ...] index.
+
+    Cached in module-level variable after first call. Returns empty dict if
+    the CSV file is missing (discovery continues without DotGov data).
+    """
+    global _DOTGOV_INDEX
+    if _DOTGOV_INDEX is not None:
+        return _DOTGOV_INDEX
+
+    index: dict[tuple[str, str], list[dict]] = {}
+    if not _DOTGOV_CSV_PATH.exists():
+        _DOTGOV_INDEX = index
+        return index
+
+    import csv as _csv
+    with _DOTGOV_CSV_PATH.open() as f:
+        for row in _csv.DictReader(f):
+            if row.get("Domain type", "") not in ("City", "City - Election"):
+                continue
+            domain = row.get("Domain name", "").strip().lower()
+            org = row.get("Organization name", "").strip()
+            city = row.get("City", "").strip()
+            state = row.get("State", "").strip().upper()
+            if not domain or not city or not state:
+                continue
+            # Filter out department sub-domains
+            org_lower = org.lower()
+            if any(kw in org_lower for kw in _DEPT_REJECT_KEYWORDS):
+                continue
+            key = (city.lower(), state)
+            index.setdefault(key, []).append({"domain": domain, "org": org})
+
+    _DOTGOV_INDEX = index
+    return index
+
+
+def lookup_gov_domain(city: str, state: str) -> str | None:
+    """Return the official .gov domain for a city, or None if not in CISA DotGov.
+
+    Prefers the main city-hall domain when multiple .gov registrants exist for
+    the same city (e.g. police dept, fire dept, and city hall all registered).
+
+    Cities not in the DotGov database — common for IL, IA, KS, MI, and others
+    that use .org/.com/.net — return None; the pipeline falls back to web search.
+    """
+    index = _load_dotgov_index()
+    hits = index.get((city.lower(), state.upper()), [])
+    if not hits:
+        return None
+
+    city_slug = city.lower().replace(" ", "").replace(".", "").replace("'", "")
+    state_lower = state.lower()
+
+    def _score(entry: dict) -> int:
+        d = entry["domain"]
+        org_lower = entry["org"].lower()
+        score = 0
+        # Strongly prefer "City of X" / "Town of X" named orgs
+        if any(org_lower.startswith(pfx) for pfx in _CITY_GOV_PREFIXES):
+            score += 100
+        # Prefer domain containing city+state slug (e.g. austintx.gov)
+        d_clean = d.replace("-", "").replace(".", "")
+        if (city_slug + state_lower) in d_clean:
+            score += 20
+        elif city_slug in d_clean:
+            score += 10
+        # Prefer shorter domains (main site, not a sub-dept like falmouthpolicema.gov)
+        score -= len(d)
+        return score
+
+    return max(hits, key=_score)["domain"]
+
 
 PLATFORM_PATTERNS = {
     "legistar": ["legistar.com"],
@@ -162,6 +263,10 @@ WRONG_ENTITY_PATTERNS = [
     "water district",
     "park district",
     "health district",
+    # Economic development / municipal corporations — active but not city council
+    "economic development corporation",
+    "economic development commission",
+    "community development authority",
 ]
 
 # Wrong-entity keywords specifically for BoardDocs page-title validation.
@@ -193,10 +298,32 @@ def _is_council_body(name: str) -> bool:
     return any(kw in lower for kw in COUNCIL_BODY_KEYWORDS)
 
 
+# State abbreviation → full name (used in search queries for disambiguation)
+_STATE_NAMES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming",
+}
+
+
 # URL patterns that are never official municipal agenda sources
 REJECT_URL_PATTERNS = [
     "facebook.com/",
     "youtube.com/watch",
+    "youtube.com/@",
+    "youtube.com/channel",
+    "youtube.com/user",
+    "youtu.be/",
     "citizenportal.ai/",
     "twitter.com/",
     "x.com/",
@@ -209,6 +336,169 @@ REJECT_URL_PATTERNS = [
     "ballotpedia.org/",  # election info, not agendas
     "patch.com/",
     "govtech.com/",
+    "politico.com/",
+    "journaltimes.com/",
+    "jsonline.com/",
+    "jsonline.com/",
+    "mlive.com/",
+    "nytimes.com/",
+    "washingtonpost.com/",
+    "foxnews.com/",
+    "nbcnews.com/",
+    "abcnews.go.com/",
+    "cbsnews.com/",
+    "usatoday.com/",
+    "apnews.com/",
+    "reuters.com/",
+    "racinecountyeye.com/",  # local news blog
+    "thebuckeyeflame.com/",  # Ohio news blog
+    "cantonrep.com/",  # Ohio newspaper
+    "mchenrytimes.com/",  # local news — not official source
+    "shawlocal.com/",  # Shaw Media local news network
+    "dailyherald.com/",  # Chicago suburb news
+    "triblocal.com/",  # Tribune local news blog
+    "suburbanchicagoland.com/",  # local news aggregator
+    # Local TV news stations — common DDG false positives
+    "wmtv15news.com/",
+    "wtmj.com/",
+    "fox6now.com/",
+    "wisn.com/",
+    "witi.com/",
+    "tmj4.com/",
+    "wkow.com/",
+    "channel3000.com/",
+    "wbay.com/",
+    "weau.com/",
+    "waow.com/",
+    "wfrv.com/",
+    "wgba.com/",
+    "wearegreenbay.com/",
+    "wsaw.com/",
+    "wkbt.com/",
+    "wqow.com/",
+    "wxow.com/",
+    "wlax.com/",
+    "nbc15.com/",
+    "abc27.com/",
+    "local3news.com/",
+    "local10.com/",
+    "kxan.com/",
+    "kvue.com/",
+    "khou.com/",
+    "click2houston.com/",
+    "abc13.com/",
+    "cbsaustin.com/",
+    "wfaa.com/",
+    "nbcdfw.com/",
+    "cbslocal.com/",
+    "myfoxny.com/",
+    "wral.com/",
+    "abc11.com/",
+    "wcnc.com/",
+    "wsoc-tv.com/",
+    "wbtv.com/",
+    "wccb.com/",
+    "wtvd.com/",
+    "wbns10tv.com/",
+    "nbc4i.com/",
+    "10tv.com/",
+    "local12.com/",
+    "fox19.com/",
+    "wkrc.com/",
+    "wcpo.com/",
+    "wlwt.com/",
+    "whio.com/",
+    "daytondailynews.com/",
+    "cincinnaticitybeat.com/",
+    "dispatch.com/",
+    "cleveland.com/",
+    "familydestinationsguide.com/",  # travel guide — not gov source
+    "towleroad.com/",  # news blog
+    # Archive / academic sites without current meeting data
+    "archive.org/details/",
+    # Travel / lifestyle sites
+    "tripadvisor.com/",
+    "travelchannel.com/",
+    # ZIP code / demographic lookup sites — not government sources
+    "zip-codes.com/",
+    "unitedstateszipcodes.org/",
+    "zipcodestogo.com/",
+    "zipdatamaps.com/",
+    "city-data.com/",
+    "bestplaces.net/",
+    "niche.com/",
+    "areavibes.com/",
+    "neighborhoodscout.com/",
+    "homefacts.com/",
+    "point2homes.com/",
+    "datausa.io/",
+    "census.gov/",
+    # Real estate sites — often have city data but not gov sources
+    "zillow.com/",
+    "realtor.com/",
+    "trulia.com/",
+    "redfin.com/",
+    "movoto.com/",
+    # Hotel / travel booking sites — not government sources
+    "agoda.com/",
+    "booking.com/",
+    "hotels.com/",
+    "expedia.com/",
+    "airbnb.com/",
+    "travelocity.com/",
+    "orbitz.com/",
+    "kayak.com/",
+    # Tech / corporate support sites — common DDG noise
+    "microsoft.com/",
+    "support.microsoft.com/",
+    "learn.microsoft.com/",
+    "apple.com/",
+    "support.apple.com/",
+    "google.com/",
+    "support.google.com/",
+    "amazon.com/",
+    "yelp.com/",
+    "yellowpages.com/",
+    "whitepages.com/",
+    "mapquest.com/",
+    "tripadvisor.com/",
+    "indeed.com/",
+    "glassdoor.com/",
+    "reddit.com/",
+    "quora.com/",
+    "stackoverflow.com/",
+    "github.com/",
+    "wikipedia.org/",
+    # Document / presentation sharing sites — not gov sources
+    "slideshare.net/",
+    "scribd.com/",
+    "issuu.com/",
+    "docsend.com/",
+    # Generic news aggregators / scrapers
+    "readkong.com/",
+    "yahoo.com/news",
+    "yahoo.com/local",
+    "msn.com/",
+    "aol.com/",
+    # Petition / crowdfunding / user-generated content
+    "change.org/",
+    "gofundme.com/",
+    "kickstarter.com/",
+    # AI-generated encyclopedias / content farms
+    "grokipedia.com/",
+    "dbpedia.org/",
+    # Generic city-data / directory sites — not official sources
+    "city2map.com/",
+    "citydata.us/",
+    "onlyinyourstate.com/",
+    # Apartment / lifestyle / travel blogs
+    "wellnesscoachingforlife.com/",
+    "familydestinationsguide.com/",
+    "roadtrippers.com/",
+    "theroamingsole.com/",
+    # Sports / entertainment
+    "espn.com/",
+    "nbcsports.com/",
 ]
 
 PILOT_CITIES = [
@@ -330,6 +620,11 @@ def get_serve_csv_cities() -> list[dict]:
     Mirrors the same logic as collect_haystaq_batch.py so both scripts
     cover the same population.  State/Region column has full state names
     (e.g. "Ohio"), which are converted to 2-letter abbreviations.
+
+    Also extracts the "Meeting URL" column as a seed URL for discovery.
+    When present, this URL is added to known_sources as custom_agenda_url,
+    which ensures the discovery probes the city's own page even when search
+    engines return poor results for that city.
     """
     if not SERVE_CSV.exists():
         print(f"ERROR: {SERVE_CSV} not found")
@@ -349,7 +644,12 @@ def get_serve_csv_cities() -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        cities.append({"city": city, "state": state})
+        entry: dict = {"city": city, "state": state}
+        # Carry the CSV meeting URL as a discovery seed (used as custom_agenda_url)
+        meeting_url = row.get("Meeting URL", "").strip()
+        if meeting_url and meeting_url.startswith("http"):
+            entry["csv_meeting_url"] = meeting_url
+        cities.append(entry)
     return cities
 
 
@@ -531,7 +831,7 @@ def normalize_platform_url(url: str, platform: str) -> str:
     return url
 
 
-def is_wrong_city(url: str, title: str, city: str) -> bool:
+def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
     """Return True if this URL/title is recognizably from the wrong city or entity."""
     combined = (url + " " + title).lower()
     # Global wrong-entity patterns apply to all cities (school boards, ISDs, etc.)
@@ -542,6 +842,75 @@ def is_wrong_city(url: str, title: str, city: str) -> bool:
     for pattern in WRONG_CITY_PATTERNS.get(city, []):
         if pattern.lower() in combined:
             return True
+    # If state is provided, reject snippets that explicitly name a different state.
+    # e.g. searching for Louisville OH — reject "City of Greenland, Arkansas"
+    if state:
+        expected_state_name = _STATE_NAMES.get(state.upper(), "").lower()
+        state_abbrev = state.upper()
+        # Check if a different state name appears explicitly in the text
+        for abbrev, name in _STATE_NAMES.items():
+            if abbrev == state_abbrev:
+                continue
+            name_lower = name.lower()
+            # Only trigger if the other state name appears as a standalone word
+            # to avoid false positives (e.g. "New" in "New York" vs "New Britain, CT")
+            import re as _re
+            if _re.search(rf'\b{_re.escape(name_lower)}\b', combined):
+                return True
+
+        # For .gov domains, check if the domain embeds a different state abbreviation.
+        # Pattern: {city}{state_abbrev}.gov — e.g. westmorelandtn.gov when searching WI.
+        # Only fires when city name is NOT in the domain (avoids false positives).
+        _parsed_url = urlparse(url)
+        _netloc = _parsed_url.netloc.lower().replace("www.", "")
+        if _netloc.endswith(".gov") and "." not in _netloc[:-4]:
+            _domain_base = _netloc[:-4]  # strip .gov
+            if len(_domain_base) >= 3:
+                _embedded = _domain_base[-2:].upper()
+                if _embedded in _STATE_NAMES and _embedded != state_abbrev:
+                    # Don't reject if the target city name is in the domain
+                    _city_in_dom = city.lower().replace(" ", "") in _domain_base
+                    if not _city_in_dom:
+                        return True  # .gov domain is in a different state
+
+        # Check if a different state name is embedded in the URL domain (no word boundary).
+        # Catches e.g. louisvillenebraska.com (Nebraska embedded) when searching Louisville OH.
+        # Only applies to non-.gov domains since .gov is already checked above.
+        _dom_check = urlparse(url).netloc.lower().replace("www.", "").replace("-", "").replace(".", "")
+        if _dom_check and not _dom_check.endswith("gov"):
+            for abbrev, name in _STATE_NAMES.items():
+                if abbrev == state_abbrev:
+                    continue
+                state_slug = name.lower().replace(" ", "")  # e.g. "nebraska", "newmexico"
+                if len(state_slug) >= 5 and state_slug in _dom_check:
+                    return True  # wrong state embedded in domain
+
+        # For Municode shared-platform URLs, validate the cid parameter's embedded
+        # state abbreviation matches the target state, AND that the city name prefix
+        # in the cid roughly matches the target city (catches same-state wrong-city:
+        # e.g. cid=MANORTX when searching Palestine TX → "manor" ≠ "palestine").
+        if "meetings.municode.com" in url or "municodemeetings.com" in url:
+            try:
+                from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+                _qs = _parse_qs(_urlparse(url).query)
+                _cid = (_qs.get("cid") or [""])[0].upper()
+                if _cid and len(_cid) >= 3:
+                    _cid_state = _cid[-2:]
+                    if _cid_state in _STATE_NAMES and _cid_state != state_abbrev:
+                        return True  # Municode client is in a different state
+                    # City name check: strip trailing state abbrev (if present), then see if
+                    # the target city name appears in the remaining cid prefix.
+                    _cid_city = (_cid[:-2] if _cid_state in _STATE_NAMES else _cid).lower()
+                    # Also strip "cityof" / "city" prefix from cid for matching
+                    _cid_city_stripped = _cid_city.replace("cityof", "").replace("city", "").replace("townof", "").replace("villageof", "")
+                    _city_slug = city.lower().replace(" ", "").replace("-", "")
+                    if _cid_city and _city_slug and len(_city_slug) >= 4:
+                        if not (_city_slug in _cid_city or _city_slug in _cid_city_stripped or
+                                _cid_city in _city_slug or _cid_city_stripped in _city_slug):
+                            return True  # Municode cid city prefix doesn't match target city
+            except Exception:
+                pass
+
     return False
 
 
@@ -715,6 +1084,7 @@ def _search_results_to_candidates(
     raw_results: list[dict],
     city: str,
     source_label: str,
+    state: str = "",
 ) -> list[dict]:
     """Convert a list of {url, title, content} dicts to verified candidate dicts.
 
@@ -729,12 +1099,40 @@ def _search_results_to_candidates(
         if not url:
             continue
         # Include snippet in wrong-city/entity check — content often names city/state
-        if is_wrong_city(url, f"{title} {content}", city):
+        if is_wrong_city(url, f"{title} {content}", city, state=state):
             continue
         if is_non_agenda_url(url):
             continue
         platform = detect_platform(url)
         url = normalize_platform_url(url, platform)
+
+        # For path-detected platforms (CivicPlus, Novus) where each city owns its own
+        # domain, validate that the target city name appears in the domain.
+        # Truly multi-tenant platforms (Legistar, BoardDocs, Granicus, Municode, CivicClerk)
+        # are exempt because the city name is embedded in paths/params, not the TLD domain.
+        _PATH_DETECTED_PLATFORMS = {"civicplus", "novus", "primegov", "diligent"}
+        if platform in _PATH_DETECTED_PLATFORMS and city:
+            _netloc = urlparse(url).netloc.lower().replace("www.", "")
+            _domain_clean = _netloc.replace("-", "").replace(".", "")
+            _city_slug = city.lower().replace(" ", "")
+            if _city_slug not in _domain_clean and city.lower() not in _domain_clean:
+                continue  # CivicPlus/Novus site belongs to a different city
+
+        # For all other unknown-platform results, require the city name to appear
+        # in the domain OR in the page title. Content is too noisy (adjacent cities
+        # mention each other), but domain+title is reliable.
+        # Multi-tenant platforms (legistar, boarddocs, granicus, etc.) are exempt.
+        _MULTITENANT_PLATFORMS = {"legistar", "boarddocs", "granicus", "municode", "civicclerk", "escribe"}
+        if platform == "unknown" and city:
+            _netloc = urlparse(url).netloc.lower().replace("www.", "")
+            _domain_clean = _netloc.replace("-", "").replace(".", "")
+            _city_slug = city.lower().replace(" ", "")
+            _title_lower = title.lower()
+            # Accept if city name is in domain OR in page title
+            city_in_domain = _city_slug in _domain_clean or city.lower() in _domain_clean
+            city_in_title = _city_slug in _title_lower.replace(" ", "") or city.lower() in _title_lower
+            if not city_in_domain and not city_in_title:
+                continue  # City absent from domain and title — skip
 
         # Build note from title + snippet prefix
         note_parts = [title[:80]]
@@ -761,6 +1159,49 @@ def _search_results_to_candidates(
 
         candidates.append(c)
     return candidates
+
+
+async def discover_from_duckduckgo(
+    city: str,
+    state: str,
+    query: Optional[str] = None,
+    max_results: int = 8,
+) -> tuple[list[dict], str]:
+    """Run a DuckDuckGo web search. Return (candidates, query_used).
+
+    DDG requires no API key and often has better coverage of small government
+    sites than Exa or Tavily. Used as the first search backend.
+    Requires: duckduckgo-search package.
+    """
+    if query is None:
+        query = f"{city} {state} city council agenda minutes"
+
+    try:
+        from ddgs import DDGS  # type: ignore
+
+        results = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: list(DDGS().text(query, max_results=max_results))
+            ),
+            timeout=30.0,
+        )
+    except ImportError:
+        return [], query
+    except Exception:
+        return [], query
+
+    raw: list[dict] = [
+        {
+            "url": r.get("href", ""),
+            "title": r.get("title", ""),
+            "content": r.get("body", "")[:500],
+        }
+        for r in results
+        if r.get("href")
+    ]
+
+    candidates = _search_results_to_candidates(raw, city, "ddg", state=state)
+    return candidates, query
 
 
 async def discover_from_exa(
@@ -811,7 +1252,7 @@ async def discover_from_exa(
     except Exception:
         return [], query
 
-    candidates = _search_results_to_candidates(raw, city, "exa")
+    candidates = _search_results_to_candidates(raw, city, "exa", state=state)
     return candidates, query
 
 
@@ -847,7 +1288,7 @@ async def discover_from_tavily(
         }
         for r in result.get("results", [])
     ]
-    candidates = _search_results_to_candidates(raw, city, "tavily")
+    candidates = _search_results_to_candidates(raw, city, "tavily", state=state)
     return candidates, query
 
 
@@ -992,28 +1433,32 @@ async def discover_official_domain(
 
     candidates_found = result.get("results", [])
 
-    # Pass 1: prefer .gov domains or domains containing the city name
+    # Pass 1: prefer .gov domains containing the city name, or city-named domains
     for r in candidates_found:
         url = r.get("url", "")
         if not url:
             continue
-        if is_wrong_city(url, (r.get("title") or "") + " " + (r.get("content") or ""), city):
+        if is_wrong_city(url, (r.get("title") or "") + " " + (r.get("content") or ""), city, state=state):
             continue
         if is_non_agenda_url(url):
             continue
         domain = urlparse(url).netloc.replace("www.", "")
-        if domain.endswith(".gov") or city_lower in domain.lower().replace("-", "").replace(".", ""):
+        domain_clean = domain.lower().replace("-", "").replace(".", "")
+        # Require city name in domain OR the domain must be city-named (.gov with city)
+        if city_lower in domain_clean:
             return domain
 
-    # Pass 2: take first non-noise result (excludes social, news, ballotpedia)
-    noise = {"facebook.", "twitter.", "x.com", "wikipedia.", "ballotpedia.",
-             "patch.com", "yelp.", "linkedin.", "nextdoor."}
+    # Pass 2: .gov domains that pass wrong-city check (city name already in domain filter above)
     for r in candidates_found:
         url = r.get("url", "")
         if not url:
             continue
+        if is_wrong_city(url, (r.get("title") or "") + " " + (r.get("content") or ""), city, state=state):
+            continue
+        if is_non_agenda_url(url):
+            continue
         domain = urlparse(url).netloc.replace("www.", "")
-        if not any(n in domain for n in noise):
+        if domain.endswith(".gov"):
             return domain
 
     return None
@@ -1073,6 +1518,221 @@ async def discover_official_domain_via_claude(city: str, state: str) -> Optional
         pass
 
     return None
+
+
+# Common US city government domain patterns — in rough order of likelihood.
+# These let us find the official city website WITHOUT depending on search engine indexing.
+# Many small cities don't rank in Exa/Tavily for "city council agenda" but their
+# homepage IS reachable at one of these predictable domains.
+_CITY_DOMAIN_PATTERNS = [
+    "{city_hyphen}-{state_lower}.gov",         # janesville-wi.gov  ← most common
+    "{city_slug}{state_lower}.gov",             # janesviellewi.gov
+    "ci.{city_hyphen}.{state_lower}.us",        # ci.janesville.wi.us
+    "ci.{city_slug}.{state_lower}.us",          # ci.janesville.wi.us
+    "cityof{city_slug}.gov",                    # cityofjanesville.gov
+    "cityof{city_slug}.{state_lower}.gov",      # cityofjanesville.wi.gov
+    "{city_slug}.gov",                          # janesville.gov
+    "{city_hyphen}.gov",                        # janesville.gov  (same when no spaces)
+    "{city_slug}city.gov",                      # janesvielleecity.gov
+    "city.{city_slug}.{state_lower}.us",        # city.janesville.wi.us
+    "{city_hyphen}-city.{state_lower}.gov",     # janesville-city.wi.gov
+]
+
+
+async def probe_city_domain_patterns(
+    city: str,
+    state: str,
+    http: httpx.AsyncClient,
+) -> Optional[str]:
+    """
+    Probe common US city government domain patterns directly.
+
+    Bypasses search engine coverage gaps for small cities — their homepage is
+    reachable at a predictable domain even when their agenda pages aren't indexed.
+    Runs all patterns in parallel with a short timeout; returns the first domain
+    that responds with a valid city website (HTTP 200 + city name in body).
+
+    Returns the domain string (e.g. "janesville-wi.gov"), or None.
+    """
+    state_lower = state.lower()
+    city_slug = city.lower().replace(" ", "").replace(".", "").replace("'", "")
+    city_hyphen = city.lower().replace(" ", "-").replace(".", "").replace("'", "")
+    city_lower = city.lower()
+
+    seen: set[str] = set()
+    domains: list[str] = []
+    for pattern in _CITY_DOMAIN_PATTERNS:
+        domain = pattern.format(
+            city_slug=city_slug, city_hyphen=city_hyphen, state_lower=state_lower,
+        )
+        if domain not in seen:
+            seen.add(domain)
+            domains.append(domain)
+
+    state_full = _STATE_NAMES.get(state, state).lower()
+
+    async def check_domain(domain: str) -> Optional[str]:
+        for base_url in [f"https://www.{domain}", f"https://{domain}"]:
+            status, body = await safe_fetch(http, base_url, timeout=6.0)
+            body_lower = body.lower() if body else ""
+            # Require city name AND state name/abbrev in body to avoid wrong-city matches
+            # (e.g. "Lexington, KY" domain showing up for "Lexington, NC")
+            city_in_body = city_lower in body_lower
+            state_in_body = state_lower in body_lower or state_full in body_lower
+            if status == 200 and len(body) > 1500 and city_in_body and state_in_body:
+                return domain
+            # 403 = site exists and blocks bots — accept if city+state confirmed
+            if status == 403 and city_in_body and state_in_body:
+                return domain
+        return None
+
+    results = await asyncio.gather(*(check_domain(d) for d in domains), return_exceptions=True)
+    return next((r for r in results if isinstance(r, str)), None)
+
+
+async def playwright_crawl_city_site(
+    domain: str,
+    city: str,
+    state: str,
+    expected_body: str = "",
+) -> list[dict]:
+    """
+    Use Playwright to crawl a city's official website and find agenda/meeting pages.
+
+    Handles JS-rendered city CMSes and non-standard path structures where
+    httpx probing of common paths (/AgendaCenter, /meetings) returns nothing.
+
+    Strategy:
+    1. Load the city homepage
+    2. Find navigation links containing government/council/meeting keywords
+    3. Follow up to MAX_NAV_LINKS links (one level deep)
+    4. On each page, check for dates + meeting content + entity validation
+    5. Return any pages that look like valid agenda sources
+
+    Returns a list of candidate dicts (same shape as make_candidate).
+    """
+    try:
+        from playwright.async_api import async_playwright  # type: ignore
+    except ImportError:
+        return []
+
+    MAX_NAV_LINKS = 8
+    NAV_KEYWORDS = re.compile(
+        r"\b(agenda|minute|meeting|council|commission|clerk|legislative|government|city hall)\b",
+        re.IGNORECASE,
+    )
+    # Pre-filter links whose text explicitly names a non-council governing body.
+    # Prevents following "Civil Service Commission", "Planning Commission", etc.
+    # which may have fresh dates but are the wrong entity.
+    WRONG_BODY_LINK_KEYWORDS = re.compile(
+        r"\b(civil service|planning commission|zoning board|historic preservation|"
+        r"ethics board|library board|park board|fire district|water board|"
+        r"advisory board|school board|board of education|port authority)\b",
+        re.IGNORECASE,
+    )
+    candidates: list[dict] = []
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                ctx = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = await ctx.new_page()
+                home_url = f"https://www.{domain}"
+                try:
+                    await page.goto(home_url, wait_until="networkidle", timeout=20000)
+                except Exception:
+                    try:
+                        home_url = f"https://{domain}"
+                        await page.goto(home_url, wait_until="domcontentloaded", timeout=15000)
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        return []
+
+                # Extract all links from the homepage
+                links = await page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => ({text: a.textContent.trim().slice(0, 80), href: a.href}))
+                    .filter(l => l.href.startsWith('http'))
+                """)
+
+                # Filter to links that look like council/meeting pages
+                nav_links = [
+                    l for l in links
+                    if NAV_KEYWORDS.search(l["text"]) or NAV_KEYWORDS.search(l["href"])
+                ][:MAX_NAV_LINKS]
+
+                for link in nav_links:
+                    link_url = link["href"]
+                    # Skip external domains, PDFs, and already-known platforms
+                    parsed = urlparse(link_url)
+                    if domain not in parsed.netloc:
+                        continue
+                    if link_url.lower().endswith(".pdf"):
+                        continue
+                    # Skip links whose text explicitly names a non-council body
+                    if WRONG_BODY_LINK_KEYWORDS.search(link.get("text", "")) or \
+                            WRONG_BODY_LINK_KEYWORDS.search(link_url):
+                        continue
+
+                    try:
+                        await page.goto(link_url, wait_until="networkidle", timeout=15000)
+                    except Exception:
+                        continue
+
+                    try:
+                        body_text = await page.inner_text("body")
+                    except Exception:
+                        continue
+
+                    if not body_text or len(body_text) < 200:
+                        continue
+
+                    # Entity validation — skip if this looks like the wrong entity
+                    if expected_body:
+                        body_text_lower = body_text.lower()
+                        wrong_entity_here = any(
+                            kw in body_text_lower for kw in WRONG_ENTITY_PATTERNS
+                        )
+                        expected_here = expected_body.lower() in body_text_lower
+                        if wrong_entity_here and not expected_here:
+                            continue
+
+                    dates = extract_dates(body_text)
+                    has_meeting_kw = bool(re.search(
+                        r"\b(agenda|minutes|meeting|council|vote|ordinance)\b",
+                        body_text, re.IGNORECASE,
+                    ))
+                    if not (dates and has_meeting_kw):
+                        continue
+
+                    # Check if the page is on a known platform
+                    platform = detect_platform(link_url)
+                    most_recent = dates[0] if dates else None
+                    c = make_candidate(
+                        url=link_url, platform=platform, source="playwright_crawl",
+                        http_status=200,
+                        notes=f"playwright_crawl:{domain} link='{link['text'][:50]}'",
+                    )
+                    if most_recent:
+                        c["most_recent_date"] = most_recent.isoformat()
+                        c["days_since_update"] = (TODAY - most_recent).days
+                        c["freshness"] = classify_freshness(most_recent)
+                        c["date_source"] = "playwright_crawl"
+                    candidates.append(c)
+
+            finally:
+                await browser.close()
+    except Exception:
+        pass
+
+    return candidates
 
 
 async def probe_domain_for_agendas(
@@ -1209,7 +1869,7 @@ async def discover_from_probes(
         # Apply global wrong-entity filter to all probe candidates.
         # Previously this filter only ran on Tavily/search results; now it also
         # covers candidates generated by URL probing.
-        if is_wrong_city(url, "", city):
+        if is_wrong_city(url, "", city, state=state):
             continue
 
         display_url = config.pop("display_url", url)
@@ -1243,7 +1903,7 @@ async def discover_from_probes(
 
 # ── Phase 2: Verify Freshness ──────────────────────────────────────────────────
 
-async def verify_freshness(candidate: dict, http: httpx.AsyncClient) -> dict:
+async def verify_freshness(candidate: dict, http: httpx.AsyncClient, city: str = "") -> dict:
     """Determine freshness of a candidate. Uses cached body if available."""
     platform = candidate["platform"]
     url = candidate["url"]
@@ -1364,6 +2024,45 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient) -> dict:
                         f" WARNING:no_council_body_top20"
                         f" (bodies found: {non_council_names})"
                     )
+
+                    # Wrong-city check: if body names indicate a different city's
+                    # Metropolitan government, mark as wrong_city.
+                    # Catches e.g. Louisville OH hitting the Louisville KY Legistar slug
+                    # (Louisville KY is "Louisville Metro Government" — top body is
+                    # "Metro Council" not "City Council").
+                    if city and slug:
+                        bodies_url = f"https://webapi.legistar.com/v1/{slug}/bodies"
+                        _, bodies_body = await safe_fetch(http, bodies_url, timeout=10.0)
+                        try:
+                            all_bodies = json.loads(bodies_body) if bodies_body else []
+                            all_body_names = [b.get("BodyName", "") for b in all_bodies if b.get("BodyName")]
+                            body_names_lower = [n.lower() for n in all_body_names]
+                            # Signal 1: top-level body is "Metro Council" (Louisville KY pattern)
+                            # — indicates this is a Metropolitan government, not a small city
+                            has_metro_council = any("metro council" in n for n in body_names_lower)
+                            # Signal 2: no body name matches "city council" (the expected gov body)
+                            # without also being a "metro" body
+                            has_city_council = any(
+                                "city council" in n and "metro" not in n
+                                for n in body_names_lower
+                            )
+                            # Also check city-specific wrong-city patterns in body names
+                            wrong_city_patterns = WRONG_CITY_PATTERNS.get(city, [])
+                            body_text_combined = " ".join(body_names_lower)
+                            wrong_match = next(
+                                (p for p in wrong_city_patterns if p.lower() in body_text_combined),
+                                None,
+                            )
+                            if (has_metro_council and not has_city_council) or wrong_match:
+                                top_names = all_body_names[:5]
+                                candidate["freshness"] = "wrong_city"
+                                candidate["notes"] = (
+                                    f"Legistar slug '{slug}' appears to be a different city's Metro govt"
+                                    f" (top bodies: {top_names})"
+                                )
+                                return candidate
+                        except (json.JSONDecodeError, TypeError):
+                            pass  # bodies check is best-effort
 
             dates = []
             for e in dates_events:
@@ -1498,6 +2197,57 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient) -> dict:
                         candidate["notes"] = (candidate.get("notes") or "") + f" council_cat:{cat_url}"
                         return candidate
             else:
+                # CivicPlus loads categories via AJAX, not static hrefs.
+                # Structure: <label for="N"><input type="checkbox" value="N">City Council</label>
+                # Extract the category ID from the label wrapping or adjacent to "City Council".
+                _COUNCIL_LABEL_RE = re.compile(
+                    r'(?:city[- ]?council|city[- ]?commission|council[- ]?meeting)',
+                    re.IGNORECASE,
+                )
+                ajax_cat_id = None
+                # Pattern A: <label for="N" ...>...(City Council text)...</label>
+                for label_m in re.finditer(r'<label[^>]+for=["\']?(\d+)["\']?[^>]*>(.*?)</label>', body, re.IGNORECASE | re.DOTALL):
+                    text = re.sub(r'<[^>]+>', '', label_m.group(2))
+                    if _COUNCIL_LABEL_RE.search(text):
+                        ajax_cat_id = label_m.group(1)
+                        break
+                if not ajax_cat_id:
+                    # Pattern B: <option value="N">City Council</option>
+                    for opt_m in re.finditer(r'<option[^>]+value=["\']?(\d+)["\']?[^>]*>(.*?)</option>', body, re.IGNORECASE | re.DOTALL):
+                        if _COUNCIL_LABEL_RE.search(opt_m.group(2)):
+                            ajax_cat_id = opt_m.group(1)
+                            break
+
+                if ajax_cat_id:
+                    parsed_url = urlparse(url)
+                    base = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    ajax_url = f"{base}/AgendaCenter/UpdateCategoryList"
+                    headers = {
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": url,
+                    }
+                    for yr in [TODAY.year, TODAY.year - 1]:
+                        try:
+                            ajax_resp = await http.post(
+                                ajax_url,
+                                content=f"catID={ajax_cat_id}&year={yr}",
+                                headers=headers,
+                                timeout=12.0,
+                            )
+                            if ajax_resp.status_code == 200 and ajax_resp.text:
+                                ajax_dates = extract_dates(ajax_resp.text)
+                                if ajax_dates:
+                                    most_recent = ajax_dates[0]
+                                    candidate["most_recent_date"] = most_recent.isoformat()
+                                    candidate["days_since_update"] = (TODAY - most_recent).days
+                                    candidate["date_source"] = "civicplus_ajax_council"
+                                    candidate["freshness"] = classify_freshness(most_recent)
+                                    candidate["notes"] = (candidate.get("notes") or "") + f" ajax_council_cat:{ajax_cat_id}"
+                                    return candidate
+                        except Exception:
+                            pass
+
                 # No City Council category link found — date will be from all categories.
                 # Mark so we can downgrade if the all-category dates look "fresh"
                 # (advisory boards may be active while city council is stale).
@@ -1601,18 +2351,155 @@ PLATFORM_TIER = {
     "boarddocs": 14, "municode": 12, "civicclerk": 12, "primegov": 12,
     "novus": 10, "diligent": 10, "unknown": 4,
 }
-SOURCE_BONUS = {"known": 10, "known_probe": 2, "tavily": 3, "probe": 0}
+SOURCE_BONUS = {"known": 10, "known_probe": 2, "tavily": 3, "ddg": 0, "probe": 0}
+
+# Known government meeting platform domains — always receive full trust
+_GOV_PLATFORM_DOMAINS = [
+    "legistar.com", "civicclerk.com", "granicus.com", "swagit.com",
+    "boarddocs.com", "escribemeetings.com", "municode.com",
+    "municodemeetings.com", "primegov.com", "novusagenda.com",
+    "diligentoneplatform.com", "civicweb.net", "civicengage.com",
+    "portal.civicclerk.com", "api.civicclerk.com",
+    "destinyhosted.com",  # Destiny Agenda — municipal agenda hosting platform
+]
+
+# Domain keyword fragments that structurally indicate content/media sites (not government)
+_CONTENT_SITE_DOMAIN_KEYWORDS = [
+    "news", "times", "herald", "journal", "tribune", "reporter",
+    "chronicle", "gazette", "press", "dispatch", "daily", "weekly",
+    "channel", "radio", "media", "broadcast", "network",
+    "hotel", "hotels", "agoda", "expedia", "kayak", "booking",
+    "apartments", "realty", "homes", "travel", "airbnb", "vrbo",
+    "weather", "accuweather",
+    "tiktok", "youtube", "facebook", "instagram", "twitter",
+    "forum", "patch", "blog",
+]
+
+# URL path fragments that structurally indicate content/media pages
+_CONTENT_SITE_PATH_PATTERNS = [
+    "/article/", "/articles/", "/story/", "/stories/",
+    "/news/local/", "/watch?", "/channel/", "/@", "/video/",
+]
 
 
-def candidate_score(c: dict) -> int:
+def classify_domain_trust(url: str, city: str = "", state: str = "") -> float:
+    """Return a trust multiplier (0.1–1.0) for how likely this URL is a gov source.
+
+    1.0 = verified government (.gov TLD) or known meeting platform
+    0.7 = city name found in domain (likely official city site)
+    0.4 = generic unknown domain (no government signal)
+    0.1 = structural content-site signals (news, TV, travel, social media)
+
+    This multiplier is applied to the freshness score so that news articles
+    with today's publication date (freshness=100) cannot outscore a government
+    SPA page with no static date (unknown_spa=55 × 1.0 = 55 vs 100 × 0.1 = 10).
+    """
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower().replace("www.", "")
+    url_lower = url.lower()
+
+    # Known government meeting platforms → full trust
+    for plat_domain in _GOV_PLATFORM_DOMAINS:
+        if plat_domain in netloc:
+            return 1.0
+
+    # .gov TLD → full trust
+    if netloc.endswith(".gov") or ".gov/" in url_lower:
+        return 1.0
+
+    # Structural content-site domain keywords → content site penalty
+    domain_base = netloc.split(".")[0] if "." in netloc else netloc
+    for kw in _CONTENT_SITE_DOMAIN_KEYWORDS:
+        if kw in domain_base or kw in netloc:
+            return 0.1
+
+    # Structural content-site URL path patterns
+    for pat in _CONTENT_SITE_PATH_PATTERNS:
+        if pat in url_lower:
+            return 0.1
+
+    # .tv TLD or "tv" in SLD → TV station (check BEFORE city-name match)
+    # Catches both auroratv.org (SLD ends in "tv") and wbtv.com (.tv TLD)
+    if netloc.endswith(".tv") or domain_base.endswith("tv") or domain_base.startswith("tv"):
+        return 0.1
+
+    # County government domain → reduced trust when searching for a city.
+    # Pattern: co.{county}.{state}.us  or  {county}county.gov/  or county.{name}.gov
+    # County agendas are for county commissioners, not city council.
+    _parts = netloc.split(".")
+    if (len(_parts) >= 4 and _parts[0] == "co" and _parts[-1] in ("us", "gov")) or \
+       ("county" in _parts[0] and netloc.endswith((".gov", ".us"))) or \
+       (len(_parts) >= 2 and _parts[0] == "county"):
+        return 0.3  # county gov: below city-name match (0.7) but above generic (0.4)
+
+    # City name in domain → likely official city website
+    if city:
+        city_slug = city.lower().replace(" ", "").replace("-", "").replace("'", "")
+        domain_clean = netloc.replace("-", "").replace(".", "")
+        if city_slug in domain_clean:
+            return 0.7
+        # State-qualified variant (e.g. "austintx" in "austintexas.gov")
+        if state:
+            state_lower = state.lower()
+            state_name_slug = _STATE_NAMES.get(state.upper(), "").lower().replace(" ", "")
+            if (city_slug + state_lower) in domain_clean:
+                return 0.7
+            if state_name_slug and (city_slug + state_name_slug[:4]) in domain_clean:
+                return 0.7
+
+    # Generic unknown domain
+    return 0.4
+
+
+def agenda_authority_score(c: dict) -> int:
+    """Return bonus points for URL/content signals that prove this is an agenda source.
+
+    Added on top of the trust-adjusted freshness score. Max ~45 points.
+    These bonuses reward government agenda pages that may have no parseable dates
+    (SPAs, JavaScript-rendered calendars) over unrelated pages that happen to be fresh.
+    """
+    url_lower = (c.get("url") or "").lower()
+    notes_lower = (c.get("notes") or "").lower()
+    score = 0
+
+    # Strong URL path signals
+    if "/agendacenter" in url_lower or "/agenda-center" in url_lower:
+        score += 20
+    elif "/agendas" in url_lower or "/agenda" in url_lower:
+        score += 15
+    if "/minutes" in url_lower:
+        score += 10
+    if "/citycouncil" in url_lower or "/city-council" in url_lower:
+        score += 8
+    elif "/council" in url_lower:
+        score += 5
+    if "/meetings" in url_lower or "/meeting" in url_lower:
+        score += 5
+
+    # Content signals from search snippet / notes
+    if "agenda" in notes_lower:
+        score += 5
+    if "minutes" in notes_lower:
+        score += 3
+
+    return score
+
+
+def candidate_score(c: dict, city: str = "", state: str = "") -> int:
     f = FRESHNESS_SCORE.get(c.get("freshness") or "", 0)
     p = PLATFORM_TIER.get(c.get("platform") or "unknown", 4)
     s = SOURCE_BONUS.get(c.get("source") or "probe", 0)
-    return f + p + s
+    b = 5 if c.get("body_match") else 0  # boost when title/content matches expected_body
+    a = agenda_authority_score(c)
+
+    # Trust multiplier: prevents content sites (news, TV, travel) that happen to have
+    # fresh publication dates from outscoring government agenda pages.
+    trust = classify_domain_trust(c.get("url") or "", city, state)
+    return int(f * trust) + p + s + b + a
 
 
-def rank_candidates(candidates: list[dict]) -> list[dict]:
-    ranked = sorted(candidates, key=candidate_score, reverse=True)
+def rank_candidates(candidates: list[dict], city: str = "", state: str = "") -> list[dict]:
+    ranked = sorted(candidates, key=lambda c: candidate_score(c, city, state), reverse=True)
     for i, c in enumerate(ranked):
         c["rank"] = i + 1
     return ranked
@@ -1954,6 +2841,7 @@ async def probe_with_playwright(
     url: str,
     city: str,
     state: str,
+    expected_body: str = "",
 ) -> dict:
     """
     Phase 5: Use Playwright headless browser to render JS-heavy pages.
@@ -2028,6 +2916,37 @@ async def probe_with_playwright(
                     )
                 )
                 dates = extract_dates(body_text)
+
+                # If expected_body is known, validate the rendered entity against it.
+                # This catches cases like school district BoardDocs pages whose HTML
+                # title is a street address (no keyword match in raw HTML) but whose
+                # JS-rendered content contains "School District" or "Board of Education".
+                if expected_body:
+                    body_text_lower = body_text.lower()
+                    expected_lower = expected_body.lower()
+                    body_name_confirmed = expected_lower in body_text_lower
+                    wrong_entity_in_text = any(
+                        kw in body_text_lower for kw in WRONG_ENTITY_PATTERNS
+                    )
+                    if not body_name_confirmed and wrong_entity_in_text:
+                        # Playwright rendered successfully but the entity is wrong.
+                        # Don't accept this as a valid source — mark wrong_entity so
+                        # the pipeline can continue searching for the correct source.
+                        wrong_kw = next(
+                            kw for kw in WRONG_ENTITY_PATTERNS if kw in body_text_lower
+                        )
+                        return {
+                            "success": True,
+                            "wrong_entity": True,
+                            "freshness": "wrong_entity",
+                            "most_recent_date": None,
+                            "date_source": "playwright_render",
+                            "note": (
+                                f"playwright: entity mismatch — "
+                                f"expected '{expected_body}' not found, "
+                                f"page contains '{wrong_kw}'"
+                            ),
+                        }
 
                 if dates and has_meeting_kw:
                     most_recent = dates[0]
@@ -2157,6 +3076,7 @@ async def run_source_discover(
     known_sources: dict,
     tavily: TavilyClient,
     http: httpx.AsyncClient,
+    expected_body: str = "",
 ) -> dict:
     start = time.monotonic()
     verified: list[dict] = []
@@ -2164,27 +3084,51 @@ async def run_source_discover(
     retries_used: list[str] = []
     retry_attempts = 0
 
+    # ── Layer 0: DotGov official domain injection ─────────────────────────────
+    # Before any web search, look up the city's official .gov domain from the
+    # CISA DotGov database. Injecting it into known_sources["domain"] causes:
+    #   • discover_from_known_sources() to probe /AgendaCenter on the .gov domain
+    #   • discover_from_probes() to probe the .gov domain for all _AGENDA_PATHS
+    #   • Retry 2 to skip its expensive domain-discovery search (domain already known)
+    # This is the highest-ROI fix for cities where web search returns noise instead
+    # of the official city site (small cities, ambiguous city names, etc.).
+    effective_known = dict(known_sources)
+    if "domain" not in effective_known:
+        gov_domain = lookup_gov_domain(city, state)
+        if gov_domain:
+            effective_known["domain"] = gov_domain
+            tavily_queries.append(f"[dotgov] {gov_domain}")
+    else:
+        effective_known = known_sources
+
     # ── Phase 1: Discover candidates ──────────────────────────────────────────
 
     # Strategy A: Check known sources
-    known_cands = await discover_from_known_sources(known_sources, http)
+    known_cands = await discover_from_known_sources(effective_known, http)
     seen_urls: set[str] = {c["url"] for c in known_cands}
 
-    # Strategy B: Search — Exa (primary) or Tavily (fallback).
-    # When EXA_API_KEY is set, use Exa as primary and skip the initial Tavily call.
-    # Tavily is still used for domain discovery (retry 2) and advanced retry queries.
-    use_exa = bool(os.environ.get("EXA_API_KEY"))
-    if use_exa:
-        exa_cands, exa_query = await discover_from_exa(city, state)
+    # Strategy B: Search — DDG (primary) → Exa → Tavily (fallbacks).
+    # DDG runs first: no API key needed and has broad government site coverage.
+    # Exa runs if DDG returns nothing and EXA_API_KEY is set.
+    # Tavily is the final fallback and also handles domain discovery in retry 2.
+    # Use expected_body from the manifest for more targeted queries.
+    body_term = expected_body or "city council"
+    state_name = _STATE_NAMES.get(state.upper(), state)
+    search_query = f"{city} {state_name} {body_term} agenda minutes"
+
+    ddg_cands, ddg_query = await discover_from_duckduckgo(city, state, query=search_query)
+    tavily_queries.append(f"[ddg] {ddg_query}")
+    search_cands = ddg_cands
+
+    if not search_cands and os.environ.get("EXA_API_KEY"):
+        exa_cands, exa_query = await discover_from_exa(city, state, query=search_query)
         if exa_query:
             tavily_queries.append(f"[exa] {exa_query}")
         search_cands = exa_cands
-        # If Exa returns nothing (API error, import failure), fall back to Tavily
-        if not search_cands:
-            search_cands, query_used = await discover_from_tavily(city, state, tavily, "basic")
-            tavily_queries.append(query_used)
-    else:
-        search_cands, query_used = await discover_from_tavily(city, state, tavily, "basic")
+
+    if not search_cands:
+        tavily_q = f"{city} {state} {body_term} meeting agendas minutes"
+        search_cands, query_used = await discover_from_tavily(city, state, tavily, "basic", query=tavily_q)
         tavily_queries.append(query_used)
 
     for c in search_cands:
@@ -2200,16 +3144,28 @@ async def run_source_discover(
         for c in all_phase1
     )
     if not has_recognized:
-        probe_cands = await discover_from_probes(city, state, known_sources, http)
+        probe_cands = await discover_from_probes(city, state, effective_known, http)
         for c in probe_cands:
             if c["url"] not in seen_urls:
                 seen_urls.add(c["url"])
                 all_phase1.append(c)
 
+    # Tag candidates whose title/content/notes contain the expected body name.
+    # This boosts the score of sources that are explicitly for the right body.
+    if expected_body:
+        expected_lower = expected_body.lower()
+        for c in all_phase1:
+            combined = " ".join([
+                (c.get("title") or ""),
+                (c.get("content") or ""),
+                (c.get("notes") or ""),
+            ]).lower()
+            c["body_match"] = expected_lower in combined
+
     # ── Phase 2: Verify freshness ──────────────────────────────────────────────
     for c in all_phase1:
         try:
-            vc = await verify_freshness(c, http)
+            vc = await verify_freshness(c, http, city=city)
         except Exception as e:
             c["freshness"] = "unknown"
             c["notes"] = (c.get("notes") or "") + f" verify_error: {str(e)[:100]}"
@@ -2218,7 +3174,7 @@ async def run_source_discover(
         verified.append(vc)
 
     # ── Phase 3: Rank ─────────────────────────────────────────────────────────
-    ranked = rank_candidates(verified)
+    ranked = rank_candidates(verified, city=city, state=state)
     best = ranked[0] if ranked else None
 
     # ── Retry loop ────────────────────────────────────────────────────────────
@@ -2228,10 +3184,12 @@ async def run_source_discover(
         if retry_attempts == 1:
             # Retry 1: Advanced Tavily with alternate queries
             retries_used.append("alternate_queries")
-            domain = known_sources.get("domain", "")
+            domain = effective_known.get("domain", "")
+            # Use expected_body in retry queries for more targeted results
+            body_term_retry = expected_body or "city council"
             alt_queries = [
-                f"{city} {state} city council agenda {TODAY.year}",
-                f"{city} {state} council meeting minutes recent",
+                f"{city} {state} {body_term_retry} agenda {TODAY.year}",
+                f"{city} {state} {body_term_retry} meeting minutes recent",
             ]
             if domain:
                 alt_queries.append(f"site:{domain} agenda OR minutes OR meeting")
@@ -2244,8 +3202,15 @@ async def run_source_discover(
                 for c in new_cands:
                     if c["url"] not in seen_urls:
                         seen_urls.add(c["url"])
+                        # Tag body_match on retry candidates too
+                        if expected_body:
+                            combined = " ".join([
+                                (c.get("title") or ""),
+                                (c.get("content") or ""),
+                            ]).lower()
+                            c["body_match"] = expected_body.lower() in combined
                         try:
-                            vc = await verify_freshness(c, http)
+                            vc = await verify_freshness(c, http, city=city)
                         except Exception:
                             vc = c
                         verified.append(vc)
@@ -2256,80 +3221,75 @@ async def run_source_discover(
                 break  # inner break propagated
 
         elif retry_attempts == 2:
-            # Retry 2: Official domain discovery → common path probe → homepage crawl
+            # Retry 2: Official domain discovery → common path probe → Playwright crawl
             #
             # Replicates the manual process: find the official city website, then look
             # for agendas there. This works for small cities where agenda-specific
-            # searches return 0 results but the city homepage is always indexed.
+            # searches return 0 results but the city homepage is always reachable.
             retries_used.append("domain_discovery")
-            domain = known_sources.get("domain", "")
+            domain = effective_known.get("domain", "")
 
-            # Step 2a: Discover domain if not already known
+            # Step 2a: Discover domain via Tavily search
             if not domain:
                 domain = await discover_official_domain(city, state, tavily) or ""
                 tavily_queries.append(f"[domain_discovery] {city} {state} official city government website")
 
-            # Step 2a-fallback: Tavily found nothing — try Claude web_search
-            # Handles small townships and obscure cities not in Tavily's index
+            # Step 2a-fallback-1: Tavily found nothing — try Claude web_search
             if not domain:
                 domain = await discover_official_domain_via_claude(city, state) or ""
                 if domain:
                     tavily_queries.append(f"[claude_websearch] {city} {state} official government website")
 
+            # Step 2a-fallback-2: Tavily and Claude both failed — try DDG for domain
+            if not domain:
+                ddg_domain_cands, ddg_dom_q = await discover_from_duckduckgo(
+                    city, state,
+                    query=f"{city} {state} official city government website",
+                    max_results=5,
+                )
+                tavily_queries.append(f"[ddg_domain] {ddg_dom_q}")
+                for c in ddg_domain_cands:
+                    parsed_d = urlparse(c["url"]).netloc.replace("www.", "")
+                    if parsed_d.endswith(".gov") or city.lower().replace(" ", "") in parsed_d.replace("-", "").replace(".", ""):
+                        domain = parsed_d
+                        break
+
             if not domain:
                 break
 
-            # Step 2b: Probe common agenda paths on the discovered domain
+            # Step 2b: Probe common agenda paths on the discovered domain (fast, httpx)
             domain_cands = await probe_domain_for_agendas(domain, http)
             for c in domain_cands:
                 if c["url"] not in seen_urls:
                     seen_urls.add(c["url"])
                     try:
-                        vc = await verify_freshness(c, http)
+                        vc = await verify_freshness(c, http, city=city)
                     except Exception:
                         vc = c
                     verified.append(vc)
                     if vc.get("freshness") == "fresh":
                         break
 
-            # Step 2c: Fallback — scan homepage HTML for agenda keyword links
-            # (catches custom CMS layouts where agendas are at non-standard paths)
+            # Step 2c: Playwright site crawl — when standard paths find nothing.
+            # Handles JS-rendered city CMSes and non-standard URL structures.
+            # Follows homepage navigation links to find the council/meetings section,
+            # with entity validation to avoid accepting wrong-body pages.
             if not any(v.get("freshness") == "fresh" for v in verified):
-                homepage_body = ""
-                for base in [f"https://{domain}", f"https://www.{domain}"]:
-                    hs, hb = await safe_fetch(http, base, timeout=15.0)
-                    if hs == 200 and hb:
-                        homepage_body = hb
-                        break
-                if homepage_body:
-                    kw_re = re.compile(r"agenda|minute|meeting|council|clerk|legislative", re.IGNORECASE)
-                    link_re = re.compile(r'href=["\']([^"\'<>\s]+)["\']', re.IGNORECASE)
-                    deep_count = 0
-                    for m in link_re.finditer(homepage_body):
-                        link = m.group(1)
-                        if not kw_re.search(link):
-                            continue
-                        if link.startswith("/"):
-                            link = f"https://{domain}{link}"
-                        elif not link.startswith("http"):
-                            continue
-                        if link in seen_urls:
-                            continue
-                        seen_urls.add(link)
-                        platform = detect_platform(link)
-                        c = make_candidate(url=link, platform=platform, source="domain_probe")
-                        try:
-                            vc = await verify_freshness(c, http)
-                        except Exception:
-                            vc = c
-                        verified.append(vc)
-                        deep_count += 1
-                        if vc.get("freshness") == "fresh":
-                            break
-                        if deep_count >= 5:
+                crawl_cands = await playwright_crawl_city_site(
+                    domain, city, state, expected_body=expected_body
+                )
+                for c in crawl_cands:
+                    if c["url"] not in seen_urls:
+                        seen_urls.add(c["url"])
+                        if expected_body:
+                            c["body_match"] = expected_body.lower() in (
+                                c.get("notes") or ""
+                            ).lower()
+                        verified.append(c)
+                        if c.get("freshness") == "fresh":
                             break
 
-        ranked = rank_candidates(verified)
+        ranked = rank_candidates(verified, city=city, state=state)
         best = ranked[0] if ranked else None
         if best and best.get("freshness") == "fresh":
             break
@@ -2364,13 +3324,13 @@ async def run_source_discover(
             upgraded = await deep_probe_candidate(target, city, state, http)
             if upgraded:
                 any_changed = True
-                ranked = rank_candidates(verified)  # re-rank after upgrade
+                ranked = rank_candidates(verified, city=city, state=state)  # re-rank after upgrade
                 best = ranked[0]
                 if best.get("freshness") == "fresh" and best.get("platform") != "unknown":
                     break
         # Always re-rank at end of Phase 4 — some probes mutate freshness without
         # returning True (e.g. CivicClerk false-positive downgrade to empty).
-        ranked = rank_candidates(verified)
+        ranked = rank_candidates(verified, city=city, state=state)
         best = ranked[0] if ranked else None
 
     # ── Phase 5: Playwright Browser Rendering ─────────────────────────────────
@@ -2381,17 +3341,36 @@ async def run_source_discover(
     #   - Bot-blocked city websites (403) where a real browser bypasses protection
     #   - Unknown platforms that only serve content after JS execution
     playwright_urls_tried: list[str] = []
-    if best and best.get("freshness") not in ("fresh",):
+    # Run Playwright if best is not fresh, OR if best has no body_match but there
+    # are body_match=True candidates that are blocked/unknown (e.g. real city site
+    # returning 403 while a wrong-entity site ranked higher due to a fresh date).
+    _has_unprobed_body_matches = any(
+        c.get("body_match") and c.get("freshness") in ("unknown_spa", "stale", "stale_warning", "unknown", "blocked")
+        for c in ranked[:6]
+    )
+    if best and (best.get("freshness") not in ("fresh",) or (not best.get("body_match") and _has_unprobed_body_matches)):
         play_targets = [
-            c for c in ranked[:4]
+            c for c in ranked[:6]
             if c.get("freshness") in ("unknown_spa", "stale", "stale_warning", "unknown", "blocked")
         ]
+        # Prioritize body_match=True candidates so we probe the right entity first
+        play_targets.sort(key=lambda c: (0 if c.get("body_match") else 1))
         for target in play_targets:
             playwright_urls_tried.append(target["url"])
-            play_result = await probe_with_playwright(target["url"], city, state)
+            play_result = await probe_with_playwright(
+                target["url"], city, state, expected_body=expected_body
+            )
             existing_notes = (target.get("notes") or "").strip()
             if play_result.get("success"):
-                if play_result.get("most_recent_date"):
+                if play_result.get("wrong_entity"):
+                    # Playwright confirmed this is the wrong entity — downgrade it so
+                    # the pipeline doesn't accept a school district / library / etc.
+                    target["freshness"] = "wrong_entity"
+                    target["wrong_entity_reason"] = play_result.get("note", "playwright entity validation")
+                    note = play_result.get("note", "playwright: wrong_entity detected")
+                    target["notes"] = f"{existing_notes} {note}".strip()
+                    # Don't break — keep trying other candidates
+                elif play_result.get("most_recent_date"):
                     target["freshness"] = play_result["freshness"]
                     target["most_recent_date"] = play_result.get("most_recent_date")
                     target["days_since_update"] = play_result.get("days_since_update")
@@ -2404,14 +3383,14 @@ async def run_source_discover(
                         target["freshness"] = "unknown_spa"
                     note = play_result.get("note", "Playwright rendered — no dates")
                     target["notes"] = f"{existing_notes} {note}".strip()
-                ranked = rank_candidates(verified)
+                ranked = rank_candidates(verified, city=city, state=state)
                 best = ranked[0]
-                if play_result.get("freshness") == "fresh":
+                if play_result.get("freshness") == "fresh" and not play_result.get("wrong_entity"):
                     break  # fresh source found — stop trying
             else:
                 error = play_result.get("error", "unknown_error")
                 target["notes"] = f"{existing_notes} playwright:failed({error[:60]})".strip()
-        ranked = rank_candidates(verified)
+        ranked = rank_candidates(verified, city=city, state=state)
         best = ranked[0] if ranked else None
 
     # ── Phase 5b: City domain crawl with Playwright ───────────────────────────
@@ -2422,8 +3401,8 @@ async def run_source_discover(
     # Limit: 4 paths max, www.domain only, stop after 2 consecutive no-content failures.
     if best and best.get("freshness") not in ("fresh",) and playwright_urls_tried:
         domain = (
-            known_sources.get("domain")
-            or known_sources.get("civicplus_domain")
+            effective_known.get("domain")
+            or effective_known.get("civicplus_domain")
         )
         if domain:
             common_agenda_paths = [
@@ -2449,7 +3428,7 @@ async def run_source_discover(
                     new_cand["date_source"] = play_result.get("date_source")
                     new_cand["notes"] = play_result.get("note", "playwright_crawl")
                     verified.append(new_cand)
-                    ranked = rank_candidates(verified)
+                    ranked = rank_candidates(verified, city=city, state=state)
                     best = ranked[0]
                     if play_result.get("freshness") == "fresh":
                         break
@@ -2509,7 +3488,7 @@ async def run_source_discover(
     # All candidates output (top 10, _body already stripped by verify_freshness)
     all_candidates_out = []
     for c in ranked[:10]:
-        all_candidates_out.append({
+        entry = {
             "platform": c.get("platform"),
             "url": c.get("url"),
             "source": c.get("source"),
@@ -2517,7 +3496,10 @@ async def run_source_discover(
             "most_recent_date": c.get("most_recent_date"),
             "rank": c.get("rank"),
             "notes": (c.get("notes") or "").strip(),
-        })
+        }
+        if c.get("body_match") is not None:
+            entry["body_match"] = c["body_match"]
+        all_candidates_out.append(entry)
 
     return {
         "city": city,
@@ -2555,51 +3537,23 @@ async def process_city(
     city = city_info["city"]
     state = city_info["state"]
     slug = city_to_slug(city)
-    base_dir = output_dir if output_dir else SOURCES_DIR
-    output_path = base_dir / f"{slug}-{state}" / "source.json"
 
-    # --resume: skip any city that has a non-empty source.json (legacy flag)
-    # --skip-existing: skip cities with a valid source (freshness not wrong_entity/stale/empty)
-    #   This mirrors collect_haystaq_batch.py --skip-existing behavior.
-    should_skip_check = (resume or skip_existing) and output_path.exists()
-    if should_skip_check:
+    # --resume / --skip-existing: read existing result from S3 (no local files)
+    if (resume or skip_existing) and storage is not None:
+        s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
         try:
-            with open(output_path) as f:
-                existing = json.load(f)
-            bs = existing.get("best_source") or {}
-            freshness = bs.get("freshness", "")
-            # Re-run if: empty source, or wrong_entity (needs re-discovery), or stale
-            if skip_existing:
-                # --skip-existing: only skip if source is genuinely good
-                rerun_freshnesses = {"empty", "wrong_entity", "stale"}
+            if storage.exists(s3_key):
+                existing = storage.read_json(s3_key)
+                bs = existing.get("best_source") or {}
+                freshness = bs.get("freshness", "")
+                rerun_freshnesses = {"empty", "wrong_entity", "stale"} if skip_existing else {"empty"}
                 if freshness not in rerun_freshnesses:
                     print(
                         f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
                     )
-                    # Still sync local file to S3 in case S3 is behind local disk.
-                    if storage is not None:
-                        s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
-                        try:
-                            storage.write_json(s3_key, existing)
-                        except Exception as e:
-                            print(f"  [warn] Could not sync source.json to S3 for {city}, {state}: {e}")
                     return existing
-            else:
-                # --resume: skip everything except empty
-                if freshness != "empty":
-                    print(
-                        f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
-                    )
-                    # Still sync local file to S3 in case S3 is behind local disk.
-                    if storage is not None:
-                        s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
-                        try:
-                            storage.write_json(s3_key, existing)
-                        except Exception as e:
-                            print(f"  [warn] Could not sync source.json to S3 for {city}, {state}: {e}")
-                    return existing
-        except (json.JSONDecodeError, OSError):
-            pass  # re-run if file is corrupt
+        except Exception:
+            pass  # re-run if S3 read fails
 
     async with semaphore:
         key = f"{city}, {state}"
@@ -2616,17 +3570,23 @@ async def process_city(
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
         }
+        # Load manifest to get expected_body for targeted search queries
+        expected_body = ""
+        if storage is not None:
+            manifest_key = f"{sources_prefix}/{slug}-{state}/manifest.json"
+            try:
+                if storage.exists(manifest_key):
+                    manifest = storage.read_json(manifest_key)
+                    expected_body = (manifest or {}).get("expected_body", "")
+            except Exception:
+                pass
+
         async with httpx.AsyncClient(headers=headers, timeout=20.0) as http:
-            result = await run_source_discover(city, state, known_sources, tavily, http)
+            result = await run_source_discover(
+                city, state, known_sources, tavily, http, expected_body=expected_body
+            )
 
-        if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, "w") as f:
-                json.dump(result, f, indent=2)
-
-        # Upload to S3 so the router always reads the current platform from S3.
-        # source_discover.py writes locally; without this upload the router would
-        # continue routing to whatever stale platform was previously stored in S3.
+        # Write to S3 only — no local files
         if storage is not None:
             s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
             try:
@@ -2728,12 +3688,6 @@ async def run_batch(
             "warnings": r.get("warnings", []),
         })
 
-    out_dir = output_dir if output_dir else SOURCES_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = out_dir / "discovery-summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
     print(f"\n{'='*78}")
     print(f"SUMMARY — {total_elapsed}s total ({total_elapsed/max(len(cities),1):.1f}s avg/city)")
     print(f"{'='*78}")
@@ -2746,8 +3700,17 @@ async def run_batch(
     print(f"  Unknown:        {summary['unknown']}")
     print(f"  No source:      {summary['no_source']}")
     print(f"  Migrations:     {summary['migrations_detected']}")
-    print(f"\n  Per-city JSON → {SOURCES_DIR}/")
-    print(f"  Summary        → {summary_path}")
+
+    # Write summary to S3
+    if storage is not None:
+        summary_key = f"{sources_prefix}/discovery-summary.json"
+        try:
+            storage.write_json(summary_key, summary)
+            print(f"\n  Summary → s3://{summary_key}")
+        except Exception as e:
+            print(f"\n  [warn] Could not upload summary to S3: {e}")
+    else:
+        print(f"\n  [warn] No storage backend — summary not persisted")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -2767,6 +3730,14 @@ def main() -> None:
         help=(
             "Use serve_users.csv as the city list instead of the hardcoded PILOT_CITIES. "
             "CSV State/Region column uses full state names (e.g. 'Ohio')."
+        ),
+    )
+    parser.add_argument(
+        "--csv",
+        metavar="PATH",
+        help=(
+            "Path to an alternate CSV file. Must have 'City' and 'State' columns "
+            "(2-letter state abbreviations). Implies --from-csv behavior."
         ),
     )
     parser.add_argument(
@@ -2790,9 +3761,9 @@ def main() -> None:
 
     exa_key = os.environ.get("EXA_API_KEY")
     if exa_key:
-        print("  [search backend] Exa (primary) + Tavily (fallback/domain-discovery)")
+        print("  [search backend] DDG (primary) → Exa → Tavily (fallbacks)")
     else:
-        print("  [search backend] Tavily (set EXA_API_KEY to enable Exa as primary)")
+        print("  [search backend] DDG (primary) → Tavily (fallback; set EXA_API_KEY to also enable Exa)")
 
     from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
     cfg = AgentConfig.from_env()
@@ -2800,8 +3771,24 @@ def main() -> None:
     registry = storage.read_json(REGISTRY_S3_KEY)
     tavily = TavilyClient(api_key=api_key)
 
-    # City list: --from-csv uses serve_users.csv; otherwise use hardcoded PILOT_CITIES
-    if args.from_csv:
+    # City list: --csv or --from-csv uses a CSV file; otherwise use hardcoded PILOT_CITIES
+    if args.csv:
+        import pathlib
+        alt_csv = pathlib.Path(args.csv)
+        if not alt_csv.exists():
+            print(f"ERROR: {alt_csv} not found")
+            sys.exit(1)
+        seen: set[tuple[str, str]] = set()
+        all_cities = []
+        for row in csv.DictReader(alt_csv.open()):
+            city = row.get("City", "").strip()
+            state = row.get("State", "").strip().upper()
+            if not city or not state or (city, state) in seen:
+                continue
+            seen.add((city, state))
+            all_cities.append({"city": city, "state": state})
+        city_source = f"{alt_csv.name} ({len(all_cities)} cities)"
+    elif args.from_csv:
         all_cities = get_serve_csv_cities()
         city_source = f"serve_users.csv ({len(all_cities)} cities)"
     else:

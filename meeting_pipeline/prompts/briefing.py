@@ -90,6 +90,7 @@ Below are all agenda items. For each one:
 2. Write a 1-2 sentence plain-language description
 3. Assign a category: procedural, consent, informational, vote_required, direction_setting, or public_hearing
 4. Decide if it's a genuine priority (isPriority=true) and assign a priorityScore (1-10)
+5. For isPriority=true items only: populate source_citations with verbatim sentences copied exactly from the FULL AGENDA SOURCE DOCUMENT. Use field names: "fiscal_amounts" for the sentence containing the dollar figure, "vote_type" for the sentence describing what action council takes, "description" for the sentence(s) that best describe the item. Copy exact wording — do not paraphrase. Omit a citation if no direct supporting sentence exists.
 
 Category definitions:
 - procedural: Call to order, adjournment, pledge, invocation, approval of agenda, approval of minutes
@@ -112,7 +113,9 @@ NEVER mark as priority:
 - Liquor license transfers or routine permit approvals
 - Proclamations, designations of commemorative days
 - Public comment periods (these are procedural, not a priority item)
-- Consent agenda items unless individually significant
+- Approval of payment of bills, accounts payable, vouchers, or city payroll — these are routine financial approvals regardless of dollar amount
+- Approval of prior meeting minutes
+- Consent agenda items unless individually significant (a large dollar total in a routine bill payment or payroll approval does NOT make it individually significant)
 - "Reports and Communications" or generic informational headers
 
 Mark at most 6-8 items as priority, even on large agendas. If fewer than 3 items qualify, that's fine.
@@ -266,13 +269,13 @@ GROUNDING RULE: whoIsPresenting and supportingContext must only contain facts th
 
 Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY.
 
-1. **whatIsHappening** (~30 words, 2 sentences max): Lead with what is physically happening {day_name}, not background history. What action is being taken and why now? History belongs in supportingContext.
+1. **whatIsHappening** (~30 words, 2 sentences max): Lead with what is physically happening {day_name}, not background history. What action is being taken and why now? History belongs in supportingContext. Then add an entry to source_citations: field="whatIsHappening", quote=the verbatim sentence from the FULL AGENDA DOCUMENT that best supports what you wrote. Copy exact wording — do not paraphrase. Omit if no direct match exists.
 
-2. **whatDecision** (~25 words, 1-2 sentences): Open with one of: "Vote required." / "No vote — direction setting." / "No vote — informational." Then in one sentence name what specifically is being decided or shaped.
+2. **whatDecision** (~25 words, 1-2 sentences): Open with one of: "Vote required." / "No vote — direction setting." / "No vote — informational." Then in one sentence name what specifically is being decided or shaped. Then add a source_citations entry: field="whatDecision", quote=the verbatim sentence from the source that names the specific decision or action.
 
-3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count.
+3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count. Then add a source_citations entry: field="whyItMatters", quote=the verbatim sentence from the source that most directly supports the impact or dollar figure you cited.
 
-4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision.
+4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision. Then add a source_citations entry: field="recommendation", quote=the verbatim sentence from the source that grounds your recommendation (e.g. a staff recommendation statement, a cost justification, or a timeline).
 
 5. **actionItem** (~28 words, 1 sentence): One specific pre-meeting action. Be concrete: "Before {day_name}, review the [document]" or "Call [person] and ask about [specific thing]".
 

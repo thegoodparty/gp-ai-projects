@@ -42,6 +42,8 @@ class LegistarConfig:
     page_size: int = 100
     request_timeout: int = 30
     rate_limit_delay: float = 0.25
+    expected_body: str = ""  # e.g. "City Council" — filters events/matters to matching bodies
+    agendas_only: bool = False  # If True, skip matter attachments (steps 4-5) — much faster
 
 
 @dataclass
@@ -165,6 +167,18 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
         print(f"     Found {len(bodies)} bodies")
         print()
 
+        # Body filter: if expected_body is set, restrict events/matters to matching bodies
+        body_ids_to_keep: set[int] = set()
+        if config.expected_body:
+            expected_lower = config.expected_body.lower()
+            body_ids_to_keep = {
+                b["BodyId"] for b in bodies
+                if expected_lower in b.get("BodyName", "").lower()
+            }
+            print(f"  [body filter] expected_body={config.expected_body!r} matched {len(body_ids_to_keep)} of {len(bodies)} bodies")
+            if not body_ids_to_keep:
+                print(f"  WARNING: [body filter] No bodies matched {config.expected_body!r} — collecting all bodies (degrading gracefully)")
+
         # 2. EVENTS
         print("2/7  Fetching events (meetings)...")
         events = await _fetch_all_pages(
@@ -172,6 +186,8 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
             odata_filter=f"EventDate ge datetime'{six_months_ago}'",
             orderby="EventDate desc",
         )
+        if body_ids_to_keep:
+            events = [e for e in events if e.get("EventBodyId") in body_ids_to_keep]
         config.storage.write_json(f"{config.output_prefix}/events.json", events)
         print(f"     Found {len(events)} events")
         print()
@@ -188,51 +204,62 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
         print()
 
         # 4. MATTERS
-        print("4/7  Fetching recent matters (legislation)...")
-        matters = await _fetch_all_pages(
-            client, f"{base_url}/matters", config.page_size, config.rate_limit_delay,
-            odata_filter=f"MatterIntroDate ge datetime'{six_months_ago}'",
-            orderby="MatterIntroDate desc",
-        )
-        config.storage.write_json(f"{config.output_prefix}/matters.json", matters)
-        print(f"     Found {len(matters)} matters")
-        print()
+        matters = []
+        pdf_count = 0
+        if config.agendas_only:
+            print("4/7  Skipping matters (agendas_only=True)")
+            print()
+        else:
+            print("4/7  Fetching recent matters (legislation)...")
+            matters = await _fetch_all_pages(
+                client, f"{base_url}/matters", config.page_size, config.rate_limit_delay,
+                odata_filter=f"MatterIntroDate ge datetime'{six_months_ago}'",
+                orderby="MatterIntroDate desc",
+            )
+            if body_ids_to_keep:
+                matters = [m for m in matters if m.get("MatterBodyId") in body_ids_to_keep]
+            config.storage.write_json(f"{config.output_prefix}/matters.json", matters)
+            print(f"     Found {len(matters)} matters")
+            print()
 
         # 5. MATTER DETAILS + PDFs
-        print("5/7  Fetching matter histories, attachments, and downloading PDFs...")
-        pdf_count = 0
-        skipped_count = 0
+        if config.agendas_only:
+            print("5/7  Skipping matter histories/attachments (agendas_only=True)")
+            print()
+        else:
+            print("5/7  Fetching matter histories, attachments, and downloading PDFs...")
+            skipped_count = 0
 
-        for i, matter in enumerate(matters):
-            matter_id = matter["MatterId"]
-            history_key = f"{config.output_prefix}/matter_histories/{matter_id}.json"
-            if config.storage.exists(history_key):
-                skipped_count += 1
-                pdf_count += _count_existing_pdfs(config.output_prefix, matter_id, config.storage)
-                continue
+            for i, matter in enumerate(matters):
+                matter_id = matter["MatterId"]
+                history_key = f"{config.output_prefix}/matter_histories/{matter_id}.json"
+                if config.storage.exists(history_key):
+                    skipped_count += 1
+                    pdf_count += _count_existing_pdfs(config.output_prefix, matter_id, config.storage)
+                    continue
 
-            histories = await _fetch_json(client, f"{base_url}/matters/{matter_id}/histories")
-            config.storage.write_json(history_key, histories)
+                histories = await _fetch_json(client, f"{base_url}/matters/{matter_id}/histories")
+                config.storage.write_json(history_key, histories)
 
-            attachments = await _fetch_json(client, f"{base_url}/matters/{matter_id}/attachments")
-            config.storage.write_json(f"{config.output_prefix}/matter_attachments/{matter_id}.json", attachments)
+                attachments = await _fetch_json(client, f"{base_url}/matters/{matter_id}/attachments")
+                config.storage.write_json(f"{config.output_prefix}/matter_attachments/{matter_id}.json", attachments)
 
-            for att in attachments:
-                pdf_url = att.get("MatterAttachmentHyperlink")
-                if pdf_url:
-                    filename = f"{matter_id}_{att['MatterAttachmentId']}.pdf"
-                    pdf_key = f"{config.output_prefix}/attachments/{filename}"
-                    success = await _download_file(client, pdf_url, pdf_key, config.storage)
-                    if success:
-                        pdf_count += 1
-                    await asyncio.sleep(config.rate_limit_delay)
+                for att in attachments:
+                    pdf_url = att.get("MatterAttachmentHyperlink")
+                    if pdf_url:
+                        filename = f"{matter_id}_{att['MatterAttachmentId']}.pdf"
+                        pdf_key = f"{config.output_prefix}/attachments/{filename}"
+                        success = await _download_file(client, pdf_url, pdf_key, config.storage)
+                        if success:
+                            pdf_count += 1
+                        await asyncio.sleep(config.rate_limit_delay)
 
-            if i % 10 == 0:
-                print(f"     Processing matter {i + 1}/{len(matters)} ({skipped_count} skipped)...")
-            await asyncio.sleep(config.rate_limit_delay)
+                if i % 10 == 0:
+                    print(f"     Processing matter {i + 1}/{len(matters)} ({skipped_count} skipped)...")
+                await asyncio.sleep(config.rate_limit_delay)
 
-        print(f"     Downloaded {pdf_count} PDF attachments")
-        print()
+            print(f"     Downloaded {pdf_count} PDF attachments")
+            print()
 
         # 6. VOTES
         print("6/7  Fetching vote records...")
