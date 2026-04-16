@@ -57,10 +57,23 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.body_validation import (
+    REJECT_KEYWORDS,
+    GOVERNING_KEYWORDS,
+    score_body_match,
+    best_body_match,
+    validate_legistar_body,
+    validate_civicplus_body,
+    validate_civicclerk_body,
+    validate_boarddocs_body,
+    apply_body_validation as _apply_body_validation,
+    validate_body_for_city,
+)
 
-LOOKAHEAD_DAYS = 90  # How many days ahead to look for meetings
-SUPPORTED_PLATFORMS = {"legistar", "civicplus", "boarddocs", "civicclerk", "escribe"}
-
+LOOKAHEAD_DAYS = 90   # How many days ahead to look for meetings
+LOOKBACK_DAYS = 60    # How many days back to include (for last meeting date)
+# escribe is collected but has no lightweight scan endpoint — excluded from scan
+SUPPORTED_PLATFORMS = {"legistar", "civicplus", "boarddocs", "civicclerk"}
 
 # ============================================================================
 # PER-PLATFORM LIGHTWEIGHT SCANNERS
@@ -76,17 +89,19 @@ async def scan_legistar(city: str, config: dict, client: httpx.AsyncClient) -> l
     if not slug:
         return []
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    cutoff = (datetime.now() + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
+    today_dt = datetime.now()
+    start = (today_dt - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    today = today_dt.strftime("%Y-%m-%d")
+    cutoff = (today_dt + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
     base_url = f"https://webapi.legistar.com/v1/{slug}"
 
     try:
         resp = await client.get(
             f"{base_url}/events",
             params={
-                "$filter": f"EventDate ge datetime'{today}' and EventDate le datetime'{cutoff}'",
+                "$filter": f"EventDate ge datetime'{start}' and EventDate le datetime'{cutoff}'",
                 "$orderby": "EventDate asc",
-                "$top": 20,
+                "$top": 50,
             },
             timeout=15,
         )
@@ -102,9 +117,7 @@ async def scan_legistar(city: str, config: dict, client: httpx.AsyncClient) -> l
         date = date_raw[:10] if date_raw else None
         if not date:
             continue
-        # agenda_url from EventAgendaFile (viewer link) or EventVideoPath
         agenda_url = ev.get("EventAgendaFile") or None
-        # EventAgendaLastPublishedUTC non-null means the agenda was published
         published = ev.get("EventAgendaLastPublishedUTC")
         agenda_posted = bool(published and published != "0001-01-01T00:00:00")
 
@@ -114,6 +127,7 @@ async def scan_legistar(city: str, config: dict, client: httpx.AsyncClient) -> l
             "agenda_posted": agenda_posted,
             "agenda_url": agenda_url,
             "event_id": str(ev.get("EventId", "")),
+            "status": "past" if date < today else "upcoming",
         })
 
     return upcoming
@@ -135,25 +149,37 @@ async def scan_civicplus(city: str, config: dict, source_url: str, client: httpx
 
     cat_id = config.get("council_category_id") or config.get("category_id")
 
+    today = datetime.now().date()
+    start = today - timedelta(days=LOOKBACK_DAYS)
+    cutoff = today + timedelta(days=LOOKAHEAD_DAYS)
+    current_year = today.year
+
     try:
         if not cat_id:
             cat_id, _ = await find_council_category(client, domain)
 
-        meetings = await fetch_meeting_list(client, domain, cat_id, datetime.now().year)
+        # Fetch current year meetings
+        raw = await fetch_meeting_list(client, domain, cat_id, current_year)
+
+        # If the lookback window spans into last year (Jan–Feb), also fetch prev year
+        if start.year < current_year:
+            try:
+                prev_year_meetings = await fetch_meeting_list(client, domain, cat_id, current_year - 1)
+                raw = prev_year_meetings + raw
+            except Exception:
+                pass  # best-effort
+
     except Exception as e:
         print(f"    CivicPlus fetch error for {domain}: {e}")
         return []
 
-    today = datetime.now().date()
-    cutoff = today + timedelta(days=LOOKAHEAD_DAYS)
     upcoming = []
-
-    for m in meetings:
+    for m in raw:
         try:
             date_obj = datetime.strptime(m.date, "%Y-%m-%d").date()
         except ValueError:
             continue
-        if date_obj < today or date_obj > cutoff:
+        if date_obj < start or date_obj > cutoff:
             continue
         upcoming.append({
             "date": m.date,
@@ -161,6 +187,7 @@ async def scan_civicplus(city: str, config: dict, source_url: str, client: httpx
             "agenda_posted": bool(m.agenda_pdf_url),
             "agenda_url": m.agenda_pdf_url,
             "event_id": m.agenda_id,
+            "status": "past" if date_obj < today else "upcoming",
         })
 
     upcoming.sort(key=lambda m: m["date"])
@@ -209,7 +236,9 @@ async def scan_boarddocs(city: str, config: dict, source_url: str, client: httpx
         council_committees = committees[:1]
 
     today = datetime.now().date()
+    start = today - timedelta(days=LOOKBACK_DAYS)
     cutoff = today + timedelta(days=LOOKAHEAD_DAYS)
+    start_str = start.strftime("%Y%m%d")
     today_str = today.strftime("%Y%m%d")
     cutoff_str = cutoff.strftime("%Y%m%d")
     upcoming = []
@@ -220,7 +249,7 @@ async def scan_boarddocs(city: str, config: dict, source_url: str, client: httpx
             num_date = str(m.get("numberdate", ""))
             if not num_date or len(num_date) < 8:
                 continue
-            if num_date < today_str or num_date > cutoff_str:
+            if num_date < start_str or num_date > cutoff_str:
                 continue
             try:
                 date_str = datetime.strptime(num_date[:8], "%Y%m%d").strftime("%Y-%m-%d")
@@ -233,6 +262,7 @@ async def scan_boarddocs(city: str, config: dict, source_url: str, client: httpx
                 "agenda_posted": bool(agenda_url),
                 "agenda_url": agenda_url,
                 "event_id": str(m.get("EventId", m.get("unique", ""))),
+                "status": "past" if num_date < today_str else "upcoming",
             })
 
     upcoming.sort(key=lambda m: m["date"])
@@ -252,16 +282,18 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
     else:
         tenant = match.group(1)
 
-    today = datetime.now().strftime("%Y-%m-%dT00:00:00")
-    cutoff = (datetime.now() + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y-%m-%dT00:00:00")
+    today_dt = datetime.now()
+    today_str = today_dt.strftime("%Y-%m-%d")
+    start = (today_dt - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT00:00:00")
+    cutoff = (today_dt + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y-%m-%dT00:00:00")
 
     try:
         resp = await client.get(
             f"https://{tenant}.api.civicclerk.com/v1/Events/",
             params={
-                "$filter": f"MeetingStartDate ge {today} and MeetingStartDate le {cutoff}",
+                "$filter": f"MeetingStartDate ge {start} and MeetingStartDate le {cutoff}",
                 "$orderby": "MeetingStartDate asc",
-                "$top": 20,
+                "$top": 50,
             },
             timeout=15,
         )
@@ -278,7 +310,6 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
         date = date_raw[:10] if date_raw else None
         if not date:
             continue
-        # Agenda is posted if AgendaFile or AgendaPostedDate is present
         agenda_url = ev.get("AgendaFile") or ev.get("AgendaUrl") or None
         agenda_posted = bool(agenda_url) or bool(ev.get("AgendaPostedDate"))
         upcoming.append({
@@ -287,6 +318,7 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
             "agenda_posted": agenda_posted,
             "agenda_url": agenda_url,
             "event_id": str(ev.get("EventId", ev.get("Id", ""))),
+            "status": "past" if date < today_str else "upcoming",
         })
 
     return upcoming
@@ -296,7 +328,14 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
 # MAIN SCAN DISPATCHER
 # ============================================================================
 
-async def scan_city(slug: str, source: dict, client: httpx.AsyncClient) -> dict | None:
+async def scan_city(
+    slug: str,
+    source: dict,
+    source_key: str,
+    client: httpx.AsyncClient,
+    storage,
+    skip_body_validation: bool = False,
+) -> dict | None:
     """Scan one city's upcoming meetings. Returns the upcoming_meetings record."""
     best = source.get("best_source") or {}
     platform = best.get("platform", "")
@@ -308,6 +347,33 @@ async def scan_city(slug: str, source: dict, client: httpx.AsyncClient) -> dict 
     # Derive body name from source
     body = best.get("expected_body", config.get("expected_body", ""))
 
+    # ── Stage 1: Body validation (before any PDF downloads) ──────────────
+    body_validation: dict = {}
+    if not skip_body_validation and platform in SUPPORTED_PLATFORMS:
+        body_validation = await validate_body_for_city(slug, source, source_key, client, storage)
+
+        status = body_validation.get("status", "skip")
+        validated_body = body_validation.get("validated_body")
+
+        if status == "unresolved":
+            # Don't block scan — but flag it clearly so orchestrator can skip collection
+            print(f"\n      ⚠ BODY MISMATCH: {body_validation.get('reason')}")
+        elif status == "corrected":
+            print(f"\n      ✓ BODY CORRECTED: {body_validation.get('correction_note')}")
+            # Re-read updated config (source.json was patched in-place)
+            try:
+                source = storage.read_json(source_key)
+                best = source.get("best_source") or {}
+                config = best.get("config") or {}
+            except Exception:
+                pass
+            # Use the validated body name
+            if validated_body:
+                body = validated_body
+        elif status == "ok" and validated_body:
+            body = validated_body
+
+    # ── Stage 2: Scan for upcoming meetings ──────────────────────────────
     upcoming: list[dict] = []
 
     if platform == "legistar":
@@ -329,6 +395,7 @@ async def scan_city(slug: str, source: dict, client: httpx.AsyncClient) -> dict 
         "body": body,
         "platform": platform,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "body_validation": body_validation,
         "upcoming": upcoming,
     }
 
@@ -341,6 +408,7 @@ async def run_batch(
     city_slug: str | None,
     dry_run: bool,
     report_new: bool,
+    skip_body_validation: bool,
     cfg: AgentConfig,
     storage,
 ):
@@ -371,7 +439,11 @@ async def run_batch(
         timeout=20,
     ) as client:
 
-        results = {"scanned": 0, "skipped": 0, "errors": 0, "new_agendas": []}
+        results = {
+            "scanned": 0, "skipped": 0, "errors": 0,
+            "new_agendas": [],
+            "body_corrections": [], "body_unresolved": [],
+        }
 
         for i, key in enumerate(source_keys, 1):
             slug = key.split("/")[-2]
@@ -405,15 +477,34 @@ async def run_batch(
 
             print(f"[{i}/{len(source_keys)}] {slug} ({platform})...", end=" ", flush=True)
             try:
-                record = await scan_city(slug, source, client)
+                record = await scan_city(
+                    slug, source, key, client, storage,
+                    skip_body_validation=skip_body_validation,
+                )
                 storage.write_json(prev_key, record)
 
-                upcoming = record.get("upcoming", [])
+                all_meetings = record.get("upcoming", [])
+                past = [m for m in all_meetings if m.get("status") == "past"]
+                upcoming = [m for m in all_meetings if m.get("status") != "past"]
                 posted = [m for m in upcoming if m.get("agenda_posted")]
                 unposted = [m for m in upcoming if not m.get("agenda_posted")]
-                print(f"{len(upcoming)} upcoming ({len(posted)} posted, {len(unposted)} pending)")
 
-                # Detect newly-posted agendas
+                bv = record.get("body_validation", {})
+                bv_status = bv.get("status", "")
+                bv_note = ""
+                if bv_status == "corrected":
+                    bv_note = f" [BODY CORRECTED → '{bv.get('validated_body')}']"
+                    results["body_corrections"].append({
+                        "city": slug, "note": bv.get("correction_note"), "patch": bv.get("config_patch"),
+                    })
+                elif bv_status == "unresolved":
+                    bv_note = f" [BODY UNRESOLVED ⚠]"
+                    results["body_unresolved"].append({"city": slug, "reason": bv.get("reason")})
+
+                past_note = f", last={past[-1]['date']}" if past else ""
+                print(f"{len(upcoming)} upcoming ({len(posted)} posted, {len(unposted)} pending{past_note}){bv_note}")
+
+                # Detect newly-posted agendas (only future meetings)
                 for m in upcoming:
                     if m.get("agenda_posted") and not prev_posted.get(m["date"], False):
                         results["new_agendas"].append({"city": slug, "date": m["date"], "title": m["title"]})
@@ -427,6 +518,16 @@ async def run_batch(
         print()
         print("=" * 60)
         print(f"SUMMARY: {results['scanned']} scanned, {results['skipped']} skipped, {results['errors']} errors")
+
+        if results["body_corrections"]:
+            print(f"\nBODY CORRECTIONS APPLIED ({len(results['body_corrections'])}):")
+            for item in results["body_corrections"]:
+                print(f"  {item['city']:<35} {item['note']}")
+
+        if results["body_unresolved"]:
+            print(f"\nBODY UNRESOLVED — COLLECTION BLOCKED ({len(results['body_unresolved'])}):")
+            for item in results["body_unresolved"]:
+                print(f"  {item['city']:<35} {item['reason']}")
 
         if results["new_agendas"]:
             print(f"\nNEW AGENDAS POSTED ({len(results['new_agendas'])}):")
@@ -448,12 +549,17 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="List cities without making HTTP requests")
     parser.add_argument("--report-new", action="store_true",
                         help="Highlight cities where agenda_posted flipped true since last scan")
+    parser.add_argument("--skip-body-validation", action="store_true",
+                        help="Skip pre-scan body validation (faster, but may collect wrong body)")
     args = parser.parse_args()
 
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
 
-    asyncio.run(run_batch(args.city, args.dry_run, args.report_new, cfg, storage))
+    asyncio.run(run_batch(
+        args.city, args.dry_run, args.report_new,
+        args.skip_body_validation, cfg, storage,
+    ))
 
 
 if __name__ == "__main__":

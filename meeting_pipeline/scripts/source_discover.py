@@ -49,6 +49,7 @@ from urllib.parse import urlparse
 import httpx
 from dotenv import load_dotenv
 from tavily import TavilyClient
+from meeting_pipeline.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -3596,6 +3597,24 @@ async def process_city(
                 storage.write_json(s3_key, result)
             except Exception as e:
                 print(f"  [warn] Could not upload source.json to S3 for {city}, {state}: {e}")
+
+            # Body validation: auto-correct council_category_id / committee_id for
+            # known platforms so collection never runs against the wrong body.
+            bs_platform = (result.get("best_source") or {}).get("platform", "")
+            if bs_platform in VALIDATABLE_PLATFORMS:
+                try:
+                    bv = await validate_body_for_city(
+                        f"{slug}-{state}", result, s3_key, http, storage
+                    )
+                    bv_status = bv.get("status", "skip")
+                    if bv_status == "corrected":
+                        print(f"  [body] corrected → {bv.get('correction_note', '')}")
+                    elif bv_status == "unresolved":
+                        print(f"  [body] UNRESOLVED — {bv.get('reason', '')}")
+                    elif bv_status not in ("skip", "ok"):
+                        print(f"  [body] {bv_status}: {bv.get('reason', '')}")
+                except Exception as e:
+                    print(f"  [body] validation error: {e}")
 
         bs = result.get("best_source") or {}
         freshness = bs.get("freshness") or "no_source"
