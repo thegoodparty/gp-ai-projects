@@ -59,6 +59,9 @@ SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
 if not SERVE_CSV.exists():
     SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
 
+# Overridden by --csv flag at runtime
+_csv_override: Path | None = None
+
 
 def parse_expected_body(candidate_office: str) -> str:
     """
@@ -135,13 +138,14 @@ def load_cities_from_csv(filter_city: str | None = None) -> list[dict]:
     """
     seen: dict[str, dict] = {}  # city_slug → record
 
-    with open(SERVE_CSV, newline="", encoding="utf-8") as f:
+    csv_path = _csv_override if _csv_override else SERVE_CSV
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             # Support unified CSV (lowercase) and legacy formats
             city = (row.get("city") or row.get("City") or "").strip()
             state_raw = (row.get("state") or row.get("State") or row.get("State/Region") or "").strip()
-            candidate_office = (row.get("office") or row.get("Candidate Office") or "").strip()
+            candidate_office = (row.get("office") or row.get("Office") or row.get("Candidate Office") or "").strip()
 
             if not city or not state_raw:
                 continue
@@ -182,7 +186,12 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing to S3")
     parser.add_argument("--force", action="store_true", help="Overwrite existing manifests")
     parser.add_argument("--city", help="Only process this city (exact name)")
+    parser.add_argument("--csv", dest="csv_path", help="Alternate CSV file (must have City, State, Office columns)")
     args = parser.parse_args()
+
+    global _csv_override
+    if args.csv_path:
+        _csv_override = Path(args.csv_path)
 
     # Set up storage
     cfg = AgentConfig.from_env()

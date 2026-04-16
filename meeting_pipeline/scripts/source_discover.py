@@ -3623,90 +3623,87 @@ async def process_city(
                 city, state, known_sources, tavily, http, expected_body=expected_body
             )
 
-        # Write to S3 only — no local files
-        if storage is not None:
-            s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
-            try:
-                # Source stability guard: never downgrade from a higher-tier (more supported)
-                # platform to a lower-tier one. Discovery reruns should only upgrade sources,
-                # not silently replace a working CivicClerk/Legistar with Granicus/unknown.
-                new_platform = (result.get("best_source") or {}).get("platform", "unknown")
-                new_tier = PLATFORM_TIER.get(new_platform, 4)
-                if storage.exists(s3_key):
-                    try:
-                        existing = storage.read_json(s3_key)
-                        old_platform = (existing.get("best_source") or {}).get("platform", "unknown")
-                        old_tier = PLATFORM_TIER.get(old_platform, 4)
-                        if new_tier < old_tier:
-                            print(
-                                f"  [guard] {city}, {state}: keeping existing {old_platform} "
-                                f"(tier={old_tier}) over new {new_platform} (tier={new_tier})"
-                            )
-                            result = existing  # keep existing result, don't overwrite
-                    except Exception:
-                        pass  # if we can't read existing, proceed with new result
-                storage.write_json(s3_key, result)
-            except Exception as e:
-                print(f"  [warn] Could not upload source.json to S3 for {city}, {state}: {e}")
-
-            # Body validation: auto-correct council_category_id / committee_id for
-            # known platforms so collection never runs against the wrong body.
-            # If the winner is unresolved, automatically try the next-ranked supported
-            # candidate — this prevents blocking collection on a single bad source.
-            bs_platform = (result.get("best_source") or {}).get("platform", "")
-            if bs_platform in VALIDATABLE_PLATFORMS:
+            # Write to S3 and run body validation while the HTTP client is still open.
+            # Body validation makes live API calls (Legistar /bodies, CivicPlus AJAX, etc.)
+            # and MUST run inside the async with block — not after the client closes.
+            if storage is not None:
+                s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
                 try:
-                    bv = await validate_body_for_city(
-                        f"{slug}-{state}", result, s3_key, http, storage
-                    )
-                    bv_status = bv.get("status", "skip")
-                    if bv_status == "corrected":
-                        print(f"  [body] corrected → {bv.get('correction_note', '')}")
-                    elif bv_status == "unresolved":
-                        print(f"  [body] UNRESOLVED for {bs_platform} — {bv.get('reason', '')}")
-                        # Fallback: try the next-ranked supported candidate
-                        for alt in (result.get("all_candidates") or [])[1:]:
-                            alt_platform = alt.get("platform", "")
-                            if alt_platform not in VALIDATABLE_PLATFORMS:
-                                continue
-                            alt_source = {
-                                **result,
-                                "best_source": {
-                                    "platform": alt_platform,
-                                    "url": alt.get("url", ""),
-                                    "display_url": alt.get("url", ""),
-                                    "freshness": alt.get("freshness"),
-                                    "most_recent_date": alt.get("most_recent_date"),
-                                    "days_since_update": alt.get("days_since_update"),
-                                    "date_source": alt.get("date_source"),
-                                    "collection_method": COLLECTION_METHODS.get(alt_platform, "fetch_and_parse"),
-                                    "config": alt.get("config") or {},
-                                    "notes": alt.get("notes") or "",
-                                },
-                            }
-                            try:
-                                alt_bv = await validate_body_for_city(
-                                    f"{slug}-{state}", alt_source, s3_key, http, storage
-                                )
-                            except Exception:
-                                continue
-                            if alt_bv.get("status") in ("ok", "corrected"):
+                    # Source stability guard: never downgrade from a higher-tier platform.
+                    new_platform = (result.get("best_source") or {}).get("platform", "unknown")
+                    new_tier = PLATFORM_TIER.get(new_platform, 4)
+                    if storage.exists(s3_key):
+                        try:
+                            existing = storage.read_json(s3_key)
+                            old_platform = (existing.get("best_source") or {}).get("platform", "unknown")
+                            old_tier = PLATFORM_TIER.get(old_platform, 4)
+                            if new_tier < old_tier:
                                 print(
-                                    f"  [body] fallback OK: switched to {alt_platform} "
-                                    f"({alt.get('url', '')})"
+                                    f"  [guard] {city}, {state}: keeping existing {old_platform} "
+                                    f"(tier={old_tier}) over new {new_platform} (tier={new_tier})"
                                 )
-                                result = alt_source
-                                try:
-                                    storage.write_json(s3_key, result)
-                                except Exception:
-                                    pass
-                                break
-                        else:
-                            print(f"  [body] no fallback candidate resolved — body unresolved")
-                    elif bv_status not in ("skip", "ok"):
-                        print(f"  [body] {bv_status}: {bv.get('reason', '')}")
+                                result = existing
+                        except Exception:
+                            pass
+                    storage.write_json(s3_key, result)
                 except Exception as e:
-                    print(f"  [body] validation error: {e}")
+                    print(f"  [warn] Could not upload source.json to S3 for {city}, {state}: {e}")
+
+                # Body validation: auto-correct category/committee IDs and expected_body.
+                # If the winner fails, automatically try next-ranked supported candidate.
+                bs_platform = (result.get("best_source") or {}).get("platform", "")
+                if bs_platform in VALIDATABLE_PLATFORMS:
+                    try:
+                        bv = await validate_body_for_city(
+                            f"{slug}-{state}", result, s3_key, http, storage
+                        )
+                        bv_status = bv.get("status", "skip")
+                        if bv_status == "corrected":
+                            print(f"  [body] corrected → {bv.get('correction_note', '')}")
+                        elif bv_status == "unresolved":
+                            print(f"  [body] UNRESOLVED for {bs_platform} — {bv.get('reason', '')}")
+                            for alt in (result.get("all_candidates") or [])[1:]:
+                                alt_platform = alt.get("platform", "")
+                                if alt_platform not in VALIDATABLE_PLATFORMS:
+                                    continue
+                                alt_source = {
+                                    **result,
+                                    "best_source": {
+                                        "platform": alt_platform,
+                                        "url": alt.get("url", ""),
+                                        "display_url": alt.get("url", ""),
+                                        "freshness": alt.get("freshness"),
+                                        "most_recent_date": alt.get("most_recent_date"),
+                                        "days_since_update": alt.get("days_since_update"),
+                                        "date_source": alt.get("date_source"),
+                                        "collection_method": COLLECTION_METHODS.get(alt_platform, "fetch_and_parse"),
+                                        "config": alt.get("config") or {},
+                                        "notes": alt.get("notes") or "",
+                                    },
+                                }
+                                try:
+                                    alt_bv = await validate_body_for_city(
+                                        f"{slug}-{state}", alt_source, s3_key, http, storage
+                                    )
+                                except Exception:
+                                    continue
+                                if alt_bv.get("status") in ("ok", "corrected"):
+                                    print(
+                                        f"  [body] fallback OK: switched to {alt_platform} "
+                                        f"({alt.get('url', '')})"
+                                    )
+                                    result = alt_source
+                                    try:
+                                        storage.write_json(s3_key, result)
+                                    except Exception:
+                                        pass
+                                    break
+                            else:
+                                print(f"  [body] no fallback candidate resolved — body unresolved")
+                        elif bv_status not in ("skip", "ok"):
+                            print(f"  [body] {bv_status}: {bv.get('reason', '')}")
+                    except Exception as e:
+                        print(f"  [body] validation error: {e}")
 
         bs = result.get("best_source") or {}
         freshness = bs.get("freshness") or "no_source"
