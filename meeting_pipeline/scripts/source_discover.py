@@ -272,6 +272,21 @@ WRONG_ENTITY_PATTERNS = [
     "community development authority",
 ]
 
+# Domain-level reject patterns: if these strings appear in a URL's domain (netloc),
+# the source is not a city government agenda site regardless of title/content.
+# Checked in is_wrong_city() against the netloc only (not title).
+WRONG_DOMAIN_PATTERNS = [
+    "library",      # huntleylibrary.org, euclidlibrary.org — library sites
+    "dems",         # quincydems.com — political party
+    "gop",          # republican party sites
+    "democrat",
+    "republican",
+    "schools",      # loganschools.org — school district
+    "school",       # schooldistrict.org variants
+    "greening",     # greeninggreenfieldma.org — advocacy/environmental
+    "fastresponse", # fastresponsecr.com — wrong entity
+]
+
 # Wrong-entity keywords specifically for BoardDocs page-title validation.
 # These appear in the <title> or main header of pages that belong to school
 # districts or other non-city entities that share the same city-name slug.
@@ -842,6 +857,12 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
     for pattern in WRONG_ENTITY_PATTERNS:
         if pattern.lower() in combined:
             return True
+    # Domain-level wrong-entity patterns — checked against netloc only.
+    # Rejects library sites, political party sites, school domains, etc.
+    _netloc_only = urlparse(url).netloc.lower().replace("www.", "")
+    for pattern in WRONG_DOMAIN_PATTERNS:
+        if pattern in _netloc_only:
+            return True
     # City-specific patterns
     for pattern in WRONG_CITY_PATTERNS.get(city, []):
         if pattern.lower() in combined:
@@ -872,22 +893,18 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
             if len(_domain_base) >= 3:
                 _embedded = _domain_base[-2:].upper()
                 if _embedded in _STATE_NAMES and _embedded != state_abbrev:
-                    # Don't reject if the target city name is in the domain
-                    _city_in_dom = city.lower().replace(" ", "") in _domain_base
-                    if not _city_in_dom:
-                        return True  # .gov domain is in a different state
+                    return True  # .gov domain is in a different state
 
-        # Check if a different state name is embedded in the URL domain (no word boundary).
-        # Catches e.g. louisvillenebraska.com (Nebraska embedded) when searching Louisville OH.
-        # Only applies to non-.gov domains since .gov is already checked above.
+        # Check if a different full state name is embedded in the URL domain.
+        # Catches e.g. louisvillenebraska.com or masoncityiowa.gov (Iowa embedded) when
+        # searching Louisville OH or Mason OH. Applies to all domains including .gov.
         _dom_check = urlparse(url).netloc.lower().replace("www.", "").replace("-", "").replace(".", "")
-        if _dom_check and not _dom_check.endswith("gov"):
-            for abbrev, name in _STATE_NAMES.items():
-                if abbrev == state_abbrev:
-                    continue
-                state_slug = name.lower().replace(" ", "")  # e.g. "nebraska", "newmexico"
-                if len(state_slug) >= 5 and state_slug in _dom_check:
-                    return True  # wrong state embedded in domain
+        for abbrev, name in _STATE_NAMES.items():
+            if abbrev == state_abbrev:
+                continue
+            state_slug = name.lower().replace(" ", "")  # e.g. "nebraska", "iowa", "newmexico"
+            if len(state_slug) >= 4 and state_slug in _dom_check:
+                return True  # wrong state embedded in domain
 
         # For Municode shared-platform URLs, validate the cid parameter's embedded
         # state abbreviation matches the target state, AND that the city name prefix

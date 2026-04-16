@@ -244,28 +244,44 @@ async def validate_civicclerk_body(
     slug: str, config: dict, source_url: str, expected_body: str, client: httpx.AsyncClient
 ) -> dict:
     """Fetch distinct event names from CivicClerk and score."""
-    match = re.search(r"https://(\w+)\.(?:api\.)?civicclerk\.com", source_url)
+    match = re.search(r"https://(\w+)\.(?:api\.|portal\.)?civicclerk\.com", source_url)
     tenant = match.group(1) if match else config.get("tenant", "")
     if not tenant:
         return {"status": "skip", "reason": "no tenant"}
 
+    is_portal = "portal.civicclerk.com" in source_url
+
     try:
-        resp = await client.get(
-            f"https://{tenant}.api.civicclerk.com/v1/Events/",
-            params={"$select": "Name,EventName", "$top": 50},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        events = data.get("value", data) if isinstance(data, dict) else data
+        if is_portal:
+            # Portal uses eventName field; $select doesn't filter portal API cleanly
+            resp = await client.get(
+                f"https://{tenant}.api.civicclerk.com/v1/EventCategories",
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            categories = data.get("value", data) if isinstance(data, dict) else data
+            names_seen = set()
+            for cat in categories:
+                n = cat.get("categoryDesc") or cat.get("categoryName") or ""
+                if n:
+                    names_seen.add(n.strip())
+        else:
+            resp = await client.get(
+                f"https://{tenant}.api.civicclerk.com/v1/Events/",
+                params={"$select": "Name,EventName", "$top": 50},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            events = data.get("value", data) if isinstance(data, dict) else data
+            names_seen = set()
+            for ev in events:
+                n = ev.get("Name") or ev.get("EventName") or ""
+                if n:
+                    names_seen.add(n.strip())
     except Exception as e:
         return {"status": "error", "reason": str(e)}
-
-    names_seen = set()
-    for ev in events:
-        n = ev.get("Name") or ev.get("EventName") or ""
-        if n:
-            names_seen.add(n.strip())
 
     candidates = list(names_seen)
     best, score = best_body_match(candidates, expected_body)
