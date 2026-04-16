@@ -1,69 +1,50 @@
 """
-pilot_registry.py — Single source of truth for pilot officials and cities.
+pilot_registry.py — Loads officials and cities from serve_users_unified.csv.
 
-Used by:
-  - scripts/collect_pilot_batch.py   (collection)
-  - scripts/collect_haystaq_batch.py (voter data)
-  - scripts/generate_meeting_queue.py (queue building)
-
-To add a new official: add an entry to PILOT_OFFICIALS.
-To remove one: delete their entry.
-Everything else picks up the change automatically.
+Previously a hardcoded list; now reads from the unified CSV so there is
+a single source of truth. All scripts that import PILOT_OFFICIALS or
+pilot_cities() continue to work without changes.
 """
 
 from __future__ import annotations
 
+import csv
+import re
+from pathlib import Path
 
-PILOT_OFFICIALS: list[dict] = [
-    # ── Tier 1: CivicClerk / Legistar ────────────────────────────────────────
-    {"name": "Nicole Shook",         "city": "Johnstown",     "state": "OH", "role": "City Council Member"},
-    {"name": "AJ Ganim",             "city": "Brecksville",   "state": "OH", "role": "City Council Member"},
-    {"name": "Mike Haigler",         "city": "Locust",        "state": "NC", "role": "City Council Member"},
-    {"name": "Jay Davis",            "city": "Texarkana",     "state": "TX", "role": "City Council Member"},
-    {"name": "Dan Reese",            "city": "Windcrest",     "state": "TX", "role": "City Council Member"},
-    {"name": "Mickey Smith",         "city": "Jacksonville",  "state": "NC", "role": "City Council Member"},
-    {"name": "Kim Singh",            "city": "Mason",         "state": "OH", "role": "City Council Member"},
-    {"name": "Doug Weiss",           "city": "Pflugerville",  "state": "TX", "role": "City Council Member"},
+_PIPELINE_DIR = Path(__file__).resolve().parent
+_UNIFIED_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
 
-    # ── Tier 2: CivicPlus / Granicus ─────────────────────────────────────────
-    {"name": "Guy Guidone",          "city": "Louisville",    "state": "OH", "role": "City Council Member"},
-    {"name": "Marcus Mcintyre",      "city": "Indian Trail",  "state": "NC", "role": "Town Council Member"},
-    {"name": "Candace Hunziker",     "city": "Pittsboro",     "state": "NC", "role": "Town Council Member"},
-    {"name": "Kevin Edmonds",        "city": "Dickinson",     "state": "TX", "role": "City Council Member"},
-    {"name": "Claudia Zapata",       "city": "Kyle",          "state": "TX", "role": "City Council Member"},
-    {"name": "Arjenae Jones",        "city": "Greenville",    "state": "NC", "role": "City Council Member"},
-    {"name": "Jess Hall",            "city": "Lago Vista",    "state": "TX", "role": "City Council Member"},
-    {"name": "Matt Kadas",           "city": "Hartville",     "state": "OH", "role": "Village Council Member"},
-    {"name": "Kristen Angelo",       "city": "Walbridge",     "state": "OH", "role": "Village Council Member"},
-    {"name": "Mark Huddleston",      "city": "Mount Vernon",  "state": "TX", "role": "City Council Member"},
-    {"name": "Michael Martinez",     "city": "Sandy Oaks",    "state": "TX", "role": "City Council Member"},
 
-    # ── Tier 3: Marginal / Needs discovery ───────────────────────────────────
-    {"name": "Fred Ilarraza",        "city": "Marvin",        "state": "NC", "role": "Village Council Member"},
-    {"name": "Michael Benson",       "city": "Lexington",     "state": "OH", "role": "City Council Member"},
-    {"name": "Mark Reams",           "city": "Marysville",    "state": "OH", "role": "City Council Member"},
-    {"name": "Todd Gordon",          "city": "Lima",          "state": "OH", "role": "City Council Member"},
-    {"name": "Patrick Shea",         "city": "North Olmsted", "state": "OH", "role": "City Council Member"},
-    {"name": "Christopher Gibbs",    "city": "Palestine",     "state": "TX", "role": "City Council Member"},
-    {"name": "Byron Bellman",        "city": "Gibsonville",   "state": "NC", "role": "Town Council Member"},
-    {"name": "Mark Cozy",            "city": "Canal Fulton",  "state": "OH", "role": "City Council Member"},
-    {"name": "Gregory Drew",         "city": "Vermilion",     "state": "OH", "role": "City Council Member"},
-    {"name": "Heather Basil",        "city": "Mount Sterling","state": "OH", "role": "Village Council Member"},
-    {"name": "Brian Spitznagel",     "city": "Walton Hills",  "state": "OH", "role": "Village Council Member"},
-    {"name": "Cody Mathews",         "city": "Hillsboro",     "state": "OH", "role": "City Council Member"},
-    {"name": "Abbie Bosak",          "city": "Poland",        "state": "OH", "role": "Village Council Member"},
-    {"name": "Laurie Mack",          "city": "Granite Quarry","state": "NC", "role": "Town Council Member"},
-    {"name": "Jon Van De Riet",      "city": "Stallings",     "state": "NC", "role": "Town Council Member"},
-    {"name": "Ixtlazihuatl Vasquez", "city": "Refugio",       "state": "TX", "role": "City Council Member"},
-    {"name": "Edwina Agee",          "city": "Maple Heights", "state": "OH", "role": "City Council Member"},
-    {"name": "Berry Phillips",       "city": "Coleman",       "state": "TX", "role": "City Council Member"},
-    {"name": "Chad Deese",           "city": "Pembroke",      "state": "NC", "role": "Town Council Member"},
-]
+def _load_from_csv() -> list[dict]:
+    if not _UNIFIED_CSV.exists():
+        return []
+    officials = []
+    with open(_UNIFIED_CSV, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            city = row.get("city", "").strip()
+            state = row.get("state", "").strip()
+            name = row.get("name", "").strip()
+            office = row.get("office", "").strip()
+            if not city or not state:
+                continue
+            officials.append({
+                "name": name,
+                "city": city,
+                "state": state.upper(),
+                "role": office or "City Council Member",
+            })
+    return officials
+
+
+PILOT_OFFICIALS: list[dict] = _load_from_csv()
 
 
 def city_slug(city: str, state: str) -> str:
     """Return the filesystem slug for a city, e.g. 'Indian Trail', 'NC' → 'indian-trail-NC'."""
-    return f"{city.lower().replace(' ', '-')}-{state}"
+    slug = city.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+    return f"{slug}-{state.upper()}"
 
 
 def pilot_cities() -> list[dict]:

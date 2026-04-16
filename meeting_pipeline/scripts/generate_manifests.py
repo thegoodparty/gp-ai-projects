@@ -55,7 +55,9 @@ STATE_ABBREVS = {
 }
 
 _PIPELINE_DIR = Path(__file__).resolve().parent.parent
-SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
+if not SERVE_CSV.exists():
+    SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
 
 
 def parse_expected_body(candidate_office: str) -> str:
@@ -136,15 +138,16 @@ def load_cities_from_csv(filter_city: str | None = None) -> list[dict]:
     with open(SERVE_CSV, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            city = row.get("City", "").strip()
-            state_raw = row.get("State/Region", "").strip()
-            candidate_office = row.get("Candidate Office", "").strip()
+            # Support unified CSV (lowercase) and legacy formats
+            city = (row.get("city") or row.get("City") or "").strip()
+            state_raw = (row.get("state") or row.get("State") or row.get("State/Region") or "").strip()
+            candidate_office = (row.get("office") or row.get("Candidate Office") or "").strip()
 
             if not city or not state_raw:
                 continue
 
             # Normalize state to 2-letter abbreviation
-            state = STATE_ABBREVS.get(state_raw, state_raw.upper()[:2])
+            state = STATE_ABBREVS.get(state_raw, state_raw.upper()[:2] if len(state_raw) > 2 else state_raw.upper())
 
             if filter_city and city.lower() != filter_city.lower():
                 continue

@@ -243,7 +243,7 @@ class PriorityIssueDetail(BaseModel):
         default_factory=list,
         description=(
             "Verbatim sentences from the FULL AGENDA DOCUMENT that most directly support each detail field. "
-            "Each entry has a 'field' name ('whatIsHappening', 'whatDecision', 'whyItMatters', or 'recommendation') "
+            "Each entry has a 'field' name ('whatIsHappening', 'whatDecision', 'whyItMatters', 'recommendation', 'whoIsPresenting', or 'supportingContext') "
             "and an exact 'quote' from the source document (not paraphrased). "
             "Omit entries where no direct match exists."
         ),
@@ -254,21 +254,25 @@ class PriorityIssueDetail(BaseModel):
 # PASS 1: CATEGORIZE AGENDA ITEMS
 # ============================================================================
 
-def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> AgendaCategorization:
-    city = meeting.get("cityName", "")
-    body = meeting.get("body", "City Council")
-    date = meeting.get("date", "")
-    items = meeting.get("data", {}).get("agendaItems", [])
+PASS1_CHUNK_SIZE = 20  # Max items per Pass 1 call — keeps structured output within Gemini limits
 
-    items_text = []
+
+def _sanitize_for_prompt(text: str) -> str:
+    """Remove characters that cause Gemini structured output to truncate mid-JSON."""
+    return text.replace("§", "sec.").replace("\u00a7", "sec.")
+
+
+def _format_items_text(items: list, start_index: int = 0) -> str:
+    """Format agenda items into the text block used in Pass 1 prompts."""
+    lines = []
     for i, item in enumerate(items):
-        title = item.get("title", "")
+        title = _sanitize_for_prompt(item.get("title", ""))
         section = item.get("section", "")
         fiscal = item.get("fiscalAmounts", [])
         hearing = item.get("isPublicHearing", False)
         desc = item.get("description", "")
 
-        parts = [f"[{i+1}] {title}"]
+        parts = [f"[{start_index + i + 1}] {title}"]
         if section:
             parts.append(f"  section: {section}")
         if fiscal:
@@ -282,33 +286,80 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, 
         if hearing:
             parts.append("  PUBLIC HEARING")
         if desc:
-            parts.append(f"  description: {desc[:200]}")
-        items_text.append("\n".join(parts))
+            parts.append(f"  description: {_sanitize_for_prompt(desc)[:200]}")
+        lines.append("\n".join(parts))
+    return "\n".join(lines)
 
-    constituent_context = format_top_constituent_issues(constituent, n=7) if constituent else ""
+
+def _run_pass1_chunk(city, body, date, items_chunk, start_index, constituent_context, pdf_text, gemini) -> list:
+    """Run Pass 1 on a single chunk of items. Returns list of CategorizedAgendaItem."""
+    items_text = _format_items_text(items_chunk, start_index)
     prompt = build_pass1_prompt(
-        city=city,
-        body=body,
-        date=date,
-        items_text="\n".join(items_text),
+        city=city, body=body, date=date,
+        items_text=items_text,
         constituent_context=constituent_context,
         pdf_text=pdf_text,
     )
-
-    # Disable thinking for small agendas — categorizing a short list is straightforward
-    # pattern-matching that doesn't benefit from reasoning. For large agendas, thinking
-    # produces better holistic prioritization and avoids structured output truncation.
-    use_thinking = len(items) >= 25
+    # No thinking for chunks — keep output tight, avoid token bloat on small batches
     result = gemini.generate_structured_content(
         prompt=prompt,
         response_schema=AgendaCategorization,
         temperature=0.1,
-        thinking_budget=None if use_thinking else 0,
+        thinking_budget=0,
+        max_tokens=16000,
     )
-
     if isinstance(result, dict):
-        return AgendaCategorization(**result)
-    return result
+        result = AgendaCategorization(**result)
+    return result.items
+
+
+def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> AgendaCategorization:
+    city = meeting.get("cityName", "")
+    body = meeting.get("body", "City Council")
+    date = meeting.get("date", "")
+    items = meeting.get("data", {}).get("agendaItems", [])
+
+    constituent_context = format_top_constituent_issues(constituent, n=7) if constituent else ""
+
+    if len(items) <= PASS1_CHUNK_SIZE:
+        # Single call — normal path
+        items_text = _format_items_text(items)
+        prompt = build_pass1_prompt(
+            city=city, body=body, date=date,
+            items_text=items_text,
+            constituent_context=constituent_context,
+            pdf_text=pdf_text,
+        )
+        use_thinking = len(items) >= 25
+        result = gemini.generate_structured_content(
+            prompt=prompt,
+            response_schema=AgendaCategorization,
+            temperature=0.1,
+            thinking_budget=None if use_thinking else 0,
+            max_tokens=32000,
+        )
+        if isinstance(result, dict):
+            return AgendaCategorization(**result)
+        return result
+
+    # Chunked path for large agendas — process in batches then merge
+    chunks = [items[i:i + PASS1_CHUNK_SIZE] for i in range(0, len(items), PASS1_CHUNK_SIZE)]
+    print(f"  Large agenda ({len(items)} items) — splitting into {len(chunks)} chunks of {PASS1_CHUNK_SIZE}")
+
+    all_categorized = []
+    for chunk_idx, chunk in enumerate(chunks):
+        start = chunk_idx * PASS1_CHUNK_SIZE
+        print(f"  Pass 1 chunk {chunk_idx + 1}/{len(chunks)}: items {start + 1}–{start + len(chunk)}")
+        chunk_items = _run_pass1_chunk(city, body, date, chunk, start, constituent_context, pdf_text, gemini)
+        all_categorized.extend(chunk_items)
+
+    # Merge: agendaSummary from first chunk (it has full context from pdf_text)
+    # Re-run a lightweight summary-only call is overkill — use a generic merge summary
+    total = len(all_categorized)
+    priority_count = sum(1 for it in all_categorized if it.isPriority)
+    agenda_summary = f"{total} agenda items including {priority_count} priority items requiring council attention."
+
+    return AgendaCategorization(items=all_categorized, agendaSummary=agenda_summary)
 
 
 # ============================================================================
@@ -784,6 +835,14 @@ def generate_briefing_for_meeting(
     if len(substantive_items) < 2:
         print(f"  SKIP: Too few substantive agenda items ({len(substantive_items)} non-procedural) — agenda likely not posted yet")
         return {"status": "skipped", "reason": "too_few_substantive_items"}
+
+    # Check for manual pipeline exclusion marker
+    if city_slug:
+        exclusion_key = f"{cfg.sources_prefix}/{city_slug}/pipeline_exclusion.json"
+        if storage.exists(exclusion_key):
+            excl = storage.read_json(exclusion_key)
+            print(f"  SKIP: {city_slug} is excluded — {excl.get('reason')}: {excl.get('detail', '')}")
+            return {"status": "skipped", "reason": "pipeline_excluded", "detail": excl.get("reason")}
 
     constituent = load_constituent_data(city_slug, storage, cfg.sources_prefix) if city_slug else None
     if constituent:

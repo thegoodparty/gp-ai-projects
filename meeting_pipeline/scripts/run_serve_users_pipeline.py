@@ -54,7 +54,10 @@ from meeting_pipeline.scripts.generate_meeting_queue import (
     _civicclerk_tenant,
 )
 
-SERVE_CSV = _ROOT / "serve_users.csv"
+SERVE_CSV = _ROOT / "serve_users_unified.csv"
+# Fall back to old CSV if unified doesn't exist yet
+if not SERVE_CSV.exists():
+    SERVE_CSV = _ROOT / "serve_users.csv"
 
 STATE_ABBREVS = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
@@ -127,19 +130,26 @@ def load_briefing_capable_officials() -> tuple[list[dict], list[dict]]:
     seen_slugs: set[str] = set()
     cities = []
 
-    # Support both old format (State/Region full name, First Name/Last Name)
-    # and new format (State abbrev, Name, Role)
+    # Support unified format (lowercase columns), new format (State abbrev), and old format (State/Region)
     first_row = rows[0] if rows else {}
-    new_format = "State" in first_row and "State/Region" not in first_row
+    unified_format = "city" in first_row  # serve_users_unified.csv uses lowercase
+    new_format = not unified_format and "State" in first_row and "State/Region" not in first_row
 
     for row in rows:
-        city = row.get("City", "").strip()
-        if new_format:
+        if unified_format:
+            city = row.get("city", "").strip()
+            state_raw = row.get("state", "").strip()
+            state = state_raw.upper() if len(state_raw) <= 2 else normalize_state(state_raw)
+            name = row.get("name", "").strip()
+            role = row.get("office", "City Council Member").strip()
+        elif new_format:
+            city = row.get("City", "").strip()
             state_raw = row.get("State", "").strip()
             state = state_raw.upper() if len(state_raw) <= 2 else normalize_state(state_raw)
             name = row.get("Name", "").strip()
             role = row.get("Role", row.get("Office", "City Council Member")).strip()
         else:
+            city = row.get("City", "").strip()
             state_raw = row.get("State/Region", "").strip()
             state = normalize_state(state_raw)
             name = f"{row.get('First Name', '')} {row.get('Last Name', '')}".strip()

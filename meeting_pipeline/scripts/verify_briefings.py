@@ -499,6 +499,51 @@ def check_g_boarddocs_account(
     return None
 
 
+def check_h_source_citations(slug: str, briefing: dict) -> Optional[dict]:
+    """Check H: source_citations populated in at least some priority issues."""
+    # priorityIssues is at top level of briefing JSON
+    issues_list = briefing.get("priorityIssues", [])
+    if not issues_list:
+        # No priority issues — nothing to check
+        return None
+
+    total_issues = len(issues_list)
+    issues_with_citations = 0
+
+    for issue in issues_list:
+        detail = issue.get("detail", {})
+        citations = detail.get("sourceCitations", [])
+        if citations:
+            issues_with_citations += 1
+
+    if issues_with_citations == 0:
+        return {
+            "level": "WARNING",
+            "check": "H",
+            "slug": slug,
+            "message": f"no source_citations in any of {total_issues} priority issue(s) — old briefing or citation wiring broken",
+            "detail": {"total_issues": total_issues, "issues_with_citations": 0},
+        }
+    return None
+
+
+def check_i_haystaq_data(slug: str, briefing: dict) -> Optional[dict]:
+    """Check I: Haystaq constituent data was used (check constituentData block in briefing)."""
+    constituent = briefing.get("constituentData", {})
+    available = constituent.get("available", False)
+    voter_count = constituent.get("voterCount", 0)
+
+    if not available or not voter_count:
+        return {
+            "level": "INFO",
+            "check": "I",
+            "slug": slug,
+            "message": "no Haystaq constituent data — briefing generated without voter context",
+            "detail": {"available": available, "voterCount": voter_count},
+        }
+    return None
+
+
 # ============================================================================
 # MAIN VERIFICATION LOOP
 # ============================================================================
@@ -600,6 +645,18 @@ def verify_briefings(cfg: AgentConfig, storage, city_filter: Optional[str] = Non
             result_g["s3_key"] = key
             item_issues.append(result_g)
 
+        # Check H — source citations presence
+        result_h = check_h_source_citations(slug, briefing)
+        if result_h:
+            result_h["s3_key"] = key
+            item_issues.append(result_h)
+
+        # Check I — Haystaq constituent data
+        result_i = check_i_haystaq_data(slug, briefing)
+        if result_i:
+            result_i["s3_key"] = key
+            item_issues.append(result_i)
+
         if item_issues:
             print(f"{len(item_issues)} issue(s)")
             issues.extend(item_issues)
@@ -680,15 +737,34 @@ def print_report(report: dict) -> None:
             print("  Duplicate briefings:")
             for i in dup_warns:
                 print(f"    {i['slug']}: {i['message']}")
+
+        citation_warns = [i for i in warnings if i["check"] == "H"]
+        if citation_warns:
+            print(f"  Missing source_citations ({len(citation_warns)}):")
+            for i in citation_warns:
+                print(f"    {i['slug']}: {i['message']}")
     else:
         print("\nWARNING: none")
 
     if infos:
-        print(f"\nINFO — Low item count (<3 items) ({len(infos)}):")
+        print(f"\nINFO ({len(infos)}):")
         for i in infos:
             d = i["detail"]
-            label = f"{i['slug']}_{d.get('date', '')}"
-            print(f"  {label}: {i['message']}")
+            check = i["check"]
+            if check == "D":
+                label = f"{i['slug']}_{d.get('date', '')}"
+                print(f"  [D] {label}: {i['message']}")
+            elif check == "I":
+                print(f"  [I] {i['slug']}: {i['message']}")
+            else:
+                label = f"{i['slug']}_{d.get('date', '')}"
+                print(f"  [{check}] {label}: {i['message']}")
+
+    # Summary counts by check
+    check_counts: dict[str, int] = {}
+    for issue in issues:
+        c = issue["check"]
+        check_counts[c] = check_counts.get(c, 0) + 1
 
     print("\n" + "-" * 60)
     print("SUMMARY")
@@ -696,7 +772,22 @@ def print_report(report: dict) -> None:
     print(f"  Critical issues         : {len(criticals)}")
     print(f"  Warnings                : {len(warnings)}")
     print(f"  Info                    : {len(infos)}")
-    print(f"  Clean                   : {report['clean']}")
+    print(f"  Clean (no issues)       : {report['clean']}")
+    if check_counts:
+        print("\n  Issues by check:")
+        for chk, cnt in sorted(check_counts.items()):
+            labels = {
+                "A": "Body name",
+                "B": "Future stub",
+                "C": "Wrong city",
+                "D": "Low item count",
+                "E": "Duplicate",
+                "F": "Content contamination",
+                "G": "BoardDocs entity",
+                "H": "Missing source citations",
+                "I": "Missing Haystaq data",
+            }
+            print(f"    [{chk}] {labels.get(chk, chk)}: {cnt}")
     print("=" * 60 + "\n")
 
 

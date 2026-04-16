@@ -45,7 +45,10 @@ from shared.databricks_client import DatabricksClient
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_slug
 
-SERVE_CSV = _ROOT / "serve_users.csv"
+SERVE_CSV = _ROOT / "serve_users_unified.csv"
+# Fall back to old CSV if unified doesn't exist yet
+if not SERVE_CSV.exists():
+    SERVE_CSV = _ROOT / "serve_users.csv"
 
 # ============================================================================
 # UNIVERSAL HAYSTAQ COLUMNS (same across all states)
@@ -137,15 +140,16 @@ STATE_ABBREVS = {
 
 
 def get_serve_csv_cities() -> list[dict]:
-    """Return deduplicated cities from serve_users.csv."""
+    """Return deduplicated cities from serve_users_unified.csv (or legacy serve_users.csv)."""
     if not SERVE_CSV.exists():
         print(f"ERROR: {SERVE_CSV} not found")
         sys.exit(1)
     seen = set()
     cities = []
     for row in csv.DictReader(SERVE_CSV.open()):
-        city = row.get("City", "").strip()
-        state_raw = row.get("State/Region", "").strip()
+        # Support unified CSV format (lowercase columns) and legacy formats
+        city = (row.get("city") or row.get("City") or "").strip()
+        state_raw = (row.get("state") or row.get("State") or row.get("State/Region") or "").strip()
         if not city or not state_raw:
             continue
         state = STATE_ABBREVS.get(state_raw, state_raw[:2].upper() if len(state_raw) > 2 else state_raw.upper())

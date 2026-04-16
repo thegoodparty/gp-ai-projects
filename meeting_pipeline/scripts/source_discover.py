@@ -55,7 +55,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # ── Paths (module-level) ───────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PIPELINE_DIR = _SCRIPT_DIR.parent
-SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
+if not SERVE_CSV.exists():
+    SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
 _DOTGOV_CSV_PATH = _PIPELINE_DIR / "config" / "dotgov.csv"
 
 # ── State name → abbreviation (mirrors collect_haystaq_batch.py) ──────────────
@@ -632,8 +634,9 @@ def get_serve_csv_cities() -> list[dict]:
     seen: set[tuple[str, str]] = set()
     cities: list[dict] = []
     for row in csv.DictReader(SERVE_CSV.open()):
-        city = row.get("City", "").strip()
-        state_raw = row.get("State/Region", "").strip()
+        # Support unified CSV (lowercase columns) and legacy formats
+        city = (row.get("city") or row.get("City") or "").strip()
+        state_raw = (row.get("state") or row.get("State") or row.get("State/Region") or "").strip()
         if not city or not state_raw:
             continue
         state = STATE_ABBREVS.get(
@@ -646,7 +649,7 @@ def get_serve_csv_cities() -> list[dict]:
         seen.add(key)
         entry: dict = {"city": city, "state": state}
         # Carry the CSV meeting URL as a discovery seed (used as custom_agenda_url)
-        meeting_url = row.get("Meeting URL", "").strip()
+        meeting_url = row.get("Meeting URL", row.get("meeting_url", "")).strip()
         if meeting_url and meeting_url.startswith("http"):
             entry["csv_meeting_url"] = meeting_url
         cities.append(entry)
