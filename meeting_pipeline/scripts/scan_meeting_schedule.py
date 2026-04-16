@@ -384,8 +384,47 @@ async def scan_city(
         validated_body = body_validation.get("validated_body")
 
         if status == "unresolved":
-            # Don't block scan — but flag it clearly so orchestrator can skip collection
-            print(f"\n      ⚠ BODY MISMATCH: {body_validation.get('reason')}")
+            # Try next-ranked supported candidate from all_candidates before giving up
+            print(f"\n      ⚠ BODY MISMATCH ({platform}): {body_validation.get('reason')}")
+            from meeting_pipeline.scripts.source_discover import PLATFORM_TIER, COLLECTION_METHODS
+            for alt in (source.get("all_candidates") or [])[1:]:
+                alt_platform = alt.get("platform", "")
+                if alt_platform not in SUPPORTED_PLATFORMS:
+                    continue
+                alt_source = {
+                    **source,
+                    "best_source": {
+                        "platform": alt_platform,
+                        "url": alt.get("url", ""),
+                        "display_url": alt.get("url", ""),
+                        "freshness": alt.get("freshness"),
+                        "most_recent_date": alt.get("most_recent_date"),
+                        "collection_method": COLLECTION_METHODS.get(alt_platform, "fetch_and_parse"),
+                        "config": alt.get("config") or {},
+                        "notes": alt.get("notes") or "",
+                    },
+                }
+                try:
+                    alt_bv = await validate_body_for_city(slug, alt_source, source_key, client, storage)
+                except Exception:
+                    continue
+                if alt_bv.get("status") in ("ok", "corrected"):
+                    print(f"\n      ↳ Switched to {alt_platform} ({alt.get('url', '')})")
+                    source = alt_source
+                    best = alt_source["best_source"]
+                    platform = alt_platform
+                    config = best.get("config", {})
+                    source_url = best.get("url", "")
+                    body_validation = alt_bv
+                    status = alt_bv.get("status", "ok")
+                    # Persist the better source so future scans use it
+                    try:
+                        storage.write_json(source_key, alt_source)
+                    except Exception:
+                        pass
+                    break
+            else:
+                print(f"\n      No fallback candidate resolved body — scan may return wrong body")
         elif status == "corrected":
             print(f"\n      ✓ BODY CORRECTED: {body_validation.get('correction_note')}")
             # Re-read updated config (source.json was patched in-place)

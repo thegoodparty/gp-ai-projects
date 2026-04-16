@@ -2367,10 +2367,26 @@ FRESHNESS_SCORE = {
 }
 # empty and blocked score 0 — they should never win over any real candidate,
 # and a Legistar "unknown" (5 + 20 = 25) beats a CivicClerk "empty" (0 + 12 = 12).
+#
+# PLATFORM_TIER reflects scanning capability — supported/scannable platforms must
+# outrank unsupported ones so discovery never downgrades a working scannable source
+# to one we cannot auto-collect from.
+#   Tier A (22-20): Full API support — Legistar, CivicClerk, CivicPlus
+#   Tier B (18):   Post-API support — BoardDocs, eScribe
+#   Tier C (8-6):  Unsupported scrapers — Granicus, Municode, PrimeGov, Novus, Diligent
+#   Tier D (4):    Unknown
 PLATFORM_TIER = {
-    "legistar": 20, "civicplus": 16, "granicus": 16, "escribe": 14,
-    "boarddocs": 14, "municode": 12, "civicclerk": 12, "primegov": 12,
-    "novus": 10, "diligent": 10, "unknown": 4,
+    "legistar": 22,    # REST API — fully supported
+    "civicclerk": 20,  # OData API — fully supported (was 12, granicus was 16: the bug)
+    "civicplus": 20,   # AJAX scraper — fully supported (was 16)
+    "escribe": 18,     # POST API — fully supported (was 14)
+    "boarddocs": 18,   # POST API — fully supported (was 14)
+    "granicus": 8,     # HTML scrape only — not auto-scannable (was 16)
+    "municode": 8,     # HTML scrape only — not auto-scannable (was 12)
+    "primegov": 8,     # SPA — not auto-scannable (was 12)
+    "novus": 6,        # HTML scrape only — not auto-scannable (was 10)
+    "diligent": 6,     # HTML scrape only — not auto-scannable (was 10)
+    "unknown": 4,      # Unknown (unchanged)
 }
 SOURCE_BONUS = {"known": 10, "known_probe": 2, "tavily": 3, "ddg": 0, "probe": 0}
 
@@ -2510,7 +2526,7 @@ def candidate_score(c: dict, city: str = "", state: str = "") -> int:
     f = FRESHNESS_SCORE.get(c.get("freshness") or "", 0)
     p = PLATFORM_TIER.get(c.get("platform") or "unknown", 4)
     s = SOURCE_BONUS.get(c.get("source") or "probe", 0)
-    b = 5 if c.get("body_match") else 0  # boost when title/content matches expected_body
+    b = 10 if c.get("body_match") else 0  # boost when title/content matches expected_body (was 5 — too weak)
     a = agenda_authority_score(c)
 
     # Trust multiplier: prevents content sites (news, TV, travel) that happen to have
@@ -3611,12 +3627,32 @@ async def process_city(
         if storage is not None:
             s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
             try:
+                # Source stability guard: never downgrade from a higher-tier (more supported)
+                # platform to a lower-tier one. Discovery reruns should only upgrade sources,
+                # not silently replace a working CivicClerk/Legistar with Granicus/unknown.
+                new_platform = (result.get("best_source") or {}).get("platform", "unknown")
+                new_tier = PLATFORM_TIER.get(new_platform, 4)
+                if storage.exists(s3_key):
+                    try:
+                        existing = storage.read_json(s3_key)
+                        old_platform = (existing.get("best_source") or {}).get("platform", "unknown")
+                        old_tier = PLATFORM_TIER.get(old_platform, 4)
+                        if new_tier < old_tier:
+                            print(
+                                f"  [guard] {city}, {state}: keeping existing {old_platform} "
+                                f"(tier={old_tier}) over new {new_platform} (tier={new_tier})"
+                            )
+                            result = existing  # keep existing result, don't overwrite
+                    except Exception:
+                        pass  # if we can't read existing, proceed with new result
                 storage.write_json(s3_key, result)
             except Exception as e:
                 print(f"  [warn] Could not upload source.json to S3 for {city}, {state}: {e}")
 
             # Body validation: auto-correct council_category_id / committee_id for
             # known platforms so collection never runs against the wrong body.
+            # If the winner is unresolved, automatically try the next-ranked supported
+            # candidate — this prevents blocking collection on a single bad source.
             bs_platform = (result.get("best_source") or {}).get("platform", "")
             if bs_platform in VALIDATABLE_PLATFORMS:
                 try:
@@ -3627,7 +3663,46 @@ async def process_city(
                     if bv_status == "corrected":
                         print(f"  [body] corrected → {bv.get('correction_note', '')}")
                     elif bv_status == "unresolved":
-                        print(f"  [body] UNRESOLVED — {bv.get('reason', '')}")
+                        print(f"  [body] UNRESOLVED for {bs_platform} — {bv.get('reason', '')}")
+                        # Fallback: try the next-ranked supported candidate
+                        for alt in (result.get("all_candidates") or [])[1:]:
+                            alt_platform = alt.get("platform", "")
+                            if alt_platform not in VALIDATABLE_PLATFORMS:
+                                continue
+                            alt_source = {
+                                **result,
+                                "best_source": {
+                                    "platform": alt_platform,
+                                    "url": alt.get("url", ""),
+                                    "display_url": alt.get("url", ""),
+                                    "freshness": alt.get("freshness"),
+                                    "most_recent_date": alt.get("most_recent_date"),
+                                    "days_since_update": alt.get("days_since_update"),
+                                    "date_source": alt.get("date_source"),
+                                    "collection_method": COLLECTION_METHODS.get(alt_platform, "fetch_and_parse"),
+                                    "config": alt.get("config") or {},
+                                    "notes": alt.get("notes") or "",
+                                },
+                            }
+                            try:
+                                alt_bv = await validate_body_for_city(
+                                    f"{slug}-{state}", alt_source, s3_key, http, storage
+                                )
+                            except Exception:
+                                continue
+                            if alt_bv.get("status") in ("ok", "corrected"):
+                                print(
+                                    f"  [body] fallback OK: switched to {alt_platform} "
+                                    f"({alt.get('url', '')})"
+                                )
+                                result = alt_source
+                                try:
+                                    storage.write_json(s3_key, result)
+                                except Exception:
+                                    pass
+                                break
+                        else:
+                            print(f"  [body] no fallback candidate resolved — body unresolved")
                     elif bv_status not in ("skip", "ok"):
                         print(f"  [body] {bv_status}: {bv.get('reason', '')}")
                 except Exception as e:
