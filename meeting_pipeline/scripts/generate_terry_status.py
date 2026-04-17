@@ -2,19 +2,21 @@
 generate_terry_status.py — Generate pipeline status for all cities in Terry Users2.csv.
 
 Status categories (mutually exclusive, checked in order):
-  1. Has Future Briefing       — briefing exists with meeting date >= today
-  2. Agenda Posted-Needs Collection — scan found future meeting with agenda posted, no briefing yet
-  3. Scannable-No Upcoming     — supported platform, scan works, no future meetings with agendas
-  4. Source Broken             — supported platform configured, but scan returns no data at all
-  5. Unsupported Platform      — platform not in supported scanner list
-  6. No Source Found           — no source.json, or source is empty/wrong_entity
+  1. Has Future Briefing    — briefing exists for a meeting date >= today
+  2. Agenda Ready           — future meeting with agenda posted, no briefing yet
+  3. Awaiting Agenda        — future meeting visible but no agenda posted yet
+  4. Scannable-No Upcoming  — supported platform, scan works, no future meetings visible yet
+  5. Source Broken          — supported platform configured, scan returns nothing
+  6. Unknown                — has past briefings but now on unsupported/broken platform
+  7. Unsupported Platform   — platform not in supported scanner list, no past briefings
+  8. No Source Found        — no source.json, or source is empty/wrong_entity
 
 CSV columns written to Terry Users2.csv:
-  Pipeline Last meeting     — most recent past meeting date from scan data (or briefing fallback)
-  Pipeline Next Meeting     — soonest upcoming meeting date (any agenda status)
-  Pipeline Agenda Posted    — soonest upcoming meeting that has an agenda posted
-  Briefing Dates            — comma-separated list of all dates we generated briefings for
-  Pipeline Status           — one of the 6 statuses above
+  Pipeline Last Meeting  — most recent past council meeting date we have seen
+  Pipeline Next Meeting  — soonest FUTURE meeting date (any agenda status); blank if none
+  Next Briefing Date     — date of the next future briefing we have (today or later); blank if none
+  Briefings              — comma-separated list of ALL briefing dates we have generated
+  Pipeline Status        — one of the 8 statuses above
 
 Usage:
     AWS_PROFILE=goodparty uv run python meeting_pipeline/scripts/generate_terry_status.py
@@ -39,16 +41,24 @@ TODAY = date.today().isoformat()
 TERRY_CSV = _ROOT / "Terry Users2.csv"
 STATUS_CSV = _ROOT / "terry-cities-status.csv"
 
-SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe"}
+SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe", "granicus"}
 
-# Columns added/managed by this script (in order)
+# Columns managed by this script (in order after "Pipeline Last Meeting")
 PIPELINE_COLUMNS = [
-    "Pipeline Last meeting",
+    "Pipeline Last Meeting",
     "Pipeline Next Meeting",
-    "Pipeline Agenda Posted",
-    "Briefing Dates",
+    "Next Briefing Date",
+    "Briefings",
     "Pipeline Status",
 ]
+
+# Old column names to migrate away from
+OLD_COLUMN_NAMES = {
+    "Pipeline Last meeting": "Pipeline Last Meeting",
+    "Pipeline Agenda Posted": "Next Briefing Date",
+    "Briefing Dates": "Briefings",
+    "Pipeline Next meeting": "Pipeline Next Meeting",
+}
 
 
 def list_briefing_keys(storage, briefings_prefix: str, slug: str) -> list[str]:
@@ -76,8 +86,8 @@ def get_city_status(slug: str, storage, cfg) -> dict:
     """
     Compute all status fields for a single city slug.
 
-    Returns dict with:
-      status, platform, last_meeting, next_meeting, agenda_posted_date, briefing_dates
+    Returns dict with keys:
+      status, platform, last_meeting, next_meeting, next_briefing_date, briefings
     """
     sources_prefix = cfg.sources_prefix
     briefings_prefix = getattr(cfg, "briefings_prefix", "meeting_pipeline/output/briefings")
@@ -101,14 +111,19 @@ def get_city_status(slug: str, storage, cfg) -> dict:
     briefing_keys = list_briefing_keys(storage, briefings_prefix, slug)
     briefing_dates = extract_briefing_dates(briefing_keys)
 
-    has_future_briefing = any(d >= TODAY for d in briefing_dates)
-    most_recent_briefing = max(briefing_dates) if briefing_dates else None
+    # Future briefing = date >= today
+    future_briefing_dates = [d for d in briefing_dates if d >= TODAY]
+    has_future_briefing = len(future_briefing_dates) > 0
+    next_briefing_date = min(future_briefing_dates) if future_briefing_dates else None
+
+    # Had any briefings ever (for Unknown status detection)
+    had_any_briefing = len(briefing_dates) > 0
 
     # ── Upcoming meetings ─────────────────────────────────────────────────────
     upcoming_key = f"{sources_prefix}/{slug}/upcoming_meetings.json"
-    last_meeting = None        # most recent past meeting from scan
-    next_meeting = None        # soonest upcoming meeting (any status)
-    agenda_posted_date = None  # soonest upcoming meeting with agenda posted
+    last_meeting = None       # most recent past meeting date
+    next_meeting = None       # soonest future meeting date (any agenda status)
+    agenda_posted_date = None # soonest future meeting with agenda posted
     scan_has_data = False
 
     if storage.exists(upcoming_key):
@@ -129,6 +144,7 @@ def get_city_status(slug: str, storage, cfg) -> dict:
             future_dates = [m["date"] for m in future_meetings]
             if future_dates:
                 next_meeting = min(future_dates)
+                scan_has_data = True
 
             agenda_dates = [
                 m["date"] for m in future_meetings if m.get("agenda_posted")
@@ -139,27 +155,36 @@ def get_city_status(slug: str, storage, cfg) -> dict:
         except Exception:
             pass
 
-    # Fall back last_meeting from most recent briefing if scan has no past data
-    # (covers unsupported platforms where we generated briefings historically)
-    if not last_meeting and most_recent_briefing:
-        last_meeting = most_recent_briefing
+    # Fall back last_meeting from most recent past briefing if scan has no past data
+    if not last_meeting and briefing_dates:
+        past_briefings = [d for d in briefing_dates if d < TODAY]
+        if past_briefings:
+            last_meeting = max(past_briefings)
 
     # ── Status determination ──────────────────────────────────────────────────
     if has_future_briefing:
+        # We have a briefing ready for an upcoming meeting
         status = "Has Future Briefing"
     elif platform in SUPPORTED_PLATFORMS:
         if agenda_posted_date:
-            # Agenda is posted and we haven't generated a briefing yet
-            status = "Agenda Posted-Needs Collection"
-        elif scan_has_data or next_meeting:
-            # Platform works — we've seen meetings — but no agenda posted yet
+            # Agenda is posted for a future meeting but no briefing generated yet
+            status = "Agenda Ready"
+        elif next_meeting:
+            # Future meeting visible but no agenda posted yet
+            status = "Awaiting Agenda"
+        elif scan_has_data:
+            # Supported platform, scan found past meetings, but nothing upcoming yet
             status = "Scannable-No Upcoming"
         else:
             # Supported platform but scan returns nothing at all
             status = "Source Broken"
+    elif had_any_briefing:
+        # We've generated briefings before but platform is now unsupported/broken
+        status = "Unknown"
     elif not source_exists or source_freshness in ("wrong_entity", "empty"):
         status = "No Source Found"
     else:
+        # Known platform but no scanner built for it
         status = "Unsupported Platform"
 
     return {
@@ -168,8 +193,8 @@ def get_city_status(slug: str, storage, cfg) -> dict:
         "status": status,
         "last_meeting": last_meeting or "",
         "next_meeting": next_meeting or "",
-        "agenda_posted_date": agenda_posted_date or "",
-        "briefing_dates": ", ".join(briefing_dates),
+        "next_briefing_date": next_briefing_date or "",
+        "briefings": ", ".join(briefing_dates),
         "briefing_count": len(briefing_keys),
     }
 
@@ -183,41 +208,42 @@ def main():
     storage = get_storage(cfg)
 
     # ── Load Terry CSV ────────────────────────────────────────────────────────
-    with open(TERRY_CSV) as f:
+    with open(TERRY_CSV, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     fieldnames = list(rows[0].keys())
 
-    # Remove the old "Pipeline Next meeting" column if present (renamed to "Pipeline Next Meeting")
-    if "Pipeline Next meeting" in fieldnames:
-        fieldnames.remove("Pipeline Next meeting")
-    # Strip old key from all row dicts so DictWriter doesn't complain
-    for row in rows:
-        row.pop("Pipeline Next meeting", None)
+    # ── Migrate old column names ──────────────────────────────────────────────
+    for old_name, new_name in OLD_COLUMN_NAMES.items():
+        if old_name in fieldnames:
+            idx = fieldnames.index(old_name)
+            fieldnames[idx] = new_name
+        # Rename keys in all row dicts
+        for row in rows:
+            if old_name in row:
+                row[new_name] = row.pop(old_name)
 
-    # Ensure all pipeline columns exist in the correct order.
-    # Strategy: find the anchor ("Pipeline Last meeting"), remove any existing
-    # pipeline cols from wherever they are, then re-insert them in order after the anchor.
-    anchor = "Pipeline Last meeting"
+    # ── Ensure pipeline columns exist in correct order ────────────────────────
+    # Anchor on "Pipeline Last Meeting"; remove any existing pipeline cols then
+    # re-insert them in order right after the anchor.
+    anchor = "Pipeline Last Meeting"
     if anchor not in fieldnames:
         fieldnames.append(anchor)
-    anchor_idx = fieldnames.index(anchor)
 
-    # Remove existing pipeline cols (they may be in wrong positions)
     for col in PIPELINE_COLUMNS:
         if col in fieldnames and col != anchor:
             fieldnames.remove(col)
 
-    # Re-insert in correct order right after anchor
+    anchor_idx = fieldnames.index(anchor)
     for i, col in enumerate(PIPELINE_COLUMNS):
         if col == anchor:
-            continue  # anchor is already there
-        insert_at = fieldnames.index(anchor) + (PIPELINE_COLUMNS.index(col))
+            continue
+        insert_at = anchor_idx + PIPELINE_COLUMNS.index(col)
         if col not in fieldnames:
             fieldnames.insert(insert_at, col)
 
-    # ── Deduplicate slugs ─────────────────────────────────────────────────────
+    # ── Deduplicate city slugs ────────────────────────────────────────────────
     slug_order = []
-    seen = set()
+    seen: set[str] = set()
     for row in rows:
         city = row.get("City", "").strip()
         state = row.get("State", "").strip()
@@ -237,16 +263,19 @@ def main():
         result = get_city_status(slug, storage, cfg)
         slug_status[slug] = result
         status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
-        agenda_marker = f" agenda={result['agenda_posted_date']}" if result["agenda_posted_date"] else ""
+        marker = ""
+        if result["next_briefing_date"]:
+            marker = f" briefing={result['next_briefing_date']}"
+        elif result["next_meeting"]:
+            marker = f" next={result['next_meeting']}"
         print(
-            f"  {slug:<45} {result['platform']:<12} {result['status']}"
-            f"{agenda_marker}"
+            f"  {slug:<45} {result['platform']:<12} {result['status']}{marker}"
         )
 
     # ── Write terry-cities-status.csv ─────────────────────────────────────────
     status_fieldnames = [
         "Slug", "Platform", "Status",
-        "Last Meeting", "Next Meeting", "Agenda Posted", "Briefing Dates", "Briefings",
+        "Last Meeting", "Next Meeting", "Next Briefing Date", "Briefings", "Briefing Count",
     ]
     status_rows = [
         {
@@ -255,15 +284,15 @@ def main():
             "Status": r["status"],
             "Last Meeting": r["last_meeting"],
             "Next Meeting": r["next_meeting"],
-            "Agenda Posted": r["agenda_posted_date"],
-            "Briefing Dates": r["briefing_dates"],
-            "Briefings": r["briefing_count"],
+            "Next Briefing Date": r["next_briefing_date"],
+            "Briefings": r["briefings"],
+            "Briefing Count": r["briefing_count"],
         }
         for r in sorted(slug_status.values(), key=lambda x: (x["status"], x["slug"]))
     ]
 
     if not args.dry_run:
-        with open(STATUS_CSV, "w", newline="") as f:
+        with open(STATUS_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=status_fieldnames)
             writer.writeheader()
             writer.writerows(status_rows)
@@ -278,26 +307,33 @@ def main():
         slug = city_to_slug(city, state)
         result = slug_status.get(slug)
         if not result:
+            # City has no S3 data — leave existing values, don't drop the row
             continue
-        row["Pipeline Last meeting"] = result["last_meeting"]
+        row["Pipeline Last Meeting"] = result["last_meeting"]
         row["Pipeline Next Meeting"] = result["next_meeting"]
-        row["Pipeline Agenda Posted"] = result["agenda_posted_date"]
-        row["Briefing Dates"] = result["briefing_dates"]
+        row["Next Briefing Date"] = result["next_briefing_date"]
+        row["Briefings"] = result["briefings"]
         row["Pipeline Status"] = result["status"]
-        # Clear the old column if it exists in row data
-        row.pop("Pipeline Next meeting", None)
 
     if not args.dry_run:
-        with open(TERRY_CSV, "w", newline="") as f:
+        # Ensure every row has all expected fieldname keys (fill missing with "")
+        # and strip any stale keys not in fieldnames to prevent DictWriter errors.
+        clean_rows = []
+        fieldnames_set = set(fieldnames)
+        for row in rows:
+            clean_row = {k: row.get(k, "") for k in fieldnames}
+            clean_rows.append(clean_row)
+        with open(TERRY_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(clean_rows)
         print(f"Updated {TERRY_CSV}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\nStatus breakdown:")
     for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
         print(f"  {status:<35} {count}")
+    print(f"  {'Total unique cities':<35} {len(slug_order)}")
 
 
 if __name__ == "__main__":

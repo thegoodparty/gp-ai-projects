@@ -67,38 +67,61 @@ def parse_expected_body(candidate_office: str) -> str:
     """
     Derive the expected governing body from the Candidate Office column.
 
+    The goal is to name the meeting BODY we want to scan on the platform —
+    not the candidate's personal role. Body validation will self-heal the
+    manifest if the platform uses a different name.
+
     Examples:
         "Fultondale City Council - Place 1"   → "City Council"
-        "Pleasant Grove City Mayor"            → "Mayor"
+        "Pleasant Grove City Mayor"            → "City Council"  (mayor chairs council)
         "Selma City Council - District 7"      → "City Council"
         "City Council"                         → "City Council"
         "Town Council"                         → "Town Council"
-        "Village Board"                        → "Village Board"
+        "Village Board"                        → "Village Board of Trustees"
+        "Trustee"                              → "Village Board of Trustees"
         "Board of Aldermen"                    → "Board of Aldermen"
         "Common Council"                       → "Common Council"
         "Chino Valley Town Council"            → "Town Council"
-        "Mayor"                                → "Mayor"
+        "Town Meeting Member"                  → "Town Meeting"
+        "Selectman"                            → "Select Board"
+        "Alderman"                             → "Board of Aldermen"
     """
     office = candidate_office.strip()
     office_lower = office.lower()
 
-    # Mayor check first (most specific)
+    # Town Meeting Member (before "town" check so it doesn't fall through)
+    if "town meeting" in office_lower:
+        return "Town Meeting"
+
+    # Select Board / Selectman (New England towns)
+    if "select board" in office_lower or "selectman" in office_lower or "selectmen" in office_lower:
+        return "Select Board"
+
+    # Alderman / Alderperson → Board of Aldermen
+    if "alderman" in office_lower or "alderperson" in office_lower or "aldermen" in office_lower:
+        return "Board of Aldermen"
+
+    # Trustee → Village Board of Trustees
+    if "trustee" in office_lower:
+        return "Village Board of Trustees"
+
+    # Mayor: the Mayor leads council meetings; map to City Council so body
+    # validation can find the right meeting body on the platform. If the
+    # platform uses a different name (e.g. "Town Council"), body validation
+    # will self-heal the manifest automatically.
     if "mayor" in office_lower:
-        return "Mayor"
+        return "City Council"
 
     # Named council types — extract just the council type
     for council_type in ("common council", "town council", "city council"):
         if council_type in office_lower:
-            # Title-case the match
             return council_type.title()
 
     # Generic "council" — extract up to and including "Council"
     if "council" in office_lower:
-        # Find position of "council" and extract everything up to that word
         words = office.split()
         for i, w in enumerate(words):
             if w.lower().rstrip(".,") == "council":
-                # Include the word before "council" if it looks like a qualifier
                 if i > 0 and words[i - 1].lower() in ("city", "town", "village", "common"):
                     return f"{words[i-1].title()} Council"
                 return "City Council"
@@ -106,16 +129,11 @@ def parse_expected_body(candidate_office: str) -> str:
 
     # Board types — exclude school board
     if "board" in office_lower and "school board" not in office_lower:
-        # Try to extract the board name
-        # "Village Board" → "Village Board"
-        # "Board of Aldermen" → "Board of Aldermen"
         words = office.split()
         for i, w in enumerate(words):
             if w.lower() == "board":
-                # "Village Board": take word before + Board
                 if i > 0:
                     return f"{words[i-1].title()} Board"
-                # "Board of Aldermen": take Board + rest up to dash
                 rest = " ".join(words[i:])
                 rest = rest.split(" - ")[0].split(",")[0].strip()
                 return rest

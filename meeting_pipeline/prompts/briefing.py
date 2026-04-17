@@ -284,6 +284,8 @@ Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY
 7. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions. Then add a source_citations entry: field="whoIsPresenting", quote=the verbatim sentence from the source that names the presenter or describes the presenting body. Omit if no presenter is named in the source.
 
 8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above. If you include this section, add a source_citations entry: field="supportingContext", quote=the verbatim sentence from the source that most directly supports the statistic or context you cited.
+
+9. **sourcePassage** (REQUIRED when FULL AGENDA DOCUMENT is provided): Copy character-for-character the paragraph(s) from the FULL AGENDA DOCUMENT that are the primary source for this item — the staff report, memo, or background section. This must be exact verbatim text with no changes, no paraphrasing, no summarizing. Include the full staff report section if present (up to ~2000 chars). If no substantive source text exists for this item, set to null.
 {constituent_block}
 MEETING CONTEXT:
 Other items on the agenda: {other_items}

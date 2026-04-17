@@ -239,6 +239,7 @@ class PriorityIssueDetail(BaseModel):
     tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
     whoIsPresenting: str = Field(description="50-75 words, 1-2 paragraphs. Who is presenting (department/role if name unknown), political dynamics, expected council reception. Always required.")
     supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
+    sourcePassage: Optional[str] = Field(None, description="Verbatim text copied character-for-character from the FULL AGENDA DOCUMENT — the staff report, memo, or agenda entry that is the primary source for this item. Copy exact wording with no changes. Null if no substantive source text exists.")
     source_citations: list[SourceCitation] = Field(
         default_factory=list,
         description=(
@@ -683,7 +684,6 @@ def assemble_briefing(
             "title": item.title,
             "description": item.description,
             "category": item.category,
-            "sourceCitations": [c.model_dump() for c in item.source_citations],
         }
         for j, card in enumerate(cards.priorityIssues):
             if card.agendaItemTitle.lower().strip() == item.title.lower().strip():
@@ -734,7 +734,7 @@ def assemble_briefing(
                 "whoIsPresenting": detail.whoIsPresenting,
                 "supportingContext": detail.supportingContext,
                 "supportingDocuments": supporting_docs,
-                "sourceCitations": [c.model_dump() for c in detail.source_citations],
+                "sourceCitations": {"sourcePassage": detail.sourcePassage},
             }
 
         priority_issues.append(issue)
@@ -852,10 +852,6 @@ def generate_briefing_for_meeting(
         print(f"  SKIP: No Haystaq constituent data for {city_slug} — run collect_haystaq_batch.py --from-csv first")
         return {"status": "skipped", "reason": "no_haystaq"}
 
-    if dry_run:
-        print(f"  DRY RUN: Would generate briefing for {city} {date}")
-        return {"status": "dry_run"}
-
     gemini = GeminiClient(default_model=GeminiModelType.FLASH)
 
     # Load the agenda PDF text once — passed to all three passes as primary source
@@ -938,8 +934,22 @@ def generate_briefing_for_meeting(
     briefing["generationCostUsd"] = round(cost, 6)
     print(f"  Cost: ${cost:.4f} ({calls} API calls)")
 
-    # Save
+    # Save — dry-run goes to /tmp, real run goes to storage
     safe_name = f"{city_slug}_{date}_briefing.json"
+    if dry_run:
+        local_path = f"/tmp/{safe_name}"
+        import json as _json
+        with open(local_path, "w") as f:
+            _json.dump(briefing, f, indent=2)
+        print(f"  DRY RUN — saved locally: {local_path}")
+        return {
+            "status": "dry_run",
+            "output": local_path,
+            "cost": cost,
+            "haystaq_available": constituent is not None,
+            "fiscal_warnings": fiscal_warnings,
+        }
+
     output_key = f"{cfg.output_prefix}/briefings/{safe_name}"
     storage.write_json(output_key, briefing)
     print(f"  Saved: {output_key}")

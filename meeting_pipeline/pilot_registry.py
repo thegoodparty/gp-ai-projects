@@ -1,9 +1,12 @@
 """
-pilot_registry.py — Loads officials and cities from serve_users_unified.csv.
+pilot_registry.py — Loads officials and cities from Terry Users2.csv.
 
-Previously a hardcoded list; now reads from the unified CSV so there is
-a single source of truth. All scripts that import PILOT_OFFICIALS or
-pilot_cities() continue to work without changes.
+Terry Users2.csv is the canonical source of truth for which cities and
+officials the pipeline serves. Falls back to serve_users_unified.csv if
+Terry Users2.csv is not present (legacy support).
+
+All scripts that import PILOT_OFFICIALS or pilot_cities() continue to work
+without changes.
 """
 
 from __future__ import annotations
@@ -13,19 +16,23 @@ import re
 from pathlib import Path
 
 _PIPELINE_DIR = Path(__file__).resolve().parent
+_TERRY_CSV = _PIPELINE_DIR / "Terry Users2.csv"
 _UNIFIED_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
 
 
 def _load_from_csv() -> list[dict]:
-    if not _UNIFIED_CSV.exists():
+    # Prefer Terry Users2.csv; fall back to serve_users_unified.csv
+    csv_path = _TERRY_CSV if _TERRY_CSV.exists() else _UNIFIED_CSV
+    if not csv_path.exists():
         return []
     officials = []
-    with open(_UNIFIED_CSV, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            city = row.get("city", "").strip()
-            state = row.get("state", "").strip()
-            name = row.get("name", "").strip()
-            office = row.get("office", "").strip()
+            # Support both Terry (City/State) and unified (city/state) column names
+            city = (row.get("City") or row.get("city") or "").strip()
+            state = (row.get("State") or row.get("state") or "").strip()
+            name = (row.get("Name") or row.get("name") or "").strip()
+            office = (row.get("Office") or row.get("office") or "").strip()
             if not city or not state:
                 continue
             officials.append({

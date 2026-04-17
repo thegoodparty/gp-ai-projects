@@ -144,11 +144,16 @@ async def validate_legistar_body(
             "candidates": body_names[:10],
         }
     else:
-        return {
+        result = {
             "status": "unresolved",
             "reason": f"Best match '{best}' (score={score}) too low for '{expected_body}'. All: {body_names[:10]}",
             "candidates": body_names[:10],
         }
+        # Self-heal: if the best candidate is a governing body (score >= 30),
+        # update the manifest so the next scan uses the correct expected_body.
+        if score >= 30:
+            result["config_patch"] = {"manifest_expected_body": best}
+        return result
 
 
 async def validate_civicplus_body(
@@ -233,11 +238,14 @@ async def validate_civicplus_body(
             "candidates": cat_names,
         }
 
-    return {
+    result = {
         "status": "unresolved",
         "reason": f"Best match '{best_name}' (score={best_score}) too low for '{expected_body}'",
         "candidates": cat_names,
     }
+    if best_score >= 30:
+        result["config_patch"] = {"manifest_expected_body": best_name}
+    return result
 
 
 async def validate_civicclerk_body(
@@ -298,11 +306,14 @@ async def validate_civicclerk_body(
             }
         return {"status": "ok", "validated_body": best, "score": score, "candidates": candidates}
 
-    return {
-        "status": "unresolved" if best is not None else "unresolved",
+    result = {
+        "status": "unresolved",
         "reason": f"No match for '{expected_body}'. Found: {candidates}",
         "candidates": candidates,
     }
+    if best is not None and score >= 30:
+        result["config_patch"] = {"manifest_expected_body": best}
+    return result
 
 
 async def validate_boarddocs_body(
@@ -358,11 +369,14 @@ async def validate_boarddocs_body(
             "candidates": candidates,
         }
 
-    return {
+    result = {
         "status": "unresolved",
         "reason": f"No committee matched '{expected_body}'. Found: {candidates}",
         "candidates": candidates,
     }
+    if best is not None and score >= 30:
+        result["config_patch"] = {"manifest_expected_body": best}
+    return result
 
 
 # ============================================================================
@@ -467,5 +481,13 @@ async def validate_body_for_city(
 
     if validation.get("status") == "corrected":
         apply_body_validation(source_key, source, validation, storage)
+    elif validation.get("status") == "unresolved":
+        manifest_body = (validation.get("config_patch") or {}).get("manifest_expected_body")
+        if manifest_body:
+            # Self-heal: the platform has a governing body that doesn't match the
+            # manifest's expected_body. Update the manifest now so the next scan
+            # uses the correct name and passes body validation.
+            apply_body_validation(source_key, source, validation, storage)
+            print(f"      → Manifest self-healed: '{expected_body}' → '{manifest_body}'")
 
     return validation

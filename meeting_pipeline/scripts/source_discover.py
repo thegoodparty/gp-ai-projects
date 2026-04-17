@@ -44,7 +44,7 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -1317,6 +1317,7 @@ async def probe_granicus_views(
     subdomain: str,
     http: httpx.AsyncClient,
     max_view_id: int = 20,
+    preferred_view_id: int | None = None,
 ) -> dict:
     """
     Enumerate Granicus RSS feeds (view_id=1..max_view_id) to find the City Council view.
@@ -1324,13 +1325,63 @@ async def probe_granicus_views(
     Granicus portals have multiple publisher views — view_id=1 is often a stale archive
     or a different body (e.g. Planning Board). The City Council view may be at any ID.
 
+    If preferred_view_id is provided (from the source URL query params), probe that view
+    first and accept it if it has fresh data — small cities often have one view that
+    serves all their meeting content under a generic title ("City WA Content").
+
     Returns a result dict with keys:
       view_id, rss_url, display_url, freshness, most_recent_date, title
     Or {"view_id": None, "error": ...} if no council view found.
     """
     best_result: dict | None = None
 
+    def _probe_result(view_id: int, body: str, title: str) -> dict:
+        dates = extract_dates(body)
+        most_recent = dates[0] if dates else None
+        freshness = classify_freshness(most_recent) if most_recent else "unknown"
+        rss_url = (
+            f"https://{subdomain}.granicus.com/ViewPublisherRSS.php"
+            f"?view_id={view_id}&mode=agendas"
+        )
+        return {
+            "view_id": view_id,
+            "rss_url": rss_url,
+            "display_url": f"https://{subdomain}.granicus.com/ViewPublisher.php?view_id={view_id}",
+            "freshness": freshness,
+            "most_recent_date": most_recent.isoformat() if most_recent else None,
+            "title": title,
+            "_body": body,
+        }
+
+    # ── Step 1: Probe the preferred view_id first (if provided) ──────────────
+    # Cities often have one Granicus view with a generic title (e.g. "City WA Content")
+    # that doesn't contain council keywords but IS the correct view. Accept it directly
+    # if it has fresh data, since the source URL already validated this view_id.
+    if preferred_view_id:
+        rss_url = (
+            f"https://{subdomain}.granicus.com/ViewPublisherRSS.php"
+            f"?view_id={preferred_view_id}&mode=agendas"
+        )
+        status, body = await safe_fetch(http, rss_url, timeout=8.0)
+        if status == 200 and "<channel>" in body:
+            title = ""
+            m = re.search(r"<title><!\[CDATA\[([^\]]+)\]\]>", body)
+            if m:
+                title = m.group(1).strip()
+            else:
+                m = re.search(r"<title>([^<]+)</title>", body)
+                if m:
+                    title = m.group(1).strip()
+            result = _probe_result(preferred_view_id, body, title)
+            if result["freshness"] in ("fresh", "stale_warning"):
+                return result
+            # Keep as fallback — still enumerate to find a council-titled view
+            best_result = result
+
+    # ── Step 2: Enumerate views looking for council-titled one ────────────────
     for view_id in range(1, max_view_id + 1):
+        if view_id == preferred_view_id:
+            continue  # already probed above
         rss_url = (
             f"https://{subdomain}.granicus.com/ViewPublisherRSS.php"
             f"?view_id={view_id}&mode=agendas"
@@ -1339,7 +1390,6 @@ async def probe_granicus_views(
         if status != 200 or "<channel>" not in body:
             continue
 
-        # Extract RSS channel title (handles both CDATA and plain text)
         title = ""
         m = re.search(r"<title><!\[CDATA\[([^\]]+)\]\]>", body)
         if m:
@@ -1354,29 +1404,15 @@ async def probe_granicus_views(
         if not is_council:
             continue
 
-        dates = extract_dates(body)
-        most_recent = dates[0] if dates else None
-        freshness = classify_freshness(most_recent) if most_recent else "unknown"
-
-        result = {
-            "view_id": view_id,
-            "rss_url": rss_url,
-            "display_url": (
-                f"https://{subdomain}.granicus.com/ViewPublisher.php?view_id={view_id}"
-            ),
-            "freshness": freshness,
-            "most_recent_date": most_recent.isoformat() if most_recent else None,
-            "title": title,
-            "_body": body,  # cache for Phase 2
-        }
+        result = _probe_result(view_id, body, title)
 
         # Fresh council view — ideal, return immediately
-        if freshness == "fresh":
+        if result["freshness"] == "fresh":
             return result
 
         # Keep as best candidate but continue looking (fresher view may exist)
         if best_result is None or (
-            freshness == "stale_warning" and best_result.get("freshness") == "unknown"
+            result["freshness"] == "stale_warning" and best_result.get("freshness") == "unknown"
         ):
             best_result = result
 
@@ -1814,12 +1850,21 @@ async def discover_from_probes(
     state_lower = state.lower()
     domain = known.get("domain") or known.get("civicplus_domain")
 
-    probe_specs: list[tuple[str, str, dict]] = [
-        (
-            f"https://webapi.legistar.com/v1/{city_nospace}/events?$top=3&$orderby=EventDate+desc",
+    # Legistar slug candidates: full city name without spaces, then first word only.
+    # Some cities register under a shortened slug (e.g. "pompano" for Pompano Beach).
+    city_first_word = city.split()[0].lower().replace(".", "")
+    legistar_slug_candidates = [city_nospace]
+    if city_first_word != city_nospace and len(city.split()) > 1:
+        legistar_slug_candidates.append(city_first_word)
+
+    probe_specs: list[tuple[str, str, dict]] = []
+    for lg_slug in legistar_slug_candidates:
+        probe_specs.append((
+            f"https://webapi.legistar.com/v1/{lg_slug}/events?$top=3&$orderby=EventDate+desc",
             "legistar",
-            {"legistar_slug": city_nospace, "display_url": f"https://{city_nospace}.legistar.com"},
-        ),
+            {"legistar_slug": lg_slug, "display_url": f"https://{lg_slug}.legistar.com"},
+        ))
+    probe_specs += [
         (
             f"https://{city_nospace}{state_lower}.portal.civicclerk.com",
             "civicclerk",
@@ -2491,13 +2536,20 @@ def classify_domain_trust(url: str, city: str = "", state: str = "") -> float:
 def agenda_authority_score(c: dict) -> int:
     """Return bonus points for URL/content signals that prove this is an agenda source.
 
-    Added on top of the trust-adjusted freshness score. Max ~45 points.
+    Added on top of the trust-adjusted freshness score. Max ~65 points.
     These bonuses reward government agenda pages that may have no parseable dates
     (SPAs, JavaScript-rendered calendars) over unrelated pages that happen to be fresh.
     """
     url_lower = (c.get("url") or "").lower()
     notes_lower = (c.get("notes") or "").lower()
+    platform = c.get("platform") or "unknown"
     score = 0
+
+    # Supported API platforms inherently provide structured agenda data — give
+    # them a strong bonus so they beat HTML pages that merely mention "agendas".
+    # This ensures Milwaukee Legistar beats city.milwaukee.gov/Agendas.htm, etc.
+    if platform in ("legistar", "civicclerk", "civicplus", "escribe", "boarddocs"):
+        score += 25
 
     # Strong URL path signals
     if "/agendacenter" in url_lower or "/agenda-center" in url_lower:
@@ -3044,9 +3096,14 @@ async def deep_probe_candidate(
     elif platform == "granicus" and current_freshness in ("stale", "stale_warning", "unknown"):
         # Known Granicus URL is stale — the council may be on a different view_id.
         # Extract subdomain and enumerate all views to find the council feed.
+        # Pass preferred_view_id from the URL so small cities with generic feed titles
+        # (e.g. "City WA Content") are accepted if they have fresh data.
         parsed = urlparse(url)
         subdomain = parsed.netloc.replace(".granicus.com", "")
-        gran = await probe_granicus_views(subdomain, http)
+        qs = parse_qs(parsed.query)
+        preferred_vid_str = (qs.get("view_id") or qs.get("view", [None]))[0]
+        preferred_vid = int(preferred_vid_str) if preferred_vid_str and preferred_vid_str.isdigit() else None
+        gran = await probe_granicus_views(subdomain, http, preferred_view_id=preferred_vid)
         if gran.get("view_id"):
             gran_body = gran.pop("_body", "")
             result = {
@@ -3629,18 +3686,35 @@ async def process_city(
             if storage is not None:
                 s3_key = f"{sources_prefix}/{slug}-{state}/source.json"
                 try:
-                    # Source stability guard: never downgrade from a higher-tier platform.
-                    new_platform = (result.get("best_source") or {}).get("platform", "unknown")
+                    # Source stability guard: never downgrade from a higher-tier platform,
+                    # and never replace a fresh/working source with an empty/blocked one.
+                    _NON_WORKING = {"empty", "blocked", "wrong_entity"}
+                    new_bs = result.get("best_source") or {}
+                    new_platform = new_bs.get("platform", "unknown")
                     new_tier = PLATFORM_TIER.get(new_platform, 4)
+                    new_freshness = new_bs.get("freshness", "unknown")
                     if storage.exists(s3_key):
                         try:
                             existing = storage.read_json(s3_key)
-                            old_platform = (existing.get("best_source") or {}).get("platform", "unknown")
+                            old_bs = existing.get("best_source") or {}
+                            old_platform = old_bs.get("platform", "unknown")
                             old_tier = PLATFORM_TIER.get(old_platform, 4)
-                            if new_tier < old_tier:
+                            old_freshness = old_bs.get("freshness", "unknown")
+                            keep_existing = False
+                            reason = ""
+                            # Only protect working sources (not empty/blocked/wrong_entity).
+                            # If existing is already broken, let any new result replace it.
+                            old_is_working = old_freshness not in _NON_WORKING
+                            if new_freshness in _NON_WORKING and old_is_working:
+                                keep_existing = True
+                                reason = f"new={new_freshness} would replace working {old_freshness} {old_platform}"
+                            elif new_tier < old_tier and old_is_working:
+                                keep_existing = True
+                                reason = f"tier downgrade ({old_tier}→{new_tier})"
+                            if keep_existing:
                                 print(
                                     f"  [guard] {city}, {state}: keeping existing {old_platform} "
-                                    f"(tier={old_tier}) over new {new_platform} (tier={new_tier})"
+                                    f"(tier={old_tier}) over new {new_platform} (tier={new_tier}) — {reason}"
                                 )
                                 result = existing
                         except Exception:
