@@ -285,7 +285,7 @@ Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY
 
 8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above. If you include this section, add a source_citations entry: field="supportingContext", quote=the verbatim sentence from the source that most directly supports the statistic or context you cited.
 
-9. **sourcePassage** (REQUIRED when FULL AGENDA DOCUMENT is provided): Copy character-for-character the paragraph(s) from the FULL AGENDA DOCUMENT that are the primary source for this item — the staff report, memo, or background section. This must be exact verbatim text with no changes, no paraphrasing, no summarizing. Include the full staff report section if present (up to ~2000 chars). If no substantive source text exists for this item, set to null.
+9. **sourcePassage** (REQUIRED when FULL AGENDA DOCUMENT is provided): Copy character-for-character the paragraph(s) from the FULL AGENDA DOCUMENT that are the primary source for this item. Look for content in this priority order: (1) staff report or memo, (2) resolution or ordinance text (WHEREAS clauses, specific details), (3) background section or public hearing notice. This must be exact verbatim text with no changes, no paraphrasing, no summarizing. Include the full relevant section if present (up to ~2000 chars). If no substantive source text exists for this item beyond the agenda title, set to null.
 {constituent_block}
 MEETING CONTEXT:
 Other items on the agenda: {other_items}

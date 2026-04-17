@@ -705,6 +705,7 @@ def assemble_briefing(
                  if item.title.lower().strip() == card.agendaItemTitle.lower().strip()),
                 "other"
             ),
+            "sourcePassage": detail.sourcePassage if detail else None,
             "card": {
                 "headline": card.headline,
                 "whatYouNeedToDo": card.whatYouNeedToDo,
@@ -734,7 +735,6 @@ def assemble_briefing(
                 "whoIsPresenting": detail.whoIsPresenting,
                 "supportingContext": detail.supportingContext,
                 "supportingDocuments": supporting_docs,
-                "sourceCitations": {"sourcePassage": detail.sourcePassage},
             }
 
         priority_issues.append(issue)
