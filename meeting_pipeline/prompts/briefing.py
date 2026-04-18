@@ -175,15 +175,17 @@ def build_pass2_prompt(
 {EDITORIAL_RULES}
 Below are candidate priority items, ranked by importance score. SELECT THE 2-4 MOST IMPACTFUL items and write cards for those only. Skip routine or ceremonial items. Prefer items with real policy, budget, or community impact.
 
-For each selected item, write:
+For each selected item, write in this order:
 
-1. **headline**: One punchy sentence, max 15 words. Captures what's at stake for constituents and what this meeting means — in a single breath. Examples: "Monday's vote puts public safety cameras on the map — your constituents are watching." / "What you say Monday shapes the city budget before the numbers are locked." Do NOT include constituent scores, percentages, or numeric rankings.
+1. **sourcePassage**: Find and copy verbatim the primary source text from the FULL AGENDA DOCUMENT for this item — the staff report, memo, resolution text, or public hearing notice. Copy character-for-character with no changes, no summarizing. Do this FIRST before writing anything else. All claims in headline and whatYouNeedToDo must come from this passage.
 
-2. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote Monday, but what you say sets the direction on X." / "This is informational — no vote — but the implicit decision is X." For vote_required items, describe what specifically is being approved and what the official should review or confirm beforehand. For direction_setting, name what gets locked in based on what's said. Be specific about what to do before the meeting. The first sentence must be scannable standalone.
+2. **headline**: One punchy sentence, max 15 words. Captures what's at stake for constituents and what this meeting means — in a single breath. Examples: "Monday's vote puts public safety cameras on the map — your constituents are watching." / "What you say Monday shapes the city budget before the numbers are locked." Do NOT include constituent scores, percentages, or numeric rankings.
 
-3. **askThisInTheRoom**: One specific, substantive question the official could ask staff or fellow members during the meeting. Write it as a direct quote they can read verbatim. One question only.
+3. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote Monday, but what you say sets the direction on X." / "This is informational — no vote — but the implicit decision is X." For vote_required items, describe what specifically is being approved and what the official should review or confirm beforehand. For direction_setting, name what gets locked in based on what's said. Be specific about what to do before the meeting. The first sentence must be scannable standalone. Base all specific claims (dollar amounts, contract details, vote type) on your sourcePassage — not on the item descriptions above.
 
-4. **slug**: URL-safe slug derived from the agenda item title.
+4. **askThisInTheRoom**: One specific, substantive question the official could ask staff or fellow members during the meeting. Write it as a direct quote they can read verbatim. One question only.
+
+5. **slug**: URL-safe slug derived from the agenda item title.
 
 Also write:
 - **executiveHeadline**: One sentence. States how many priority items need attention and signals the work has been done. Never use the word "briefing." (e.g. "{day_name}'s meeting has [N] items that require your attention.")
@@ -285,7 +287,6 @@ Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY
 
 8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above. If you include this section, add a source_citations entry: field="supportingContext", quote=the verbatim sentence from the source that most directly supports the statistic or context you cited.
 
-9. **sourcePassage** (REQUIRED when FULL AGENDA DOCUMENT is provided): Copy character-for-character the paragraph(s) from the FULL AGENDA DOCUMENT that are the primary source for this item. Look for content in this priority order: (1) staff report or memo, (2) resolution or ordinance text (WHEREAS clauses, specific details), (3) background section or public hearing notice. This must be exact verbatim text with no changes, no paraphrasing, no summarizing. Include the full relevant section if present (up to ~2000 chars). If no substantive source text exists for this item beyond the agenda title, set to null.
 {constituent_block}
 MEETING CONTEXT:
 Other items on the agenda: {other_items}

@@ -217,8 +217,9 @@ class AgendaCategorization(BaseModel):
 class PriorityIssueCard(BaseModel):
     agendaItemTitle: str = Field(description="Title of the underlying agenda item")
     slug: str = Field(description="URL-safe slug (e.g. 'public-safety-camera-expansion')")
+    sourcePassage: Optional[str] = Field(None, description="Verbatim text copied character-for-character from the FULL AGENDA DOCUMENT — the staff report, resolution text, or public hearing notice that is the primary source for this item. Copy exact wording with no changes. Must be populated before writing headline or whatYouNeedToDo.")
     headline: str = Field(description="One punchy sentence, max 15 words. What's at stake for constituents and what this meeting means — in a single breath. No scores, percentages, or numeric rankings.")
-    whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for")
+    whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for. Base all claims on sourcePassage, not on the item description above.")
     askThisInTheRoom: str = Field(description="A specific question the council member could ask during the meeting")
     tryThis: Optional[str] = Field(None, description="Optional: a suggested statement or talking point the council member could use")
 
@@ -239,7 +240,6 @@ class PriorityIssueDetail(BaseModel):
     tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
     whoIsPresenting: str = Field(description="50-75 words, 1-2 paragraphs. Who is presenting (department/role if name unknown), political dynamics, expected council reception. Always required.")
     supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
-    sourcePassage: Optional[str] = Field(None, description="Verbatim text copied character-for-character from the FULL AGENDA DOCUMENT — the staff report, memo, or agenda entry that is the primary source for this item. Copy exact wording with no changes. Null if no substantive source text exists.")
     source_citations: list[SourceCitation] = Field(
         default_factory=list,
         description=(
@@ -399,7 +399,6 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
         items_text.append(
             f"[{i+1}] {item.title} (score: {item.priorityScore}/10)\n"
             f"  Category: {item.category}{('  ' + vote_flag) if vote_flag else ''}\n"
-            f"  Description: {item.description}\n"
             f"  Priority reason: {item.priorityReason or 'N/A'}"
         )
 
@@ -525,24 +524,9 @@ def pass3_generate_detail(
     except ValueError:
         day_name = "the upcoming"
 
-    raw_items = meeting.get("data", {}).get("agendaItems", [])
-    raw_item = next(
-        (it for it in raw_items
-         if (it.get("title") or "").lower().strip() == card.agendaItemTitle.lower().strip()),
-        None,
-    )
-    source_text_parts = []
-    if raw_item:
-        if raw_item.get("description"):
-            source_text_parts.append(f"Description: {raw_item['description']}")
-        if raw_item.get("staffRecommendation"):
-            source_text_parts.append(f"Staff recommendation: {raw_item['staffRecommendation']}")
-        if raw_item.get("presenter"):
-            source_text_parts.append(f"Presenter: {raw_item['presenter']}")
-        if raw_item.get("fiscalAmounts"):
-            source_text_parts.append(f"Fiscal amounts: {raw_item['fiscalAmounts']}")
-
-    source_text = "\n".join(source_text_parts) if source_text_parts else "No additional source text available for this item."
+    # Use the verbatim passage extracted in Pass 2 as the primary source for Pass 3.
+    # This ensures Pass 3 synthesizes from real PDF text, not LLM-generated summaries.
+    source_text = card.sourcePassage or "No source passage available for this item."
 
     constituent_context = format_constituent_context(constituent) if constituent else ""
     other_items = ", ".join(
@@ -705,7 +689,7 @@ def assemble_briefing(
                  if item.title.lower().strip() == card.agendaItemTitle.lower().strip()),
                 "other"
             ),
-            "sourcePassage": detail.sourcePassage if detail else None,
+            "sourcePassage": card.sourcePassage,
             "card": {
                 "headline": card.headline,
                 "whatYouNeedToDo": card.whatYouNeedToDo,
