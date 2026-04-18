@@ -90,7 +90,6 @@ Below are all agenda items. For each one:
 2. Write a 1-2 sentence plain-language description
 3. Assign a category: procedural, consent, informational, vote_required, direction_setting, or public_hearing
 4. Decide if it's a genuine priority (isPriority=true) and assign a priorityScore (1-10)
-5. For isPriority=true items only: populate source_citations with verbatim sentences copied exactly from the FULL AGENDA SOURCE DOCUMENT. Use field names: "fiscal_amounts" for the sentence containing the dollar figure, "vote_type" for the sentence describing what action council takes, "description" for the sentence(s) that best describe the item. Copy exact wording — do not paraphrase. Omit a citation if no direct supporting sentence exists.
 
 Category definitions:
 - procedural: Call to order, adjournment, pledge, invocation, approval of agenda, approval of minutes
@@ -141,6 +140,7 @@ def build_pass2_prompt(
     total_items: int,
     constituent_context: str = "",
     pdf_text: str = "",
+    available_docs: str = "",
 ) -> str:
     """
     Build the Pass 2 prompt: generate headline, whatYouNeedToDo, and askThis cards.
@@ -156,6 +156,7 @@ def build_pass2_prompt(
         constituent_context: Optional pre-formatted Haystaq full constituent context string.
                              Pass "" if no constituent data is available.
         pdf_text: Optional full text extracted from the agenda PDF, for richer context.
+        available_docs: Optional pre-formatted available source document URLs.
     """
     constituent_block = ""
     if constituent_context:
@@ -196,6 +197,7 @@ CANDIDATE PRIORITY ITEMS (ranked by score, select the 2-4 most impactful):
 
 FULL AGENDA CONTEXT:
 The meeting has {total_items} total items. Summary: {agenda_summary}
+{available_docs}
 {pdf_block}"""
 
 
@@ -253,8 +255,8 @@ def build_pass3_prompt(
     if pdf_text:
         pdf_block = f"\nFULL AGENDA DOCUMENT (primary source — use for specific names, dollar amounts, staff reports, and supporting details):\n{pdf_text}\n"
 
-    source_label = "STRUCTURED ITEM DATA (extracted fields for this item)" if pdf_text else "SOURCE TEXT (everything known about this item from the official agenda)"
-    grounding_source = "the FULL AGENDA DOCUMENT and STRUCTURED ITEM DATA above" if pdf_text else "the SOURCE TEXT above"
+    source_label = "VERBATIM SOURCE PASSAGE (copied directly from the agenda document — treat this as the ground truth for all claims)"
+    grounding_source = "the VERBATIM SOURCE PASSAGE and FULL AGENDA DOCUMENT above"
 
     return f"""You are a senior policy advisor writing a detailed page for one agenda item from a {city}, {state} {body} meeting on {day_name}, {date}.
 {EDITORIAL_RULES}
@@ -271,21 +273,21 @@ GROUNDING RULE: whoIsPresenting and supportingContext must only contain facts th
 
 Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY.
 
-1. **whatIsHappening** (~30 words, 2 sentences max): Lead with what is physically happening {day_name}, not background history. What action is being taken and why now? History belongs in supportingContext. Then add an entry to source_citations: field="whatIsHappening", quote=the verbatim sentence from the FULL AGENDA DOCUMENT that best supports what you wrote. Copy exact wording — do not paraphrase. Omit if no direct match exists.
+1. **whatIsHappening** (~30 words, 2 sentences max): Lead with what is physically happening {day_name}, not background history. What action is being taken and why now? History belongs in supportingContext.
 
-2. **whatDecision** (~25 words, 1-2 sentences): Open with one of: "Vote required." / "No vote — direction setting." / "No vote — informational." Then in one sentence name what specifically is being decided or shaped. Then add a source_citations entry: field="whatDecision", quote=the verbatim sentence from the source that names the specific decision or action.
+2. **whatDecision** (~25 words, 1-2 sentences): Open with one of: "Vote required." / "No vote — direction setting." / "No vote — informational." Then in one sentence name what specifically is being decided or shaped.
 
-3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count. Then add a source_citations entry: field="whyItMatters", quote=the verbatim sentence from the source that most directly supports the impact or dollar figure you cited.
+3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count.
 
-4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision. Then add a source_citations entry: field="recommendation", quote=the verbatim sentence from the source that grounds your recommendation (e.g. a staff recommendation statement, a cost justification, or a timeline).
+4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision.
 
 5. **actionItem** (~28 words, 1 sentence): One specific pre-meeting action. Be concrete: "Before {day_name}, review the [document]" or "Call [person] and ask about [specific thing]".
 
 6. **askThis** (~30 words, 1 question): A specific, substantive question to ask in the meeting. Write it as a direct quote they can read verbatim. One question only.
 
-7. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions. Then add a source_citations entry: field="whoIsPresenting", quote=the verbatim sentence from the source that names the presenter or describes the presenting body. Omit if no presenter is named in the source.
+7. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions.
 
-8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above. If you include this section, add a source_citations entry: field="supportingContext", quote=the verbatim sentence from the source that most directly supports the statistic or context you cited.
+8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above.
 
 {constituent_block}
 MEETING CONTEXT:

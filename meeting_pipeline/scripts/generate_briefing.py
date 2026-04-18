@@ -198,15 +198,6 @@ class CategorizedAgendaItem(BaseModel):
     isPriority: bool = Field(False, description="True if this item is a genuine policy decision, significant spending, or high public interest")
     priorityScore: int = Field(0, description="0 if not priority. 1-10 if priority: 10=highest impact (major policy/budget), 1=lowest (routine vote). Only score items where isPriority=true.")
     priorityReason: Optional[str] = Field(None, description="If isPriority, brief reason why (e.g. 'Large contract approval', 'Zoning change with public hearing')")
-    source_citations: list[SourceCitation] = Field(
-        default_factory=list,
-        description=(
-            "Verbatim sentences from the PDF that directly support key extracted fields. "
-            "Each entry has a 'field' name ('fiscal_amounts', 'vote_type', or 'description') "
-            "and an exact 'quote' from the source document. "
-            "Only populate for isPriority=true items. Leave empty for procedural/routine items."
-        ),
-    )
 
 
 class AgendaCategorization(BaseModel):
@@ -218,6 +209,8 @@ class PriorityIssueCard(BaseModel):
     agendaItemTitle: str = Field(description="Title of the underlying agenda item")
     slug: str = Field(description="URL-safe slug (e.g. 'public-safety-camera-expansion')")
     sourcePassage: Optional[str] = Field(None, description="Verbatim text copied character-for-character from the FULL AGENDA DOCUMENT — the staff report, resolution text, or public hearing notice that is the primary source for this item. Copy exact wording with no changes. Must be populated before writing headline or whatYouNeedToDo.")
+    sourcePassagePage: Optional[int] = Field(None, description="Page number (from [PAGE N] markers in the document) where the sourcePassage was found.")
+    sourceDocUrl: Optional[str] = Field(None, description="URL of the source document this passage came from, if multiple documents are listed in AVAILABLE SOURCE DOCUMENTS. Use the exact URL from that list.")
     headline: str = Field(description="One punchy sentence, max 15 words. What's at stake for constituents and what this meeting means — in a single breath. No scores, percentages, or numeric rankings.")
     whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for. Base all claims on sourcePassage, not on the item description above.")
     askThisInTheRoom: str = Field(description="A specific question the council member could ask during the meeting")
@@ -240,15 +233,6 @@ class PriorityIssueDetail(BaseModel):
     tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
     whoIsPresenting: str = Field(description="50-75 words, 1-2 paragraphs. Who is presenting (department/role if name unknown), political dynamics, expected council reception. Always required.")
     supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
-    source_citations: list[SourceCitation] = Field(
-        default_factory=list,
-        description=(
-            "Verbatim sentences from the FULL AGENDA DOCUMENT that most directly support each detail field. "
-            "Each entry has a 'field' name ('whatIsHappening', 'whatDecision', 'whyItMatters', 'recommendation', 'whoIsPresenting', or 'supportingContext') "
-            "and an exact 'quote' from the source document (not paraphrased). "
-            "Omit entries where no direct match exists."
-        ),
-    )
 
 
 # ============================================================================
@@ -367,7 +351,7 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, 
 # PASS 2: GENERATE CARD CONTENT FOR PRIORITY ISSUES
 # ============================================================================
 
-def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> BriefingCards:
+def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: Optional[dict] = None, pdf_text: str = "", available_docs: Optional[list[dict]] = None) -> BriefingCards:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
     date = meeting.get("date", "")
@@ -409,6 +393,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
         day_name = "the upcoming"
 
     constituent_context = format_constituent_context(constituent) if constituent else ""
+    available_docs_str = _format_available_docs(available_docs, meeting.get("sourceUrl"))
     prompt = build_pass2_prompt(
         city=city,
         body=body,
@@ -419,6 +404,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
         total_items=len(categorized.items),
         constituent_context=constituent_context,
         pdf_text=pdf_text,
+        available_docs=available_docs_str,
     )
 
     result = gemini.generate_structured_content(
@@ -474,32 +460,13 @@ def _load_pdf_text(meeting: dict, storage) -> str:
         pdf_bytes = storage.read_bytes(pdf_storage_key)
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = "\n".join(doc[i].get_text() for i in range(min(len(doc), 60)))
+        text = "\n".join(f"[PAGE {i+1}]\n{doc[i].get_text()}" for i in range(min(len(doc), 60)))
         if len(text) > _PDF_TEXT_CHAR_LIMIT:
             text = text[:_PDF_TEXT_CHAR_LIMIT]
         return text.strip()
     except Exception:
         return ""
 
-
-def _extract_item_passage(pdf_bytes: bytes, item_title: str, context_chars: int = 2000) -> str:
-    """Extract a passage from the raw PDF near the agenda item title."""
-    try:
-        import fitz
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        full_text = "\n".join(doc[i].get_text() for i in range(min(len(doc), 60)))
-        title_lower = item_title.lower()
-        idx = full_text.lower().find(title_lower[:40])  # search first 40 chars of title
-        if idx == -1:
-            # fallback: try first 20 chars
-            idx = full_text.lower().find(title_lower[:20])
-        if idx == -1:
-            return ""
-        start = max(0, idx - 200)
-        end = min(len(full_text), idx + context_chars)
-        return full_text[start:end].strip()
-    except Exception:
-        return ""
 
 
 def pass3_generate_detail(
@@ -614,24 +581,19 @@ def _normalize_amount(s: str) -> str:
     return re.sub(r'[\s,$]', '', s).lower()
 
 
-def check_fiscal_amounts(briefing: dict, meeting: dict) -> list[str]:
+def check_fiscal_amounts(briefing: dict, cards: "BriefingCards") -> list[str]:
     """
     Extract all dollar amounts from generated briefing text and check each
-    appears in the normalized agenda source. Returns list of warning strings
+    appears in the verbatim sourcePassage. Returns list of warning strings
     for amounts that could not be verified.
     """
-    # Build source corpus from all agenda items
-    source_parts = []
-    for item in meeting.get("data", {}).get("agendaItems", []):
-        for field in ("description", "staffRecommendation", "fiscalAmounts"):
-            val = item.get(field)
-            if val:
-                source_parts.append(str(val))
+    # Build source corpus from verbatim sourcePassages (ground truth)
+    source_parts = [card.sourcePassage for card in cards.priorityIssues if card.sourcePassage]
     source_text = " ".join(source_parts)
     source_amounts = {_normalize_amount(m) for m in _DOLLAR_PATTERN.findall(source_text)}
 
-    # Extract amounts from generated briefing text
-    generated_text = json.dumps(briefing.get("data", {}))
+    # Extract amounts from generated briefing text (cards + details)
+    generated_text = json.dumps(briefing.get("priorityIssues", []))
     generated_amounts = _DOLLAR_PATTERN.findall(generated_text)
 
     warnings = []
@@ -690,6 +652,8 @@ def assemble_briefing(
                 "other"
             ),
             "sourcePassage": card.sourcePassage,
+            "sourcePassagePage": card.sourcePassagePage,
+            "sourceDocUrl": card.sourceDocUrl,
             "card": {
                 "headline": card.headline,
                 "whatYouNeedToDo": card.whatYouNeedToDo,
@@ -856,9 +820,12 @@ def generate_briefing_for_meeting(
     # Pass 2: Generate cards
     print(f"  Pass 2: Generating card content...")
     t0 = time.time()
-    cards = pass2_generate_cards(meeting, categorized, gemini, constituent=constituent, pdf_text=pdf_text)
+    cards = pass2_generate_cards(meeting, categorized, gemini, constituent=constituent, pdf_text=pdf_text, available_docs=meeting.get("agendaFiles"))
     t1 = time.time()
     print(f"  Pass 2 done: {len(cards.priorityIssues)} priority cards ({t1-t0:.1f}s)")
+    for card in cards.priorityIssues:
+        if not card.sourcePassage:
+            print(f"  ⚠ No sourcePassage for priority item: '{card.agendaItemTitle[:60]}' — detail will be ungrounded")
 
     # Pass 3: Generate details for each priority
     details = []
@@ -884,15 +851,8 @@ def generate_briefing_for_meeting(
             t1 = time.time()
             print(f"  Pass 3.{i+1} done ({t1-t0:.1f}s)")
 
-    # Provenance check
-    source_texts = {}
-    for card in cards.priorityIssues:
-        raw_items = meeting.get("data", {}).get("agendaItems", [])
-        raw_item = next((it for it in raw_items if (it.get("title") or "").lower().strip() == card.agendaItemTitle.lower().strip()), None)
-        if raw_item:
-            source_texts[card.agendaItemTitle] = " ".join(filter(None, [
-                raw_item.get("description"), raw_item.get("staffRecommendation")
-            ]))
+    # Provenance check — compare against verbatim sourcePassage, not normalized summaries
+    source_texts = {card.agendaItemTitle: card.sourcePassage or "" for card in cards.priorityIssues}
     provenance_warnings = check_provenance(details, source_texts)
     if provenance_warnings:
         for w in provenance_warnings:
@@ -905,7 +865,7 @@ def generate_briefing_for_meeting(
         briefing["provenanceWarnings"] = provenance_warnings
 
     # Fiscal cross-check
-    fiscal_warnings = check_fiscal_amounts(briefing, meeting)
+    fiscal_warnings = check_fiscal_amounts(briefing, cards)
     if fiscal_warnings:
         for w in fiscal_warnings:
             print(f"  ⚠ {w}")
