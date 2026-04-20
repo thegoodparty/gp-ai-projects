@@ -758,37 +758,43 @@ def assemble_briefing(
 # ============================================================================
 
 def _run_qa_hook(briefing_key: str) -> None:
-    """Invoke the QA pipeline for a newly-written briefing. Non-blocking.
+    """Invoke the QA pipeline for a newly-written briefing. Fire-and-forget.
 
+    Runs in a daemon thread so it never blocks or delays briefing generation.
     Set QA_REPO_PATH in .env to the root of the meeting-briefing-qa repo.
     If unset, this is a no-op.
     """
     import os
     import subprocess
+    import threading
 
     qa_root = os.environ.get("QA_REPO_PATH", "")
     if not qa_root:
         return
-    print("  Running QA...")
-    try:
-        proc = subprocess.run(
-            ["uv", "run", "python", "scripts/run_qa.py", briefing_key, "--output-s3"],
-            cwd=qa_root,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        status = "✓" if proc.returncode == 0 else f"✗ exit {proc.returncode}"
-        print(f"  QA: {status}")
-        for line in (proc.stdout or "").strip().splitlines()[-8:]:
-            print(f"  QA: {line}")
-        if proc.returncode != 0 and proc.stderr:
-            for line in proc.stderr.strip().splitlines()[-4:]:
-                print(f"  QA err: {line}")
-    except subprocess.TimeoutExpired:
-        print("  QA: timed out (>10 min) — results available on next --batch run")
-    except Exception as e:
-        print(f"  QA: hook error — {e}")
+
+    def _run() -> None:
+        try:
+            proc = subprocess.run(
+                ["uv", "run", "python", "scripts/run_qa.py", briefing_key, "--output-s3"],
+                cwd=qa_root,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            status = "✓" if proc.returncode == 0 else f"✗ exit {proc.returncode}"
+            print(f"  QA [{briefing_key.split('/')[-1]}]: {status}")
+            for line in (proc.stdout or "").strip().splitlines()[-8:]:
+                print(f"  QA: {line}")
+            if proc.returncode != 0 and proc.stderr:
+                for line in proc.stderr.strip().splitlines()[-4:]:
+                    print(f"  QA err: {line}")
+        except subprocess.TimeoutExpired:
+            print(f"  QA [{briefing_key.split('/')[-1]}]: timed out (>10 min)")
+        except Exception as e:
+            print(f"  QA [{briefing_key.split('/')[-1]}]: hook error — {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    print("  QA: running in background")
 
 
 # ============================================================================
