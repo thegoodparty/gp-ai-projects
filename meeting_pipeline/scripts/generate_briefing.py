@@ -754,6 +754,44 @@ def assemble_briefing(
 
 
 # ============================================================================
+# QA HOOK
+# ============================================================================
+
+def _run_qa_hook(briefing_key: str) -> None:
+    """Invoke the QA pipeline for a newly-written briefing. Non-blocking.
+
+    Set QA_REPO_PATH in .env to the root of the meeting-briefing-qa repo.
+    If unset, this is a no-op.
+    """
+    import os
+    import subprocess
+
+    qa_root = os.environ.get("QA_REPO_PATH", "")
+    if not qa_root:
+        return
+    print("  Running QA...")
+    try:
+        proc = subprocess.run(
+            ["uv", "run", "python", "scripts/run_qa.py", briefing_key, "--output-s3"],
+            cwd=qa_root,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        status = "✓" if proc.returncode == 0 else f"✗ exit {proc.returncode}"
+        print(f"  QA: {status}")
+        for line in (proc.stdout or "").strip().splitlines()[-8:]:
+            print(f"  QA: {line}")
+        if proc.returncode != 0 and proc.stderr:
+            for line in proc.stderr.strip().splitlines()[-4:]:
+                print(f"  QA err: {line}")
+    except subprocess.TimeoutExpired:
+        print("  QA: timed out (>10 min) — results available on next --batch run")
+    except Exception as e:
+        print(f"  QA: hook error — {e}")
+
+
+# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
@@ -897,6 +935,8 @@ def generate_briefing_for_meeting(
     output_key = f"{cfg.output_prefix}/briefings/{safe_name}"
     storage.write_json(output_key, briefing)
     print(f"  Saved: {output_key}")
+
+    _run_qa_hook(output_key)
 
     return {
         "status": "ok",
