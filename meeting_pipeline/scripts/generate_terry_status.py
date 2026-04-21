@@ -50,6 +50,7 @@ PIPELINE_COLUMNS = [
     "Next Briefing Date",
     "Briefings",
     "Pipeline Status",
+    "QA Pass",
 ]
 
 # Old column names to migrate away from
@@ -59,6 +60,39 @@ OLD_COLUMN_NAMES = {
     "Briefing Dates": "Briefings",
     "Pipeline Next meeting": "Pipeline Next Meeting",
 }
+
+
+_QA_S3_PREFIX = "meeting_pipeline/qa_outputs"
+
+
+def get_qa_result(storage, slug: str, briefing_date: str) -> str:
+    """Return QA delivery status for the given briefing: 'Pass', 'Block', or ''."""
+    if not briefing_date:
+        return ""
+    # Try both stem formats: with and without _briefing suffix
+    for stem in (f"{slug}_{briefing_date}", f"{slug}_{briefing_date}_briefing"):
+        key = f"{_QA_S3_PREFIX}/{stem}/qa_result.json"
+        try:
+            data = storage.read_json(key)
+            status = data.get("delivery_status", "")
+            if status == "OK":
+                return "Pass"
+            if status == "Block":
+                return "Block"
+            return status
+        except Exception:
+            pass
+    return ""
+    try:
+        data = storage.read_json(key)
+        status = data.get("delivery_status", "")
+        if status == "OK":
+            return "Pass"
+        if status == "Block":
+            return "Block"
+        return status
+    except Exception:
+        return ""
 
 
 def list_briefing_keys(storage, briefings_prefix: str, slug: str) -> list[str]:
@@ -187,6 +221,8 @@ def get_city_status(slug: str, storage, cfg) -> dict:
         # Known platform but no scanner built for it
         status = "Unsupported Platform"
 
+    qa_pass = get_qa_result(storage, slug, next_briefing_date) if next_briefing_date else ""
+
     return {
         "slug": slug,
         "platform": platform,
@@ -196,6 +232,7 @@ def get_city_status(slug: str, storage, cfg) -> dict:
         "next_briefing_date": next_briefing_date or "",
         "briefings": ", ".join(briefing_dates),
         "briefing_count": len(briefing_keys),
+        "qa_pass": qa_pass,
     }
 
 
@@ -275,7 +312,7 @@ def main():
     # ── Write terry-cities-status.csv ─────────────────────────────────────────
     status_fieldnames = [
         "Slug", "Platform", "Status",
-        "Last Meeting", "Next Meeting", "Next Briefing Date", "Briefings", "Briefing Count",
+        "Last Meeting", "Next Meeting", "Next Briefing Date", "Briefings", "Briefing Count", "QA Pass",
     ]
     status_rows = [
         {
@@ -287,6 +324,7 @@ def main():
             "Next Briefing Date": r["next_briefing_date"],
             "Briefings": r["briefings"],
             "Briefing Count": r["briefing_count"],
+            "QA Pass": r["qa_pass"],
         }
         for r in sorted(slug_status.values(), key=lambda x: (x["status"], x["slug"]))
     ]
@@ -314,6 +352,7 @@ def main():
         row["Next Briefing Date"] = result["next_briefing_date"]
         row["Briefings"] = result["briefings"]
         row["Pipeline Status"] = result["status"]
+        row["QA Pass"] = result["qa_pass"]
 
     if not args.dry_run:
         # Ensure every row has all expected fieldname keys (fill missing with "")

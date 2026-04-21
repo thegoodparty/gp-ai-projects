@@ -61,11 +61,11 @@ class MeetingExtraction(BaseModel):
 # ── PDF extraction ────────────────────────────────────────────────────────────
 
 def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 60) -> str:
-    """Extract text from PDF bytes using PyMuPDF. Returns full text."""
+    """Extract text from PDF bytes using PyMuPDF. Returns full text with [PAGE N] markers."""
     import fitz  # PyMuPDF — imported here to keep tests fast (heavy dependency)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = min(len(doc), max_pages)
-    return "\n".join(doc[i].get_text() for i in range(pages))
+    return "\n".join(f"[PAGE {i+1}]\n{doc[i].get_text()}" for i in range(pages))
 
 
 def find_best_pdf(city_slug: str, date: str, platform: str, storage, sources_prefix: str) -> tuple[str | None, str | None]:
@@ -337,9 +337,9 @@ def main():
             print(f"  Extracted {word_count} words from PDF")
 
             truncation_warning = None
-            if len(text) > 50_000:
-                truncated_chars = len(text) - 50_000
-                truncation_warning = f"Text truncated: {len(text):,} chars → 50,000 ({truncated_chars:,} chars dropped — tail agenda items may be missing)"
+            if len(text) > 100_000:
+                truncated_chars = len(text) - 100_000
+                truncation_warning = f"Text truncated: {len(text):,} chars → 100,000 ({truncated_chars:,} chars dropped — tail agenda items may be missing)"
                 print(f"  ⚠ {truncation_warning}")
 
             if len(text.strip()) < 500 and pdf_size > 5000:
