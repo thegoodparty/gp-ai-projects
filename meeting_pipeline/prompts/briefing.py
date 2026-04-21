@@ -172,12 +172,16 @@ SECTIONS TO EXTRACT (include all that are present in the document for this item)
 
 EXTRACTION RULES:
 - Copy each section character-for-character. This is a transcription task, not a writing task.
-- Assign a short descriptive label to each section (e.g. "Staff Memo", "Resolution Text", "Financial Schedule", "Exhibit A").
+- Assign a short descriptive label to each section (e.g. "Staff Memo", "Resolution Text", "Financial Schedule", "Exhibit A"). For prior meeting minutes, use a date-specific label like "April 7 Meeting Minutes".
 - Record the [PAGE N] number for each section.
 - Exclude boilerplate signature/attestation blocks: "PASSED:", "APPROVED:", "ATTEST:", "AYES:", "NAYS:", "Mayor", "Clerk of Council", blank signature lines.
-- EXCLUDE completed vote records embedded in the packet: text such as "A motion was made by… seconded by… Upon the roll call… Motion carried.", "RECORD OF VOTES:", vote tallies with names and Y/N marks, or any text recording that a vote has already occurred. These appear when a city reuses agenda packet forms as minutes — they describe a past event, not the upcoming meeting. Do not include them in any extracted section.
 - If a section is absent from the document (e.g. no staff memo, no financial schedule), skip it — do not fabricate.
 - The first section in your list should be the most substantive (usually Staff Memo or Resolution Text).
+
+PRIOR MEETING MINUTES — set is_prior_minutes=true when a section is narrative from a prior meeting (past-tense language: "presented", "motion passed 5-0", "no action was taken", "councilmember X seconded by Y moved to…"). These sections are VALUABLE — include them — but must be flagged so the briefing writer knows the context.
+- Forward-looking sections (staff memos, resolutions, staff reports, exhibits) → is_prior_minutes=false
+- Prior meeting minutes embedded in the packet → is_prior_minutes=true
+- An item may have a mix: e.g. a staff memo (is_prior_minutes=false) plus a prior vote record showing council already debated this (is_prior_minutes=true)
 
 Also record:
 - **sourcePassagePage**: the [PAGE N] number of the first (primary) section
@@ -232,11 +236,16 @@ def build_pass2b_prompt(
 {EDITORIAL_RULES}
 Below are selected priority items with their verbatim source passages already extracted. Write card content for each item. Base all specific claims on the sourcePassage provided — do not introduce facts from other sources.
 
+SOURCE TYPE RULE — check is_prior_minutes on each section:
+- If any section labeled "Staff Memo", "Staff Report", "Resolution Text", or "Ordinance Text" has is_prior_minutes=false: write normally in future tense — this is genuine upcoming business.
+- If ALL narrative sections (Staff Memo, Staff Report, Resolution Text) have is_prior_minutes=true — even if a Financial Schedule is also present — the substantive source is prior meeting minutes only. Write to reflect what ALREADY happened and clarify Tuesday's role (formal approval of those minutes, follow-up, or informational). Do NOT write "You are asked to approve X" or "You will vote on X" when X already passed at a prior meeting. Example: "At the April 7 meeting, council voted 5-0 to authorize Bolton and Menk. Tuesday's item is the formal approval of those minutes."
+- If an item has a true mix (forward-looking staff memo + prior minutes): lead with the staff memo content and reference the prior vote as context.
+
 For each item write:
 
 1. **headline**: One punchy sentence, max 15 words. Captures what's at stake and what this meeting means. Do NOT include constituent scores, percentages, or numeric rankings.
 
-2. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote {day_name}, but what you say sets the direction on X." For vote_required items, describe what specifically is being approved and what to review beforehand. The first sentence must be scannable standalone. Base all specific claims on the sourcePassage.
+2. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote {day_name}, but what you say sets the direction on X." For vote_required items, describe what specifically is being approved and what to review beforehand. The first sentence must be scannable standalone. Base all specific claims on the sourcePassage. If all sources are prior minutes, the first sentence should reflect Tuesday's actual role (e.g. "You're voting to approve the April 7 minutes, which record council's 5-0 decision to authorize X.").
 
 3. **askThisInTheRoom**: One specific, substantive question the official could ask in the meeting. Write it as a direct quote they can read verbatim.
 
@@ -306,6 +315,11 @@ Card headline: {headline}
 
 SOURCE SECTIONS (verbatim extracts from the agenda packet — these are the sole ground truth for all claims):
 {source_sections}
+
+SOURCE TYPE RULE — check is_prior_minutes on each section:
+- If any section labeled "Staff Memo", "Staff Report", "Resolution Text", or "Ordinance Text" has is_prior_minutes=false: that is genuine forward-looking agenda material. Use it as the primary ground truth and write in future tense.
+- If ALL narrative sections (Staff Memo, Staff Report, Resolution Text) have is_prior_minutes=true — even if a Financial Schedule or Exhibit is present — treat this item as prior-minutes-only: write to reflect what already happened and what Tuesday's role actually is (formal approval of minutes, follow-up discussion, or informational). In whatIsHappening, say what was already decided and that Tuesday's action is approving those minutes. In whatDecision, say "Vote required. Council is voting to approve the [date] minutes, which record the [X] decision." Do NOT write "You are asked to approve X" or "You are asked to formally approve X" when X already passed at a prior meeting.
+  - CRITICAL: If the minutes say "No action was taken" for this item, do NOT say the minutes "record a decision" — they record a discussion with no outcome. Use "No vote, informational. The [date] minutes note staff presented [topic]; no council action was taken."
 
 GROUNDING RULE: Every factual claim in every field must be traceable to a word or phrase in the SOURCE SECTIONS above. Do not draw on training knowledge for specific names, dollar amounts, statistics, addresses, parcel numbers, or historical claims. If a fact does not appear in the source sections, do not state it. There is no other document to consult — what is in the source sections is all you have.
 

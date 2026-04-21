@@ -220,9 +220,10 @@ class AgendaCategorization(BaseModel):
 # Results are merged back into BriefingCards for downstream compatibility.
 
 class SourceSection(BaseModel):
-    label: str = Field(description="Short label for this section, e.g. 'Staff Memo', 'Resolution Text', 'Financial Schedule', 'Exhibit A'")
+    label: str = Field(description="Short label for this section, e.g. 'Staff Memo', 'Resolution Text', 'Financial Schedule', 'Exhibit A'. If from prior meeting minutes, use a date-specific label like 'April 7 Meeting Minutes'.")
     text: str = Field(description="Verbatim text copied character-for-character from this section of the document. No changes, no summarizing.")
     page: Optional[int] = Field(None, description="Page number from [PAGE N] markers where this section was found")
+    is_prior_minutes: bool = Field(False, description="True if this section comes from prior meeting minutes embedded in the packet (past-tense narrative: presented, motion passed, no action was taken, etc.) rather than from forward-looking agenda materials (staff memos, resolutions, staff reports).")
 
 
 class PriorityIssueCard(BaseModel):
@@ -494,12 +495,25 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
     if isinstance(result_2a, dict):
         result_2a = SourcePassageExtractions(**result_2a)
 
+    # Infer is_prior_minutes from label when the LLM left it None/False but the label signals minutes.
+    # This catches cases where the model correctly names the section "April 7 Meeting Minutes" but
+    # doesn't populate the boolean field.
+    _MINUTES_LABEL_SIGNALS = re.compile(
+        r"\b(minutes|meeting minutes|council minutes|workshop minutes|special meeting minutes)\b",
+        re.IGNORECASE,
+    )
+    for sel_item in result_2a.selectedItems:
+        for sec in sel_item.sections:
+            if not sec.is_prior_minutes and _MINUTES_LABEL_SIGNALS.search(sec.label):
+                sec.is_prior_minutes = True
+
     # Pass 2b: write card text using the extracted passages as grounding (temp 0.3 — writing task)
     def _format_sections_for_prompt(item: SourcePassageItem) -> str:
         if item.sections:
             parts = []
             for sec in item.sections:
-                parts.append(f"[{sec.label}]\n{sec.text}")
+                tag = " [is_prior_minutes=true]" if sec.is_prior_minutes else ""
+                parts.append(f"[{sec.label}{tag}]\n{sec.text}")
             return "\n\n".join(parts)
         return "(no source passages found)"
 
@@ -660,7 +674,7 @@ def pass3_generate_detail(
     # No windowed PDF is passed; all grounding comes from the curated sections extracted in Pass 2a.
     if card.sourceSections:
         source_sections_str = "\n\n".join(
-            f"[{sec.label}]\n{sec.text}"
+            f"[{sec.label}{' [is_prior_minutes=true]' if sec.is_prior_minutes else ''}]\n{sec.text}"
             for sec in card.sourceSections
         )
     elif card.sourcePassage:
@@ -854,7 +868,7 @@ def assemble_briefing(
             ),
             "sourcePassage": card.sourcePassage,
             "sourceSections": [
-                {"label": s.label, "text": s.text, "page": s.page}
+                {"label": s.label, "text": s.text, "page": s.page, "is_prior_minutes": s.is_prior_minutes or False}
                 for s in card.sourceSections
             ],
             "sourcePassagePage": card.sourcePassagePage,
