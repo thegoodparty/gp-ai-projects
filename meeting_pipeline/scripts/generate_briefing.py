@@ -54,7 +54,8 @@ from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 from meeting_pipeline.prompts.briefing import (
     EDITORIAL_RULES,
     build_pass1_prompt,
-    build_pass2_prompt,
+    build_pass2a_prompt,
+    build_pass2b_prompt,
     build_pass3_prompt,
 )
 
@@ -140,11 +141,20 @@ def load_constituent_data(city_slug: str, storage, sources_prefix: str) -> Optio
     return data if data.get("issues") else None
 
 
-def format_constituent_context(constituent: dict) -> str:
-    """Format constituent data into a text block for LLM prompts using tiered prose."""
+def format_constituent_context(constituent: dict, n: int | None = None) -> str:
+    """Format constituent data into a text block for LLM prompts using tiered prose.
+
+    Args:
+        constituent: Haystaq constituent data dict.
+        n: If set, limit to the top N issues by score. Pass n=5 for Pass 2 and Pass 3
+           so the model only references issues that appear in constituentData.topIssues output.
+    """
     issues = constituent.get("issues", [])
     if not issues:
         return ""
+
+    if n is not None:
+        issues = sorted(issues, key=lambda i: i.get("score", 0), reverse=True)[:n]
 
     lines = ["CONSTITUENT PRIORITIES (modeled estimates of resident sentiment — directional, not precise):"]
     voter_count = constituent.get("voter_count_with_scores", 0)
@@ -193,11 +203,10 @@ class SourceCitation(BaseModel):
 class CategorizedAgendaItem(BaseModel):
     originalTitle: str = Field(description="Original title from the agenda")
     title: str = Field(description="Clean, readable title (fix ALL CAPS, remove numbering prefixes)")
-    description: str = Field(description="1-2 sentence plain-language description of what this item is about")
+    description: Optional[str] = Field(None, description="1-2 sentence plain-language description of what this item is about. Omit entirely for procedural items (call to order, roll call, adjournment, pledge, invocation, approval of minutes) — do not generate filler content for items with nothing substantive to describe.")
     category: str = Field(description="One of: procedural, consent, informational, vote_required, direction_setting, public_hearing")
     isPriority: bool = Field(False, description="True if this item is a genuine policy decision, significant spending, or high public interest")
     priorityScore: int = Field(0, description="0 if not priority. 1-10 if priority: 10=highest impact (major policy/budget), 1=lowest (routine vote). Only score items where isPriority=true.")
-    priorityReason: Optional[str] = Field(None, description="If isPriority, brief reason why (e.g. 'Large contract approval', 'Zoning change with public hearing')")
 
 
 class AgendaCategorization(BaseModel):
@@ -205,11 +214,23 @@ class AgendaCategorization(BaseModel):
     agendaSummary: str = Field(description="One-sentence summary of the full agenda (e.g. '12 items including votes, direction-setting discussions, and procedural business.')")
 
 
+# ── Pass 2 split schemas ──────────────────────────────────────────────────────
+# Pass 2a (temp 0.1) extracts verbatim source sections (multiple labeled excerpts per item).
+# Pass 2b (temp 0.3) writes card text using those sections as grounding.
+# Results are merged back into BriefingCards for downstream compatibility.
+
+class SourceSection(BaseModel):
+    label: str = Field(description="Short label for this section, e.g. 'Staff Memo', 'Resolution Text', 'Financial Schedule', 'Exhibit A'")
+    text: str = Field(description="Verbatim text copied character-for-character from this section of the document. No changes, no summarizing.")
+    page: Optional[int] = Field(None, description="Page number from [PAGE N] markers where this section was found")
+
+
 class PriorityIssueCard(BaseModel):
     agendaItemTitle: str = Field(description="Title of the underlying agenda item")
     slug: str = Field(description="URL-safe slug (e.g. 'public-safety-camera-expansion')")
-    sourcePassage: Optional[str] = Field(None, description="Verbatim text copied character-for-character from the FULL AGENDA DOCUMENT — the staff report, resolution text, or public hearing notice that is the primary source for this item. Copy exact wording with no changes. Must be populated before writing headline or whatYouNeedToDo.")
-    sourcePassagePage: Optional[int] = Field(None, description="Page number (from [PAGE N] markers in the document) where the sourcePassage was found.")
+    sourcePassage: Optional[str] = Field(None, description="Primary verbatim source text (first section). Kept for backward compatibility.")
+    sourceSections: list[SourceSection] = Field(default_factory=list, description="All labeled source sections extracted for this item.")
+    sourcePassagePage: Optional[int] = Field(None, description="Page number (from [PAGE N] markers in the document) where the primary source section was found.")
     sourceDocUrl: Optional[str] = Field(None, description="URL of the source document this passage came from, if multiple documents are listed in AVAILABLE SOURCE DOCUMENTS. Use the exact URL from that list.")
     headline: str = Field(description="One punchy sentence, max 15 words. What's at stake for constituents and what this meeting means — in a single breath. No scores, percentages, or numeric rankings.")
     whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for. Base all claims on sourcePassage, not on the item description above.")
@@ -223,15 +244,41 @@ class BriefingCards(BaseModel):
     priorityIssues: list[PriorityIssueCard] = Field(description="2-4 priority issues, ordered by importance")
 
 
+class SourcePassageItem(BaseModel):
+    agendaItemTitle: str = Field(description="Title of the agenda item — must match a candidate item exactly")
+    sections: list[SourceSection] = Field(default_factory=list, description="All relevant source sections for this item, each labeled and copied verbatim")
+    sourcePassagePage: Optional[int] = Field(None, description="Page number from [PAGE N] markers where the primary section was found")
+    sourceDocUrl: Optional[str] = Field(None, description="URL of the source document from AVAILABLE SOURCE DOCUMENTS, if listed")
+
+
+class SourcePassageExtractions(BaseModel):
+    selectedItems: list[SourcePassageItem] = Field(description="The 2-4 most impactful items selected from the candidates, with verbatim source sections")
+
+
+class PriorityIssueCardText(BaseModel):
+    agendaItemTitle: str = Field(description="Title of the agenda item — must match one of the items provided")
+    slug: str = Field(description="URL-safe slug derived from the agenda item title")
+    headline: str = Field(description="One punchy sentence, max 15 words. What's at stake and what this meeting means.")
+    whatYouNeedToDo: str = Field(description="3-5 sentences. First sentence states vote type. Base all claims on the sourcePassage provided.")
+    askThisInTheRoom: str = Field(description="One specific question to ask in the meeting, written as a direct quote")
+    tryThis: Optional[str] = Field(None, description="Optional suggested talking point")
+
+
+class BriefingCardTexts(BaseModel):
+    executiveHeadline: str
+    executiveSubheadline: str
+    cards: list[PriorityIssueCardText]
+
+
 class PriorityIssueDetail(BaseModel):
     whatIsHappening: str = Field(description="~30 words, 2 sentences. Concise context: what is this about and why is it on the agenda now")
     whatDecision: str = Field(description="~25 words, 1-2 sentences. What specific decision is being made or asked of the council member")
     whyItMatters: str = Field(description="50-70 words, 2-3 sentences. Why this matters — include concrete details, dollar amounts, affected areas. Use the full word count.")
-    recommendation: str = Field(description="~40 words, 2-3 sentences. Clear recommendation with reasoning: what to do AND why")
-    actionItem: str = Field(description="~28 words, 1 sentence. One specific pre-meeting action to take")
+    recommendation: str = Field(description="~40 words, 2-3 sentences. A frame for how to think about this decision — what questions to weigh, what trade-offs to understand. Not a task or directive.")
+    actionItem: str = Field(description="~28 words, 1 sentence. One specific, concrete, pre-meeting task — name the exact document to read, the person to call, or the specific thing to verify. Not general framing.")
     askThis: str = Field(description="~30 words. A direct-quote question to ask in the meeting")
     tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
-    whoIsPresenting: str = Field(description="50-75 words, 1-2 paragraphs. Who is presenting (department/role if name unknown), political dynamics, expected council reception. Always required.")
+    whoIsPresenting: Optional[str] = Field(None, description="50-75 words, 1-2 paragraphs. Who is presenting this item — name and title if stated in the agenda or PDF, otherwise the responsible department by type (e.g. 'Public Works' or 'City Manager's office'). Omit entirely if no presenter or responsible department can be identified from the source text. Do not predict vote outcomes or describe political dynamics.")
     supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
 
 
@@ -239,12 +286,14 @@ class PriorityIssueDetail(BaseModel):
 # PASS 1: CATEGORIZE AGENDA ITEMS
 # ============================================================================
 
-PASS1_CHUNK_SIZE = 20  # Max items per Pass 1 call — keeps structured output within Gemini limits
+PASS1_CHUNK_SIZE = 15  # Max items per Pass 1 call — keeps structured output within Gemini limits
 
 
 def _sanitize_for_prompt(text: str) -> str:
     """Remove characters that cause Gemini structured output to truncate mid-JSON."""
-    return text.replace("§", "sec.").replace("\u00a7", "sec.")
+    text = text.replace("§", "sec.").replace("\u00a7", "sec.")
+    # Strip non-ASCII garbage from PDF extraction (garbled chars cause structured output to bail)
+    return "".join(c if ord(c) < 128 else " " for c in text)
 
 
 def _format_items_text(items: list, start_index: int = 0) -> str:
@@ -335,16 +384,50 @@ def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, 
     for chunk_idx, chunk in enumerate(chunks):
         start = chunk_idx * PASS1_CHUNK_SIZE
         print(f"  Pass 1 chunk {chunk_idx + 1}/{len(chunks)}: items {start + 1}–{start + len(chunk)}")
-        chunk_items = _run_pass1_chunk(city, body, date, chunk, start, constituent_context, pdf_text, gemini)
+        # Don't pass pdf_text to chunks — the full PDF contains all agenda items and causes
+        # the LLM to extract items beyond the 15-item slice it was given.
+        chunk_items = _run_pass1_chunk(city, body, date, chunk, start, constituent_context, "", gemini)
         all_categorized.extend(chunk_items)
 
-    # Merge: agendaSummary from first chunk (it has full context from pdf_text)
-    # Re-run a lightweight summary-only call is overkill — use a generic merge summary
-    total = len(all_categorized)
-    priority_count = sum(1 for it in all_categorized if it.isPriority)
-    agenda_summary = f"{total} agenda items including {priority_count} priority items requiring council attention."
+    # Merge: generate a real one-sentence agendaSummary from the full categorized item list.
+    # The generic count template is not useful in Pass 2 context or the user-visible fullAgendaSummary.
+    agenda_summary = _generate_agenda_summary(city, body, date, all_categorized, gemini)
 
     return AgendaCategorization(items=all_categorized, agendaSummary=agenda_summary)
+
+
+class _AgendaSummaryResult(BaseModel):
+    agendaSummary: str
+
+
+def _generate_agenda_summary(
+    city: str,
+    body: str,
+    date: str,
+    items: list[CategorizedAgendaItem],
+    gemini,
+) -> str:
+    """Generate a real one-sentence agenda summary after chunked Pass 1 completes."""
+    items_list = "\n".join(
+        f"- [{item.category}] {item.title}" + (" (priority)" if item.isPriority else "")
+        for item in items
+    )
+    prompt = (
+        f"You summarized a {city} {body} agenda for {date} in chunks. "
+        f"Here is the full categorized item list:\n{items_list}\n\n"
+        "Write a single sentence summarizing the full agenda — what the meeting covers and what kinds of action are required. "
+        "Be specific: name the main topics or themes. Do not use the word 'briefing'."
+    )
+    result = gemini.generate_structured_content(
+        prompt=prompt,
+        response_schema=_AgendaSummaryResult,
+        temperature=0.1,
+        thinking_budget=0,
+        max_tokens=200,
+    )
+    if isinstance(result, dict):
+        return result.get("agendaSummary", "")
+    return result.agendaSummary
 
 
 # ============================================================================
@@ -382,8 +465,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
         vote_flag = _VOTE_FLAG.get(item.category, "")
         items_text.append(
             f"[{i+1}] {item.title} (score: {item.priorityScore}/10)\n"
-            f"  Category: {item.category}{('  ' + vote_flag) if vote_flag else ''}\n"
-            f"  Priority reason: {item.priorityReason or 'N/A'}"
+            f"  Category: {item.category}{('  ' + vote_flag) if vote_flag else ''}"
         )
 
     try:
@@ -392,31 +474,86 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
     except ValueError:
         day_name = "the upcoming"
 
-    constituent_context = format_constituent_context(constituent) if constituent else ""
     available_docs_str = _format_available_docs(available_docs, meeting.get("sourceUrl"))
-    prompt = build_pass2_prompt(
+
+    # Pass 2a: select items and extract verbatim source passages (temp 0.1 — transcription task)
+    prompt_2a = build_pass2a_prompt(
+        city=city,
+        body=body,
+        date=date,
+        items_text="\n".join(items_text),
+        pdf_text=pdf_text,
+        available_docs=available_docs_str,
+    )
+    result_2a = gemini.generate_structured_content(
+        prompt=prompt_2a,
+        response_schema=SourcePassageExtractions,
+        temperature=0.1,
+        thinking_budget=0,
+    )
+    if isinstance(result_2a, dict):
+        result_2a = SourcePassageExtractions(**result_2a)
+
+    # Pass 2b: write card text using the extracted passages as grounding (temp 0.3 — writing task)
+    def _format_sections_for_prompt(item: SourcePassageItem) -> str:
+        if item.sections:
+            parts = []
+            for sec in item.sections:
+                parts.append(f"[{sec.label}]\n{sec.text}")
+            return "\n\n".join(parts)
+        return "(no source passages found)"
+
+    passages_text = "\n\n".join(
+        f"[{i+1}] {item.agendaItemTitle}\n"
+        f"SOURCE PASSAGES:\n{_format_sections_for_prompt(item)}"
+        for i, item in enumerate(result_2a.selectedItems)
+    )
+    constituent_context = format_constituent_context(constituent, n=5) if constituent else ""
+    prompt_2b = build_pass2b_prompt(
         city=city,
         body=body,
         date=date,
         day_name=day_name,
-        items_text="\n".join(items_text),
+        passages_text=passages_text,
         agenda_summary=categorized.agendaSummary,
         total_items=len(categorized.items),
         constituent_context=constituent_context,
-        pdf_text=pdf_text,
-        available_docs=available_docs_str,
     )
-
-    result = gemini.generate_structured_content(
-        prompt=prompt,
-        response_schema=BriefingCards,
+    result_2b = gemini.generate_structured_content(
+        prompt=prompt_2b,
+        response_schema=BriefingCardTexts,
         temperature=0.3,
         thinking_budget=0,
     )
+    if isinstance(result_2b, dict):
+        result_2b = BriefingCardTexts(**result_2b)
 
-    if isinstance(result, dict):
-        return BriefingCards(**result)
-    return result
+    # Merge: passages from 2a + card text from 2b → BriefingCards
+    passage_by_title = {item.agendaItemTitle: item for item in result_2a.selectedItems}
+    issues = []
+    for card_text in result_2b.cards:
+        passage = passage_by_title.get(card_text.agendaItemTitle)
+        sections = passage.sections if passage else []
+        # sourcePassage = text of first section (backward compat for downstream consumers)
+        primary_passage = sections[0].text if sections else None
+        issues.append(PriorityIssueCard(
+            agendaItemTitle=card_text.agendaItemTitle,
+            slug=card_text.slug,
+            sourcePassage=primary_passage,
+            sourceSections=sections,
+            sourcePassagePage=passage.sourcePassagePage if passage else None,
+            sourceDocUrl=passage.sourceDocUrl if passage else None,
+            headline=card_text.headline,
+            whatYouNeedToDo=card_text.whatYouNeedToDo,
+            askThisInTheRoom=card_text.askThisInTheRoom,
+            tryThis=card_text.tryThis,
+        ))
+
+    return BriefingCards(
+        executiveHeadline=result_2b.executiveHeadline,
+        executiveSubheadline=result_2b.executiveSubheadline,
+        priorityIssues=issues,
+    )
 
 
 # ============================================================================
@@ -469,6 +606,32 @@ def _load_pdf_text(meeting: dict, storage) -> str:
 
 
 
+def _window_pdf_around_page(pdf_text: str, page: int, radius: int = 3) -> str:
+    """Return a slice of pdf_text covering pages within `radius` of `page`.
+
+    Uses [PAGE N] markers (added by _load_pdf_text and extract_pdf_text) to locate
+    page boundaries. Falls back to the full pdf_text if markers aren't found.
+
+    The lower bound is clamped to `page` itself — we never look before the source page.
+    This prevents early-page items (sourcePassagePage=1) from pulling in prior-meeting
+    minutes or roll calls that appear at the top of the PDF.
+    """
+    if not pdf_text or not page:
+        return pdf_text
+    page_matches = list(re.finditer(r'\[PAGE (\d+)\]', pdf_text))
+    if not page_matches:
+        return pdf_text
+    pages = [(int(m.group(1)), m.start()) for m in page_matches]
+    lo, hi = page, page + radius  # never look before the source page
+    in_window = [(p, pos) for p, pos in pages if lo <= p <= hi]
+    if not in_window:
+        return pdf_text
+    start = in_window[0][1]
+    after_window = [(p, pos) for p, pos in pages if p > hi]
+    end = after_window[0][1] if after_window else len(pdf_text)
+    return pdf_text[start:end]
+
+
 def pass3_generate_detail(
     meeting: dict,
     card: PriorityIssueCard,
@@ -491,11 +654,22 @@ def pass3_generate_detail(
     except ValueError:
         day_name = "the upcoming"
 
-    # Use the verbatim passage extracted in Pass 2 as the primary source for Pass 3.
-    # This ensures Pass 3 synthesizes from real PDF text, not LLM-generated summaries.
-    source_text = card.sourcePassage or "No source passage available for this item."
+    # sourcePassage from Pass 2 is the verbatim ground truth for Pass 3.
+    # Caller is responsible for gating on sourcePassage before calling this function.
+    # Format source sections for the prompt — these are the sole ground truth for Pass 3.
+    # No windowed PDF is passed; all grounding comes from the curated sections extracted in Pass 2a.
+    if card.sourceSections:
+        source_sections_str = "\n\n".join(
+            f"[{sec.label}]\n{sec.text}"
+            for sec in card.sourceSections
+        )
+    elif card.sourcePassage:
+        # Backward compat: single passage with no label
+        source_sections_str = f"[Source Text]\n{card.sourcePassage}"
+    else:
+        source_sections_str = "(no source sections available)"
 
-    constituent_context = format_constituent_context(constituent) if constituent else ""
+    constituent_context = format_constituent_context(constituent, n=5) if constituent else ""
     other_items = ", ".join(
         item.title for item in all_items if item.title != card.agendaItemTitle
     )[:500]
@@ -508,14 +682,11 @@ def pass3_generate_detail(
         day_name=day_name,
         agenda_item_title=card.agendaItemTitle,
         category=categorized_item.category,
-        description=categorized_item.description,
-        priority_reason=categorized_item.priorityReason or "",
         headline=card.headline,
-        source_text=source_text,
+        source_sections=source_sections_str,
         other_items=other_items,
         constituent_context=constituent_context,
         available_docs=available_docs_str,
-        pdf_text=pdf_text,
     )
 
     result = gemini.generate_structured_content(
@@ -534,34 +705,59 @@ def pass3_generate_detail(
 # ============================================================================
 
 # Fields where the prompt requires source-grounded claims only.
-# Any specific name, dollar amount, or statistic should be prefixed "Inferred:"
-# if it doesn't appear in the source text.
 _INFERRED_PATTERN = re.compile(
     r'\b(?:typically|generally|usually|historically|often|commonly|tends to|in most cases)\b',
     re.IGNORECASE,
 )
+# Matches sequences of two or more Title Case words — likely proper names or named roles.
+# Used to catch claims about specific people or departments not found in the source PDF.
+_PROPER_NAME_PATTERN = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b')
 _GROUNDED_FIELDS = ("whoIsPresenting", "supportingContext")
 
 
-def check_provenance(details: list, source_texts: dict[str, str]) -> list[str]:
+def check_provenance(details: list, cards: "BriefingCards") -> list[str]:
     """
-    Check that restricted fields in Pass 3 output don't contain likely-inferred
-    claims without the 'Inferred:' prefix. Returns list of warning strings.
+    Check whoIsPresenting and supportingContext in Pass 3 output for two classes of problems:
+
+    1. Hedging language without an 'Inferred:' prefix — catches cautious fabrication.
+    2. Named persons or roles (Title Case multi-word phrases) that do not appear verbatim
+       in any source section — catches confident fabrication.
+
+    Args:
+        details: List of PriorityIssueDetail objects (may contain None for skipped items).
+        cards: BriefingCards with sourceSections for each priority issue — used as
+               the ground truth corpus for named entity verification.
     """
+    # Build source corpus from all extracted source sections
+    source_parts = []
+    for card in cards.priorityIssues:
+        if card.sourceSections:
+            source_parts.extend(sec.text for sec in card.sourceSections if sec.text)
+        elif card.sourcePassage:
+            source_parts.append(card.sourcePassage)
+    source_corpus = " ".join(source_parts)
+
     warnings = []
     for detail in details:
-        title = getattr(detail, "agendaItemTitle", "") if hasattr(detail, "agendaItemTitle") else ""
-        source = source_texts.get(title, "")
+        if detail is None:
+            continue
         for field in _GROUNDED_FIELDS:
             value = getattr(detail, field, None) or ""
             if not value:
                 continue
-            # Flag sentences with inference language but no Inferred: prefix
+            # Check 1: hedging language without Inferred: prefix
             for sentence in re.split(r'(?<=[.!?])\s+', value):
                 if _INFERRED_PATTERN.search(sentence) and not sentence.strip().startswith("Inferred:"):
                     warnings.append(
                         f"{field} may contain untagged inference: \"{sentence.strip()[:120]}\""
                     )
+            # Check 2: named persons/roles not found in the source sections
+            if source_corpus:
+                for name in _PROPER_NAME_PATTERN.findall(value):
+                    if name not in source_corpus:
+                        warnings.append(
+                            f"{field} references '{name}' which does not appear in the source sections"
+                        )
     return warnings
 
 
@@ -587,8 +783,13 @@ def check_fiscal_amounts(briefing: dict, cards: "BriefingCards") -> list[str]:
     appears in the verbatim sourcePassage. Returns list of warning strings
     for amounts that could not be verified.
     """
-    # Build source corpus from verbatim sourcePassages (ground truth)
-    source_parts = [card.sourcePassage for card in cards.priorityIssues if card.sourcePassage]
+    # Build source corpus from all verbatim source sections (ground truth)
+    source_parts = []
+    for card in cards.priorityIssues:
+        if card.sourceSections:
+            source_parts.extend(sec.text for sec in card.sourceSections if sec.text)
+        elif card.sourcePassage:
+            source_parts.append(card.sourcePassage)
     source_text = " ".join(source_parts)
     source_amounts = {_normalize_amount(m) for m in _DOLLAR_PATTERN.findall(source_text)}
 
@@ -652,6 +853,10 @@ def assemble_briefing(
                 "other"
             ),
             "sourcePassage": card.sourcePassage,
+            "sourceSections": [
+                {"label": s.label, "text": s.text, "page": s.page}
+                for s in card.sourceSections
+            ],
             "sourcePassagePage": card.sourcePassagePage,
             "sourceDocUrl": card.sourceDocUrl,
             "card": {
@@ -797,8 +1002,7 @@ def generate_briefing_for_meeting(
         top = format_top_constituent_issues(constituent)
         print(f"  Haystaq data: {constituent.get('voter_count_with_scores', 0):,} voters — top: {top}")
     else:
-        print(f"  SKIP: No Haystaq constituent data for {city_slug} — run collect_haystaq_batch.py --from-csv first")
-        return {"status": "skipped", "reason": "no_haystaq"}
+        print(f"  No Haystaq constituent data for {city_slug} — proceeding without constituent framing")
 
     gemini = GeminiClient(default_model=GeminiModelType.FLASH)
 
@@ -828,8 +1032,15 @@ def generate_briefing_for_meeting(
             print(f"  ⚠ No sourcePassage for priority item: '{card.agendaItemTitle[:60]}' — detail will be ungrounded")
 
     # Pass 3: Generate details for each priority
+    # Gate: skip items with no sourcePassage — a card without a detail page is more
+    # honest than a detail page built on nothing.
     details = []
     for i, card in enumerate(cards.priorityIssues):
+        if not card.sourcePassage or len(card.sourcePassage) < 80:
+            print(f"  Pass 3.{i+1}: SKIP '{card.agendaItemTitle[:60]}' — sourcePassage missing or too short")
+            details.append(None)
+            continue
+
         print(f"  Pass 3.{i+1}: Deep-dive '{card.agendaItemTitle[:50]}...'")
         t0 = time.time()
 
@@ -850,10 +1061,11 @@ def generate_briefing_for_meeting(
             details.append(detail)
             t1 = time.time()
             print(f"  Pass 3.{i+1} done ({t1-t0:.1f}s)")
+        else:
+            details.append(None)
 
-    # Provenance check — compare against verbatim sourcePassage, not normalized summaries
-    source_texts = {card.agendaItemTitle: card.sourcePassage or "" for card in cards.priorityIssues}
-    provenance_warnings = check_provenance(details, source_texts)
+    # Provenance check — validate generated text against source sections
+    provenance_warnings = check_provenance(details, cards)
     if provenance_warnings:
         for w in provenance_warnings:
             print(f"  ⚠ Provenance: {w}")

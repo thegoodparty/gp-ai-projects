@@ -53,11 +53,12 @@ For each item:
 - Extract ALL dollar amounts mentioned verbatim (e.g. "$1,234,567")
 - Note staff recommendation if stated (approve, deny, table, receive and file, etc.)
 - Mark is_public_hearing=true if it's a public hearing
+- For procedural items (call to order, roll call, adjournment, approval of minutes, pledge of allegiance, invocation) that have no staff report or background section, omit the description field entirely — do not fabricate content for items with nothing substantive to describe
 
 GROUNDING RULE: Distinguish between what the agenda item itself states versus what appears only in supporting documents (staff reports, resolutions, attachments). If a specific name, dollar amount, or detail appears only in a supporting document and not in the agenda item heading, prefix it in the description with "Per staff report:" or "Per resolution text:". If a detail is an inference from context rather than an explicit statement, prefix it with "Inferred:". Never present inferred details as stated facts.
 
 The goal is for someone reading this JSON to understand what is actually being discussed at the meeting without having to open the PDF.
 
 AGENDA PACKET TEXT:
-{text[:50000]}
+{text[:100000]}
 """

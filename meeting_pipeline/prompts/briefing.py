@@ -32,7 +32,7 @@ Sentence length: Prefer short sentences. If a sentence exceeds 25 words, break i
 
 Progressive disclosure: The first sentence of every section must be scannable standalone. An official should be able to read only the first sentence of each section and have a working understanding of the item.
 
-Numbers: Write dollar amounts with the unit spelled out under $1 million ($329,000 not $329K). Use M for millions ($6.2 million). Write constituent priorities as descriptive tiers (e.g. "strong constituent concern" or "a top priority for residents") — not as raw numeric scores.
+Numbers: Always write dollar amounts as numerals with a $ sign — never spell them out as words ("seventy-five thousand" is wrong; "$75,188" is correct). Use M for millions ($6.2 million). For amounts under $1 million, write the full numeral ($329,000 not $329K). Write constituent priorities as descriptive tiers (e.g. "strong constituent concern" or "a top priority for residents") — not as raw numeric scores.
 
 NEVER recommend how to vote. Recommendations are about how to show up, what to ask, and how to frame a position. The vote is always the official's decision.
 
@@ -87,7 +87,7 @@ def build_pass1_prompt(
 
 Below are all agenda items. For each one:
 1. Clean up the title (fix ALL CAPS to Title Case, remove boilerplate numbering)
-2. Write a 1-2 sentence plain-language description
+2. Write a 1-2 sentence plain-language description — except for procedural items (call to order, roll call, adjournment, pledge of allegiance, invocation, approval of minutes, approval of agenda) which have no substantive content. For those, omit the description field entirely.
 3. Assign a category: procedural, consent, informational, vote_required, direction_setting, or public_hearing
 4. Decide if it's a genuine priority (isPriority=true) and assign a priorityScore (1-10)
 
@@ -127,78 +127,130 @@ AGENDA ITEMS:
 
 
 # ============================================================================
-# PASS 2 — Generate card content for each priority issue
+# PASS 2A — Select priority items and extract verbatim source passages
 # ============================================================================
 
-def build_pass2_prompt(
+def build_pass2a_prompt(
     city: str,
     body: str,
     date: str,
-    day_name: str,
     items_text: str,
-    agenda_summary: str,
-    total_items: int,
-    constituent_context: str = "",
     pdf_text: str = "",
     available_docs: str = "",
 ) -> str:
     """
-    Build the Pass 2 prompt: generate headline, whatYouNeedToDo, and askThis cards.
+    Build the Pass 2a prompt: select the 2-4 most impactful items and extract
+    verbatim source passages for each. Runs at temperature 0.1 — this is a
+    transcription task, not a writing task.
+
+    Args:
+        city: City name
+        body: Meeting body, e.g. "City Council"
+        date: Meeting date in YYYY-MM-DD format
+        items_text: Pre-formatted string with priority candidate items (ranked)
+        pdf_text: Full text extracted from the agenda PDF (with [PAGE N] markers).
+        available_docs: Optional pre-formatted available source document URLs.
+    """
+    pdf_block = ""
+    if pdf_text:
+        pdf_block = f"\nFULL AGENDA SOURCE DOCUMENT:\n{pdf_text}\n"
+
+    return f"""You are extracting source text from a {city} {body} agenda packet for the meeting on {date}.
+
+Below are candidate priority items, ranked by importance score. Do two things:
+
+1. SELECT THE 2-4 MOST IMPACTFUL items. Skip routine, ceremonial, or purely procedural items. Prefer items with real policy, budget, or community impact.
+
+2. For each selected item, extract ALL relevant source sections as a labeled list. Each section should be copied verbatim, character-for-character, with no changes, no summarizing, no paraphrasing.
+
+SECTIONS TO EXTRACT (include all that are present in the document for this item):
+- **Staff Memo** — the cover memo or transmittal letter, including the full TO:/FROM:/SUBJECT:/DATE: header lines. The header identifies the author and presenter.
+- **Resolution Text** or **Ordinance Text** — the formal legislative language (WHEREAS clauses, NOW THEREFORE, SECTION 1, etc.)
+- **Staff Report** — the narrative analysis or background report if present
+- **Financial Schedule** — any table or schedule of dollar amounts, appropriations, or budget line items
+- **Exhibit** — key exhibits (easement terms, contract terms) if they contain material facts not in the resolution
+
+EXTRACTION RULES:
+- Copy each section character-for-character. This is a transcription task, not a writing task.
+- Assign a short descriptive label to each section (e.g. "Staff Memo", "Resolution Text", "Financial Schedule", "Exhibit A").
+- Record the [PAGE N] number for each section.
+- Exclude boilerplate signature/attestation blocks: "PASSED:", "APPROVED:", "ATTEST:", "AYES:", "NAYS:", "Mayor", "Clerk of Council", blank signature lines.
+- EXCLUDE completed vote records embedded in the packet: text such as "A motion was made by… seconded by… Upon the roll call… Motion carried.", "RECORD OF VOTES:", vote tallies with names and Y/N marks, or any text recording that a vote has already occurred. These appear when a city reuses agenda packet forms as minutes — they describe a past event, not the upcoming meeting. Do not include them in any extracted section.
+- If a section is absent from the document (e.g. no staff memo, no financial schedule), skip it — do not fabricate.
+- The first section in your list should be the most substantive (usually Staff Memo or Resolution Text).
+
+Also record:
+- **sourcePassagePage**: the [PAGE N] number of the first (primary) section
+- **sourceDocUrl**: the URL of the source document if listed in AVAILABLE SOURCE DOCUMENTS
+{available_docs}
+CANDIDATE PRIORITY ITEMS (ranked by score):
+{items_text}
+{pdf_block}"""
+
+
+# ============================================================================
+# PASS 2B — Write card content using extracted source passages as grounding
+# ============================================================================
+
+def build_pass2b_prompt(
+    city: str,
+    body: str,
+    date: str,
+    day_name: str,
+    passages_text: str,
+    agenda_summary: str,
+    total_items: int,
+    constituent_context: str = "",
+) -> str:
+    """
+    Build the Pass 2b prompt: write headline, whatYouNeedToDo, and askThis for
+    each selected item, using the verbatim source passages extracted in Pass 2a
+    as the ground truth. Runs at temperature 0.3.
 
     Args:
         city: City name
         body: Meeting body, e.g. "City Council"
         date: Meeting date in YYYY-MM-DD format
         day_name: Day of week, e.g. "Monday"
-        items_text: Pre-formatted string with priority candidate items (ranked)
+        passages_text: Pre-formatted string with selected items and their verbatim passages
         agenda_summary: One-sentence summary from Pass 1
-        total_items: Total number of agenda items (for context sentence)
-        constituent_context: Optional pre-formatted Haystaq full constituent context string.
-                             Pass "" if no constituent data is available.
-        pdf_text: Optional full text extracted from the agenda PDF, for richer context.
-        available_docs: Optional pre-formatted available source document URLs.
+        total_items: Total number of agenda items
+        constituent_context: Optional pre-formatted Haystaq constituent context string.
     """
     constituent_block = ""
     if constituent_context:
         constituent_block = (
             f"\n{constituent_context}\n\n"
             "IMPORTANT: Use the constituent scores above to inform your framing and prioritization — "
-            "but do NOT cite scores or percentages in headlines. Instead, weave constituent priorities "
-            "into the headline naturally (e.g. 'Public safety is your constituents' top concern. Monday's vote puts cameras on the map.'). "
-            "Frame 'what you need to do' around constituent priorities."
+            "but do NOT cite scores or percentages in headlines. "
+            "Only reference a constituent issue when one of the issue names listed above appears explicitly in the sourcePassage. "
+            "Do not describe an item as addressing constituent concerns unless you can name a specific issue from the list. "
+            "If none of the listed issues connect to the sourcePassage, write the headline and whatYouNeedToDo without any constituent framing."
         )
-
-    pdf_block = ""
-    if pdf_text:
-        pdf_block = f"\nFULL AGENDA SOURCE DOCUMENT (reference this for specific dollar amounts, presenter names, and details when writing card content):\n{pdf_text}\n"
 
     return f"""You are a senior policy advisor preparing a {city} {body} member for their {day_name} meeting on {date}.
 {EDITORIAL_RULES}
-Below are candidate priority items, ranked by importance score. SELECT THE 2-4 MOST IMPACTFUL items and write cards for those only. Skip routine or ceremonial items. Prefer items with real policy, budget, or community impact.
+Below are selected priority items with their verbatim source passages already extracted. Write card content for each item. Base all specific claims on the sourcePassage provided — do not introduce facts from other sources.
 
-For each selected item, write in this order:
+For each item write:
 
-1. **sourcePassage**: Find and copy verbatim the primary source text from the FULL AGENDA DOCUMENT for this item — the staff report, memo, resolution text, or public hearing notice. Copy character-for-character with no changes, no summarizing. Do this FIRST before writing anything else. All claims in headline and whatYouNeedToDo must come from this passage.
+1. **headline**: One punchy sentence, max 15 words. Captures what's at stake and what this meeting means. Do NOT include constituent scores, percentages, or numeric rankings.
 
-2. **headline**: One punchy sentence, max 15 words. Captures what's at stake for constituents and what this meeting means — in a single breath. Examples: "Monday's vote puts public safety cameras on the map — your constituents are watching." / "What you say Monday shapes the city budget before the numbers are locked." Do NOT include constituent scores, percentages, or numeric rankings.
+2. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote {day_name}, but what you say sets the direction on X." For vote_required items, describe what specifically is being approved and what to review beforehand. The first sentence must be scannable standalone. Base all specific claims on the sourcePassage.
 
-3. **whatYouNeedToDo**: 3-5 sentences. The FIRST sentence must state the vote type explicitly — e.g. "You're voting on X." / "There's no vote Monday, but what you say sets the direction on X." / "This is informational — no vote — but the implicit decision is X." For vote_required items, describe what specifically is being approved and what the official should review or confirm beforehand. For direction_setting, name what gets locked in based on what's said. Be specific about what to do before the meeting. The first sentence must be scannable standalone. Base all specific claims (dollar amounts, contract details, vote type) on your sourcePassage — not on the item descriptions above.
+3. **askThisInTheRoom**: One specific, substantive question the official could ask in the meeting. Write it as a direct quote they can read verbatim.
 
-4. **askThisInTheRoom**: One specific, substantive question the official could ask staff or fellow members during the meeting. Write it as a direct quote they can read verbatim. One question only.
-
-5. **slug**: URL-safe slug derived from the agenda item title.
+4. **slug**: URL-safe slug derived from the agenda item title.
 
 Also write:
-- **executiveHeadline**: One sentence. States how many priority items need attention and signals the work has been done. Never use the word "briefing." (e.g. "{day_name}'s meeting has [N] items that require your attention.")
+- **executiveHeadline**: One sentence. States how many priority items need attention. Never use the word "briefing." (e.g. "{day_name}'s meeting has [N] items that require your attention.")
 - **executiveSubheadline**: A follow-up line.
 {constituent_block}
-CANDIDATE PRIORITY ITEMS (ranked by score, select the 2-4 most impactful):
-{items_text}
+SELECTED ITEMS WITH SOURCE PASSAGES:
+{passages_text}
 
 FULL AGENDA CONTEXT:
-The meeting has {total_items} total items. Summary: {agenda_summary}
-{available_docs}
-{pdf_block}"""
+The meeting has {total_items} total items. Summary: {agenda_summary}"""
 
 
 # ============================================================================
@@ -213,14 +265,11 @@ def build_pass3_prompt(
     day_name: str,
     agenda_item_title: str,
     category: str,
-    description: str,
-    priority_reason: str,
     headline: str,
-    source_text: str,
+    source_sections: str,
     other_items: str,
     constituent_context: str = "",
     available_docs: str = "",
-    pdf_text: str = "",
 ) -> str:
     """
     Build the Pass 3 prompt: deep-dive detail page for a single priority issue.
@@ -229,17 +278,13 @@ def build_pass3_prompt(
         city, state, body, date, day_name: Meeting metadata
         agenda_item_title: Title of the priority issue being detailed
         category: Category from Pass 1 (vote_required, direction_setting, etc.)
-        description: Plain-language description from Pass 1
-        priority_reason: Why this item was flagged as priority
         headline: Card headline from Pass 2
-        source_text: Structured fields extracted for this item (description,
-                     staff recommendation, presenter, fiscal amounts).
+        source_sections: Pre-formatted string of labeled source sections extracted in
+                         Pass 2a — the sole ground truth for all claims. Each section
+                         is labeled (e.g. [Staff Memo], [Resolution Text]) and verbatim.
         other_items: Comma-separated titles of other agenda items (for context)
         constituent_context: Optional pre-formatted Haystaq full constituent context string.
         available_docs: Optional pre-formatted available source document URLs.
-        pdf_text: Optional full text of the agenda PDF. When provided, this is the
-                  primary source of truth — prefer it over source_text for specific
-                  names, dollar amounts, and supporting details.
     """
     constituent_block = ""
     if constituent_context:
@@ -248,46 +293,43 @@ def build_pass3_prompt(
             "IMPORTANT: These are modeled estimates of constituent sentiment — directional, not precise. "
             "In whyItMatters, describe constituent priorities using tier language "
             "(e.g. 'Residents show strong concern for infrastructure investment') rather than citing raw numeric scores. "
-            "Connect this agenda item to the issues voters care about most."
+            "Only reference a constituent issue when one of the issue names listed above appears explicitly in the source sections or agenda item. "
+            "Do not describe an item as addressing constituent concerns unless you can name a specific issue from the list. "
+            "If none of the listed issues connect to the source sections, write whyItMatters without any constituent framing."
         )
-
-    pdf_block = ""
-    if pdf_text:
-        pdf_block = f"\nFULL AGENDA DOCUMENT (primary source — use for specific names, dollar amounts, staff reports, and supporting details):\n{pdf_text}\n"
-
-    source_label = "VERBATIM SOURCE PASSAGE (copied directly from the agenda document — treat this as the ground truth for all claims)"
-    grounding_source = "the VERBATIM SOURCE PASSAGE and FULL AGENDA DOCUMENT above"
 
     return f"""You are a senior policy advisor writing a detailed page for one agenda item from a {city}, {state} {body} meeting on {day_name}, {date}.
 {EDITORIAL_RULES}
 AGENDA ITEM: {agenda_item_title}
 Category: {category}
-Description: {description}
-Priority reason: {priority_reason}
 Card headline: {headline}
 
-{source_label}:
-{source_text}
-{pdf_block}
-GROUNDING RULE: whoIsPresenting and supportingContext must only contain facts that appear in {grounding_source} or the constituent data below. Do not draw on training knowledge for specific names, dollar amounts, statistics, or historical claims. If the source text does not name a presenter, write "The presenting department was not specified in the agenda" and describe the likely responsible body by type only (e.g. "Public Works" or "City Manager's office"). If there is insufficient source text for supportingContext, omit it.
+SOURCE SECTIONS (verbatim extracts from the agenda packet — these are the sole ground truth for all claims):
+{source_sections}
+
+GROUNDING RULE: Every factual claim in every field must be traceable to a word or phrase in the SOURCE SECTIONS above. Do not draw on training knowledge for specific names, dollar amounts, statistics, addresses, parcel numbers, or historical claims. If a fact does not appear in the source sections, do not state it. There is no other document to consult — what is in the source sections is all you have.
+
+DOLLAR AMOUNT RULE: Dollar amounts may only appear in any field if they appear verbatim in the SOURCE SECTIONS above. Do not infer, round, compute, or paraphrase amounts.
+
+ADDRESS AND NAME RULE: Street addresses, parcel numbers (PPN, APN, etc.), and individual person names may only appear if they appear verbatim in the SOURCE SECTIONS above.
 
 Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY.
 
 1. **whatIsHappening** (~30 words, 2 sentences max): Lead with what is physically happening {day_name}, not background history. What action is being taken and why now? History belongs in supportingContext.
 
-2. **whatDecision** (~25 words, 1-2 sentences): Open with one of: "Vote required." / "No vote — direction setting." / "No vote — informational." Then in one sentence name what specifically is being decided or shaped.
+2. **whatDecision** (~25 words, 1-2 sentences): Open with one of these exact phrases (no dashes, no line breaks, no variations): "Vote required." / "No vote, direction setting." / "No vote, informational." Then in one sentence name what specifically is being decided or shaped. IMPORTANT: If the agenda item title or source text includes the word "Action" (e.g. "Discussion and Action," "Discussion and Possible Action"), use "Vote required." — do not use "No vote" phrases when action is explicitly listed.
 
-3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source text. Never repeat information already stated in whatIsHappening. Use the full word count.
+3. **whyItMatters** (50-70 words, 2-3 sentences): Connect explicitly to the official's district or constituency, not the city generally. Name the specific geographic area or population most affected when the data supports it. Include concrete details (dollar amounts, affected areas, number of people) only if they appear in the source sections. Never repeat information already stated in whatIsHappening. Use the full word count.
 
-4. **recommendation** (~40 words, 2-3 sentences): A frame or question to consider before the meeting. Draw from what the staff materials say. You may want to suggest what to review or what to ask, but do not assume positions the official has not taken. Never recommend how to vote. The vote is always the official's decision.
+4. **recommendation** (~40 words, 2-3 sentences): A frame for how to think about this decision — what questions to weigh, what trade-offs to understand. Draw from the staff materials in the source sections. Do not assign tasks or directives here. Never recommend how to vote. The vote is always the official's decision.
 
-5. **actionItem** (~28 words, 1 sentence): One specific pre-meeting action. Be concrete: "Before {day_name}, review the [document]" or "Call [person] and ask about [specific thing]".
+5. **actionItem** (~28 words, 1 sentence): One specific, concrete, pre-meeting task — name the exact document to read, the person to call, or the specific thing to verify. Not general framing. Be concrete: "Before {day_name}, review the [document]" or "Call [person] and ask about [specific thing]".
 
 6. **askThis** (~30 words, 1 question): A specific, substantive question to ask in the meeting. Write it as a direct quote they can read verbatim. One question only.
 
-7. **whoIsPresenting** (REQUIRED, 50-75 words, 1-2 short paragraphs): Always write this section. Use only information from the SOURCE TEXT. If no presenter is named, say so and describe the responsible department by type. Note whether this item is expected to pass with broad support or generate debate, based only on the item's nature and category — do not fabricate council member names or positions.
+7. **whoIsPresenting** (optional, 50-75 words, 1-2 short paragraphs): Include this only if a presenter or responsible department is explicitly named in the SOURCE SECTIONS above — typically in a Staff Memo FROM: line or a staff report byline. Write only what the source says: name and title. Do not add "is responsible for presenting," "will be presenting," "will handle," or any inference language. STRICT RULE: If you find yourself writing "likely," "probably," "may be," "presumably," "responsible for," or "is expected to" — stop and omit the field instead. CRITICAL: If the source contains "Presentation: No" (or similar wording indicating no live presentation), omit this field entirely even if a "Presented by:" name appears — that name is the document author, not a presenter.
 
-8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE TEXT contains specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. If the source text is thin, omit this field rather than inventing content. Never repeat information already in the sections above.
+8. **supportingContext** (optional, 50-70 words): Only include if the SOURCE SECTIONS contain specific facts worth surfacing — numbers, dates, comparisons, or context not already stated above. Every sentence must be directly traceable to a word or phrase in the source sections. When in doubt, omit. Never repeat information already in the sections above.
 
 {constituent_block}
 MEETING CONTEXT:
