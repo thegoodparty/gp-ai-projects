@@ -224,6 +224,7 @@ class SourceSection(BaseModel):
     text: str = Field(description="Verbatim text copied character-for-character from this section of the document. No changes, no summarizing.")
     page: Optional[int] = Field(None, description="Page number from [PAGE N] markers where this section was found")
     is_prior_minutes: bool = Field(False, description="True if this section comes from prior meeting minutes embedded in the packet (past-tense narrative: presented, motion passed, no action was taken, etc.) rather than from forward-looking agenda materials (staff memos, resolutions, staff reports).")
+    section_type: Optional[str] = Field(None, description="Machine-readable section type: 'staff_memo' | 'staff_report' | 'resolution' | 'ordinance' | 'exhibit' | 'financial_schedule' | 'minutes' | 'other'")
 
 
 class PriorityIssueCard(BaseModel):
@@ -868,9 +869,18 @@ def assemble_briefing(
             ),
             "sourcePassage": card.sourcePassage,
             "sourceSections": [
-                {"label": s.label, "text": s.text, "page": s.page, "is_prior_minutes": s.is_prior_minutes or False}
+                {
+                    "label": s.label,
+                    "text": s.text,
+                    "page": s.page,
+                    "is_prior_minutes": s.is_prior_minutes or False,
+                    "section_type": s.section_type,
+                }
                 for s in card.sourceSections
             ],
+            "is_prior_minutes_only": bool(card.sourceSections) and all(
+                s.is_prior_minutes for s in card.sourceSections
+            ),
             "sourcePassagePage": card.sourcePassagePage,
             "sourceDocUrl": card.sourceDocUrl,
             "card": {
