@@ -173,6 +173,7 @@ SECTIONS TO EXTRACT (include all that are present in the document for this item)
 EXTRACTION RULES:
 - Copy each section character-for-character. This is a transcription task, not a writing task.
 - Assign a short descriptive label to each section (e.g. "Staff Memo", "Resolution Text", "Financial Schedule", "Exhibit A"). For prior meeting minutes, use a date-specific label like "April 7 Meeting Minutes".
+- Set section_type to one of: staff_memo | staff_report | resolution | ordinance | exhibit | financial_schedule | minutes | other.
 - Record the [PAGE N] number for each section.
 - Exclude boilerplate signature/attestation blocks: "PASSED:", "APPROVED:", "ATTEST:", "AYES:", "NAYS:", "Mayor", "Clerk of Council", blank signature lines.
 - If a section is absent from the document (e.g. no staff memo, no financial schedule), skip it — do not fabricate.

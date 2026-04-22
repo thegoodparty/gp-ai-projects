@@ -224,6 +224,7 @@ class SourceSection(BaseModel):
     text: str = Field(description="Verbatim text copied character-for-character from this section of the document. No changes, no summarizing.")
     page: Optional[int] = Field(None, description="Page number from [PAGE N] markers where this section was found")
     is_prior_minutes: bool = Field(False, description="True if this section comes from prior meeting minutes embedded in the packet (past-tense narrative: presented, motion passed, no action was taken, etc.) rather than from forward-looking agenda materials (staff memos, resolutions, staff reports).")
+    section_type: Optional[str] = Field(None, description="Machine-readable section type: 'staff_memo' | 'staff_report' | 'resolution' | 'ordinance' | 'exhibit' | 'financial_schedule' | 'minutes' | 'other'")
 
 
 class PriorityIssueCard(BaseModel):
@@ -868,9 +869,18 @@ def assemble_briefing(
             ),
             "sourcePassage": card.sourcePassage,
             "sourceSections": [
-                {"label": s.label, "text": s.text, "page": s.page, "is_prior_minutes": s.is_prior_minutes or False}
+                {
+                    "label": s.label,
+                    "text": s.text,
+                    "page": s.page,
+                    "is_prior_minutes": s.is_prior_minutes or False,
+                    "section_type": s.section_type,
+                }
                 for s in card.sourceSections
             ],
+            "is_prior_minutes_only": bool(card.sourceSections) and all(
+                s.is_prior_minutes for s in card.sourceSections
+            ),
             "sourcePassagePage": card.sourcePassagePage,
             "sourceDocUrl": card.sourceDocUrl,
             "card": {
@@ -970,6 +980,50 @@ def assemble_briefing(
             "contactNote": "Questions about this briefing? Reply to your briefing email.",
         },
     }
+
+
+# ============================================================================
+# QA HOOK
+# ============================================================================
+
+def _run_qa_hook(briefing_key: str) -> None:
+    """Invoke the QA pipeline for a newly-written briefing. Fire-and-forget.
+
+    Runs in a daemon thread so it never blocks or delays briefing generation.
+    Set QA_REPO_PATH in .env to the root of the meeting-briefing-qa repo.
+    If unset, this is a no-op.
+    """
+    import os
+    import subprocess
+    import threading
+
+    qa_root = os.environ.get("QA_REPO_PATH", "")
+    if not qa_root:
+        return
+
+    def _run() -> None:
+        try:
+            proc = subprocess.run(
+                ["uv", "run", "python", "scripts/run_qa.py", briefing_key, "--output-s3"],
+                cwd=qa_root,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            status = "✓" if proc.returncode == 0 else f"✗ exit {proc.returncode}"
+            print(f"  QA [{briefing_key.split('/')[-1]}]: {status}")
+            for line in (proc.stdout or "").strip().splitlines()[-8:]:
+                print(f"  QA: {line}")
+            if proc.returncode != 0 and proc.stderr:
+                for line in proc.stderr.strip().splitlines()[-4:]:
+                    print(f"  QA err: {line}")
+        except subprocess.TimeoutExpired:
+            print(f"  QA [{briefing_key.split('/')[-1]}]: timed out (>10 min)")
+        except Exception as e:
+            print(f"  QA [{briefing_key.split('/')[-1]}]: hook error — {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    print("  QA: running in background")
 
 
 # ============================================================================
@@ -1123,6 +1177,8 @@ def generate_briefing_for_meeting(
     output_key = f"{cfg.output_prefix}/briefings/{safe_name}"
     storage.write_json(output_key, briefing)
     print(f"  Saved: {output_key}")
+
+    _run_qa_hook(output_key)
 
     return {
         "status": "ok",
