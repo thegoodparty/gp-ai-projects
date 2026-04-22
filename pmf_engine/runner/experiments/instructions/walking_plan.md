@@ -18,6 +18,9 @@ Read this entire file. Then create a TODO checklist of every step below. Work th
 
 ## CRITICAL RULES
 
+**NEVER fabricate, synthesize, or mock voter data.** Every voter record and address must come from a successful `pmf_runtime.databricks` query. If Databricks returns errors (502, timeout, session invalid, etc.), do NOT fall back to generated data, `random.seed`, placeholder records, or any other form of synthetic output. Instead: retry the query after a short wait, and if it still fails, STOP and exit the run with a non-zero status so the run is recorded as FAILED. Canvassers will knock on these doors — fake addresses waste days of field volunteer time. The broker now enforces this: it rejects any publish where no Databricks query succeeded.
+
+0. **The broker automatically scopes all queries to the candidate's state and city. Do NOT add WHERE clauses for `Residence_Addresses_State` or `Residence_Addresses_City` — they are injected for you. The only filter you need to add is the district column and `Voters_Active`.**
 1. `/workspace/output/` must contain ONLY `walking_plan.json` — put scripts in `/tmp/`.
 2. **A "door" is a unique address.** If 3 voters live at 100 Oak St, that's 1 door. `door_count` on each area = unique addresses. Voters at the same address must be grouped together in the `voters` array (same `order` number).
 3. **Cluster by lat/lon proximity, not street name.** Use `Residence_Addresses_Latitude` and `Residence_Addresses_Longitude` to group nearby voters into walkable areas. A simple approach: round lat/lon to a grid (e.g., ~500m cells), group by grid cell, then split/merge to meet size constraints.
@@ -32,7 +35,7 @@ Read this entire file. Then create a TODO checklist of every step below. Work th
 
 ```python
 import os, json
-from databricks.sql import connect
+from pmf_runtime import databricks as sql
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 l2_district_type = params.get("l2DistrictType", "")
@@ -41,11 +44,7 @@ city = params.get("city", "")
 print(f"L2 district: {l2_district_type} = {l2_district_name}")
 print(f"City: {city}")
 
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 cursor.execute("DESCRIBE TABLE goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq")
 cols = [row[0] for row in cursor.fetchall()]
@@ -55,20 +54,22 @@ print("Haystaq columns:", hs_cols[:20])
 assert l2_district_type in cols, f"District column '{l2_district_type}' not found"
 print(f"District column '{l2_district_type}' confirmed")
 
+# NOTE: The broker injects WHERE Residence_Addresses_State = '...' AND Residence_Addresses_City IN (...)
+# automatically — do NOT add state or city to the query or parameters.
 cursor.execute(f"""
     SELECT COUNT(*) FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq
-    WHERE Residence_Addresses_State = :state AND `{l2_district_type}` = :district_name AND Voters_Active = 'A'
-""", {"state": params.get("state", ""), "district_name": l2_district_name})
+    WHERE `{l2_district_type}` = :district_name AND Voters_Active = 'A'
+""", {"district_name": l2_district_name})
 district_count = cursor.fetchone()[0]
 print(f"Voters matching district filter: {district_count}")
 
-if district_count == 0 and city:
+if district_count == 0:
     cursor.execute("""
         SELECT COUNT(*) FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq
-        WHERE Residence_Addresses_State = :state AND LOWER(Residence_Addresses_City) = LOWER(:city) AND Voters_Active = 'A'
-    """, {"state": params.get("state", ""), "city": city})
+        WHERE Voters_Active = 'A'
+    """, {})
     city_count = cursor.fetchone()[0]
-    print(f"FALLBACK: Voters matching city '{city}': {city_count}")
+    print(f"FALLBACK: Voters in scoped city: {city_count}")
 ```
 
 Look for: `hs_likely_polling_turnout`, `hs_partisanship_moderate_third_party_support`, `hs_partisanship_moderate_third_party_oppose`.
@@ -169,7 +170,7 @@ For each area, build:
 **Output schema:**
 ```json
 {
-  "candidate_id": "from env CANDIDATE_ID or 'unknown'",
+  "organization_slug": "from env ORGANIZATION_SLUG or 'unknown'",
   "district": {"state": "CO"},
   "generated_at": "ISO 8601",
   "summary": {

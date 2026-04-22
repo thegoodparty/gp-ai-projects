@@ -10,6 +10,7 @@ def test_derive_projects_required_fields_only():
             "harness": "claude_sdk",
             "model": "sonnet",
             "timeout_seconds": 1200,
+            "required_params": ["state"],
             "contract": {
                 "type": "json",
                 "s3_key_template": "test_exp/{run_id}/test_exp.json",
@@ -26,6 +27,7 @@ def test_derive_projects_required_fields_only():
             "harness": "claude_sdk",
             "model": "sonnet",
             "timeout_seconds": 1200,
+            "required_params": ["state"],
             "contract": {"s3_key_template": "test_exp/{run_id}/test_exp.json"},
         },
     }

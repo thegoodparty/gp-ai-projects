@@ -38,10 +38,16 @@ def collect_contract_errors(
     if not schema:
         return []
 
+    raw = artifact_bytes or b""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="replace")
+
     try:
-        data = json.loads(artifact_bytes)
+        data = json.loads(raw) if raw else None
     except (json.JSONDecodeError, ValueError) as e:
-        return [f"Invalid JSON ({len(artifact_bytes)} bytes): {e}"]
+        return [f"Invalid JSON ({len(raw)} bytes): {e}"]
+    if data is None:
+        return ["Artifact is empty"]
 
     if not isinstance(data, dict):
         return ["Artifact must be a JSON object"]

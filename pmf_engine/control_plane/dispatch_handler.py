@@ -4,6 +4,7 @@ import json
 import os
 
 import boto3
+import httpx
 
 try:
     from shared.logger import get_logger
@@ -15,10 +16,12 @@ except (ImportError, OSError):
 
 try:
     from .dispatch_registry import DISPATCH_REGISTRY
-    from .param_screening import screen_params
+    from .broker_client import BrokerClient, BrokerError
+    from .scope_derivation import derive_scope
 except ImportError:
     from dispatch_registry import DISPATCH_REGISTRY
-    from param_screening import screen_params
+    from broker_client import BrokerClient, BrokerError
+    from scope_derivation import derive_scope
 
 _ecs_client = None
 _sqs_client = None
@@ -63,11 +66,10 @@ def _emit_metric(metric_name: str, dimensions: list[dict]):
         logger.warning(f"Failed to emit metric {metric_name}: {e}")
 
 
-def emit_screening_rejected_metric(experiment_id: str, candidate_id: str, reason: str):
-    _emit_metric("ParamScreeningRejected", [
+def emit_dispatch_metric(metric_name: str, experiment_id: str):
+    _emit_metric(metric_name, [
         {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
         {"Name": "ExperimentId", "Value": experiment_id},
-        {"Name": "Reason", "Value": reason},
     ])
 
 
@@ -77,24 +79,42 @@ def send_error_callback(
     callback_queue_url: str,
     dedup_id: str | None = None,
 ):
+    """Send a `failed` callback to gp-api's results queue.
+
+    Wire format MUST match what the broker's CallbackSender emits so gp-api's
+    AgentExperimentResultSchema (zod) parses it — otherwise the message hits
+    the DLQ and the ExperimentRun row stays PENDING forever.
+
+    Envelope: `{type: "agentExperimentResult", data: {experimentId, runId,
+    organizationSlug, status, error, reasonCode, detail}}` — camelCase, enveloped.
+
+    Dedup IDs align with the broker (`{run_id}-{status}`) + MessageGroupId
+    matches (`agentExperiments`) so a dispatch-error-then-runner-success race
+    is eligible for FIFO dedupe.
+    """
     if not callback_queue_url:
         return
     try:
-        import uuid
+        run_id = message.get("run_id", "unknown")
         body = json.dumps({
-            "experiment_id": message.get("experiment_id", "unknown"),
-            "run_id": message.get("run_id", "unknown"),
-            "candidate_id": message.get("candidate_id", "unknown"),
-            "status": "failed",
-            "error": error,
+            "type": "agentExperimentResult",
+            "data": {
+                "experimentId": message.get("experiment_id", "unknown"),
+                "runId": run_id,
+                "organizationSlug": message.get("organization_slug", "unknown"),
+                "status": "failed",
+                "error": error,
+                "detail": error,
+                "reasonCode": "DispatchError",
+            },
         })
         get_sqs_client().send_message(
             QueueUrl=callback_queue_url,
             MessageBody=body,
-            MessageGroupId=f"callback-{message.get('candidate_id', 'unknown')}",
-            MessageDeduplicationId=dedup_id or str(uuid.uuid4()),
+            MessageGroupId="agentExperiments",
+            MessageDeduplicationId=dedup_id or f"{run_id}-failed",
         )
-        logger.info(f"Sent error callback for run {message.get('run_id')}: {error}")
+        logger.info(f"Sent error callback for run {run_id}: {error}")
     except Exception as e:
         logger.exception(f"Failed to send error callback: {e}")
 
@@ -102,8 +122,9 @@ ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 ECS_TASK_DEFINITION = os.environ.get("ECS_TASK_DEFINITION", "")
 ECS_SUBNET_IDS = [s for s in os.environ.get("ECS_SUBNET_IDS", "").split(",") if s]
 ECS_SECURITY_GROUP_ID = os.environ.get("ECS_SECURITY_GROUP_ID", "")
-ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
-CALLBACK_QUEUE_URL = os.environ.get("CALLBACK_QUEUE_URL", "")
+RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
+BROKER_URL = os.environ.get("BROKER_URL", "")
+SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "pmf-engine")
 
 
@@ -117,18 +138,16 @@ def _missing_critical_config() -> list[str]:
         missing.append("ECS_SUBNET_IDS")
     if not ECS_SECURITY_GROUP_ID:
         missing.append("ECS_SECURITY_GROUP_ID")
-    if not CALLBACK_QUEUE_URL:
-        missing.append("CALLBACK_QUEUE_URL")
-    if not ARTIFACT_BUCKET:
-        missing.append("ARTIFACT_BUCKET")
+    if not RESULTS_QUEUE_URL:
+        missing.append("RESULTS_QUEUE_URL")
+    if not BROKER_URL:
+        missing.append("BROKER_URL")
+    if not SERVICE_TOKEN:
+        missing.append("SERVICE_TOKEN")
     return missing
 
 
 MAX_PARAMS_JSON_BYTES = 6000
-SCREENER_INFRA_REASONS = (
-    "screener_not_configured",
-    "screener_invalid_response",
-)
 
 
 def parse_dispatch_message(body: str) -> dict:
@@ -137,7 +156,7 @@ def parse_dispatch_message(body: str) -> dict:
     except (json.JSONDecodeError, TypeError) as e:
         raise ValueError(f"Invalid message body: {e}")
 
-    for field in ("experiment_id", "candidate_id", "run_id"):
+    for field in ("experiment_id", "organization_slug", "run_id"):
         if not data.get(field):
             raise ValueError(f"Missing required field: {field}")
 
@@ -149,8 +168,8 @@ def parse_dispatch_message(body: str) -> dict:
 def build_container_overrides(
     experiment: dict,
     message: dict,
-    artifact_bucket: str,
-    callback_queue_url: str,
+    broker_token: str,
+    broker_url: str,
     container_name: str,
     params_json: str | None = None,
 ) -> dict:
@@ -163,12 +182,13 @@ def build_container_overrides(
                 "environment": [
                     {"name": "EXPERIMENT_ID", "value": message["experiment_id"]},
                     {"name": "RUN_ID", "value": message["run_id"]},
-                    {"name": "CANDIDATE_ID", "value": message["candidate_id"]},
+                    {"name": "ORGANIZATION_SLUG", "value": message["organization_slug"]},
                     {"name": "HARNESS", "value": experiment["harness"]},
                     {"name": "AGENT_MODEL", "value": experiment["model"]},
-                    {"name": "ARTIFACT_BUCKET", "value": artifact_bucket},
-                    {"name": "ARTIFACT_KEY_TEMPLATE", "value": experiment["contract"]["s3_key_template"]},
-                    {"name": "CALLBACK_QUEUE_URL", "value": callback_queue_url},
+                    {"name": "BROKER_TOKEN", "value": broker_token},
+                    {"name": "BROKER_URL", "value": broker_url},
+                    {"name": "ANTHROPIC_BASE_URL", "value": f"{broker_url}/anthropic"},
+                    {"name": "ANTHROPIC_API_KEY", "value": broker_token},
                     {"name": "PARAMS_JSON", "value": params_json},
                     {"name": "TIMEOUT_SECONDS", "value": str(experiment.get("timeout_seconds", 600))},
                 ],
@@ -201,7 +221,7 @@ def handler(event: dict, context) -> dict:
             send_error_callback(
                 message,
                 f"Dispatch Lambda misconfigured: missing required env vars {missing_config}",
-                CALLBACK_QUEUE_URL,
+                RESULTS_QUEUE_URL,
                 dedup_id=f"dispatch-misconfig-{message['run_id']}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})
@@ -224,7 +244,7 @@ def handler(event: dict, context) -> dict:
             send_error_callback(
                 message,
                 f"Unknown experiment: {experiment_id}",
-                CALLBACK_QUEUE_URL,
+                RESULTS_QUEUE_URL,
                 dedup_id=f"unknown-experiment-{message['run_id']}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})
@@ -234,16 +254,14 @@ def handler(event: dict, context) -> dict:
             type_name = type(message["params"]).__name__
             logger.error(
                 f"Invalid params type for {experiment_id} "
-                f"(run: {message['run_id']}, candidate: {message['candidate_id']}): "
+                f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
                 f"got {type_name}, expected object"
             )
-            emit_screening_rejected_metric(
-                experiment_id, message["candidate_id"], "invalid_params_type"
-            )
+            emit_dispatch_metric("InvalidParamsType", experiment_id)
             send_error_callback(
                 message,
                 f"params must be a JSON object, got {type_name}",
-                CALLBACK_QUEUE_URL,
+                RESULTS_QUEUE_URL,
                 dedup_id=f"invalid-params-type-{message['run_id']}",
             )
             continue
@@ -253,60 +271,74 @@ def handler(event: dict, context) -> dict:
         if params_bytes > MAX_PARAMS_JSON_BYTES:
             logger.error(
                 f"Params too large for {experiment_id} "
-                f"(run: {message['run_id']}, candidate: {message['candidate_id']}): "
+                f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
                 f"{params_bytes} bytes > {MAX_PARAMS_JSON_BYTES}"
             )
-            emit_screening_rejected_metric(
-                experiment_id, message["candidate_id"], "params_too_large"
-            )
+            emit_dispatch_metric("ParamsTooLarge", experiment_id)
             send_error_callback(
                 message,
                 f"Experiment parameters exceed size limit ({params_bytes} > {MAX_PARAMS_JSON_BYTES} bytes)",
-                CALLBACK_QUEUE_URL,
+                RESULTS_QUEUE_URL,
                 dedup_id=f"params-too-large-{message['run_id']}",
             )
             continue
 
-        screening = screen_params(message["params"])
-        if not screening.safe:
-            reason = screening.reason or "unknown"
-            is_infra_failure = (
-                reason.startswith("screener_unavailable") or reason in SCREENER_INFRA_REASONS
+        required = experiment.get("required_params", [])
+        missing = [p for p in required if not message["params"].get(p)]
+        if missing:
+            logger.error(
+                f"Missing required params for {experiment_id} "
+                f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
+                f"{missing}"
             )
-            if is_infra_failure:
-                logger.error(
-                    f"Param screener unavailable for {experiment_id} "
-                    f"(run: {message['run_id']}, candidate: {message['candidate_id']}, "
-                    f"reason: {reason}) — retrying via SQS"
-                )
-                emit_screening_rejected_metric(experiment_id, message["candidate_id"], reason)
-                batch_item_failures.append({"itemIdentifier": message_id})
-                continue
-
-            logger.warning(
-                f"Param screening rejected for {experiment_id} "
-                f"(candidate: {message['candidate_id']}, run: {message['run_id']}, "
-                f"reason: {reason}, key: {screening.flagged_key})"
-            )
-            emit_screening_rejected_metric(experiment_id, message["candidate_id"], reason)
+            emit_dispatch_metric("MissingRequiredParams", experiment_id)
             send_error_callback(
                 message,
-                "Invalid experiment parameters",
-                CALLBACK_QUEUE_URL,
-                dedup_id=f"screening-rejected-{message['run_id']}",
+                f"Missing required params for {experiment_id}: {missing}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"missing-params-{message['run_id']}",
             )
+            continue
+
+        scope = derive_scope(experiment_id, message["params"])
+        prior_artifact_versions = message.get("prior_artifact_versions")
+        try:
+            broker = BrokerClient(BROKER_URL, SERVICE_TOKEN)
+            mint_result = broker.mint_run_token(
+                run_id=message["run_id"],
+                organization_slug=message["organization_slug"],
+                experiment_id=experiment_id,
+                scope=scope,
+                params=message["params"],
+                exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
+                prior_artifact_versions=prior_artifact_versions,
+            )
+        except BrokerError as e:
+            logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
+            send_error_callback(
+                message,
+                e.user_safe_message or "Broker rejected the request",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"broker-rejected-{message['run_id']}",
+            )
+            continue
+        except (httpx.HTTPError, Exception) as e:
+            logger.exception(
+                f"Transient error during mint for run {message.get('run_id')}: {e}"
+            )
+            batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         overrides = build_container_overrides(
             experiment=experiment,
             message=message,
-            artifact_bucket=ARTIFACT_BUCKET,
-            callback_queue_url=CALLBACK_QUEUE_URL,
+            broker_token=mint_result["broker_token"],
+            broker_url=BROKER_URL,
             container_name=CONTAINER_NAME,
             params_json=params_json,
         )
 
-        logger.info(f"Dispatching experiment '{experiment_id}' for candidate '{message['candidate_id']}' (run: {message['run_id']})")
+        logger.info(f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})")
 
         try:
             response = get_ecs_client().run_task(
@@ -332,7 +364,7 @@ def handler(event: dict, context) -> dict:
                 send_error_callback(
                     message,
                     f"ECS RunTask failed: {failure_reasons}",
-                    CALLBACK_QUEUE_URL,
+                    RESULTS_QUEUE_URL,
                     dedup_id=f"runtask-failed-{message['run_id']}",
                 )
                 batch_item_failures.append({"itemIdentifier": message_id})
@@ -346,7 +378,7 @@ def handler(event: dict, context) -> dict:
             send_error_callback(
                 message,
                 f"ECS RunTask exception: {e}",
-                CALLBACK_QUEUE_URL,
+                RESULTS_QUEUE_URL,
                 dedup_id=f"runtask-exception-{message['run_id']}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})

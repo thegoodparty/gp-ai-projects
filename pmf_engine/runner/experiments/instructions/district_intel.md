@@ -63,21 +63,34 @@ print(f"L2 district: {l2_district_type} = {l2_district_name}")
 
 ## STEP 2: Research the governing body
 
-Use WebFetch and Bash (curl) to find information. Follow this strategy:
+Use the **`WebSearch`** and **`WebFetch`** tools (Claude SDK built-ins) for web research. Follow this strategy:
+
+### CRITICAL: WebFetch domain-verification failures
+
+If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (each attempt burns ~2 minutes). Fall back immediately to `pmf_runtime.http.get`, which routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification:
+
+```python
+from pmf_runtime import http
+r = http.get("https://city.gov/council-minutes")
+# r = {"status": 200, "headers": {...}, "body": "<html>…</html>"}
+print(r["body"][:2000])
+```
+
+Most `.gov` and municipal portal domains are already allowlisted. Use `pmf_runtime.http.get` whenever `WebFetch` errors, not as a second fallback after more `WebFetch` retries.
 
 **2a. Find the municipality website**
-- Search for: `"{city} {state} city council"`, `"{city} {state} official website"`, `"{county} county {state} board"`
-- Use WebFetch to load the homepage and find links to meeting minutes, agendas, or a "meetings" page
+- `WebSearch({city} {state} city council)` — find the homepage
+- `WebFetch(homepage_url, prompt="find meeting minutes and agendas page")` — locate the minutes section
 
 **2b. Pull recent meeting minutes/agendas**
 - Look for the last 3-6 months of meeting minutes or agendas
-- Meeting minutes are often PDFs or HTML pages — fetch and extract key topics
+- Meeting minutes are often PDFs or HTML pages. For PDFs, try `WebFetch` first (returns extracted text). If it fails or the PDF is large, use `pmf_runtime.pdf.download(url)` to pull raw bytes through the broker, then `pdftotext -layout /workspace/downloads/file.pdf -` to extract.
 - If the official site has a "meetings" or "agendas" section, start there
 
 **2c. Search for local news**
-- Use WebSearch to find recent news about the governing body:
-  - `"CITY STATE city council recent issues 2026"`
-  - `"CITY STATE council budget vote 2026"`
+- Use `WebSearch` to find recent news about the governing body:
+  - `WebSearch("CITY STATE city council recent issues 2026")`
+  - `web.search("CITY STATE council budget vote 2026")`
 - Also search for specific policy areas if the official has stated top issues
 
 **2d. Compile findings**
@@ -86,48 +99,36 @@ Use WebFetch and Bash (curl) to find information. Follow this strategy:
 
 ## STEP 3: Query Databricks for district demographics
 
+**IMPORTANT:** The broker automatically injects `WHERE Residence_Addresses_State = '...' AND Residence_Addresses_City IN (...)` for you. Do NOT add state/city to your WHERE clause or query parameters — the broker will reject those with `scope_predicate_override`.
+
 ```python
 import os, json
-from databricks.sql import connect
+from pmf_runtime import databricks as sql
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
-state = params.get("state", "")
 l2_district_type = params.get("l2DistrictType", "")
 l2_district_name = params.get("l2DistrictName", "")
-city = params.get("city", "")
-county = params.get("county", "")
 
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 
 # Discover columns
 cursor.execute("DESCRIBE TABLE goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq")
 cols = [row[0] for row in cursor.fetchall()]
 
-# Build district filter — prefer L2 district column, fall back to city/county
+# Use L2 district column if the type is a real column; else the broker's state+city scope alone
 if l2_district_type and l2_district_type in cols:
     district_filter = f"AND `{l2_district_type}` = :district_name"
-    query_params = {"state": state, "district_name": l2_district_name}
-elif city:
-    district_filter = "AND Residence_Addresses_City = :city"
-    query_params = {"state": state, "city": city}
-elif county:
-    district_filter = "AND County = :county"
-    query_params = {"state": state, "county": county}
+    query_params = {"district_name": l2_district_name}
 else:
     district_filter = ""
-    query_params = {"state": state}
+    query_params = {}
 
 query = (
     "SELECT Voters_Age, Voters_Gender, Parties_Description, Voters_Active, "
     "Residence_Addresses_City, Residence_Addresses_Zip "
     "FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq "
-    f"WHERE Residence_Addresses_State = :state {district_filter} "
-    "AND Voters_Active = 'A'"
+    f"WHERE Voters_Active = 'A' {district_filter}"
 )
 cursor.execute(query, query_params)
 columns = [desc[0] for desc in cursor.description]
@@ -183,7 +184,7 @@ import json, os
 from datetime import datetime, timezone
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
-candidate_id = os.environ.get("CANDIDATE_ID", "unknown")
+organization_slug = os.environ.get("ORGANIZATION_SLUG", "unknown")
 
 # --- Fill in from your research ---
 official_name = params.get("officialName", "")  # MUST be filled with a real name from research if empty

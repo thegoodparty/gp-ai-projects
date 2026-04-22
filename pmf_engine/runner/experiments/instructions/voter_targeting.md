@@ -18,6 +18,9 @@ Create this checklist in your first message, then reference it throughout:
 
 ## CRITICAL RULES
 
+**NEVER fabricate, synthesize, or mock voter data.** Every voter record, demographic, geographic cluster, and count must come from a successful `pmf_runtime.databricks` query. If Databricks returns errors (502, timeout, session invalid, etc.), do NOT fall back to generated data, `random.seed`, placeholder records, or any other form of synthetic output. Instead: retry the query after a short wait, and if it still fails, STOP and exit the run with a non-zero status so the run is recorded as FAILED. A failed run with no artifact is infinitely better than a schema-valid artifact full of fake voters — campaigns will make real canvassing decisions from this data. The broker now enforces this: it rejects any publish where no Databricks query succeeded.
+
+0. **The broker automatically scopes all queries to the candidate's state and city. Do NOT add WHERE clauses for `Residence_Addresses_State` or `Residence_Addresses_City` — they are injected for you. The only filter you need to add is the district column and `Voters_Active`.**
 1. `/workspace/output/` must contain ONLY `voter_targeting.json` — put scripts in `/tmp/`.
 2. Each segment MUST include a `voters` array with ALL voter records for that segment. Empty voters = FAILURE. The script generates voters programmatically from query results — there is no size concern.
 3. Output JSON MUST use the exact field names from the template (`tier`, `name`, `district`, `summary`).
@@ -30,7 +33,7 @@ Create this checklist in your first message, then reference it throughout:
 
 ```python
 import os, json
-from databricks.sql import connect
+from pmf_runtime import databricks as sql
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 l2_district_type = params.get("l2DistrictType", "")
@@ -39,11 +42,7 @@ city = params.get("city", "")
 print(f"L2 district: {l2_district_type} = {l2_district_name}")
 print(f"City: {city}")
 
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 cursor.execute("DESCRIBE TABLE goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq")
 cols = [row[0] for row in cursor.fetchall()]
@@ -55,20 +54,22 @@ assert l2_district_type in cols, f"District column '{l2_district_type}' not foun
 print(f"District column '{l2_district_type}' confirmed in table")
 
 # CHECK if the district value actually has rows
+# NOTE: The broker injects WHERE Residence_Addresses_State = '...' AND Residence_Addresses_City IN (...)
+# automatically — do NOT add state or city to parameters.
 cursor.execute(f"""
     SELECT COUNT(*) FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq
-    WHERE Residence_Addresses_State = :state AND `{l2_district_type}` = :district_name AND Voters_Active = 'A'
-""", {"state": params.get("state", ""), "district_name": l2_district_name})
+    WHERE `{l2_district_type}` = :district_name AND Voters_Active = 'A'
+""", {"district_name": l2_district_name})
 district_count = cursor.fetchone()[0]
 print(f"Voters matching district filter: {district_count}")
 
 if district_count == 0 and city:
     cursor.execute("""
         SELECT COUNT(*) FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq
-        WHERE Residence_Addresses_State = :state AND LOWER(Residence_Addresses_City) = LOWER(:city) AND Voters_Active = 'A'
-    """, {"state": params.get("state", ""), "city": city})
+        WHERE Voters_Active = 'A'
+    """, {})
     city_count = cursor.fetchone()[0]
-    print(f"FALLBACK: Voters matching city '{city}': {city_count}")
+    print(f"FALLBACK: Voters in scoped city: {city_count}")
     print("USE_CITY_FILTER=true" if city_count > 0 else "WARNING: No voters found by city either")
 ```
 
@@ -83,11 +84,11 @@ Write this script to `/tmp/build_targeting.py`, replacing `<HAYSTAQ_COLS>` with 
 ```python
 import json, math, os
 from datetime import datetime
-from databricks.sql import connect
+from pmf_runtime import databricks as sql
 
 # --- Config from env ---
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
-candidate_id = os.environ.get("CANDIDATE_ID", "unknown")
+organization_slug = os.environ.get("ORGANIZATION_SLUG", "unknown")
 state = params.get("state", "MI")
 l2_district_type = params.get("l2DistrictType", "")
 l2_district_name = params.get("l2DistrictName", "")
@@ -100,13 +101,11 @@ city = params.get("city", "")
 county = params.get("county", "")
 
 # --- Query Databricks ---
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 district_filter = f"AND `{l2_district_type}` = :district_name" if l2_district_type else ""
+# NOTE: The broker injects WHERE Residence_Addresses_State = '...' AND Residence_Addresses_City IN (...)
+# automatically. Do NOT include state or city in the WHERE clause or parameters.
 query = (
     "SELECT LALVOTERID, Voters_FirstName, Voters_LastName, "
     "Residence_Addresses_AddressLine, Residence_Addresses_City, Residence_Addresses_Zip, "
@@ -118,10 +117,9 @@ query = (
     "hs_ideology_overall_party_gop_strong, "
     "hs_ideology_overall_party_dem_strong "
     "FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq "
-    f"WHERE Residence_Addresses_State = :state {district_filter} "
-    "AND Voters_Active = 'A'"
+    f"WHERE Voters_Active = 'A' {district_filter}"
 )
-query_params = {"state": state}
+query_params = {}
 if l2_district_type:
     query_params["district_name"] = l2_district_name
 cursor.execute(query, query_params)
@@ -257,7 +255,7 @@ for gc in geo_clusters[:5]:
     print(f"  {gc['area']}: {gc['voter_count']} voters (rank {gc['density_rank']})")
 
 output = {
-    "candidate_id": candidate_id,
+    "organization_slug": organization_slug,
     "district": {"state": state, "type": params.get("districtType", ""), "name": office, "city": city, "county": county, "zip": zip_code, "l2_type": l2_district_type, "l2_name": l2_district_name},
     "generated_at": datetime.utcnow().isoformat() + "Z",
     "summary": {

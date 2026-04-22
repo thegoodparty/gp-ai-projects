@@ -8,16 +8,14 @@ import signal
 import sys
 import tempfile
 import time
-import uuid
-
-import boto3
 
 from shared.braintrust import BraintrustClient
 from shared.logger import get_logger
-from shared.metrics import emit_metric
 from .config import RunnerConfig
 from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
+from .pmf_runtime import publish
+from .pmf_runtime.config import init_config
 
 logger = get_logger(__name__)
 
@@ -83,10 +81,6 @@ def get_harness(harness_name: str) -> AgentHarness:
     raise ValueError(f"Unknown harness: {harness_name}")
 
 
-_TERMINAL_CALLBACK_STATUSES = {"success", "contract_violation", "failed"}
-_CALLBACK_RETRY_DELAYS = (1, 3, 9)
-
-
 def _mark_callback_sent() -> None:
     global _terminal_callback_sent
     _terminal_callback_sent = True
@@ -99,119 +93,6 @@ def _is_callback_already_sent() -> bool:
 def _reset_callback_marker() -> None:
     global _terminal_callback_sent
     _terminal_callback_sent = False
-
-
-def _emit_bootstrap_failure_metric(reason: str, environment: str) -> None:
-    try:
-        cw = boto3.client("cloudwatch")
-        cw.put_metric_data(
-            Namespace="PMFEngine",
-            MetricData=[
-                {
-                    "MetricName": "BootstrapFailure",
-                    "Value": 1,
-                    "Unit": "Count",
-                    "Dimensions": [
-                        {"Name": "Environment", "Value": environment},
-                        {"Name": "Reason", "Value": reason},
-                    ],
-                },
-            ],
-        )
-    except Exception as metric_err:
-        logger.warning(f"Failed to emit BootstrapFailure metric: {metric_err}")
-
-
-def _emit_orphaned_callback_metric(config: RunnerConfig) -> None:
-    try:
-        cw = boto3.client("cloudwatch")
-        cw.put_metric_data(
-            Namespace="PMFEngine",
-            MetricData=[
-                {
-                    "MetricName": "OrphanedCallback",
-                    "Value": 1,
-                    "Unit": "Count",
-                    "Dimensions": [
-                        {"Name": "Environment", "Value": config.environment},
-                        {"Name": "ExperimentId", "Value": config.experiment_id},
-                    ],
-                },
-            ],
-        )
-    except Exception as metric_err:
-        logger.warning(f"Failed to emit OrphanedCallback metric: {metric_err}")
-
-
-def _send_callback(
-    sqs_client,
-    config: RunnerConfig,
-    status: str,
-    artifact_key: str = "",
-    cost_usd: float = 0.0,
-    duration_seconds: float = 0.0,
-    error: str | None = None,
-) -> None:
-    if not config.callback_queue_url:
-        logger.warning("No callback queue URL configured, skipping callback")
-        return
-
-    body = {
-        "experiment_id": config.experiment_id,
-        "run_id": config.run_id,
-        "candidate_id": config.candidate_id,
-        "status": status,
-        "artifact_key": artifact_key,
-        "artifact_bucket": config.artifact_bucket,
-        "cost_usd": cost_usd,
-        "duration_seconds": duration_seconds,
-        "error": error,
-    }
-
-    is_terminal = status in _TERMINAL_CALLBACK_STATUSES
-    max_attempts = len(_CALLBACK_RETRY_DELAYS) if is_terminal else 1
-    last_exc: Exception | None = None
-
-    for attempt in range(max_attempts):
-        try:
-            sqs_client.send_message(
-                QueueUrl=config.callback_queue_url,
-                MessageBody=json.dumps(body),
-                MessageGroupId=config.candidate_id or "bootstrap",
-                MessageDeduplicationId=f"{config.run_id or 'bootstrap'}-{status}",
-            )
-            logger.info(f"Sent {status} callback for run {config.run_id}")
-            return
-        except Exception as e:
-            last_exc = e
-            if is_terminal and attempt < max_attempts - 1:
-                delay = _CALLBACK_RETRY_DELAYS[attempt]
-                logger.warning(
-                    f"SQS send failed for {status} callback (run {config.run_id}, "
-                    f"attempt {attempt + 1}/{max_attempts}): {e}. Retrying in {delay}s."
-                )
-                time.sleep(delay)
-                continue
-            break
-
-    if is_terminal:
-        logger.error(
-            f"ORPHANED CALLBACK: Failed to send {status} callback after {max_attempts} attempts. "
-            f"run_id={config.run_id} experiment_id={config.experiment_id} "
-            f"candidate_id={config.candidate_id} artifact_bucket={config.artifact_bucket} "
-            f"artifact_key={artifact_key or '(none)'} error={last_exc}"
-        )
-        _emit_orphaned_callback_metric(config)
-        if last_exc is None:
-            raise RuntimeError(
-                f"BUG: {status} callback failed after {max_attempts} attempts "
-                "but no exception was captured"
-            )
-        raise last_exc
-
-    logger.warning(
-        f"Failed to send non-terminal {status} callback for run {config.run_id}: {last_exc}"
-    )
 
 
 _SECRET_PATTERNS = [
@@ -229,14 +110,6 @@ def _redact_line(line: str) -> str:
     return line
 
 
-def _emit_session_redaction_failed_metric() -> None:
-    emit_metric(
-        namespace="PMFEngine",
-        name="SessionRedactionFailed",
-        dimensions={"Environment": os.environ.get("ENVIRONMENT", "dev")},
-    )
-
-
 def _redact_session_jsonl(source_path: str) -> str | None:
     try:
         fd, redacted_path = tempfile.mkstemp(suffix=".jsonl", prefix="session_redacted_")
@@ -246,7 +119,6 @@ def _redact_session_jsonl(source_path: str) -> str | None:
         return redacted_path
     except Exception as e:
         logger.exception(f"Failed to redact session JSONL: {e}")
-        _emit_session_redaction_failed_metric()
         return None
 
 
@@ -276,25 +148,24 @@ def _is_sensitive_file(filename: str) -> bool:
     return False
 
 
-def _collect_files(
+def _collect_workspace_files(
     root_dir: str,
-    prefix: str,
     max_file_size: int = 50 * 1024 * 1024,
     max_total_size: int = 200 * 1024 * 1024,
     allowed_extensions: set[str] | None = None,
-) -> list[tuple[str, str]]:
-    collected = []
+) -> dict[str, bytes]:
+    collected: dict[str, bytes] = {}
     total_size = 0
     if not os.path.isdir(root_dir):
         return collected
     for dirpath, _dirnames, filenames in os.walk(root_dir):
         for filename in filenames:
+            if _is_sensitive_file(filename):
+                continue
             if allowed_extensions is not None:
                 _, ext = os.path.splitext(filename)
                 if ext.lower() not in allowed_extensions:
                     continue
-            elif _is_sensitive_file(filename):
-                continue
             filepath = os.path.join(dirpath, filename)
             try:
                 file_size = os.path.getsize(filepath)
@@ -303,89 +174,57 @@ def _collect_files(
                 if total_size + file_size > max_total_size:
                     return collected
                 relpath = os.path.relpath(filepath, root_dir)
-                s3_key = f"{prefix}/{relpath}"
-                collected.append((filepath, s3_key))
+                with open(filepath, "rb") as f:
+                    collected[f"workspace/{relpath}"] = f.read()
                 total_size += file_size
             except OSError:
                 continue
     return collected
 
 
-def _emit_run_log_upload_failed_metric(config: RunnerConfig, failed_count: int) -> None:
-    emit_metric(
-        namespace="PMFEngine",
-        name="RunLogUploadFailed",
-        value=failed_count,
-        dimensions={
-            "Environment": config.environment,
-            "ExperimentId": config.experiment_id,
-        },
-    )
+def _collect_log_files(workspace_dir: str) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
 
-
-def _upload_run_logs(s3_client, config: RunnerConfig, workspace_dir: str) -> None:
-    prefix = f"{config.experiment_id}/{config.run_id}/logs"
-    files_to_upload: list[tuple[str, str]] = []
-
-    files_to_upload.extend(_collect_files(workspace_dir, f"{prefix}/workspace"))
-    files_to_upload.extend(_collect_files(
-        "/tmp", f"{prefix}/tmp", allowed_extensions=_SAFE_TMP_EXTENSIONS,
+    files.update(_collect_workspace_files(workspace_dir))
+    files.update(_collect_workspace_files(
+        "/tmp", allowed_extensions=_SAFE_TMP_EXTENSIONS,
     ))
 
     session_file = _find_session_jsonl()
     if session_file:
         redacted = _redact_session_jsonl(session_file)
         if redacted:
-            files_to_upload.append((redacted, f"{prefix}/session.jsonl"))
+            try:
+                with open(redacted, "rb") as f:
+                    files["session.jsonl"] = f.read()
+            except OSError:
+                pass
         else:
             logger.warning("Skipping session JSONL upload — redaction failed")
 
-    uploaded = 0
-    failed = 0
-    for filepath, s3_key in files_to_upload:
-        try:
-            with open(filepath, "rb") as f:
-                s3_client.put_object(
-                    Bucket=config.artifact_bucket,
-                    Key=s3_key,
-                    Body=f.read(),
-                    Tagging="lifecycle=logs",
-                )
-            uploaded += 1
-        except Exception as e:
-            failed += 1
-            logger.warning(f"Failed to upload {filepath}: {e}")
+    return files
 
-    total = len(files_to_upload)
-    if total > 0 and failed == total:
-        logger.error(
-            f"ALL run log uploads failed ({failed}/{total}) for run {config.run_id} "
-            f"to s3://{config.artifact_bucket}/{prefix}/ — diagnostics lost"
-        )
-        _emit_run_log_upload_failed_metric(config, failed)
-    else:
-        logger.info(
-            f"Uploaded {uploaded}/{total} run logs to s3://{config.artifact_bucket}/{prefix}/"
-        )
+
+def _upload_logs(workspace_dir: str) -> None:
+    try:
+        files = _collect_log_files(workspace_dir)
+        if files:
+            publish.upload_logs(files)
+            logger.info(f"Uploaded {len(files)} log files via broker")
+    except Exception as e:
+        logger.warning(f"Failed to upload logs via broker: {e}")
 
 
 async def run_experiment(
     config: RunnerConfig,
     harness: AgentHarness | None = None,
-    s3_client=None,
-    sqs_client=None,
 ) -> None:
     if harness is None:
         harness = get_harness(config.harness)
-    if s3_client is None:
-        s3_client = boto3.client("s3")
-    if sqs_client is None:
-        sqs_client = boto3.client("sqs")
 
     bt = BraintrustClient.get_instance()
     bt.init("pmf-engine")
 
-    artifact_key = config.resolve_artifact_key()
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")
     start_time = time.monotonic()
 
@@ -395,7 +234,7 @@ async def run_experiment(
             input_data={
                 "experiment_id": config.experiment_id,
                 "run_id": config.run_id,
-                "candidate_id": config.candidate_id,
+                "organization_slug": config.organization_slug,
                 "model": config.model,
                 "params": config.params,
             },
@@ -412,12 +251,18 @@ async def run_experiment(
                     contract_schema=config.contract_schema,
                     contract_constraints=config.contract_constraints,
                     parent_span=span,
+                    experiment_id=config.experiment_id,
                 )
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Harness failed for run {config.run_id}: {e}")
-                _upload_run_logs(s3_client, config, workspace_dir)
-                _send_callback(sqs_client, config, "failed", duration_seconds=duration, error=str(e))
+                _upload_logs(workspace_dir)
+                publish.report_status(
+                    "failed",
+                    reason_code=type(e).__name__,
+                    detail=str(e),
+                    duration_seconds=duration,
+                )
                 span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
@@ -431,30 +276,39 @@ async def run_experiment(
             except ContractViolation as e:
                 duration = time.monotonic() - start_time
                 logger.error(f"Contract violation for run {config.run_id}: {e}")
-                rejected_key = f"{config.experiment_id}/{config.run_id}/rejected.json"
+                _upload_logs(workspace_dir)
+                # ContractViolation fires for Invalid-JSON too, so json.loads
+                # would JSONDecodeError — silently skipping the callback and
+                # leaving the run PENDING forever. Preserve the raw bytes
+                # instead when we can't re-parse. Coerce to bytes first so
+                # None / str / other types don't crash the fallback itself.
+                raw = result.artifact_bytes or b""
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8", errors="replace")
                 try:
-                    s3_client.put_object(
-                        Bucket=config.artifact_bucket,
-                        Key=rejected_key,
-                        Body=result.artifact_bytes,
-                        ContentType=result.content_type,
-                        Tagging="lifecycle=logs",
-                    )
-                except Exception as upload_err:
-                    logger.warning(
-                        f"Failed to upload rejected artifact for run {config.run_id}: {upload_err}"
-                    )
-                _upload_run_logs(s3_client, config, workspace_dir)
-                _send_callback(
-                    sqs_client, config, "contract_violation",
+                    rejected = json.loads(raw) if raw else {}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    rejected = {
+                        "_raw_bytes": raw[:4096].decode("utf-8", errors="replace"),
+                        "_truncated": len(raw) > 4096,
+                    }
+                if not isinstance(rejected, dict):
+                    rejected = {"_raw_bytes": str(rejected)[:4096], "_truncated": False}
+                if "_raw_bytes" not in rejected and not raw:
+                    # None / empty bytes case — preserve the empty marker
+                    # for downstream tooling that branches on truncation.
+                    rejected = {"_raw_bytes": "", "_truncated": False}
+                publish.report_status(
+                    "contract_violation",
+                    rejected_artifact=rejected,
+                    detail=str(e),
                     duration_seconds=duration,
-                    error=f"{e} (rejected artifact: {rejected_key})",
+                    cost_usd=result.cost_usd,
                 )
                 _mark_callback_sent()
                 span.log(output={
                     "status": "contract_violation",
                     "error": str(e),
-                    "rejected_artifact_key": rejected_key,
                     "cost_usd": result.cost_usd,
                     "num_turns": result.num_turns,
                     "duration_seconds": duration,
@@ -463,61 +317,51 @@ async def run_experiment(
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Validator error for run {config.run_id}: {e}")
-                _upload_run_logs(s3_client, config, workspace_dir)
-                _send_callback(
-                    sqs_client, config, "failed",
-                    duration_seconds=duration, error=str(e),
+                _upload_logs(workspace_dir)
+                publish.report_status(
+                    "failed",
+                    reason_code=type(e).__name__,
+                    detail=str(e),
+                    duration_seconds=duration,
+                    cost_usd=result.cost_usd,
                 )
                 span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
 
             try:
-                s3_client.put_object(
-                    Bucket=config.artifact_bucket,
-                    Key=artifact_key,
-                    Body=result.artifact_bytes,
-                    ContentType=result.content_type,
-                )
-                logger.info(f"Uploaded artifact to s3://{config.artifact_bucket}/{artifact_key}")
-
-                latest_key = f"{config.experiment_id}/latest.json"
-                try:
-                    s3_client.put_object(
-                        Bucket=config.artifact_bucket,
-                        Key=latest_key,
-                        Body=result.artifact_bytes,
-                        ContentType=result.content_type,
-                    )
-                    logger.info(
-                        f"Updated canonical latest pointer at s3://{config.artifact_bucket}/{latest_key}"
-                    )
-                except Exception as latest_err:
-                    logger.warning(
-                        f"Failed to update latest pointer {latest_key} for run {config.run_id}: {latest_err}"
-                    )
-            except Exception as e:
+                artifact = json.loads(result.artifact_bytes)
+            except (json.JSONDecodeError, TypeError) as e:
                 duration = time.monotonic() - start_time
-                logger.exception(f"S3 upload failed for run {config.run_id}: {e}")
-                _upload_run_logs(s3_client, config, workspace_dir)
-                _send_callback(sqs_client, config, "failed", duration_seconds=duration, error=str(e))
-                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
+                logger.exception(f"Artifact not valid JSON for run {config.run_id}: {e}")
+                _upload_logs(workspace_dir)
+                publish.report_status(
+                    "failed",
+                    reason_code="InvalidJSON",
+                    detail=str(e),
+                    duration_seconds=duration,
+                    cost_usd=result.cost_usd,
+                )
                 _mark_callback_sent()
                 raise
 
-            _upload_run_logs(s3_client, config, workspace_dir)
+            _upload_logs(workspace_dir)
 
             duration = time.monotonic() - start_time
-            _emit_run_metrics(config, result.cost_usd, duration, result.num_turns)
             try:
-                _send_callback(
-                    sqs_client,
-                    config,
-                    "success",
-                    artifact_key=artifact_key,
-                    cost_usd=result.cost_usd,
+                publish.publish(artifact)
+                logger.info(f"Published artifact via broker for run {config.run_id}")
+            except Exception as e:
+                logger.exception(f"Broker publish failed for run {config.run_id}: {e}")
+                publish.report_status(
+                    "failed",
+                    reason_code="PublishFailed",
+                    detail=str(e),
                     duration_seconds=duration,
+                    cost_usd=result.cost_usd,
                 )
+                _mark_callback_sent()
+                raise
             finally:
                 _mark_callback_sent()
 
@@ -531,41 +375,6 @@ async def run_experiment(
         bt.flush()
 
 
-def _emit_run_metrics(config: RunnerConfig, cost_usd: float, duration_seconds: float, num_turns: int) -> None:
-    try:
-        cw = boto3.client("cloudwatch")
-        env = config.environment
-        dimensions = [
-            {"Name": "Environment", "Value": env},
-            {"Name": "ExperimentId", "Value": config.experiment_id},
-        ]
-        cw.put_metric_data(
-            Namespace="PMFEngine",
-            MetricData=[
-                {
-                    "MetricName": "RunCostUsd",
-                    "Value": cost_usd,
-                    "Unit": "None",
-                    "Dimensions": dimensions,
-                },
-                {
-                    "MetricName": "RunDurationSeconds",
-                    "Value": duration_seconds,
-                    "Unit": "Seconds",
-                    "Dimensions": dimensions,
-                },
-                {
-                    "MetricName": "RunTurns",
-                    "Value": num_turns,
-                    "Unit": "Count",
-                    "Dimensions": dimensions,
-                },
-            ],
-        )
-    except Exception as e:
-        logger.warning(f"Failed to emit run metrics: {e}")
-
-
 def _handle_signal(signum, _frame=None):
     global _shutdown_requested
     _shutdown_requested = True
@@ -575,44 +384,12 @@ def _handle_signal(signum, _frame=None):
         task.cancel()
 
 
-def _send_bootstrap_callback(error: str) -> None:
-    callback_url = os.environ.get("CALLBACK_QUEUE_URL", "")
-    run_id = os.environ.get("RUN_ID", "")
-    if not callback_url or not run_id:
-        logger.error(
-            f"Cannot send bootstrap callback (missing CALLBACK_QUEUE_URL or RUN_ID): {error}"
-        )
-        return
-    try:
-        sqs = boto3.client("sqs")
-        candidate_id = os.environ.get("CANDIDATE_ID", "")
-        body = json.dumps({
-            "experiment_id": os.environ.get("EXPERIMENT_ID", ""),
-            "run_id": run_id,
-            "candidate_id": candidate_id,
-            "status": "failed",
-            "artifact_key": "",
-            "artifact_bucket": os.environ.get("ARTIFACT_BUCKET", ""),
-            "cost_usd": 0.0,
-            "duration_seconds": 0.0,
-            "error": error,
-        })
-        sqs.send_message(
-            QueueUrl=callback_url,
-            MessageBody=body,
-            MessageGroupId=candidate_id or "bootstrap",
-            MessageDeduplicationId=f"{run_id}-bootstrap-failed",
-        )
-        logger.info(f"Sent bootstrap-failure callback for run {run_id}")
-    except Exception as cb_err:
-        logger.exception(f"Failed to send bootstrap-failure callback: {cb_err}")
-
-
 async def main():
     global _current_task, _shutdown_requested
     _current_task = None
     _shutdown_requested = False
     _reset_callback_marker()
+    main_start_time = time.monotonic()
 
     loop = asyncio.get_running_loop()
     try:
@@ -625,32 +402,39 @@ async def main():
     try:
         config = RunnerConfig.from_env()
     except Exception as e:
-        environment = os.environ.get("ENVIRONMENT", "dev")
         logger.exception(f"Failed to load RunnerConfig from env: {e}")
-        _emit_bootstrap_failure_metric("ConfigLoad", environment)
-        _send_bootstrap_callback(f"Config load failed: {e}")
         sys.exit(1)
-
-    timeout = config.timeout_seconds
 
     try:
-        sqs_client = boto3.client("sqs")
+        init_config(config.broker_url, config.broker_token)
     except Exception as e:
-        logger.exception(f"Failed to create SQS client: {e}")
-        _emit_bootstrap_failure_metric("SQSClientInit", config.environment)
+        logger.exception(f"Failed to initialize broker config: {e}")
         sys.exit(1)
 
+    publish.report_status("running")
+
+    timeout = config.timeout_seconds
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")
 
     try:
         if not config.experiment_id:
             logger.error("EXPERIMENT_ID environment variable required")
-            _send_callback(sqs_client, config, "failed", error="EXPERIMENT_ID not set")
+            publish.report_status(
+                "failed",
+                reason_code="MissingConfig",
+                detail="EXPERIMENT_ID not set",
+                duration_seconds=time.monotonic() - main_start_time,
+            )
             sys.exit(1)
 
         if not config.instruction:
             logger.error("No instruction available (not in env var or registry)")
-            _send_callback(sqs_client, config, "failed", error="No instruction available")
+            publish.report_status(
+                "failed",
+                reason_code="MissingConfig",
+                detail="No instruction available",
+                duration_seconds=time.monotonic() - main_start_time,
+            )
             sys.exit(1)
 
         os.makedirs(workspace_dir, exist_ok=True)
@@ -686,29 +470,31 @@ async def main():
             _current_task.cancel()
             try:
                 await _current_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
-        try:
-            _upload_run_logs(boto3.client("s3"), config, workspace_dir)
-        except Exception as log_err:
-            logger.warning(f"Failed to upload run logs on timeout: {log_err}")
-        _send_callback(
-            sqs_client, config, "failed",
-            duration_seconds=config.timeout_seconds,
-            error=f"Experiment timed out after {config.timeout_seconds}s",
+            except Exception as drain_err:
+                logger.warning(
+                    f"Error draining cancelled task for run {config.run_id}: "
+                    f"{drain_err}",
+                    exc_info=True,
+                )
+        _upload_logs(workspace_dir)
+        publish.report_status(
+            "failed",
+            reason_code="Timeout",
+            detail=f"Experiment timed out after {config.timeout_seconds}s",
+            duration_seconds=time.monotonic() - main_start_time,
         )
         sys.exit(1)
 
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
-        try:
-            _upload_run_logs(boto3.client("s3"), config, workspace_dir)
-        except Exception as log_err:
-            logger.warning(f"Failed to upload run logs after cancel: {log_err}")
-        _send_callback(
-            sqs_client, config, "failed",
-            duration_seconds=0,
-            error="Task terminated by signal",
+        _upload_logs(workspace_dir)
+        publish.report_status(
+            "failed",
+            reason_code="Signal",
+            detail="Task terminated by signal",
+            duration_seconds=time.monotonic() - main_start_time,
         )
         sys.exit(1)
 
@@ -718,19 +504,21 @@ async def main():
     except Exception as e:
         if _shutdown_requested:
             logger.warning(f"Task terminated by signal for run {config.run_id}")
-            _send_callback(
-                sqs_client, config, "failed",
-                duration_seconds=0,
-                error="Task terminated by signal",
+            publish.report_status(
+                "failed",
+                reason_code="Signal",
+                detail="Task terminated by signal",
+                duration_seconds=time.monotonic() - main_start_time,
             )
             sys.exit(1)
 
         logger.exception(f"Unhandled error in main for run {config.run_id}: {e}")
         if not _is_callback_already_sent():
-            _send_callback(
-                sqs_client, config, "failed",
-                duration_seconds=0,
-                error=f"Unhandled error: {e}",
+            publish.report_status(
+                "failed",
+                reason_code=type(e).__name__,
+                detail=f"Unhandled error: {e}",
+                duration_seconds=time.monotonic() - main_start_time,
             )
         raise
 

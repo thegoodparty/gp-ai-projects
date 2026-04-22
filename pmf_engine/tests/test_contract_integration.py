@@ -1,11 +1,10 @@
 import json
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pmf_engine.runner.config import RunnerConfig
-from pmf_engine.runner.contract import ContractViolation
 from pmf_engine.runner.harness.base import HarnessResult
 from pmf_engine.runner.harness.claude_sdk import build_system_prompt
 from pmf_engine.runner.main import run_experiment
@@ -15,25 +14,25 @@ def _make_config(**overrides):
     defaults = {
         "experiment_id": "test_exp",
         "run_id": "run-001",
-        "candidate_id": "cand-123",
+        "organization_slug": "org-123",
         "instruction": "Write result.json",
         "params": {},
         "harness": "claude_sdk",
         "model": "sonnet",
         "environment": "dev",
-        "artifact_bucket": "test-bucket",
-        "artifact_key_template": "{experiment_id}/{run_id}/result.json",
-        "callback_queue_url": "https://sqs.example.com/queue.fifo",
+        "broker_url": "https://broker.test",
+        "broker_token": "tok-test",
         "contract_schema": None,
     }
     defaults.update(overrides)
     return RunnerConfig(**defaults)
 
 
-@patch("pmf_engine.runner.main._upload_run_logs")
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
 class TestRunnerContractValidation:
     @pytest.mark.asyncio
-    async def test_valid_artifact_uploads_and_succeeds(self, _mock_logs):
+    async def test_valid_artifact_publishes_via_broker(self, mock_publish, _mock_logs):
         schema = {"greeting": "string"}
         config = _make_config(contract_schema=schema)
         artifact = json.dumps({"greeting": "hello"}).encode()
@@ -42,19 +41,13 @@ class TestRunnerContractValidation:
         mock_harness.run.return_value = HarnessResult(
             artifact_bytes=artifact, content_type="application/json",
         )
-        mock_s3 = MagicMock()
-        mock_sqs = MagicMock()
 
-        await run_experiment(config, harness=mock_harness, s3_client=mock_s3, sqs_client=mock_sqs)
+        await run_experiment(config, harness=mock_harness)
 
-        keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
-        assert "test_exp/run-001/result.json" in keys
-        assert "test_exp/latest.json" in keys
-        body = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
-        assert body["status"] == "success"
+        mock_publish.publish.assert_called_once_with({"greeting": "hello"})
 
     @pytest.mark.asyncio
-    async def test_invalid_artifact_sends_contract_violation(self, _mock_logs):
+    async def test_invalid_artifact_reports_contract_violation(self, mock_publish, _mock_logs):
         schema = {"greeting": "string", "count": "number"}
         config = _make_config(contract_schema=schema)
         artifact = json.dumps({"greeting": "hello"}).encode()
@@ -63,46 +56,35 @@ class TestRunnerContractValidation:
         mock_harness.run.return_value = HarnessResult(
             artifact_bytes=artifact, content_type="application/json",
         )
-        mock_s3 = MagicMock()
-        mock_sqs = MagicMock()
 
-        await run_experiment(config, harness=mock_harness, s3_client=mock_s3, sqs_client=mock_sqs)
+        await run_experiment(config, harness=mock_harness)
 
-        keys = [c.kwargs.get("Key", "") for c in mock_s3.put_object.call_args_list]
-        assert "test_exp/run-001/result.json" not in keys
-        assert not any("latest.json" in k for k in keys)
-        assert any(k.endswith("rejected.json") for k in keys)
-        body = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
-        assert body["status"] == "contract_violation"
-        assert "count" in body["error"]
+        mock_publish.publish.assert_not_called()
+        mock_publish.report_status.assert_called_once()
+        call_args = mock_publish.report_status.call_args
+        assert call_args[0][0] == "contract_violation"
+        assert "count" in call_args[1]["detail"]
 
     @pytest.mark.asyncio
-    async def test_no_schema_skips_validation(self, _mock_logs):
+    async def test_no_schema_skips_validation_and_publishes(self, mock_publish, _mock_logs):
         config = _make_config(contract_schema=None)
-        artifact = b"not even json"
+        artifact = b'{"result": "ok"}'
 
         mock_harness = AsyncMock()
         mock_harness.run.return_value = HarnessResult(
             artifact_bytes=artifact, content_type="application/json",
         )
-        mock_s3 = MagicMock()
-        mock_sqs = MagicMock()
 
-        await run_experiment(config, harness=mock_harness, s3_client=mock_s3, sqs_client=mock_sqs)
+        await run_experiment(config, harness=mock_harness)
 
-        keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
-        assert "test_exp/run-001/result.json" in keys
-        body = json.loads(mock_sqs.send_message.call_args[1]["MessageBody"])
-        assert body["status"] == "success"
+        mock_publish.publish.assert_called_once_with({"result": "ok"})
 
 
-@patch("pmf_engine.runner.main.time.sleep", return_value=None)
-@patch("pmf_engine.runner.main._upload_run_logs")
-class TestCallbackFailure:
-    """Terminal callbacks retry 3 times then raise (orphaned-callback path)."""
-
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+class TestPublishFailure:
     @pytest.mark.asyncio
-    async def test_success_callback_failure_raises_after_retries(self, _mock_logs, _mock_sleep):
+    async def test_publish_failure_reports_failed_status(self, mock_publish, _mock_logs):
         config = _make_config(contract_schema=None)
         artifact = json.dumps({"result": "ok"}).encode()
 
@@ -110,60 +92,55 @@ class TestCallbackFailure:
         mock_harness.run.return_value = HarnessResult(
             artifact_bytes=artifact, content_type="application/json",
         )
-        mock_s3 = MagicMock()
-        mock_sqs = MagicMock()
-        mock_sqs.send_message.side_effect = Exception("SQS unreachable")
+        mock_publish.publish.side_effect = Exception("Broker unreachable")
 
-        with pytest.raises(Exception, match="SQS unreachable"):
-            await run_experiment(config, harness=mock_harness, s3_client=mock_s3, sqs_client=mock_sqs)
+        with pytest.raises(Exception, match="Broker unreachable"):
+            await run_experiment(config, harness=mock_harness)
 
-        assert mock_sqs.send_message.call_count == 3
+        mock_publish.report_status.assert_called_once()
+        assert mock_publish.report_status.call_args[0][0] == "failed"
 
     @pytest.mark.asyncio
-    async def test_failure_callback_failure_raises_after_retries(self, _mock_logs, _mock_sleep):
+    async def test_harness_failure_reports_failed_status(self, mock_publish, _mock_logs):
         config = _make_config(contract_schema=None)
 
         mock_harness = AsyncMock()
         mock_harness.run.side_effect = RuntimeError("Agent crashed")
-        mock_s3 = MagicMock()
-        mock_sqs = MagicMock()
-        mock_sqs.send_message.side_effect = Exception("SQS unreachable")
 
-        with pytest.raises(Exception, match="SQS unreachable"):
-            await run_experiment(config, harness=mock_harness, s3_client=mock_s3, sqs_client=mock_sqs)
+        with pytest.raises(RuntimeError, match="Agent crashed"):
+            await run_experiment(config, harness=mock_harness)
 
-        assert mock_sqs.send_message.call_count == 3
+        mock_publish.report_status.assert_called_once()
+        assert mock_publish.report_status.call_args[0][0] == "failed"
 
 
-class TestUploadRunLogsSecurity:
-    """Fix #2: _collect_files should skip sensitive files and have aggregate size cap."""
-
-    def test_collect_files_skips_env_files(self, tmp_path):
-        from pmf_engine.runner.main import _collect_files
+class TestCollectWorkspaceFilesSecurity:
+    def test_skips_env_files(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
         (tmp_path / "data.json").write_text('{"ok": true}')
         (tmp_path / ".env").write_text("SECRET_KEY=hunter2")
         (tmp_path / "credentials.json").write_text('{"token": "abc"}')
         (tmp_path / "subdir").mkdir()
         (tmp_path / "subdir" / "config.key").write_text("private key data")
 
-        files = _collect_files(str(tmp_path), "prefix")
-        filenames = [f.split("/")[-1] for _, f in files]
+        files = _collect_workspace_files(str(tmp_path))
+        filenames = [k.split("/")[-1] for k in files.keys()]
 
         assert "data.json" in filenames
         assert ".env" not in filenames
         assert "credentials.json" not in filenames
         assert "config.key" not in filenames
 
-    def test_collect_files_respects_aggregate_cap(self, tmp_path):
-        from pmf_engine.runner.main import _collect_files
+    def test_respects_aggregate_cap(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
         for i in range(10):
             (tmp_path / f"file_{i}.txt").write_bytes(b"x" * 1024 * 1024)
 
-        files = _collect_files(str(tmp_path), "prefix", max_total_size=5 * 1024 * 1024)
+        files = _collect_workspace_files(str(tmp_path), max_total_size=5 * 1024 * 1024)
         assert len(files) < 10
 
-    def test_collect_files_allowlist_only_permits_safe_extensions(self, tmp_path):
-        from pmf_engine.runner.main import _collect_files
+    def test_allowlist_only_permits_safe_extensions(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
         (tmp_path / "data.json").write_text('{"ok": true}')
         (tmp_path / "notes.txt").write_text("hello")
         (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4")
@@ -173,21 +150,23 @@ class TestUploadRunLogsSecurity:
         (tmp_path / ".env").write_text("SECRET=x")
 
         allowed = {".json", ".txt", ".pdf"}
-        files = _collect_files(str(tmp_path), "prefix", allowed_extensions=allowed)
-        filenames = {f.split("/")[-1] for _, f in files}
+        files = _collect_workspace_files(str(tmp_path), allowed_extensions=allowed)
+        filenames = {k.split("/")[-1] for k in files.keys()}
 
         assert filenames == {"data.json", "notes.txt", "report.pdf"}
 
-    def test_collect_files_allowlist_ignores_blocklist(self, tmp_path):
-        """When allowlist is set, blocklist patterns are bypassed (allowlist takes precedence)."""
-        from pmf_engine.runner.main import _collect_files
+    def test_blocklist_still_applies_under_allowlist(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
         (tmp_path / "credentials.json").write_text('{"token": "abc"}')
+        (tmp_path / "data.json").write_text('{"ok": true}')
 
-        files_blocklist = _collect_files(str(tmp_path), "prefix")
-        assert len(files_blocklist) == 0
+        files_blocklist = _collect_workspace_files(str(tmp_path))
+        assert len(files_blocklist) == 1
+        assert list(files_blocklist.keys())[0].endswith("data.json")
 
-        files_allowlist = _collect_files(str(tmp_path), "prefix", allowed_extensions={".json"})
+        files_allowlist = _collect_workspace_files(str(tmp_path), allowed_extensions={".json"})
         assert len(files_allowlist) == 1
+        assert list(files_allowlist.keys())[0].endswith("data.json")
 
 
 class TestSessionJsonlRedaction:

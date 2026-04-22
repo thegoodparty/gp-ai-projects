@@ -17,11 +17,12 @@ You will execute three phases in sequence:
 5. `based_on_district_intel_run` must be `"none"` (the string) if no district intel artifact was provided in the parameters.
 6. `agenda_items` must have at least one entry. If no agenda is found, include a single item with `item_number: "N/A"`, `title: "Agenda not yet published"`, `type: "informational"`, `requires_vote: false`. Agenda items must be substantive — items where council takes action, holds a hearing, receives a report, or makes a decision. Do not include meeting logistics (roll call, pledge, invocation, adjournment, approval of minutes).
 7. **CITATIONS ARE REQUIRED** in the briefing content. Every factual claim about fiscal data, council dynamics, or news must reference a source.
-8. **ALWAYS read staff report PDFs.** After pulling the agenda, download and read staff reports for decision items (Step 4b). Staff reports contain fiscal impact, staff recommendations, and conditions that dramatically improve briefing quality. Skip site plans and engineering drawings. **Always use `pdftotext /workspace/downloads/file.pdf -` to extract PDF text** — you do not have a PDF reader tool.
+8. **ALWAYS read staff report PDFs.** After pulling the agenda, download and read staff reports for decision items (Step 4b). Staff reports contain fiscal impact, staff recommendations, and conditions that dramatically improve briefing quality. Skip site plans and engineering drawings. Use `pmf_runtime.pdf.download(url)` to pull the PDF through the broker, then `pdftotext -layout /workspace/downloads/file.pdf -` to extract text (you do not have a PDF reader tool). For large budget books (>50 pages), use `pdftotext -layout -f N -l M` to extract only the pages you need.
 9. **Track all sources.** Every data source you access (API endpoint, web page, PDF document) must be recorded in `/workspace/sources.json`. Each entry needs: `id` (unique slug like `linc-property-tax`), `type` (one of: `government_record`, `news`, `staff_report`, `campaign`, `modeled`, `web_search`), `title` (human-readable), `url` (the URL or API endpoint), and `accessed_at` (ISO 8601 timestamp). These sources appear in the final output and are referenced inline in the briefing via `[source-id]` markers. **Never use `internal://` URLs.** For voter score data from Databricks, use source id `gp-voter-data` with title "GoodParty proprietary voter issue modeling" and url `https://goodparty.org`. For district intel data, use the original source URLs from the district intel artifact's sources array.
 10. **Do NOT remove or omit any fields from the output template.** Every field in the contract schema must appear in the output. If data is unavailable, use sensible defaults: `""` for strings, `0` for numbers, `[]` for arrays. Never use `null`.
 11. **`eo.name`**: If no `officialName` is provided in params, research the governing body and use the name of a real sitting council member or official. Never use generic values like "Council Member" or the body name itself.
 12. **Scoring dimension IDs are fixed.** The `score.dimensions` array MUST contain exactly 12 entries with these exact IDs (in this order): `legislative_record`, `fiscal_depth`, `voter_constituent_intelligence`, `gap_analysis`, `political_intelligence`, `strategic_roadmap`, `procedural_guidance`, `personal_tailoring`, `news_narrative_context`, `state_policy_integration`, `source_transparency`, `accuracy_risk_management`. Do not rename, abbreviate, or reorder them.
+13. **The broker automatically scopes all queries to the candidate's state and city. Do NOT add WHERE clauses for `Residence_Addresses_State` or `Residence_Addresses_City` — they are injected for you. The only filters you need to add are `Voters_Active = 'A'` and optional L2 district/column filters.**
 
 ---
 
@@ -41,16 +42,52 @@ touch /workspace/conversation.log
 - `/workspace/api_responses/` — saved API responses (Legistar events, agenda items, fiscal data)
 - `/workspace/conversation.log` — turn-by-turn log of every action taken
 
-**Save everything you download or fetch.** Use `curl -o` (not WebFetch) when downloading files so they persist on disk:
+**Save the content you extract.** The runner has narrow network egress and cannot `curl` arbitrary hosts. Three retrieval paths:
 
-- **PDFs**: `curl -s -o /workspace/downloads/{source-id}.pdf "URL"`
-- **API responses**: `curl -s "URL" > /workspace/api_responses/{source-id}.json`
-- **Web pages with useful data**: `curl -s "URL" > /workspace/downloads/{source-id}.html`
+- **`WebFetch` (Claude SDK)** — HTML pages and short PDFs. Returns extracted text to your context. No disk write.
+- **`pmf_runtime.http.get(url)`** — HTTP GET through the broker. Returns `{"status", "headers", "body"}`. **Use this whenever `WebFetch` errors.**
+- **`pmf_runtime.pdf.download(url)`** — pulls PDFs through the broker and writes the raw bytes to `/workspace/downloads/`. Use this for staff reports, budget books, and any PDF too large or auth-walled for `WebFetch`.
 
-Do NOT use WebFetch for downloads — it returns content to your context but does not save to disk. Use WebFetch only for quick page reads where you don't need to keep the file. If you read something useful with WebFetch, save it afterward:
+### CRITICAL: WebFetch domain-verification failures
+
+If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (it will fail the same way after ~2 minutes per attempt, burning your turn budget).
+
+Fall back immediately to `pmf_runtime.http.get`:
+
+```python
+from pmf_runtime import http
+r = http.get("https://hendersonvillenc.gov/council-meeting-agendas")
+# r = {"status": 200, "headers": {...}, "body": "<html>…</html>"}
+print(r["body"][:2000])
+```
+
+This routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification entirely. Most `.gov` and municipal portal domains are already allowlisted.
+
+Example — download a staff report and extract the sections you need:
+
+```python
+from pmf_runtime import pdf
+result = pdf.download("https://city.gov/agenda/staff_report_1234.pdf", purpose="item 8 staff report")
+# result = {"path": "/workspace/downloads/staff_report_1234.pdf", "byte_size": 823104, "source_url": "..."}
+```
 
 ```bash
-echo 'DATA_YOU_EXTRACTED' > /workspace/api_responses/{source-id}.txt
+# Then extract text locally with pdftotext (installed in the container):
+pdftotext -layout /workspace/downloads/staff_report_1234.pdf -
+
+# For large budget books, extract only relevant pages:
+pdftotext -layout -f 120 -l 145 /workspace/downloads/fy2026_budget.pdf -
+```
+
+Persist extracted text to disk so it's included in run artifacts:
+
+```bash
+pdftotext -layout /workspace/downloads/staff_report_1234.pdf /workspace/downloads/staff_report_1234.txt
+
+# API responses (JSON) go under api_responses/:
+cat > /workspace/api_responses/{source-id}.json <<'EOF'
+{"key": "value"}
+EOF
 ```
 
 These files are collected as run artifacts for debugging and auditing.
@@ -66,13 +103,15 @@ echo "  RESULT: {1-2 line summary of what was returned}" >> /workspace/conversat
 
 For example:
 ```
-[2026-04-06T14:32:00Z] TOOL: WebSearch | searched "Palestine TX city council members"
+[2026-04-06T14:32:00Z] TOOL: WebSearch | "Palestine TX city council members"
   RESULT: Found 7 council members. Selected Angela Woodard (District 5, elected 2024).
-[2026-04-06T14:32:15Z] TOOL: Bash(curl) | fetched Legistar events API for palestine
-  RESULT: 404 - Palestine does not use Legistar.
-[2026-04-06T14:33:00Z] TOOL: WebSearch | searched "Palestine TX" legistar OR granicus OR escribemeetings
+[2026-04-06T14:32:15Z] TOOL: http.get | https://webapi.legistar.com/v1/palestinetx/events?$top=1
+  RESULT: 404 Not Found — Palestine does not use Legistar.
+[2026-04-06T14:33:00Z] TOOL: WebSearch | "Palestine TX" legistar OR granicus OR escribemeetings
   RESULT: Found CivicPlus AgendaCenter at cityofpalestinetx.com/AgendaCenter
-[2026-04-06T14:34:00Z] TOOL: Read | read budget PDF pages 1-5
+[2026-04-06T14:34:00Z] TOOL: pdf.download | staff_report_1234.pdf via broker
+  RESULT: 823104 bytes saved to /workspace/downloads/staff_report_1234.pdf
+[2026-04-06T14:34:10Z] TOOL: Bash(pdftotext) | extracted pages 1-5 of FY2026 budget
   RESULT: FY2026 total budget $70.4M, tax rate $0.614285/$100, General Fund $24.5M
 ```
 
@@ -132,31 +171,31 @@ zip_code = params.get("zip", "")
 top_issues = params.get("topIssues", [])
 
 district_intel_run_id = params.get("districtIntelRunId", "")
-district_intel_bucket = params.get("districtIntelArtifactBucket", "")
-district_intel_key = params.get("districtIntelArtifactKey", "")
 
 print(f"Official: {official_name}")
 print(f"Office: {office}")
 print(f"Location: {city}, {county}, {state} {zip_code}")
 print(f"Top issues: {top_issues}")
 print(f"District intel run: {district_intel_run_id or 'none'}")
-print(f"District intel artifact: s3://{district_intel_bucket}/{district_intel_key}" if district_intel_key else "No district intel artifact")
 ```
 
-If `district_intel_key` and `district_intel_bucket` are present, fetch the district intel artifact from S3 to use as context for the briefing. The issues identified in district intel can inform which agenda items are most relevant to the official's district.
+If `district_intel_run_id` is present, fetch the district intel artifact to use as context for the briefing. The issues identified in district intel can inform which agenda items are most relevant to the official's district.
 
-```bash
-# Only run if district intel artifact params are set
-if [ -n "$DISTRICT_INTEL_KEY" ]; then
-  aws s3 cp "s3://${DISTRICT_INTEL_BUCKET}/${DISTRICT_INTEL_KEY}" /workspace/downloads/district_intel.json
-  python3 -c "
-import json
-d = json.load(open('/workspace/downloads/district_intel.json'))
-print(f'District intel loaded: {len(d.get(\"issues\", []))} issues')
-for i in d.get('issues', []):
-    print(f'  - {i[\"title\"]}')
-"
-fi
+```python
+from pmf_runtime import priors
+
+if district_intel_run_id:
+    try:
+        district_intel = priors.read("district_intel")
+        issues = district_intel.get("issues", [])
+        print(f"District intel loaded: {len(issues)} issues")
+        for i in issues:
+            print(f"  - {i['title']}")
+    except FileNotFoundError:
+        print("No district intel artifact found — proceeding without it")
+        district_intel = None
+else:
+    district_intel = None
 ```
 
 ---
@@ -171,18 +210,16 @@ Do NOT guess the Legistar client name. Discover it.
    - `cityoffayetteville.legistar.com` → client = `cityoffayetteville`
    - `durhamnc.legistar.com` → client = `durhamnc`
    - `austintx.legistar.com` → client = `austintx`
-4. Verify the client works:
+4. Verify the client works. Runner has no direct internet egress — use the broker's `pmf_runtime.http.get` for Legistar REST API calls (Claude's WebFetch refuses `webapi.legistar.com`):
 
-```bash
-curl -s "https://webapi.legistar.com/v1/{client}/events?$top=1" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-if isinstance(data, list) and len(data) > 0:
-    print(f'Legistar client verified: {len(data)} events returned')
-else:
-    print('WARNING: Legistar client returned no data')
-"
+```python
+from pmf_runtime import http
+import json
+r = http.get("https://webapi.legistar.com/v1/{client}/events?$top=1")
+events = json.loads(r["body"])
+print(f"Verified: {len(events)} event(s), first body: {events[0]['EventBodyName']}")
 ```
+If the response is a valid event list, the client is verified.
 
 5. If the city doesn't use Legistar, search for these platforms **in order** (try ALL of them before falling back to web_search):
    - PrimeGov: `"[city]" primegov.com` → URL pattern: `cityof{city}.primegov.com` or `{city}.primegov.com`
@@ -190,7 +227,8 @@ else:
    - CivicPlus AgendaCenter: `"[city]" AgendaCenter`
    - BoardDocs: `"[city]" boarddocs`
    - Granicus: `"[city]" granicus.com`
-   - Municode/CivicPlus Meetings: `"[city]" meetings civicplus`
+   - Municode/CivicPlus Meetings: `"[city]" meetings civicplus` or `[city]-[state].municodemeetings.com`
+   - CivicClerk (MeetingCentral, Azure blob): `"[city]" mccmeetings.blob.core.usgovcloudapi.net` or search for past packets `site:mccmeetings.blob.core.usgovcloudapi.net "[CITY NAME]"`. Packets live at `https://mccmeetings.blob.core.usgovcloudapi.net/{tenant}-pubu/MEET-Packet-{guid}.pdf`. Tenant is usually a short city code (e.g. `hvlnc` for Hendersonville NC).
 6. **Verify the platform actually works** before moving on. Load the agenda page and confirm it shows real meeting items. If it returns a login wall or empty page, try the next platform.
 7. Record which platform was found (or "web_search" if none)
 
@@ -198,26 +236,29 @@ else:
 
 ## STEP 3: Find the next meeting
 
+### Turn budget: Steps 2 + 3 + 4 combined = 15 turns max
+
+Platform discovery, finding the next meeting, and pulling the agenda **must finish within 15 agent turns total.** If you reach 15 turns without a confirmed upcoming agenda:
+1. Check whether a **prior month's packet** is already downloadable (via `pmf_runtime.pdf.download`). If so, use it as a reference packet and record `agenda_source: "prior_month_packet"`.
+2. Otherwise use the `"Agenda not yet published"` placeholder per Critical Rule 6 and move on to Step 5.
+
+**Do not burn turns chasing an agenda that isn't published yet** — municipal agendas are usually posted 3-7 days before the meeting. If today's date is >10 days before the next meeting, the agenda almost certainly doesn't exist yet; skip straight to the placeholder.
+
 **Legistar cities:**
 
-```bash
-curl -s "https://webapi.legistar.com/v1/{client}/events?$top=10&$orderby=EventDate+desc" | python3 -c "
-import sys, json
+Use `pmf_runtime.http.get` to call the Legistar REST API — returns raw JSON the agent can parse:
+
+```python
+from pmf_runtime import http
+import json
 from datetime import datetime, timezone
 
-events = json.load(sys.stdin)
+r = http.get("https://webapi.legistar.com/v1/{client}/events?$top=10&$orderby=EventDate+desc")
+events = json.loads(r["body"])
 now = datetime.now(timezone.utc)
-
-# Find the next upcoming meeting, or the most recent if all are past
-future = [e for e in events if datetime.fromisoformat(e['EventDate'].replace('T', 'T').rstrip('Z')).replace(tzinfo=timezone.utc) >= now]
+future = [e for e in events if datetime.fromisoformat(e['EventDate'].rstrip('Z')).replace(tzinfo=timezone.utc) >= now]
 target = future[-1] if future else events[0]
-
-print(f'Meeting: {target[\"EventBodyName\"]}')
-print(f'Date: {target[\"EventDate\"]}')
-print(f'Time: {target.get(\"EventTime\", \"TBD\")}')
-print(f'Location: {target.get(\"EventLocation\", \"TBD\")}')
-print(f'EventId: {target[\"EventId\"]}')
-"
+print(f"Meeting: {target['EventBodyName']} on {target['EventDate']} at {target.get('EventTime','TBD')} — EventId={target['EventId']}")
 ```
 
 Look for "City Council" or "Regular Meeting" body types. Skip work sessions and committee meetings unless no regular meeting is found.
@@ -230,38 +271,31 @@ Look for "City Council" or "Regular Meeting" body types. Skip work sessions and 
 
 **Legistar cities:**
 
-```bash
-# Get agenda items for the meeting
-curl -s "https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems?$orderby=EventItemMinutesSequence" > /workspace/api_responses/agenda_items.json
+Pull event items via `pmf_runtime.http.get`:
 
-python3 -c "
+```python
+from pmf_runtime import http
 import json
-items = json.load(open('/workspace/api_responses/agenda_items.json'))
-print(f'Total agenda items: {len(items)}')
+r = http.get(f"https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems?$orderby=EventItemMinutesSequence")
+items = json.loads(r["body"])
+with open("/workspace/api_responses/agenda_items.json", "w") as f:
+    json.dump(items, f)
+print(f"Total agenda items: {len(items)}")
 for item in items:
-    title = item.get('EventItemTitle', 'No title')
-    file_num = item.get('EventItemMatterFile', '')
-    matter_type = item.get('EventItemMatterType', '')
-    consent = item.get('EventItemConsentAgendaFlag', 0)
-    roll_call = item.get('EventItemRollCallFlag', 0)
-    matter_id = item.get('EventItemMatterId')
-    print(f'  [{file_num}] {title[:80]} | type={matter_type} consent={consent} roll_call={roll_call} matter_id={matter_id}')
-"
+    print(f"  [{item.get('EventItemMatterFile','')}] {item.get('EventItemTitle','')[:80]} | type={item.get('EventItemMatterType','')} consent={item.get('EventItemConsentAgendaFlag',0)} roll_call={item.get('EventItemRollCallFlag',0)} matter_id={item.get('EventItemMatterId')}")
 ```
 
-For items with a `matter_id`, fetch matter detail for summaries:
-```bash
-curl -s "https://webapi.legistar.com/v1/{client}/matters/{matterId}" | python3 -c "
-import sys, json
-m = json.load(sys.stdin)
-print(f'Matter: {m.get(\"MatterFile\", \"\")} - {m.get(\"MatterTitle\", \"\")}')
-text = m.get('MatterText', '')
+For items with a `MatterId`, fetch matter detail for summaries:
+```python
+from pmf_runtime import http
+import json, re
+r = http.get(f"https://webapi.legistar.com/v1/{client}/matters/{matterId}")
+m = json.loads(r["body"])
+print(f"Matter: {m.get('MatterFile','')} - {m.get('MatterTitle','')}")
+text = m.get("MatterText", "")
 if text:
-    # Strip HTML tags for a clean summary
-    import re
-    clean = re.sub('<[^<]+?>', '', text)[:500]
-    print(f'Summary: {clean}')
-"
+    clean = re.sub("<[^<]+?>", "", text)[:500]
+    print(f"Summary: {clean}")
 ```
 
 **Type classification rules:**
@@ -277,28 +311,11 @@ if text:
 | Everything else with `EventItemRollCallFlag > 0` | `business` |
 | Everything else | `informational` |
 
-**PrimeGov cities:** PrimeGov hosts agendas at `https://{client}.primegov.com/Portal/Meeting?meetingTemplateId=XXX`. To find meetings:
+**PrimeGov cities:** PrimeGov hosts agendas at `https://{client}.primegov.com/Portal/Meeting?meetingTemplateId=XXX`. To find meetings, use `WebFetch` on the portal page to list upcoming meetings, then `pmf_runtime.pdf.download(url)` to pull the compiled meeting PDF. Extract agenda items with `pdftotext`. PrimeGov PDFs typically have numbered items with section headers (Consent Agenda, Public Hearings, Action Items, etc.).
 
-```bash
-# List upcoming meetings — PrimeGov uses a public portal page
-curl -s "https://{client}.primegov.com/Portal/Meeting" > /workspace/api_responses/primegov_meetings.html
+**eSCRIBE cities:** Use `WebFetch` on the meetings endpoint, parse for item titles, numbers, attachments. Mark items under "Consent Agenda" header as consent.
 
-# Extract meeting links and dates from the HTML
-python3 -c "
-import re
-html = open('/workspace/api_responses/primegov_meetings.html').read()
-# Find meeting links with dates
-meetings = re.findall(r'href=\"(/Portal/Meeting\?compiledMeetingDocumentFileId=\d+)\"[^>]*>.*?(\d{1,2}/\d{1,2}/\d{4})', html, re.DOTALL)
-for url, date in meetings[:10]:
-    print(f'{date} | https://{client}.primegov.com{url}')
-"
-```
-
-Download the compiled meeting document (PDF) for the target meeting and extract agenda items with `pdftotext`. PrimeGov PDFs typically have numbered items with section headers (Consent Agenda, Public Hearings, Action Items, etc.).
-
-**eSCRIBE cities:** POST to the meetings endpoint, parse HTML for item titles, numbers, attachments. Mark items under "Consent Agenda" header as consent.
-
-**CivicPlus AgendaCenter:** Scrape the AgendaCenter page, download agenda PDF, extract text. Parse by numbered items and section headers.
+**CivicPlus AgendaCenter:** Use `WebFetch` on the AgendaCenter page to locate the agenda PDF URL, then `pmf_runtime.pdf.download(url)` to retrieve it, then `pdftotext` to extract text. Parse by numbered items and section headers.
 
 **Fallback:** Search `"[city]" "[state]" city council agenda [meeting date]` and extract what you can. Record `agenda_source: "web_search"`.
 
@@ -312,26 +329,15 @@ After identifying agenda items, look for downloadable PDF attachments — especi
 
 **Municode/CivicPlus cities:**
 
-The `adaHtmlDocument` HTML page links to PDFs on Azure blob storage (`mccmeetingspublic.blob.core.usgovcloudapi.net`). Extract the URLs:
-
-```bash
-curl -s "AGENDA_HTML_URL" | python3 -c "
-import sys, re
-html = sys.stdin.read()
-pdfs = re.findall(r'href=\"(https://mccmeetingspublic[^\"]+)\"[^>]*>([^<]+)', html)
-for url, name in pdfs:
-    name = name.strip()
-    print(f'{name} | {url}')
-" > /workspace/api_responses/attachments.txt
-cat /workspace/api_responses/attachments.txt
-```
+The `adaHtmlDocument` HTML page links to PDFs on Azure blob storage (`mccmeetingspublic.blob.core.usgovcloudapi.net`). Pull the agenda HTML with `WebFetch`, scan the returned text for PDF URLs on that blob domain, and save the list to `/workspace/api_responses/attachments.txt`.
 
 **Legistar cities:**
 
-Legistar matter attachments are available via:
-```bash
-curl -s "https://webapi.legistar.com/v1/{client}/matters/{matterId}/attachments"
+Legistar matter attachments are available via `WebFetch` on:
 ```
+https://webapi.legistar.com/v1/{client}/matters/{matterId}/attachments
+```
+Returns a JSON array with `MatterAttachmentHyperlink` fields pointing to PDFs.
 
 **Which attachments to read (prioritize, do not read all):**
 
@@ -340,13 +346,17 @@ curl -s "https://webapi.legistar.com/v1/{client}/matters/{matterId}/attachments"
 3. **Budget amendments** — contain line-item financial changes. Read pages 1-3.
 4. **Skip**: site plans, engineering drawings, maps, full agenda packets (too large), meeting minutes from prior meetings.
 
-```bash
-# Download a staff report
-curl -s -o /workspace/downloads/staff_report.pdf "BLOB_URL"
-# Read it (the Read tool handles PDFs natively — use pages parameter for large files)
+```python
+# Download a staff report through the broker (curl is blocked — runner has no egress)
+from pmf_runtime import pdf
+result = pdf.download("BLOB_URL", purpose="staff report item 8")
 ```
 
-Then use the Read tool with `pages: "1-5"` to read the first few pages. Extract:
+Then extract the relevant pages with `pdftotext`:
+```bash
+pdftotext -layout -f 1 -l 5 /workspace/downloads/staff_report.pdf -
+```
+Extract:
 - Staff recommendation (approve/deny/defer)
 - Fiscal impact (dollar amounts, funding source)
 - Key conditions or stipulations
@@ -360,15 +370,23 @@ This data directly feeds the Legislative Record, Fiscal Depth, Gap Analysis, and
 
 ### North Carolina
 
-```bash
-# Property tax rate (3-year history)
-curl -s "https://linc.osbm.nc.gov/api/explore/v2.1/catalog/datasets/property-tax-rate/records?where=area_name%3D'${CITY}'&order_by=year+desc&limit=3"
+Use `pmf_runtime.http.get` for the NC LINC open data API (URL-encode the city name):
 
-# Government finances
-curl -s "https://linc.osbm.nc.gov/api/explore/v2.1/catalog/datasets/government/records?where=area_name%3D'${CITY}'&order_by=year+desc&limit=3"
+```python
+from pmf_runtime import http
+import json
+from urllib.parse import quote
 
-# Population
-curl -s "https://linc.osbm.nc.gov/api/explore/v2.1/catalog/datasets/population/records?where=area_name%3D'${CITY}'&order_by=year+desc&limit=1"
+city = CITY_NAME  # e.g. "Fayetteville"
+where = quote(f"area_name='{city}'")
+
+for dataset in ["property-tax-rate", "government", "population"]:
+    limit = 1 if dataset == "population" else 3
+    r = http.get(f"https://linc.osbm.nc.gov/api/explore/v2.1/catalog/datasets/{dataset}/records?where={where}&order_by=year+desc&limit={limit}")
+    data = json.loads(r["body"])
+    with open(f"/workspace/api_responses/linc_{dataset}.json", "w") as f:
+        json.dump(data, f)
+    print(f"{dataset}: {len(data.get('results', []))} records")
 ```
 
 Extract: property tax rate per $100 valuation (3-year trend), total revenues, total expenditures, public safety spending, capital outlay, population.
@@ -425,25 +443,22 @@ Run up to 3 web searches:
 
 **Legistar cities (preferred):**
 
-```bash
-# Search for the person
-curl -s "https://webapi.legistar.com/v1/{client}/persons" | python3 -c "
-import sys, json
-persons = json.load(sys.stdin)
-# Search for the official by name (case-insensitive partial match)
-name = '${OFFICIAL_NAME}'.lower()
-matches = [p for p in persons if name in p.get('PersonFullName', '').lower() or any(part in p.get('PersonFullName', '').lower() for part in name.split())]
-for m in matches:
-    print(f'PersonId: {m[\"PersonId\"]} - {m[\"PersonFullName\"]}')
-"
+```python
+from pmf_runtime import http
+import json
 
-# Get office records for the person
-curl -s "https://webapi.legistar.com/v1/{client}/persons/{personId}/officerecords" | python3 -c "
-import sys, json
-records = json.load(sys.stdin)
-for r in records:
-    print(f'{r.get(\"OfficeRecordTitle\", \"\")} - {r.get(\"OfficeRecordBodyName\", \"\")} ({r.get(\"OfficeRecordMemberType\", \"\")})')
-"
+r = http.get(f"https://webapi.legistar.com/v1/{client}/persons")
+persons = json.loads(r["body"])
+name = OFFICIAL_NAME.lower()
+matches = [p for p in persons if name in p.get("PersonFullName", "").lower()]
+for m in matches:
+    print(f"PersonId: {m['PersonId']} - {m['PersonFullName']}")
+
+# Then for the target person:
+r = http.get(f"https://webapi.legistar.com/v1/{client}/persons/{personId}/officerecords")
+records = json.loads(r["body"])
+for rec in records:
+    print(f"{rec.get('OfficeRecordTitle','')} - {rec.get('OfficeRecordBodyName','')} ({rec.get('OfficeRecordMemberType','')})")
 ```
 
 **Fallback:** Search city website council page, then `"[eo_name]" "[city]" committee`.
@@ -454,28 +469,27 @@ for r in records:
 
 If the city uses Legistar, pull voting records from recent meetings to understand council dynamics.
 
-```bash
-# Get the 3 most recent regular meeting event IDs
-# For each, get event items that had votes
-curl -s "https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems" | python3 -c "
-import sys, json
-items = json.load(sys.stdin)
-voted = [i for i in items if i.get('EventItemRollCallFlag', 0) > 0]
-print(f'Items with votes: {len(voted)}')
+For each of the 3 most recent regular meeting event IDs, pull the items that had votes:
+
+```python
+from pmf_runtime import http
+import json
+r = http.get(f"https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems")
+items = json.loads(r["body"])
+voted = [i for i in items if i.get("EventItemRollCallFlag", 0) > 0]
+print(f"Items with votes: {len(voted)}")
 for item in voted[:5]:
-    print(f'  {item.get(\"EventItemMatterFile\", \"\")} - {item.get(\"EventItemTitle\", \"\")[:60]}')
-    print(f'    PassedFlag: {item.get(\"EventItemPassedFlag\")}')
-"
+    print(f"  {item.get('EventItemMatterFile','')} - {item.get('EventItemTitle','')[:60]}  passed={item.get('EventItemPassedFlag')}")
 ```
 
 For contentious items (not unanimous), pull individual votes:
-```bash
-curl -s "https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems/{eventItemId}/votes" | python3 -c "
-import sys, json
-votes = json.load(sys.stdin)
+```python
+from pmf_runtime import http
+import json
+r = http.get(f"https://webapi.legistar.com/v1/{client}/events/{eventId}/eventitems/{eventItemId}/votes")
+votes = json.loads(r["body"])
 for v in votes:
-    print(f'  {v.get(\"VotePersonName\", \"\")}: {v.get(\"VoteValueName\", \"\")}')
-"
+    print(f"  {v.get('VotePersonName','')}: {v.get('VoteValueName','')}")
 ```
 
 This data feeds the Political Intelligence dimension of the score. Record voting patterns, common splits, and which members tend to ally.
@@ -507,25 +521,21 @@ Connect to Databricks and pull real aggregated Haystaq voter issue scores for th
 
 ```python
 import os, json
+from pmf_runtime import databricks as sql
+
+# NOTE: Broker auto-injects state + city scope; do not add those WHERE clauses.
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 state = params.get("state", "").lower()
 city = params.get("city", "")
 print(f"State: {state}, City: {city}")
 
-from databricks.sql import connect
-
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 
-scores_table = f"goodparty_data_catalog.dbt.stg_dbt_source__l2_s3_{state}_haystaq_dna_scores"
-uniform_table = f"goodparty_data_catalog.dbt.stg_dbt_source__l2_s3_{state}_uniform"
+voter_table = "goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"
 
-cursor.execute(f"DESCRIBE TABLE {scores_table}")
+cursor.execute(f"DESCRIBE TABLE {voter_table}")
 cols = [row[0] for row in cursor.fetchall()]
 hs_cols = [c for c in cols if c.startswith('hs_')]
 print(f"Total hs_ columns: {len(hs_cols)}")
@@ -533,10 +543,7 @@ print(f"Total hs_ columns: {len(hs_cols)}")
 with open("/tmp/hs_columns.json", "w") as f:
     json.dump(hs_cols, f)
 
-cursor.execute(f"""
-    SELECT COUNT(*) FROM {uniform_table}
-    WHERE UPPER(Residence_Addresses_City) = UPPER(:city)
-""", {"city": city})
+cursor.execute(f"SELECT COUNT(*) FROM {voter_table}")
 voter_count = cursor.fetchone()[0]
 print(f"Voters in {city}: {voter_count}")
 
@@ -573,67 +580,57 @@ Adapt this script with the columns from your mapping:
 
 ```python
 import os, json
+from pmf_runtime import databricks as sql
+
+# NOTE: Broker auto-injects state + city scope; do not add those WHERE clauses.
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 state = params.get("state", "").lower()
 city = params.get("city", "")
 
-from databricks.sql import connect
-
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 
-scores_table = f"goodparty_data_catalog.dbt.stg_dbt_source__l2_s3_{state}_haystaq_dna_scores"
-uniform_table = f"goodparty_data_catalog.dbt.stg_dbt_source__l2_s3_{state}_uniform"
+voter_table = "goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"
 
 mapping = json.load(open("/tmp/agenda_hs_mapping.json"))
 all_hs_cols = sorted(set(col for cols in mapping.values() for col in cols))
 
-avg_exprs = ", ".join(f"AVG(CAST(s.{col} AS DOUBLE)) AS {col}" for col in all_hs_cols)
+avg_exprs = ", ".join(f"AVG(CAST({col} AS DOUBLE)) AS {col}" for col in all_hs_cols)
 
 # Overall city averages
 cursor.execute(f"""
     SELECT COUNT(*) AS voter_count, {avg_exprs}
-    FROM {uniform_table} u
-    JOIN {scores_table} s ON u.LALVOTERID = s.LALVOTERID
-    WHERE UPPER(u.Residence_Addresses_City) = UPPER(:city)
-""", {"city": city})
+    FROM {voter_table}
+""")
 columns = [desc[0] for desc in cursor.description]
 overall = dict(zip(columns, cursor.fetchone()))
 
 # Cross-tab by party
 cursor.execute(f"""
-    SELECT u.Parties_Description AS party, COUNT(*) AS voter_count, {avg_exprs}
-    FROM {uniform_table} u
-    JOIN {scores_table} s ON u.LALVOTERID = s.LALVOTERID
-    WHERE UPPER(u.Residence_Addresses_City) = UPPER(:city)
-    GROUP BY u.Parties_Description ORDER BY COUNT(*) DESC
-""", {"city": city})
+    SELECT Parties_Description AS party, COUNT(*) AS voter_count, {avg_exprs}
+    FROM {voter_table}
+    GROUP BY Parties_Description ORDER BY COUNT(*) DESC
+""")
 party_cols = [desc[0] for desc in cursor.description]
 party_rows = [dict(zip(party_cols, r)) for r in cursor.fetchall()]
 
 # Cross-tab by age group
 cursor.execute(f"""
     SELECT
-        CASE WHEN u.Voters_Age < 35 THEN '18-34'
-             WHEN u.Voters_Age < 55 THEN '35-54'
+        CASE WHEN Voters_Age < 35 THEN '18-34'
+             WHEN Voters_Age < 55 THEN '35-54'
              ELSE '55+' END AS age_group,
         COUNT(*) AS voter_count, {avg_exprs}
-    FROM {uniform_table} u
-    JOIN {scores_table} s ON u.LALVOTERID = s.LALVOTERID
-    WHERE UPPER(u.Residence_Addresses_City) = UPPER(:city)
+    FROM {voter_table}
     GROUP BY age_group ORDER BY age_group
-""", {"city": city})
+""")
 age_cols = [desc[0] for desc in cursor.description]
 age_rows = [dict(zip(age_cols, r)) for r in cursor.fetchall()]
 
 results = {
     "state": state, "city": city,
-    "scores_table": scores_table, "uniform_table": uniform_table,
+    "voter_table": voter_table,
     "agenda_hs_mapping": mapping,
     "overall": {col: round(float(overall[col]), 1) if overall[col] is not None else None for col in all_hs_cols},
     "overall_voter_count": overall["voter_count"],

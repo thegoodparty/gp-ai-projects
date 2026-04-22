@@ -28,6 +28,7 @@ def _derive(full: dict[str, dict]) -> dict[str, dict]:
             "harness": exp["harness"],
             "model": exp["model"],
             "timeout_seconds": exp.get("timeout_seconds", 600),
+            "required_params": exp.get("required_params", []),
             "contract": {"s3_key_template": exp["contract"]["s3_key_template"]},
         }
         for name, exp in full.items()

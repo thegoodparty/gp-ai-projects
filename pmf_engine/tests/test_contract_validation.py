@@ -21,7 +21,7 @@ WALKING_PLAN_SCHEMA = _WALKING_PLAN_EXPERIMENT["contract"]["schema"]
 
 def _valid_voter_targeting_artifact() -> dict:
     return {
-        "candidate_id": "1",
+        "organization_slug": "1",
         "district": {"state": "MI", "type": "CITY", "name": "Mayor"},
         "generated_at": "2026-03-25T00:00:00Z",
         "summary": {
@@ -65,7 +65,7 @@ def _valid_voter_targeting_artifact() -> dict:
 
 def _valid_walking_plan_artifact() -> dict:
     return {
-        "candidate_id": "1",
+        "organization_slug": "1",
         "district": {"state": "MI"},
         "generated_at": "2026-03-25T00:00:00Z",
         "summary": {
@@ -102,13 +102,13 @@ class TestValidateArtifactContract:
         validate_artifact_contract(json.dumps(artifact).encode(), VOTER_TARGETING_SCHEMA)
 
     def test_missing_top_level_field_raises(self):
-        artifact = {"candidate_id": "1"}
+        artifact = {"organization_slug": "1"}
         with pytest.raises(ContractViolation, match="district"):
             validate_artifact_contract(json.dumps(artifact).encode(), VOTER_TARGETING_SCHEMA)
 
     def test_missing_nested_field_raises(self):
         artifact = {
-            "candidate_id": "1",
+            "organization_slug": "1",
             "district": {"state": "MI"},
             "generated_at": "2026-03-25T00:00:00Z",
             "summary": {
@@ -124,7 +124,7 @@ class TestValidateArtifactContract:
 
     def test_wrong_type_raises(self):
         artifact = {
-            "candidate_id": "1",
+            "organization_slug": "1",
             "district": {"state": "MI", "type": "CITY", "name": "Mayor"},
             "generated_at": "2026-03-25T00:00:00Z",
             "summary": {
@@ -140,7 +140,7 @@ class TestValidateArtifactContract:
 
     def test_empty_array_raises(self):
         artifact = {
-            "candidate_id": "1",
+            "organization_slug": "1",
             "district": {"state": "MI", "type": "CITY", "name": "Mayor"},
             "generated_at": "2026-03-25T00:00:00Z",
             "summary": {
@@ -156,7 +156,7 @@ class TestValidateArtifactContract:
 
     def test_array_item_missing_field_raises(self):
         artifact = {
-            "candidate_id": "1",
+            "organization_slug": "1",
             "district": {"state": "MI", "type": "CITY", "name": "Mayor"},
             "generated_at": "2026-03-25T00:00:00Z",
             "summary": {

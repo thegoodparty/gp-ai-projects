@@ -9,7 +9,7 @@ EXPERIMENT = {
         "type": "json",
         "s3_key_template": "{experiment_id}/{run_id}/voter_targeting.json",
         "schema": {
-            "candidate_id": "string",
+            "organization_slug": "string",
             "district": {
                 "state": "string",
                 "type": "string",
@@ -61,4 +61,5 @@ EXPERIMENT = {
     "cpu": "2048",
     "memory": "4096",
     "timeout_seconds": 900,
+    "required_params": ["state", "city", "l2DistrictType", "l2DistrictName"],
 }

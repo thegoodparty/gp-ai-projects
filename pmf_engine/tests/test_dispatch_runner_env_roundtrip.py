@@ -2,7 +2,7 @@
 
 The env-var contract between dispatch_handler.build_container_overrides and
 RunnerConfig.from_env is fragile — a single rename on either side (e.g.
-CAND_ID vs CANDIDATE_ID, TIMEOUT vs TIMEOUT_SECONDS) would break every
+CAND_ID vs ORGANIZATION_SLUG, TIMEOUT vs TIMEOUT_SECONDS) would break every
 in-flight dispatch silently because the two layers live in different
 deployable units. This test runs a mock dispatch message through
 build_container_overrides, installs the result as real os.environ, and
@@ -31,8 +31,14 @@ def _base_message(experiment_id: str) -> dict:
     return {
         "experiment_id": experiment_id,
         "run_id": f"run-{experiment_id}-abc123",
-        "candidate_id": f"candidate-{experiment_id}",
-        "params": {"state": "MI", "district": "Ward 3", "priority": 42},
+        "organization_slug": f"organization-{experiment_id}",
+        "params": {
+            "state": "MI",
+            "city": "Detroit",
+            "l2DistrictType": "City",
+            "l2DistrictName": "DETROIT CITY",
+            "priority": 42,
+        },
     }
 
 
@@ -44,8 +50,8 @@ def test_dispatch_env_roundtrips_to_runner_config(experiment_id):
     overrides = build_container_overrides(
         experiment=experiment,
         message=message,
-        artifact_bucket="gp-agent-artifacts-test",
-        callback_queue_url="https://sqs.us-west-2.amazonaws.com/333022194791/test.fifo",
+        broker_token="tok-test-123",
+        broker_url="https://broker.example.com",
         container_name="pmf-engine",
     )
 
@@ -55,12 +61,13 @@ def test_dispatch_env_roundtrips_to_runner_config(experiment_id):
     for critical in (
         "EXPERIMENT_ID",
         "RUN_ID",
-        "CANDIDATE_ID",
+        "ORGANIZATION_SLUG",
         "HARNESS",
         "AGENT_MODEL",
-        "ARTIFACT_BUCKET",
-        "ARTIFACT_KEY_TEMPLATE",
-        "CALLBACK_QUEUE_URL",
+        "BROKER_TOKEN",
+        "BROKER_URL",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
         "PARAMS_JSON",
         "TIMEOUT_SECONDS",
     ):
@@ -69,34 +76,23 @@ def test_dispatch_env_roundtrips_to_runner_config(experiment_id):
             f"RunnerConfig.from_env will read stale/missing values"
         )
 
+    assert env_map["BROKER_TOKEN"] == "tok-test-123"
+    assert env_map["BROKER_URL"] == "https://broker.example.com"
+    assert env_map["ANTHROPIC_BASE_URL"] == "https://broker.example.com/anthropic"
+    assert env_map["ANTHROPIC_API_KEY"] == "tok-test-123"
+
     with patch.dict(os.environ, env_map, clear=False):
         os.environ.pop("INSTRUCTION", None)
         config = RunnerConfig.from_env()
 
     assert config.experiment_id == experiment_id
     assert config.run_id == message["run_id"]
-    assert config.candidate_id == message["candidate_id"]
+    assert config.organization_slug == message["organization_slug"]
     assert config.params == message["params"]
     assert config.harness == experiment["harness"]
     assert config.model == experiment["model"]
-    assert config.artifact_bucket == "gp-agent-artifacts-test"
-    assert config.callback_queue_url == (
-        "https://sqs.us-west-2.amazonaws.com/333022194791/test.fifo"
-    )
-
-    assert config.artifact_key_template == experiment["contract"]["s3_key_template"]
-    assert config.artifact_key_template.startswith("{experiment_id}/"), (
-        "s3_key_template convention is '{experiment_id}/{run_id}/<file>.json'"
-    )
-    assert "{run_id}" in config.artifact_key_template
 
     assert config.timeout_seconds == experiment.get("timeout_seconds", 600)
-
-    resolved = config.resolve_artifact_key()
-    assert experiment_id in resolved
-    assert message["run_id"] in resolved
-    assert "{experiment_id}" not in resolved
-    assert "{run_id}" not in resolved
 
     assert config.instruction, (
         f"RunnerConfig.from_env did not load instruction for {experiment_id} "
@@ -120,8 +116,8 @@ def test_dispatch_env_params_json_is_valid_json_and_dict():
     overrides = build_container_overrides(
         experiment=experiment,
         message=message,
-        artifact_bucket="b",
-        callback_queue_url="q",
+        broker_token="tok",
+        broker_url="https://broker.example.com",
         container_name="c",
     )
     env_map = _env_list_to_map(overrides["containerOverrides"][0]["environment"])
@@ -135,8 +131,8 @@ def test_dispatch_env_timeout_is_string_type():
     overrides = build_container_overrides(
         experiment=experiment,
         message=_base_message(experiment_id),
-        artifact_bucket="b",
-        callback_queue_url="q",
+        broker_token="tok",
+        broker_url="https://broker.example.com",
         container_name="c",
     )
     env_map = _env_list_to_map(overrides["containerOverrides"][0]["environment"])

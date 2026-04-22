@@ -65,5 +65,6 @@ EXPERIMENT = {
     "max_turns": 60,
     "cpu": "2048",
     "memory": "4096",
-    "timeout_seconds": 1800,
+    "timeout_seconds": 3000,
+    "required_params": ["state", "city", "l2DistrictType", "l2DistrictName"],
 }

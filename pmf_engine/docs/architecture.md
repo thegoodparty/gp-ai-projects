@@ -26,7 +26,7 @@ The dispatch queue triggers a Lambda that validates the incoming message — che
 
 ### 4. Agent Execution
 
-Inside the runtime, the Claude Agent SDK loads the instruction, contract schema, and params. The agent runs autonomously for up to the turn budget, with access to tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch. What data sources it queries and what processing it performs depends entirely on the experiment's instruction — the platform is agnostic.
+Inside the runtime, the Claude Agent SDK loads the instruction, contract schema, and params. The agent runs autonomously for up to the turn budget, with access to tools: Bash, Write, Edit, Glob, Grep. What data sources it queries and what processing it performs depends entirely on the experiment's instruction — the platform is agnostic.
 
 The agent writes its output to a known path. The runner validates the output against the contract schema. If it passes, the artifact uploads to S3. If it violates the schema, no upload — the run is marked CONTRACT_VIOLATION and considered a failure.
 

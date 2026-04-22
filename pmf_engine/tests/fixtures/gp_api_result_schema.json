@@ -10,12 +10,12 @@
     },
     "data": {
       "type": "object",
-      "required": ["experimentId", "runId", "candidateId", "status"],
+      "required": ["experimentId", "runId", "organizationSlug", "status"],
       "additionalProperties": true,
       "properties": {
         "experimentId": {"type": "string"},
         "runId": {"type": "string"},
-        "candidateId": {"type": "string"},
+        "organizationSlug": {"type": "string"},
         "status": {
           "type": "string",
           "enum": ["success", "failed", "contract_violation"]

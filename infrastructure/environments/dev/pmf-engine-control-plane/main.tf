@@ -40,6 +40,15 @@ data "terraform_remote_state" "fargate" {
   }
 }
 
+data "terraform_remote_state" "broker" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "broker/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 module "pmf_engine_control_plane" {
   source = "../../../modules/pmf-engine-control-plane"
 
@@ -57,5 +66,16 @@ module "pmf_engine_control_plane" {
   gp_api_sqs_queue_url = var.gp_api_sqs_queue_url
   gp_api_sqs_queue_arn = var.gp_api_sqs_queue_arn
 
+  broker_url                = data.terraform_remote_state.broker.outputs.broker_url
+  service_tokens_secret_arn = data.terraform_remote_state.broker.outputs.service_tokens_secret_arn
+
+  vpc_id                   = "vpc-0763fa52c32ebcf6a"
+  broker_security_group_id = try(data.terraform_remote_state.broker.outputs.security_group_id, "")
+
   sns_topic_arn = try(data.terraform_remote_state.fargate.outputs.sns_topic_arn, "")
+}
+
+output "dispatch_lambda_sg_id" {
+  value       = module.pmf_engine_control_plane.dispatch_lambda_sg_id
+  description = "Security group ID of the dispatch Lambda (consumed by broker for ingress rule in Step 4)"
 }

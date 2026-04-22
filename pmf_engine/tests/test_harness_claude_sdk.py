@@ -9,6 +9,7 @@ from claude_agent_sdk import ResultMessage
 
 from pmf_engine.runner.harness.base import AgentHarness, HarnessResult
 from pmf_engine.runner.harness.claude_sdk import (
+    ALLOWED_TOOLS,
     ClaudeSdkHarness,
     build_system_prompt,
     collect_output_artifact,
@@ -56,8 +57,17 @@ def test_build_system_prompt_includes_capability_header():
 
 
 def test_build_system_prompt_includes_output_contract():
+    """The prompt MUST point the agent at /workspace/output/ (the real writable
+    path), not bare /root-level /output/. Agents on 2026-04-20 wasted ~22 turns
+    (~3 min) trying to `mkdir /output` (permission denied) because the prompt
+    said /output/ while the instruction said /workspace/output/. The runner's
+    collect_output_artifact reads from /workspace/output/, so the prompt must
+    match or the agent thrashes.
+    """
     prompt = build_system_prompt("Generate a report.")
-    assert "/output/" in prompt
+    assert "/workspace/output/" in prompt
+    # No bare "/output/" reference anywhere in the prompt.
+    assert "/output/" not in prompt.replace("/workspace/output/", "")
 
 
 def test_build_system_prompt_includes_instruction_reference():
@@ -177,7 +187,7 @@ class TestCollectOutputArtifact:
             assert content_type == "application/octet-stream"
             assert data == b"binary-stuff"
 
-    def test_raises_when_multiple_files_in_output(self):
+    def test_raises_when_multiple_files_and_no_preferred_filename(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = os.path.join(tmpdir, "output")
             os.makedirs(output_dir)
@@ -188,6 +198,49 @@ class TestCollectOutputArtifact:
 
             with pytest.raises(RuntimeError, match="Expected exactly one artifact"):
                 collect_output_artifact(tmpdir)
+
+    def test_prefers_experiment_named_file_when_multiple_present(self):
+        """Agent sometimes writes a helper file alongside the real artifact
+        (e.g., meeting_briefing wrote EXPERIMENT_SUMMARY.md next to
+        meeting_briefing.json). If the experiment_id matches one of the files,
+        that one is the artifact; the others are ignored with a log warning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "output")
+            os.makedirs(output_dir)
+            with open(os.path.join(output_dir, "meeting_briefing.json"), "w") as f:
+                f.write('{"ok": true}')
+            with open(os.path.join(output_dir, "EXPERIMENT_SUMMARY.md"), "w") as f:
+                f.write("# Summary")
+
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            assert content_type == "application/json"
+            assert json.loads(data) == {"ok": True}
+
+    def test_raises_when_multiple_files_and_preferred_filename_not_present(self):
+        """If experiment_id is given but no matching file exists, fail
+        explicitly — don't silently pick an arbitrary file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "output")
+            os.makedirs(output_dir)
+            with open(os.path.join(output_dir, "notes.md"), "w") as f:
+                f.write("# notes")
+            with open(os.path.join(output_dir, "data.csv"), "w") as f:
+                f.write("a,b\n")
+
+            with pytest.raises(RuntimeError, match="Expected exactly one artifact"):
+                collect_output_artifact(tmpdir, experiment_id="voter_targeting")
+
+    def test_single_file_returned_regardless_of_experiment_id(self):
+        """Preserves existing single-file contract: if there's only one file,
+        it's the artifact — no name-match required."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "output")
+            os.makedirs(output_dir)
+            with open(os.path.join(output_dir, "whatever.json"), "w") as f:
+                f.write('{"ok": true}')
+
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            assert content_type == "application/json"
 
     def test_raises_when_output_dir_empty(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -254,7 +307,7 @@ async def test_run_creates_child_spans_for_tool_calls():
         yield AssistantMessage(
             model="sonnet",
             content=[
-                ToolUseBlock(id="tool_2", name="WebFetch", input={"url": "https://example.com"}),
+                ToolUseBlock(id="tool_2", name="Read", input={"file_path": "/workspace/data.json"}),
             ],
         )
         yield UserMessage(
@@ -282,7 +335,7 @@ async def test_run_creates_child_spans_for_tool_calls():
             )
 
     spans_by_name = {s.name: s for s in parent_span.children}
-    assert set(spans_by_name) == {"tool:Bash", "tool:WebFetch"}
+    assert set(spans_by_name) == {"tool:Bash", "tool:Read"}
 
     bash_span = spans_by_name["tool:Bash"]
     assert bash_span.input == {"command": "ls /workspace"}
@@ -290,11 +343,11 @@ async def test_run_creates_child_spans_for_tool_calls():
     assert "file1.json" in bash_span.output["result"]
     assert bash_span.closed
 
-    web_span = spans_by_name["tool:WebFetch"]
-    assert web_span.input == {"url": "https://example.com"}
-    assert web_span.output["status"] == "ok"
-    assert "<html>page</html>" in web_span.output["result"]
-    assert web_span.closed
+    read_span = spans_by_name["tool:Read"]
+    assert read_span.input == {"file_path": "/workspace/data.json"}
+    assert read_span.output["status"] == "ok"
+    assert "<html>page</html>" in read_span.output["result"]
+    assert read_span.closed
 
 
 @pytest.mark.asyncio
@@ -331,7 +384,7 @@ async def test_tool_spans_paired_by_tool_use_id_not_fifo():
             model="sonnet",
             content=[
                 ToolUseBlock(id="tool_A", name="Bash", input={"command": "echo A"}),
-                ToolUseBlock(id="tool_B", name="WebFetch", input={"url": "https://b.com"}),
+                ToolUseBlock(id="tool_B", name="Read", input={"file_path": "/workspace/b.json"}),
             ],
         )
         yield UserMessage(
@@ -368,12 +421,24 @@ async def test_tool_spans_paired_by_tool_use_id_not_fifo():
         f"Bash span should receive A-result, got: {bash_outputs[0]['output']['result']}"
     )
 
-    fetch_span = created_spans["tool:WebFetch"]
-    fetch_outputs = [c for c in fetch_span._log_calls if "output" in c]
-    assert len(fetch_outputs) == 1
-    assert "B-result" in fetch_outputs[0]["output"]["result"], (
-        f"WebFetch span should receive B-result, got: {fetch_outputs[0]['output']['result']}"
+    read_span = created_spans["tool:Read"]
+    read_outputs = [c for c in read_span._log_calls if "output" in c]
+    assert len(read_outputs) == 1
+    assert "B-result" in read_outputs[0]["output"]["result"], (
+        f"Read span should receive B-result, got: {read_outputs[0]['output']['result']}"
     )
+
+
+def test_allowed_tools_contains_expected_tools():
+    assert ALLOWED_TOOLS == ["Bash", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"]
+
+
+def test_allowed_tools_includes_web_retrieval():
+    # WebFetch + WebSearch go through Anthropic's servers (not the broker).
+    # The quarantine's containment guarantee still holds — runner has no egress
+    # and no IAM, so a compromised agent acting on fetched content can't exfiltrate.
+    assert "WebFetch" in ALLOWED_TOOLS
+    assert "WebSearch" in ALLOWED_TOOLS
 
 
 @pytest.mark.asyncio

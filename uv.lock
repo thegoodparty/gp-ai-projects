@@ -10,6 +10,7 @@ resolution-markers = [
 [manifest]
 members = [
     "gp-ai-projects",
+    "gp-broker",
     "gp-clickup-bot",
     "gp-ddhq-matcher",
     "gp-engineer-agent",
@@ -1208,6 +1209,7 @@ dependencies = [
     { name = "seaborn" },
     { name = "slack-sdk" },
     { name = "spacy" },
+    { name = "sqlglot" },
     { name = "tabulate" },
     { name = "tavily-python" },
     { name = "tqdm" },
@@ -1275,6 +1277,7 @@ requires-dist = [
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "slack-sdk", specifier = ">=3.39.0" },
     { name = "spacy", specifier = ">=3.8.7" },
+    { name = "sqlglot", specifier = ">=30.4.3" },
     { name = "tabulate", specifier = ">=0.9.0" },
     { name = "tavily-python", specifier = ">=0.7.8" },
     { name = "tqdm", specifier = ">=4.67.1" },
@@ -1295,6 +1298,33 @@ dev = [
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
+]
+
+[[package]]
+name = "gp-broker"
+version = "0.1.0"
+source = { virtual = "broker" }
+dependencies = [
+    { name = "boto3" },
+    { name = "databricks-sql-connector" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "python-multipart" },
+    { name = "sqlglot" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.40.50" },
+    { name = "databricks-sql-connector", specifier = ">=4.0.5" },
+    { name = "fastapi", specifier = ">=0.116.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "python-multipart", specifier = ">=0.0.20" },
+    { name = "sqlglot", specifier = ">=30.4.3" },
+    { name = "uvicorn", specifier = ">=0.35.0" },
 ]
 
 [[package]]
@@ -1345,24 +1375,30 @@ source = { virtual = "pmf_engine" }
 dependencies = [
     { name = "boto3" },
     { name = "claude-agent-sdk" },
+    { name = "fastapi" },
     { name = "fpdf2" },
     { name = "gp-shared" },
     { name = "kmapper" },
     { name = "networkx" },
     { name = "qrcode" },
     { name = "ripser" },
+    { name = "sqlglot" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.50" },
     { name = "claude-agent-sdk", specifier = ">=0.1.19" },
+    { name = "fastapi", specifier = ">=0.116.0" },
     { name = "fpdf2", specifier = ">=2.8.7" },
     { name = "gp-shared", virtual = "shared" },
     { name = "kmapper", specifier = ">=2.0.0" },
     { name = "networkx", specifier = ">=3.0" },
     { name = "qrcode", specifier = ">=8.2" },
     { name = "ripser", specifier = ">=0.6.0" },
+    { name = "sqlglot", specifier = ">=30.4.3" },
+    { name = "uvicorn", specifier = ">=0.35.0" },
 ]
 
 [[package]]
@@ -3933,6 +3969,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/67/3d/926db774c9c98acf66cb4ed7faf6c377746f3e00b84b700d0868b95d0712/spacy-loggers-1.0.5.tar.gz", hash = "sha256:d60b0bdbf915a60e516cc2e653baeff946f0cfc461b452d11a4d5458c6fe5f24", size = 20811, upload-time = "2023-09-11T12:26:52.323Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/33/78/d1a1a026ef3af911159398c939b1509d5c36fe524c7b644f34a5146c4e16/spacy_loggers-1.0.5-py3-none-any.whl", hash = "sha256:196284c9c446cc0cdb944005384270d775fdeaf4f494d8e269466cfa497ef645", size = 22343, upload-time = "2023-09-11T12:26:50.586Z" },
+]
+
+[[package]]
+name = "sqlglot"
+version = "30.4.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/9b/af8fcaca1b0821349ef4f88e2775e059bcd7640900bca6533832f1fb845d/sqlglot-30.4.3.tar.gz", hash = "sha256:3a4e9a1e1dd47f8e536ba822d77cb784681704da5e4a3e1a07d2ef86b6067826", size = 5827662, upload-time = "2026-04-13T17:05:15.456Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/19/7df8b292accba3bc0de92c611c1e89423b25c08c82c18b14ca1fdbcf6e44/sqlglot-30.4.3-py3-none-any.whl", hash = "sha256:58ea8e723444569da5cec91e4c8f16e385bce3f0ce0374b8c722c3088e1c1c7a", size = 670965, upload-time = "2026-04-13T17:05:13.128Z" },
 ]
 
 [[package]]

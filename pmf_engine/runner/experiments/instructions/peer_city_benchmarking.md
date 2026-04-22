@@ -10,7 +10,7 @@ Read this entire file. Then create a TODO checklist of every step below. Work th
 
 Create this checklist in your first message, then reference it throughout:
 
-- [ ] Step 1: Read parameters + fetch district intel artifact from S3
+- [ ] Step 1: Read parameters + fetch district intel artifact
 - [ ] Step 2: Get home city population from Databricks
 - [ ] Step 3: Identify 3-5 peer cities
 - [ ] Step 4: Research peer city approaches for each issue
@@ -31,10 +31,11 @@ Create this checklist in your first message, then reference it throughout:
 9. **`official_name`**: If no `officialName` is provided in params, research the governing body and use the name of a real sitting council member or official. Never use generic values like "Official" or the body name itself.
 10. **Takeaways must be actionable.** Each comparison's `takeaways` must include at least one specific action the official could take (e.g., "Propose a 0.3% sales tax increase modeled on Thornton's 2024 ballot measure that passed 62-38"), not generic advice like "explore regional models" or "consider best practices."
 
-## STEP 1: Read parameters and fetch district intel from S3
+## STEP 1: Read parameters and fetch district intel
 
 ```python
 import os, json
+from pmf_runtime import priors
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 official_name = params.get("officialName", "")  # MUST be filled with a real name from research if empty
@@ -45,38 +46,13 @@ county = params.get("county", "")
 l2_district_type = params.get("l2DistrictType", "")
 l2_district_name = params.get("l2DistrictName", "")
 district_intel_run_id = params.get("districtIntelRunId", "")
-artifact_bucket = params.get("districtIntelArtifactBucket", "")
-artifact_key = params.get("districtIntelArtifactKey", "")
 
 print(f"Official: {official_name}")
 print(f"Office: {office}")
 print(f"Location: {city}, {county}, {state}")
 print(f"District intel run: {district_intel_run_id}")
-print(f"Artifact: s3://{artifact_bucket}/{artifact_key}")
-```
 
-Now fetch the district intel artifact. Check local workspace first, then fall back to S3:
-
-```bash
-if [ -f /workspace/district_intel.json ]; then
-  cp /workspace/district_intel.json /tmp/district_intel.json
-  echo "Using local district_intel.json"
-elif [ -n "$ARTIFACT_BUCKET" ] && [ -n "$ARTIFACT_KEY" ]; then
-  aws s3 cp "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}" /tmp/district_intel.json
-  echo "Fetched from S3"
-else
-  echo "ERROR: No district intel artifact found"
-  exit 1
-fi
-```
-
-Then read the issues:
-
-```python
-import json
-
-with open("/tmp/district_intel.json") as f:
-    district_intel = json.load(f)
+district_intel = priors.read("district_intel")
 
 issues = district_intel.get("issues", [])
 print(f"Issues to benchmark ({len(issues)}):")
@@ -88,7 +64,7 @@ for issue in issues:
 
 ```python
 import os, json
-from databricks.sql import connect
+from pmf_runtime import databricks as sql
 
 params = json.loads(os.environ.get("PARAMS_JSON", "{}"))
 state = params.get("state", "")
@@ -96,32 +72,26 @@ city = params.get("city", "")
 l2_district_type = params.get("l2DistrictType", "")
 l2_district_name = params.get("l2DistrictName", "")
 
-conn = connect(
-    server_hostname=os.environ["DATABRICKS_SERVER_HOSTNAME"],
-    http_path=os.environ["DATABRICKS_HTTP_PATH"],
-    access_token=os.environ["DATABRICKS_API_KEY"]
-)
+conn = sql.connect()
 cursor = conn.cursor()
 
 # Count active voters in the home city/district
+# NOTE: The broker injects WHERE Residence_Addresses_State = '...' AND Residence_Addresses_City IN (...)
+# automatically. Do NOT add state or city to the WHERE clause or parameters.
 cursor.execute("DESCRIBE TABLE goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq")
 cols = [row[0] for row in cursor.fetchall()]
 
 if l2_district_type and l2_district_type in cols:
     district_filter = f"AND `{l2_district_type}` = :district_name"
-    query_params = {"state": state, "district_name": l2_district_name}
-elif city:
-    district_filter = "AND Residence_Addresses_City = :city"
-    query_params = {"state": state, "city": city}
+    query_params = {"district_name": l2_district_name}
 else:
     district_filter = ""
-    query_params = {"state": state}
+    query_params = {}
 
 query = (
     "SELECT COUNT(*) as voter_count "
     "FROM goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq "
-    f"WHERE Residence_Addresses_State = :state {district_filter} "
-    "AND Voters_Active = 'A'"
+    f"WHERE Voters_Active = 'A' {district_filter}"
 )
 cursor.execute(query, query_params)
 home_population = cursor.fetchone()[0]
@@ -138,10 +108,10 @@ Search for 3-5 peer cities using these criteria:
 - **Government structure**: Similar type (city council, town board, etc.)
 - **Each peer should serve a purpose**: One demographic match, one that solved a similar problem well, one from the same region. Don't pick 5 cities that are all the same.
 
-Use WebSearch to find comparable cities:
-- `"cities similar to CITY STATE population SIZE government structure"`
-- `"CITY STATE comparable cities municipal benchmarking"`
-- `"STATE cities population RANGE local government"`
+Use the `WebSearch` tool (Claude SDK) to find comparable cities:
+- `WebSearch("cities similar to CITY STATE population SIZE government structure")`
+- `WebSearch("CITY STATE comparable cities municipal benchmarking")`
+- `WebSearch("STATE cities population RANGE local government")`
 
 For each peer city, note: name, state, approximate population, and why it's comparable.
 
@@ -149,10 +119,23 @@ For each peer city, note: name, state, approximate population, and why it's comp
 
 ## STEP 4: Research peer city approaches to each issue
 
+### CRITICAL: WebFetch domain-verification failures
+
+If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (each attempt burns ~2 minutes). Fall back immediately to `pmf_runtime.http.get`, which routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification:
+
+```python
+from pmf_runtime import http
+r = http.get("https://peercity.gov/council-minutes")
+# r = {"status": 200, "headers": {...}, "body": "<html>…</html>"}
+print(r["body"][:2000])
+```
+
+Most `.gov` and municipal portal domains are already allowlisted. Use `pmf_runtime.http.get` whenever `WebFetch` errors, not as a second fallback after more `WebFetch` retries.
+
 For each issue from the district intel, and each peer city:
 
 **4a. Search for how the peer city handled the issue:**
-- Use WebSearch: `"PEER_CITY STATE ISSUE_TOPIC council policy"`
+- Use `WebSearch("PEER_CITY STATE ISSUE_TOPIC council policy")`
 
 **4b. Look for specifics:**
 - What approach did they take?
@@ -160,11 +143,18 @@ For each issue from the district intel, and each peer city:
 - What was the timeline?
 - What was the outcome?
 
-**4c. Fetch source pages with WebFetch for details:**
+**4c. Fetch source pages for details:**
 - Council meeting minutes showing votes and decisions
 - News articles covering the policy
 - City budget documents or reports
 - Policy implementation reports
+
+For HTML pages and short PDFs use `WebFetch(url, prompt="what did PEER_CITY do about ISSUE_TOPIC")`. For large budget books or staff reports, download through the broker:
+```python
+from pmf_runtime import pdf
+result = pdf.download("https://peercity.gov/fy2026_budget.pdf", purpose="public safety line items")
+```
+Then `pdftotext -layout -f N -l M /workspace/downloads/fy2026_budget.pdf -` for the section you need.
 
 **4d. Stay on topic.** Each peer approach must be about the SAME issue being compared. If you're comparing fire/EMS approaches, don't discuss the peer city's water infrastructure — that belongs in a different comparison. If a peer city has no relevant action on the issue, say so clearly.
 

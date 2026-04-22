@@ -21,6 +21,24 @@ provider "aws" {
   region = "us-west-2"
 }
 
+data "terraform_remote_state" "broker" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "broker/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+data "terraform_remote_state" "vpc_endpoints" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "pmf-vpc-endpoints/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 module "pmf_engine_fargate" {
   source = "../../../modules/pmf-engine-fargate"
 
@@ -32,8 +50,10 @@ module "pmf_engine_fargate" {
   task_cpu           = "1024"
   task_memory        = "2048"
 
-  artifact_bucket_arn = "arn:aws:s3:::gp-agent-artifacts-dev"
-  callback_queue_arn  = "arn:aws:sqs:us-west-2:333022194791:agent-callback-dev.fifo"
+  artifact_bucket_arn      = "arn:aws:s3:::gp-agent-artifacts-dev"
+  broker_security_group_id = try(data.terraform_remote_state.broker.outputs.security_group_id, "")
+  broker_url               = data.terraform_remote_state.broker.outputs.broker_url
+  vpce_security_group_id   = try(data.terraform_remote_state.vpc_endpoints.outputs.vpce_security_group_id, "")
 
   shared_slack_notifier_lambda_arn = "arn:aws:lambda:us-west-2:333022194791:function:shared-slack-notifier"
 }

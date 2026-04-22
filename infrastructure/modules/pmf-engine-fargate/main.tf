@@ -53,13 +53,37 @@ variable "artifact_bucket_arn" {
   type        = string
 }
 
-variable "callback_queue_arn" {
-  description = "ARN of the agent-callback SQS queue"
+variable "broker_security_group_id" {
+  description = "Security group ID of the broker service (for egress rules)"
   type        = string
+}
+
+variable "broker_url" {
+  description = "HTTPS URL of the broker (e.g. https://broker-dev.ai.goodparty.org). Injected into runner env as BROKER_URL + ANTHROPIC_BASE_URL. Must be https — runner's RunnerConfig.from_env() enforces this at boot, but validate at plan-time too to fail fast."
+  type        = string
+
+  validation {
+    condition     = startswith(lower(var.broker_url), "https://")
+    error_message = "broker_url must use https:// — runner rejects plaintext in dev/qa/prod."
+  }
+
+  validation {
+    condition     = !endswith(var.broker_url, "/")
+    error_message = "broker_url must not end with a trailing slash — downstream concatenates paths like ${"/"}anthropic."
+  }
+}
+
+variable "vpce_security_group_id" {
+  description = "Security group ID of the PMF VPC endpoints (ECR, Logs). Runner egress 443 is narrowed to this SG only — image pull + log delivery via endpoints, nothing else on 443. Empty string skips the narrow rule (Phase 1 bring-up before endpoints exist)."
+  type        = string
+  default     = ""
 }
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+data "aws_vpc" "selected" {
+  id = var.vpc_id
+}
 
 resource "aws_cloudwatch_log_group" "runner" {
   name              = "/ecs/pmf-engine-${var.environment}"
@@ -92,23 +116,9 @@ resource "aws_iam_role_policy_attachment" "task_execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-resource "aws_iam_role_policy" "task_execution_secrets_access" {
-  name = "secrets-manager-access"
-  role = aws_iam_role.task_execution_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue"
-        ]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}-*"
-      }
-    ]
-  })
-}
+# No custom secrets-manager policy on task execution role — v2 runner has no
+# `secrets` block on the task def. The execution role only needs ECR + Logs
+# (provided by the attached AmazonECSTaskExecutionRolePolicy managed policy).
 
 resource "aws_iam_role" "task_role" {
   name = "pmf-engine-task-${var.environment}"
@@ -127,108 +137,76 @@ resource "aws_iam_role" "task_role" {
   })
 }
 
-resource "aws_iam_role_policy" "task_s3_access" {
-  name = "s3-artifact-access"
-  role = aws_iam_role.task_role.id
-
-  # PutObject is permitted on the full bucket because the harness writes its
-  # own run artifact at `{experiment_id}/{run_id}/{artifact}.json`. The run_id
-  # is generated per task invocation so cross-run collision risk is low.
-  #
-  # GetObject is scoped to serve-mode prerequisite reads: the only legitimate
-  # cross-run read pattern is an experiment (e.g. peer_city_benchmarking)
-  # fetching the latest artifact from an upstream experiment (e.g.
-  # district_intel). Those are published under `<experiment_id>/latest.json`.
-  # Limiting GetObject to `*/latest.json` prevents a compromised runner from
-  # exfiltrating arbitrary run artifacts across tenants while still supporting
-  # the documented prerequisite pattern.
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "WriteOwnArtifacts"
-        Effect = "Allow"
-        Action = [
-          "s3:PutObject",
-          "s3:PutObjectTagging",
-        ]
-        Resource = "${var.artifact_bucket_arn}/*"
-      },
-      {
-        Sid      = "ReadPrerequisiteArtifacts"
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
-        Resource = "${var.artifact_bucket_arn}/*/latest.json"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "task_sqs_callback" {
-  name = "sqs-callback-access"
-  role = aws_iam_role.task_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = "sqs:SendMessage"
-        Resource = var.callback_queue_arn
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "task_cloudwatch_logs" {
-  name = "cloudwatch-logs-access"
-  role = aws_iam_role.task_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:DescribeLogGroups",
-          "logs:DescribeLogStreams",
-          "logs:GetLogEvents",
-          "logs:FilterLogEvents"
-        ]
-        Resource = [
-          aws_cloudwatch_log_group.runner.arn,
-          "${aws_cloudwatch_log_group.runner.arn}:*"
-        ]
-      }
-    ]
-  })
-}
+# Agent task has NO AWS permissions. All operations (S3, SQS, Databricks,
+# Anthropic) go through the broker. A compromised agent (via prompt injection)
+# cannot exfiltrate data through AWS APIs because the task role has no inline
+# policies and no managed policies attached — only the trust policy allowing
+# ECS to assume it.
 
 resource "aws_security_group" "ecs_tasks" {
   name        = "pmf-engine-ecs-tasks-${var.environment}"
-  description = "Security group for PMF Engine ECS tasks"
+  description = "Security group for PMF Engine ECS tasks (quarantined: broker-only egress)"
   vpc_id      = var.vpc_id
-
-  egress {
-    description = "HTTPS for APIs (Anthropic, S3, SQS)"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "DNS resolution"
-    from_port   = 53
-    to_port     = 53
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 
   tags = {
     Name        = "PMF Engine ECS Tasks"
     Environment = var.environment
   }
+}
+
+resource "aws_security_group_rule" "agent_egress_broker" {
+  count                    = var.broker_security_group_id != "" ? 1 : 0
+  type                     = "egress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  description              = "Broker access only (HTTPS)"
+  security_group_id        = aws_security_group.ecs_tasks.id
+  source_security_group_id = var.broker_security_group_id
+}
+
+resource "aws_security_group_rule" "agent_egress_dns" {
+  type              = "egress"
+  from_port         = 53
+  to_port           = 53
+  protocol          = "udp"
+  description       = "DNS resolution via VPC DNS"
+  security_group_id = aws_security_group.ecs_tasks.id
+  cidr_blocks       = [data.aws_vpc.selected.cidr_block]
+}
+
+# 443 egress is narrowed to VPC endpoint ENIs only. The ECS platform needs
+# this for image pull (ECR) and log streaming (CloudWatch Logs). Runner code
+# cannot reach arbitrary internet hosts on 443 because the only valid
+# destination is vpce-sg, which hosts AWS-managed endpoint ENIs.
+resource "aws_security_group_rule" "agent_egress_vpce" {
+  count                    = var.vpce_security_group_id != "" ? 1 : 0
+  type                     = "egress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  description              = "ECR + CloudWatch Logs via VPC endpoints"
+  security_group_id        = aws_security_group.ecs_tasks.id
+  source_security_group_id = var.vpce_security_group_id
+}
+
+# S3 gateway endpoint routes traffic via the VPC route table, but the SG on
+# the task's ENI still inspects the destination IP — which for S3 is the
+# service's public IP range. The AWS-managed prefix list (pl-68a54001 for
+# us-west-2 S3) is the narrow allowlist that permits S3 traffic without
+# widening to 0.0.0.0/0. Required for ECR image layer blob fetches.
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.us-west-2.s3"
+}
+
+resource "aws_security_group_rule" "agent_egress_s3" {
+  type              = "egress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  description       = "S3 via gateway endpoint (for ECR layer blobs)"
+  security_group_id = aws_security_group.ecs_tasks.id
+  prefix_list_ids   = [data.aws_prefix_list.s3.id]
 }
 
 resource "aws_ecs_cluster" "runner" {
@@ -263,6 +241,11 @@ resource "aws_ecs_task_definition" "runner" {
       name  = "pmf-engine"
       image = "${var.ecr_repository_url}:${var.docker_image_tag}"
 
+      command = [
+        "/bin/bash", "-c",
+        "export AWS_EC2_METADATA_DISABLED=true && unset AWS_CONTAINER_CREDENTIALS_RELATIVE_URI && exec python -m pmf_engine.runner.main"
+      ]
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -272,33 +255,9 @@ resource "aws_ecs_task_definition" "runner" {
         }
       }
 
-      secrets = [
-        {
-          name      = "ANTHROPIC_API_KEY"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:PMF_ANTHROPIC_API_KEY::"
-        },
-        {
-          name      = "GEMINI_API_KEY"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:GEMINI_API_KEY::"
-        },
-        {
-          name      = "DATABRICKS_SERVER_HOSTNAME"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:DATABRICKS_SERVER_HOSTNAME::"
-        },
-        {
-          name      = "DATABRICKS_HTTP_PATH"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:DATABRICKS_HTTP_PATH::"
-        },
-        {
-          name      = "DATABRICKS_API_KEY"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:DATABRICKS_API_KEY::"
-        },
-        {
-          name      = "BRAINTRUST_API_KEY"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:BRAINTRUST_API_KEY::"
-        }
-      ]
-
+      # No secrets injected — runner has zero AWS access in v2. All
+      # credentials are held by the broker. If runner code ever needs
+      # BRAINTRUST/etc, proxy it through broker.
       environment = [
         {
           name  = "ENVIRONMENT"
@@ -307,6 +266,18 @@ resource "aws_ecs_task_definition" "runner" {
         {
           name  = "WORKSPACE_DIR"
           value = "/workspace"
+        },
+        {
+          name  = "BROKER_URL"
+          value = var.broker_url
+        },
+        {
+          name  = "ANTHROPIC_BASE_URL"
+          value = "${var.broker_url}/anthropic"
+        },
+        {
+          name  = "ANTHROPIC_API_KEY"
+          value = "placeholder-overridden-by-dispatch"
         }
       ]
     }
@@ -337,14 +308,6 @@ resource "aws_cloudwatch_event_rule" "ecs_task_failed" {
   name        = "pmf-engine-task-failed-${var.environment}"
   description = "Capture ECS task failures for PMF Engine"
 
-  # Match any STOPPED task for our cluster whose failure mode is NOT a clean
-  # container exit with code 0. This catches:
-  #   (a) container exits with non-zero exit code (task ran but failed)
-  #   (b) provisioning failures (CannotPullContainerError, TaskFailedToStart,
-  #       ResourceInitializationError) where containers never start and
-  #       `exitCode` is absent from the event payload
-  # The previous pattern only matched (a) because `anything-but: [0]` on
-  # `exitCode` silently drops events where `exitCode` is missing.
   event_pattern = jsonencode({
     source      = ["aws.ecs"]
     detail-type = ["ECS Task State Change"]

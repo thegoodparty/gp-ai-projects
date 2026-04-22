@@ -32,6 +32,7 @@ def render_flat_registry(registry: dict[str, dict]) -> str:
         lines.append(f'        "harness": {entry["harness"]!r},')
         lines.append(f'        "model": {entry["model"]!r},')
         lines.append(f'        "timeout_seconds": {entry["timeout_seconds"]!r},')
+        lines.append(f'        "required_params": {entry.get("required_params", [])!r},')
         lines.append(
             f'        "contract": {{"s3_key_template": {entry["contract"]["s3_key_template"]!r}}},'
         )

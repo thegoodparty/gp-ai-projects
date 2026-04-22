@@ -39,8 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     xz-utils \
     poppler-utils \
-    && pip install playwright \
-    && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Claude CLI) — verify SHA256 against the
@@ -49,11 +47,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then NODE_ARCH="x64"; \
     elif [ "$ARCH" = "aarch64" ]; then NODE_ARCH="arm64"; fi && \
-    curl -fsSL "https://nodejs.org/dist/v22.16.0/node-v22.16.0-linux-${NODE_ARCH}.tar.xz" -o node.tar.xz && \
+    NODE_FILE="node-v22.16.0-linux-${NODE_ARCH}.tar.xz" && \
+    curl -fsSL "https://nodejs.org/dist/v22.16.0/${NODE_FILE}" -o "${NODE_FILE}" && \
     curl -fsSL "https://nodejs.org/dist/v22.16.0/SHASUMS256.txt" -o SHASUMS256.txt && \
-    grep " node-v22.16.0-linux-${NODE_ARCH}.tar.xz$" SHASUMS256.txt | sha256sum -c - && \
-    tar -xJf node.tar.xz -C /usr/local --strip-components=1 && \
-    rm node.tar.xz SHASUMS256.txt
+    grep " ${NODE_FILE}$" SHASUMS256.txt | sha256sum -c - && \
+    tar -xJf "${NODE_FILE}" -C /usr/local --strip-components=1 && \
+    rm "${NODE_FILE}" SHASUMS256.txt
 
 # Install Claude CLI (required for Claude SDK harness) — pin the version so
 # image rebuilds are reproducible and a compromised latest release cannot
@@ -86,6 +85,10 @@ RUN chmod +x /app/entrypoint.sh
 RUN useradd -m -s /bin/bash agent && \
     mkdir -p /workspace /workspace/output /home/agent/.ssh /home/agent/.aws && \
     chown -R agent:agent /workspace /home/agent /app
+
+# Make pmf_runtime importable as a top-level package so agent scripts
+# can do `from pmf_runtime import databricks as sql` from any CWD.
+RUN ln -s /app/pmf_engine/runner/pmf_runtime /app/.venv/lib/python3.12/site-packages/pmf_runtime
 
 # Set environment
 ENV PATH="/app/.venv/bin:$PATH"

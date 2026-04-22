@@ -43,27 +43,46 @@ You are an experiment agent for GoodParty.org.
 
 ## TURN BUDGET
 
-You have **{max_turns} tool-use turns** to complete this task. Each tool call (Bash, WebFetch, etc.) counts as one turn. Plan your work accordingly — if you are past the halfway point, prioritize writing the output artifact over collecting more data. Partial data with a written artifact is better than thorough research with no output.
+You have **{max_turns} tool-use turns** to complete this task. Each tool call (Bash, etc.) counts as one turn. Plan your work accordingly — if you are past the halfway point, prioritize writing the output artifact over collecting more data. Partial data with a written artifact is better than thorough research with no output — BUT "partial" means fewer real records, not fabricated ones. NEVER synthesize, mock, or randomly generate data to meet the schema. If required data sources are unreachable, stop and fail the run.
 
 ## TOOLS AVAILABLE
 
-**CLI**: python, curl, aws, pdftotext (poppler-utils), playwright (chromium) (can install more via pip)
+**CLI**: python, aws, pdftotext (poppler-utils). You can `pip install` additional Python packages if needed.
 
-**Data access**: Use curl or python httpx/requests to call APIs.
-Credentials are available as environment variables.
+**Network egress**: The container has NO direct internet access. `curl`, `wget`, and raw `httpx` calls to external hosts will fail. All external access goes through either:
+- `WebFetch(url, prompt=...)` / `WebSearch(query)` (Claude SDK) — for HTML pages and web search. Returns extracted text. Note: some domains (e.g. `webapi.legistar.com` REST API) are blocked by Anthropic's fetch allowlist — use `pmf_runtime.http.get` for those.
+- `pmf_runtime.http.get(url)` (via broker) — for JSON REST APIs (Legistar, LINC, etc.). Broker's domain allowlist covers `.gov`, `.us`, Legistar, Granicus, PrimeGov, CivicPlus, BoardDocs, eSCRIBE, Municode.
+- `pmf_runtime.pdf.download(url)` (via broker) — for PDFs. Same allowlist.
+- `pmf_runtime` (Databricks, priors, publish, Anthropic proxy) — structured data + artifact I/O.
 
-**JS-rendered pages**: If curl/WebFetch returns empty or minimal HTML (the page requires JavaScript), use the fetch script:
-```bash
-python3 /app/pmf_engine/runner/scripts/fetch_js_page.py "URL" --dir /workspace/downloads
+**Retrieving JSON from REST APIs** (Legistar, LINC, civic data portals):
+```python
+from pmf_runtime import http
+r = http.get("https://webapi.legistar.com/v1/cityoffayetteville/events?$top=10")
+# r = {{"status": 200, "content_type": "application/json", "body": "[...]", "source_url": "...", "byte_size": 1234}}
+import json
+events = json.loads(r["body"])
 ```
-This renders the page with headless Chromium, saves the HTML, and prints the file path. Options: `--selector ".css-selector"` (wait for AJAX content), `--delay 3000` (extra wait in ms).
 
-**Reading files**: You do not have the Read tool. Use `cat` (via Bash) for text/JSON files. For PDFs, always use `pdftotext file.pdf -` via Bash to extract text — never attempt to read PDFs directly.
+**Retrieving PDFs** (staff reports, budget books, meeting minutes):
+```python
+from pmf_runtime import pdf
+result = pdf.download("https://legistar.granicus.com/cityoffayetteville/staff_report.pdf", purpose="item 8 staff report")
+# result = {{"path": "/workspace/downloads/staff_report.pdf", "byte_size": 823104, "source_url": "..."}}
+```
+Then extract text with `pdftotext`:
+```bash
+pdftotext -layout /workspace/downloads/staff_report.pdf -            # whole document
+pdftotext -layout -f 120 -l 145 /workspace/downloads/budget.pdf -    # page range (use for large PDFs)
+```
+
+**Reading files**: You do not have the Read tool. Use `cat` (via Bash) for text/JSON files. For PDFs, first `pmf_runtime.pdf.download(url)` to land the file, then `pdftotext` to extract — never attempt to read PDFs directly.
 
 ## OUTPUT
 
-Write your artifact to /output/. The specific filename is defined in your instruction.
-The runner will upload whatever you write to /output/ to S3 as the experiment artifact.
+Write your artifact to /workspace/output/. The specific filename is defined in your instruction.
+The runner will upload whatever you write to /workspace/output/ to S3 as the experiment artifact.
+Do not try to write to or create /output (root-level) — it does not exist and you will get a permission error.
 
 **Before finishing**, run `python3 /workspace/validate_output.py` to check your output against the contract schema. Fix any errors it reports — contract violations will cause the experiment to fail.
 
@@ -107,7 +126,7 @@ async def run_agent(
     # They flow in via the first user message, fenced inside <untrusted_data> tags,
     # and the system prompt instructs the agent to treat that block as literal data.
     # This is the defense against prompt injection since the agent runs with broad
-    # tool access (Bash/WebFetch/WebSearch) and a permissive permission mode.
+    # tool access (Bash) and a permissive permission mode.
     options = ClaudeAgentOptions(
         system_prompt=build_system_prompt(
             instruction,
@@ -128,7 +147,7 @@ async def run_agent(
         max_buffer_size=100 * 1024 * 1024,  # 100MB
     )
 
-    base_prompt = "Execute the experiment according to your instructions. Write the output artifact to /output/."
+    base_prompt = "Execute the experiment according to your instructions. Write the output artifact to /workspace/output/."
     if params:
         params_json = json.dumps(params, indent=2)
         prompt = (
@@ -227,18 +246,38 @@ async def run_agent(
     raise RuntimeError("Agent stream ended without result")
 
 
-def collect_output_artifact(workspace_dir: str) -> tuple[bytes, str]:
+def collect_output_artifact(workspace_dir: str, experiment_id: str | None = None) -> tuple[bytes, str]:
     output_dir = os.path.join(workspace_dir, "output")
     files = [f for f in glob.glob(os.path.join(output_dir, "*")) if os.path.isfile(f)]
     if not files:
         raise FileNotFoundError(f"No artifact files found in {output_dir}")
-    if len(files) > 1:
-        raise RuntimeError(
-            f"Expected exactly one artifact in {output_dir}, found {len(files)}: "
-            f"{[os.path.basename(f) for f in files]}"
-        )
 
-    artifact_path = files[0]
+    if len(files) == 1:
+        artifact_path = files[0]
+    else:
+        # Multiple files — agents sometimes leave helper files (summaries,
+        # scratch notes) alongside the real artifact. If the experiment_id
+        # matches one file's basename (stem), that's the artifact; the rest
+        # are ignored with a warning. If nothing matches, fail explicitly.
+        preferred: str | None = None
+        if experiment_id:
+            for f in files:
+                stem = os.path.splitext(os.path.basename(f))[0]
+                if stem == experiment_id:
+                    preferred = f
+                    break
+        if preferred is None:
+            raise RuntimeError(
+                f"Expected exactly one artifact in {output_dir}, found {len(files)}: "
+                f"{[os.path.basename(f) for f in files]}"
+            )
+        extras = [os.path.basename(f) for f in files if f != preferred]
+        logger.warning(
+            "agent wrote %d files in output/; using %s, ignoring: %s",
+            len(files), os.path.basename(preferred), extras,
+        )
+        artifact_path = preferred
+
     ext = os.path.splitext(artifact_path)[1].lower()
 
     content_types = {
@@ -265,6 +304,7 @@ class ClaudeSdkHarness:
         contract_schema: dict | None = None,
         contract_constraints: dict | None = None,
         parent_span=None,
+        experiment_id: str | None = None,
     ) -> HarnessResult:
         result = await run_agent(
             instruction=instruction,
@@ -277,7 +317,7 @@ class ClaudeSdkHarness:
             parent_span=parent_span,
         )
 
-        artifact_bytes, content_type = collect_output_artifact(workspace_dir)
+        artifact_bytes, content_type = collect_output_artifact(workspace_dir, experiment_id=experiment_id)
 
         return HarnessResult(
             artifact_bytes=artifact_bytes,

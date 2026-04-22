@@ -2,9 +2,12 @@
 import sys
 import os
 import hashlib
+import logging
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -24,8 +27,11 @@ def fetch(
         if selector:
             try:
                 page.wait_for_selector(selector, timeout=timeout)
-            except Exception:
-                pass
+            except Exception as sel_err:
+                logger.warning(
+                    f"Selector {selector!r} did not appear within {timeout}ms "
+                    f"on {url}: {sel_err}"
+                )
         if delay:
             page.wait_for_timeout(delay)
         html = page.content()

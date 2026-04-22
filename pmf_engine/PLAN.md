@@ -79,7 +79,7 @@ Goal: prove the PMF engine with two data-driven experiments.
 - callback_handler.py wraps results in `{type: "agentExperimentResult", data: {camelCase}}` envelope
 - Message group ID: `gp-queue-agentExperiments`
 - Terraform updated: `gp_api_sqs_queue_url`/`gp_api_sqs_queue_arn` variables
-- Dev env points to `Collin_Queue.fifo` for testing
+- Each env routes callbacks to its `${stage}-Queue.fifo` (gp-api's consumer)
 
 ### 3a. Voter Targeting — "People Likely to Vote for You"
 - `pmf_engine/runner/experiments/voter_targeting.py`
@@ -125,8 +125,8 @@ Local machine (uv run)
   → Claude agent spawns, queries Databricks
   → Writes /workspace/output/voter_targeting.json
   → Uploads to S3 gp-agent-artifacts-dev
-  → Sends callback to Collin_Queue.fifo
-  → Local gp-api picks up result
+  → Sends callback to gp-api's stage-scoped results queue
+  → gp-api picks up result
 ```
 
 ### What to validate
@@ -141,7 +141,7 @@ Local machine (uv run)
 - [x] Lambda packaging — build script `pmf_engine/scripts/build_lambda_package.sh` + try/except imports for Lambda compatibility
 - [x] Fargate env vars — DATABRICKS_* added to task definition from AI_SECRETS_DEV
 - [x] `terraform apply` pmf-engine-fargate (dev) — ECS cluster, task def, IAM, security groups
-- [x] `terraform apply` pmf-engine-control-plane (dev) — SQS queues, Lambdas, S3 bucket, callback→Collin_Queue.fifo
+- [x] `terraform apply` pmf-engine-control-plane (dev) — SQS queues, Lambdas, S3 bucket, callback→gp-api `${stage}-Queue.fifo`
 - [x] Docker build + push to ECR (`gp-ai-projects:pmf-engine-dev`)
 - [x] hello_world e2e: dispatch→Lambda→Fargate→S3→callback→gp-api SUCCESS
 - [x] voter_targeting e2e: real Databricks data for Tecumseh, MI

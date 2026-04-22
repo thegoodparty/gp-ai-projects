@@ -63,7 +63,7 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | F1 | DB create + SQS send both succeed → PENDING run | [x] |
 | F2 | SQS send fails → marks run FAILED, throws 502 | [x] |
 | F3 | DB create fails → SQS never attempted | [x] |
-| F4 | SQS message body contains correct fields (experimentId, candidateId, runId, params) | [x] |
+| F4 | SQS message body contains correct fields (experimentId, organizationSlug, runId, params) | [x] |
 | F5 | SQS message uses correct groupId and dedup key | [x] |
 
 ## G. Lambda Dispatch Handler (SQS → ECS)
@@ -73,7 +73,7 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | G1 | Valid message → ECS RunTask succeeds | [x] |
 | G2 | Invalid JSON body → batch failure | [x] |
 | G3 | Missing experiment_id → batch failure | [x] |
-| G4 | Missing candidate_id → batch failure | [x] |
+| G4 | Missing organization_slug → batch failure | [x] |
 | G5 | Missing run_id → batch failure | [x] |
 | G6 | Unknown experiment_id → error callback sent | [x] |
 | G7 | ECS RunTask returns failures array → error callback + batch failure | [x] |
@@ -176,7 +176,7 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | M8 | Zod rejects unknown status value | [x] |
 | M9 | Zod rejects missing experimentId | [x] |
 | M10 | Zod rejects missing runId | [x] |
-| M11 | Zod rejects missing candidateId | [x] |
+| M11 | Zod rejects missing organizationSlug | [x] |
 | M12 | DB update fails during status transition | [x] |
 | M13 | durationSeconds stored correctly | [x] |
 
