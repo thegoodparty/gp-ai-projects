@@ -203,10 +203,10 @@ def artifact_publish(
     )
 
     try:
-        store.delete_ticket(broker_token)
+        store.delete_ticket_and_run_lock(broker_token, ticket.run_id)
     except Exception:
         logger.error(
-            "ticket delete failed after publish run_id=%s broker_token_prefix=%s",
+            "ticket/run-lock delete failed after publish run_id=%s broker_token_prefix=%s",
             ticket.run_id, broker_token[:8],
             exc_info=True,
         )

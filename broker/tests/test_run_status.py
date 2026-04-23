@@ -89,7 +89,7 @@ class TestRunStatusRunning:
         call_kwargs = mock_sender.send_result.call_args[1]
         assert call_kwargs["status"] == "running"
 
-        mock_store.delete_ticket.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
 
 
 class TestRunStatusFailed:
@@ -116,7 +116,7 @@ class TestRunStatusFailed:
         assert call_kwargs["reason_code"] == "timeout"
         assert call_kwargs["detail"] == "Exceeded time limit"
 
-        mock_store.delete_ticket.assert_called_once_with(BROKER_TOKEN)
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(BROKER_TOKEN, "run-001")
 
 
 class TestRunStatusContractViolation:
@@ -222,7 +222,7 @@ class TestRunStatusContractViolation:
         stored_body = json.loads(s3_call_kwargs["Body"])
         assert stored_body == rejected
 
-        mock_store.delete_ticket.assert_called_once_with(BROKER_TOKEN)
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(BROKER_TOKEN, "run-001")
 
 
 class TestRunStatusSuccessRejected:
@@ -254,7 +254,7 @@ class TestRunStatusSuccessRejected:
 
         assert resp.status_code == 422
         mock_sender.send_result.assert_not_called()
-        mock_store.delete_ticket.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
 
 
 class TestRunStatusTimeoutTranslated:
@@ -285,7 +285,7 @@ class TestRunStatusTimeoutTranslated:
         assert call_kwargs["reason_code"] == "timeout"
         assert call_kwargs["detail"] == "Experiment exceeded 3000s limit"
         # Still terminal — ticket deleted
-        mock_store.delete_ticket.assert_called_once_with(BROKER_TOKEN)
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(BROKER_TOKEN, "run-001")
 
 
 class TestRunStatusRejectsUnknownStatus:
@@ -305,7 +305,7 @@ class TestRunStatusRejectsUnknownStatus:
 
         assert resp.status_code == 422
         mock_sender.send_result.assert_not_called()
-        mock_store.delete_ticket.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
 
 
 class TestRunStatusTrackerCleanup:
@@ -389,3 +389,63 @@ class TestRunStatusTrackerCleanup:
 
         assert resp.status_code == 200
         assert tracker.get(ticket.pk) == 3
+
+
+class TestRunStatusClearsRunLock:
+    """Terminal run-status must delete BOTH the ticket row and the run-lock
+    row so a legitimate re-dispatch of the same run_id isn't blocked by a
+    stale lock until TTL. Verified end-to-end against moto DynamoDB — mock
+    assertions in the sibling tests prove the method was called, this
+    proves the rows are actually gone."""
+
+    def test_failed_status_clears_both_ticket_and_run_lock_in_ddb(self):
+        import boto3
+        from moto import mock_aws
+        from broker.endpoints.run_status import get_data_query_tracker
+
+        with mock_aws():
+            ddb = boto3.client("dynamodb", region_name="us-west-2")
+            ddb.create_table(
+                TableName="scope-tickets-term",
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            real_store = ScopeTicketStore("scope-tickets-term", dynamodb_client=ddb)
+            ticket = _make_ticket(run_id="run-term-001")
+            real_store.put_ticket(ticket)
+
+            assert "Item" in ddb.get_item(
+                TableName="scope-tickets-term", Key={"pk": {"S": ticket.pk}}
+            )
+            assert "Item" in ddb.get_item(
+                TableName="scope-tickets-term", Key={"pk": {"S": f"run:{ticket.run_id}"}}
+            )
+
+            app = FastAPI()
+            app.include_router(router)
+            app.dependency_overrides[get_scope_ticket] = lambda: ticket
+            app.dependency_overrides[get_s3_client] = lambda: MagicMock()
+            app.dependency_overrides[get_callback_sender] = lambda: MagicMock(spec=CallbackSender)
+            app.dependency_overrides[get_ticket_store] = lambda: real_store
+            app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
+            app.dependency_overrides[get_artifact_bucket] = lambda: "bucket"
+            app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
+
+            client = TestClient(app)
+            resp = client.post(
+                "/internal/run-status",
+                json={"status": "failed", "reason_code": "TestFail"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+            assert resp.status_code == 200
+
+            assert "Item" not in ddb.get_item(
+                TableName="scope-tickets-term", Key={"pk": {"S": ticket.pk}}
+            ), "ticket row must be gone after terminal status"
+            assert "Item" not in ddb.get_item(
+                TableName="scope-tickets-term", Key={"pk": {"S": f"run:{ticket.run_id}"}}
+            ), (
+                "run-lock row must also be gone — otherwise re-dispatching the "
+                "same run_id hits 409 against the stale lock until TTL expires"
+            )

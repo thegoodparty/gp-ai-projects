@@ -126,14 +126,16 @@ def run_status(
         cost_usd=req.cost_usd or 0,
     )
 
-    # Delete ticket on any terminal state (failed/contract_violation/timeout —
-    # the agent is done regardless of what wire_status we emitted).
+    # Delete ticket + run-lock on any terminal state (failed/contract_violation/timeout —
+    # the agent is done regardless of what wire_status we emitted). Cleaning up
+    # the run-lock here is load-bearing: without it, a legitimate re-dispatch of
+    # the same run_id 409s against the stale lock until TTL expires.
     if req.status in ("failed", "contract_violation", "timeout"):
         try:
-            store.delete_ticket(broker_token)
+            store.delete_ticket_and_run_lock(broker_token, ticket.run_id)
         except Exception:
             logger.error(
-                "ticket delete failed after terminal run_status run_id=%s broker_token_prefix=%s",
+                "ticket/run-lock delete failed after terminal run_status run_id=%s broker_token_prefix=%s",
                 ticket.run_id, broker_token[:8],
                 exc_info=True,
             )

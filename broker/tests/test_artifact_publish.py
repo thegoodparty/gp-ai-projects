@@ -110,7 +110,7 @@ class TestArtifactPublishSuccess:
 
         mock_sender.send_result.assert_called_once()
 
-        mock_store.delete_ticket.assert_called_once_with(BROKER_TOKEN)
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(BROKER_TOKEN, "run-001")
 
 
 class TestArtifactPublishCallbackKeyIsRunScoped:
@@ -377,7 +377,9 @@ class TestArtifactPublishVoterTargeting:
             artifact_bucket="gp-agent-artifacts-dev",
         )
 
-        mock_store.delete_ticket.assert_called_once_with(BROKER_TOKEN)
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "331e5b56-e316-45a3-bdb3-08f81c7fad00"
+        )
 
 
 class TestArtifactPublishDataRequiredGuard:
@@ -407,7 +409,7 @@ class TestArtifactPublishDataRequiredGuard:
         assert "NoDataQueriesSucceeded" in resp.json()["detail"]
         mock_s3.put_object.assert_not_called()
         mock_sender.send_result.assert_not_called()
-        mock_store.delete_ticket.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
 
     def test_voter_targeting_with_one_query_is_accepted(self):
         ticket = _make_ticket(experiment_id="voter_targeting", organization_slug="4")
@@ -566,7 +568,7 @@ class TestArtifactPublishRunKeyImmutability:
         mock_sender.send_result.assert_not_called()
         # Ticket NOT deleted — caller should investigate; deleting would mask
         # the bug that allowed the duplicate attempt.
-        mock_store.delete_ticket.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
 
     def test_run_key_put_includes_if_none_match_star(self):
         ticket = _make_ticket(

@@ -1056,3 +1056,45 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
         assert "workspace/config.env.yaml" not in keys, (
             f"config.env.yaml must NOT be collected (contains .env), got keys: {keys}"
         )
+
+
+class TestMainInitialRunningStatusResilience:
+    """Covers the residual of CRITICAL #2: the retry in report_status handles
+    ~7s of broker blip but longer outages must not crash Fargate unhandled
+    (the SQS dispatch message is already ACK'd, so a crashed task leaves
+    the run stuck PENDING forever).
+
+    The initial report_status('running') at the top of main() is the one
+    call that, if it raises past all retries, bypasses every try/except in
+    the rest of main(). Must swallow-and-log — the agent still runs and
+    the terminal callback will reach the broker when it recovers."""
+
+    @pytest.mark.asyncio
+    async def test_broker_outage_on_initial_running_status_does_not_crash_main(self):
+        import httpx
+        config = _make_config(instruction="Do stuff")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+                with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                    with patch("pmf_engine.runner.main.init_config"):
+                        with patch("pmf_engine.runner.main.publish") as mock_publish:
+                            with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                                request = httpx.Request("POST", "https://broker/internal/run-status")
+                                response = httpx.Response(502, request=request)
+                                mock_publish.report_status.side_effect = [
+                                    httpx.HTTPStatusError(
+                                        "upstream 502", request=request, response=response
+                                    ),
+                                ]
+                                await main()
+
+        running_calls = [
+            c for c in mock_publish.report_status.call_args_list
+            if c.args and c.args[0] == "running"
+        ]
+        assert len(running_calls) == 1, (
+            "initial report_status('running') must fire exactly once — "
+            "the subsequent exception must be caught, not bubble past "
+            "the main() async frame"
+        )
