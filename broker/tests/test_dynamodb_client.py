@@ -1,13 +1,28 @@
 import time
 from unittest.mock import MagicMock
 
+import boto3
 import pytest
+from moto import mock_aws
 
 from broker.dynamodb_client import (
     ScopeTicket,
     ScopeTicketStore,
     TicketAlreadyExistsError,
 )
+
+
+@pytest.fixture
+def moto_ddb():
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name="us-west-2")
+        client.create_table(
+            TableName="scope-tickets",
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield client
 
 
 def _make_ticket(
@@ -48,15 +63,18 @@ class TestScopeTicketModel:
 class TestPutAndGetRoundTrip:
     def test_put_then_get_returns_ticket(self):
         mock_client = _mock_dynamodb_client()
-        mock_client.put_item.return_value = {}
+        mock_client.transact_write_items.return_value = {}
 
         ticket = _make_ticket()
         store = ScopeTicketStore("scope-tickets", dynamodb_client=mock_client)
         store.put_ticket(ticket)
 
-        mock_client.put_item.assert_called_once()
-        call_args = mock_client.put_item.call_args
-        assert call_args[1]["TableName"] == "scope-tickets"
+        mock_client.transact_write_items.assert_called_once()
+        transact_items = mock_client.transact_write_items.call_args[1]["TransactItems"]
+        assert len(transact_items) == 2
+        assert transact_items[0]["Put"]["TableName"] == "scope-tickets"
+        assert transact_items[0]["Put"]["Item"]["pk"]["S"] == ticket.pk
+        assert transact_items[1]["Put"]["Item"]["pk"]["S"] == f"run:{ticket.run_id}"
 
         mock_client.get_item.return_value = {
             "Item": {
@@ -117,13 +135,22 @@ class TestGetExpired:
 
 
 class TestPutDuplicate:
-    def test_put_raises_ticket_already_exists_on_condition_failure(self):
+    def test_put_raises_ticket_already_exists_on_transaction_cancelled(self):
         mock_client = _mock_dynamodb_client()
         from botocore.exceptions import ClientError
 
-        mock_client.put_item.side_effect = ClientError(
-            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "condition"}},
-            "PutItem",
+        mock_client.transact_write_items.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "TransactionCanceledException",
+                    "Message": "Transaction cancelled",
+                },
+                "CancellationReasons": [
+                    {"Code": "None"},
+                    {"Code": "ConditionalCheckFailed"},
+                ],
+            },
+            "TransactWriteItems",
         )
 
         ticket = _make_ticket()
@@ -145,3 +172,90 @@ class TestDelete:
             TableName="scope-tickets",
             Key={"pk": {"S": "broker-token-abc"}},
         )
+
+
+class TestRunIdIdempotency:
+    def test_put_ticket_writes_run_lock_item(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        ticket = _make_ticket(pk="token-xyz", run_id="run-ABC")
+
+        store.put_ticket(ticket)
+
+        run_lock = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "run:run-ABC"}},
+        )
+        assert "Item" in run_lock
+        assert run_lock["Item"]["run_id"]["S"] == "run-ABC"
+        assert run_lock["Item"]["broker_token"]["S"] == "token-xyz"
+        assert int(run_lock["Item"]["exp"]["N"]) == ticket.exp
+
+    def test_mint_rejects_duplicate_run_id(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        first = _make_ticket(pk="token-1", run_id="run-DUPLICATE")
+        second = _make_ticket(pk="token-2", run_id="run-DUPLICATE")
+
+        store.put_ticket(first)
+
+        with pytest.raises(TicketAlreadyExistsError):
+            store.put_ticket(second)
+
+        second_ticket = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "token-2"}},
+        )
+        assert "Item" not in second_ticket
+
+    def test_mint_allows_new_run_id_after_expiry(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        expired = _make_ticket(pk="token-old", run_id="run-REUSED", exp_offset=-60)
+        fresh = _make_ticket(pk="token-new", run_id="run-REUSED")
+
+        store.put_ticket(expired)
+        store.put_ticket(fresh)
+
+        run_lock = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "run:run-REUSED"}},
+        )
+        assert run_lock["Item"]["broker_token"]["S"] == "token-new"
+
+    def test_get_ticket_rejects_run_lock_prefix(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        ticket = _make_ticket(pk="token-real", run_id="run-GUARD")
+        store.put_ticket(ticket)
+
+        assert store.get_ticket("run:run-GUARD") is None
+
+    def test_delete_ticket_and_run_lock_removes_both(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        ticket = _make_ticket(pk="token-del", run_id="run-DEL")
+        store.put_ticket(ticket)
+
+        store.delete_ticket_and_run_lock("token-del", "run-DEL")
+
+        ticket_row = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "token-del"}},
+        )
+        run_lock = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "run:run-DEL"}},
+        )
+        assert "Item" not in ticket_row
+        assert "Item" not in run_lock
+
+    def test_delete_then_remint_same_run_id_succeeds(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        first = _make_ticket(pk="token-1", run_id="run-RETRY")
+        store.put_ticket(first)
+        store.delete_ticket_and_run_lock("token-1", "run-RETRY")
+
+        retry = _make_ticket(pk="token-2", run_id="run-RETRY")
+        store.put_ticket(retry)
+
+        run_lock = moto_ddb.get_item(
+            TableName="scope-tickets",
+            Key={"pk": {"S": "run:run-RETRY"}},
+        )
+        assert run_lock["Item"]["broker_token"]["S"] == "token-2"

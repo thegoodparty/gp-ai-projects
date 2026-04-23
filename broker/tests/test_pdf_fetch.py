@@ -53,6 +53,8 @@ def _create_app(
     head: httpx.Response | None = None,
     get: httpx.Response | None = None,
     get_side_effect: Exception | None = None,
+    get_status: int = 200,
+    get_content_length: int | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
@@ -65,15 +67,18 @@ def _create_app(
         mock_client.stream = MagicMock(side_effect=get_side_effect)
     else:
         body = get.content if get else b"%PDF-1.4 fake bytes"
+        cl = get_content_length if get_content_length is not None else len(body)
+        status = get_status
         def _stream(method, url, **kw):
             class _Ctx:
                 async def __aenter__(self_):
                     resp = MagicMock()
-                    resp.status_code = 200
+                    resp.status_code = status
                     resp.headers = {
                         "content-type": "application/pdf",
-                        "content-length": str(len(body)),
+                        "content-length": str(cl),
                     }
+                    resp.aclose = AsyncMock(return_value=None)
                     async def _iter(chunk_size=8192):
                         for i in range(0, len(body), chunk_size):
                             yield body[i:i + chunk_size]
@@ -190,6 +195,39 @@ class TestStreamingProxy:
         assert resp.headers["content-type"] == "application/pdf"
         assert resp.headers.get("x-byte-size") == str(len(payload))
         assert resp.headers.get("x-source-url") == "https://legistar.granicus.com/cityoffayetteville/x.pdf"
+
+    def test_upstream_5xx_returns_502_not_200_with_truncated_body(self):
+        app = _create_app(get_status=500)
+        client = TestClient(app)
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": "https://legistar.granicus.com/cityoffayetteville/x.pdf"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 502, (
+            f"expected 502 when upstream GET returns 500, got {resp.status_code} "
+            f"(StreamingResponse sent 200 headers before generator could raise)"
+        )
+
+    def test_get_content_length_exceeds_cap_returns_413_before_streaming(self):
+        # HEAD returns no content-length, so the HEAD-time check doesn't catch it.
+        # GET reveals content-length > MAX_BYTES — must 413 before committing to 200.
+        head = httpx.Response(
+            status_code=200,
+            headers={"content-type": "application/pdf"},
+            request=httpx.Request("HEAD", "https://legistar.granicus.com/cityoffayetteville/x.pdf"),
+        )
+        oversized = 260 * 1024 * 1024
+        app = _create_app(head=head, get_content_length=oversized)
+        client = TestClient(app)
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": "https://legistar.granicus.com/cityoffayetteville/x.pdf"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 413, (
+            f"expected 413 when GET content-length exceeds cap, got {resp.status_code}"
+        )
 
     def test_rejects_unauthenticated_request(self):
         app = FastAPI()

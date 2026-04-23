@@ -8,6 +8,7 @@ _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\ufeff]")
 _BIDI_RE = re.compile(r"[\u202a-\u202e]")
+_FENCE_BREAKOUT_RE = re.compile(r"</?untrusted_web_content\b", re.IGNORECASE)
 
 
 def sanitize_html(raw_html: str) -> str:
@@ -21,6 +22,8 @@ def sanitize_html(raw_html: str) -> str:
 
 
 def fence_content(content: str, source: str, fetched_at: str | None = None) -> str:
+    if _FENCE_BREAKOUT_RE.search(content):
+        raise ValueError("fence_content refused: content contains fence tag")
     safe_source = escape(source, quote=True)
     if fetched_at:
         safe_ts = escape(fetched_at, quote=True)

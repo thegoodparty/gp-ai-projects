@@ -185,6 +185,42 @@ class TestAnthropicProxyAuth:
         assert resp.status_code == 401
 
 
+class TestAnthropicProxyHeaderConsistency:
+    def test_rejects_mismatched_x_api_key_and_x_broker_token(self):
+        app = _create_test_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 100},
+            headers={
+                "x-api-key": VALID_BROKER_TOKEN,
+                "x-broker-token": "some-other-token-xyz",
+            },
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "header_token_mismatch" in body.get("detail", "")
+
+    def test_accepts_matching_x_api_key_and_x_broker_token(self):
+        app = _create_test_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 100},
+            headers={
+                "x-api-key": VALID_BROKER_TOKEN,
+                "x-broker-token": VALID_BROKER_TOKEN,
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["content"][0]["text"] == "Hello"
+
+
 class TestAnthropicProxyUpstreamErrors:
     def test_upstream_502_propagated(self):
         transport = httpx.MockTransport(_error_handler)

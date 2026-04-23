@@ -43,6 +43,11 @@ from broker.endpoints.mint_run_token import (
     get_ticket_store,
     router as mint_router,
 )
+from broker.endpoints.delete_run_token import (
+    get_service_token_hash as delete_get_service_token_hash,
+    get_ticket_store as delete_get_ticket_store,
+    router as delete_router,
+)
 from broker.endpoints.pdf_fetch import (
     get_httpx_client as pdf_get_httpx_client,
     get_scope_ticket as pdf_get_scope_ticket,
@@ -129,6 +134,8 @@ async def lifespan(app: FastAPI):
 
     app.dependency_overrides[get_ticket_store] = lambda: store
     app.dependency_overrides[get_service_token_hash] = lambda: secrets.service_token_hash
+    app.dependency_overrides[delete_get_ticket_store] = lambda: store
+    app.dependency_overrides[delete_get_service_token_hash] = lambda: secrets.service_token_hash
     app.dependency_overrides[get_broker_auth] = lambda: broker_auth
     app.dependency_overrides[get_upstream_client] = lambda: upstream_client
     app.dependency_overrides[get_anthropic_api_key] = lambda: secrets.anthropic_api_key
@@ -193,6 +200,7 @@ async def auth_error_handler(request: Request, exc: AuthError):
 
 
 app.include_router(mint_router)
+app.include_router(delete_router)
 app.include_router(anthropic_router)
 app.include_router(publish_router)
 app.include_router(read_router)

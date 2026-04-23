@@ -95,28 +95,58 @@ async def pdf_fetch(
     # GET uses the already-validated final URL (current_url) — redirect chain
     # was resolved by the HEAD loop above. follow_redirects=False prevents the
     # GET from chasing any new redirects beyond what HEAD approved.
+    # Enter the stream context manually so we can inspect status + headers
+    # BEFORE constructing StreamingResponse. Once StreamingResponse is built
+    # and returned, Starlette has committed status 200 to the wire — any raise
+    # inside the generator becomes a truncated body with a 200 status.
     stream_ctx = client.stream("GET", current_url, timeout=STREAM_TIMEOUT, follow_redirects=False)
+    try:
+        resp = await stream_ctx.__aenter__()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"GET request failed: {e}")
+
+    try:
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream GET returned {resp.status_code}",
+            )
+
+        get_content_length_header = resp.headers.get("content-length")
+        if get_content_length_header is not None:
+            try:
+                get_cl = int(get_content_length_header)
+            except ValueError:
+                get_cl = None
+            if get_cl is not None and get_cl > MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"PDF too large: {get_cl} bytes > {MAX_BYTES}",
+                )
+    except BaseException:
+        await stream_ctx.__aexit__(None, None, None)
+        raise
 
     async def _iter():
         bytes_seen = 0
-        async with stream_ctx as resp:
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"Upstream GET returned {resp.status_code}")
+        try:
             async for chunk in resp.aiter_bytes(STREAM_CHUNK):
                 bytes_seen += len(chunk)
                 if bytes_seen > MAX_BYTES:
+                    # Status 200 is already on the wire — can't 413 now.
+                    # Truncate cleanly and log; downstream will see a short PDF.
                     logger.warning(
-                        "pdf_fetch exceeded byte cap run_id=%s url=%s", ticket.run_id, req.url,
+                        "pdf_fetch truncated at byte cap run_id=%s url=%s bytes_seen=%d cap=%d",
+                        ticket.run_id, req.url, bytes_seen, MAX_BYTES,
                     )
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"PDF stream exceeded {MAX_BYTES} bytes",
-                    )
+                    return
                 yield chunk
-        logger.info(
-            "pdf_fetch ok run_id=%s purpose=%s bytes=%d url=%s",
-            ticket.run_id, req.purpose or "", bytes_seen, req.url,
-        )
+            logger.info(
+                "pdf_fetch ok run_id=%s purpose=%s bytes=%d url=%s",
+                ticket.run_id, req.purpose or "", bytes_seen, req.url,
+            )
+        finally:
+            await stream_ctx.__aexit__(None, None, None)
 
     headers = {
         "X-Source-URL": req.url,

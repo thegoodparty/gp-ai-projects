@@ -117,6 +117,16 @@ def artifact_read(
 
     content_str = json.dumps(artifact)
 
-    fenced = fence_content(content_str, source=s3_key)
+    try:
+        fenced = fence_content(content_str, source=s3_key)
+    except ValueError:
+        logger.error(
+            "fence-breakout token found in stored artifact run_id=%s experiment_id=%s key=%s bucket=%s",
+            ticket.run_id,
+            req.experiment_id,
+            s3_key,
+            bucket,
+        )
+        raise HTTPException(status_code=500, detail="Artifact failed safety check")
 
     return ArtifactReadResponse(content=fenced, artifact=artifact)

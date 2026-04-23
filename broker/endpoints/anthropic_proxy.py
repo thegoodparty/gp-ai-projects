@@ -47,6 +47,9 @@ async def proxy_messages(
     broker_token = request.headers.get("x-api-key", "")
     if not broker_token:
         raise HTTPException(status_code=401, detail="Missing x-api-key header")
+    x_broker_token = request.headers.get("x-broker-token", "")
+    if x_broker_token and x_broker_token != broker_token:
+        raise HTTPException(status_code=400, detail="header_token_mismatch")
     try:
         ticket = broker_auth.verify(broker_token)
     except AuthError as exc:

@@ -426,6 +426,74 @@ class TestDatabricksReconnectOnStaleSession:
             client.execute("SELECT 1", {})
 
 
+class TestDatabricksQueryParameterTypeValidation:
+    """Parameters must be scalars (str/int/float/bool/None). Nested objects or
+    lists must be rejected at the Pydantic layer (422), never passed to the
+    Databricks SDK where behavior is undefined."""
+
+    def test_nested_object_parameter_value_is_rejected_with_422(self):
+        app, mock_db = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/databricks/query",
+            json={
+                "sql": "SELECT 1",
+                "parameters": {"x": {"nested": "object"}},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 422, (
+            f"expected 422 for non-scalar parameter value, got {resp.status_code}: {resp.text}"
+        )
+        assert mock_db.execute.call_count == 0
+
+    def test_list_parameter_value_is_rejected_with_422(self):
+        app, mock_db = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/databricks/query",
+            json={
+                "sql": "SELECT 1",
+                "parameters": {"x": [1, 2, 3]},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 422
+        assert mock_db.execute.call_count == 0
+
+
+class TestDatabricksQueryParameterValidationAlwaysRuns:
+    """validate_parameters must run even when `parameters` is empty. Otherwise
+    SQL with unbound `:placeholder` markers slips through to Databricks, where
+    the rewriter's scope guarantees no longer hold."""
+
+    def test_empty_params_with_unbound_placeholder_returns_400(self):
+        app, mock_db = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/databricks/query",
+            json={
+                "sql": "SELECT party FROM goodparty_data_catalog.gold.voter_file WHERE party = :missing_param",
+                "parameters": {},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 400, (
+            f"expected 400 for empty params + unbound placeholder, got {resp.status_code}: {resp.text}"
+        )
+        detail = resp.json()["detail"]
+        assert detail["reason_code"] == "parameter_mismatch", (
+            f"expected reason_code=parameter_mismatch, got {detail}"
+        )
+        assert mock_db.execute.call_count == 0
+
+
 class TestEventLoopNotBlockedByDatabricks:
     """Long Databricks queries must not serialize other in-flight requests.
 

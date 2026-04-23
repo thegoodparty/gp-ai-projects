@@ -233,6 +233,36 @@ class TestMintRunTokenConflict:
         )
         assert resp.status_code == 409
 
+    def test_duplicate_run_id_returns_409(self):
+        import boto3
+        from moto import mock_aws
+
+        with mock_aws():
+            ddb = boto3.client("dynamodb", region_name="us-west-2")
+            ddb.create_table(
+                TableName="scope-tickets-conflict",
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            store = ScopeTicketStore("scope-tickets-conflict", dynamodb_client=ddb)
+            app = _create_test_app(store=store)
+            client = TestClient(app)
+
+            first = client.post(
+                "/internal/mint-run-token",
+                json=_mint_payload(run_id="run-SQS-redelivery"),
+                headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+            )
+            assert first.status_code == 200
+
+            second = client.post(
+                "/internal/mint-run-token",
+                json=_mint_payload(run_id="run-SQS-redelivery"),
+                headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+            )
+            assert second.status_code == 409
+
 
 class TestMintRunTokenIdentifierValidation:
     """Identifiers are composed into S3 keys like

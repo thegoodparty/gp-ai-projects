@@ -6,6 +6,13 @@ from botocore.exceptions import ClientError
 from pydantic import BaseModel
 
 
+RUN_LOCK_PK_PREFIX = "run:"
+
+
+def _run_lock_pk(run_id: str) -> str:
+    return f"{RUN_LOCK_PK_PREFIX}{run_id}"
+
+
 class TicketAlreadyExistsError(Exception):
     pass
 
@@ -43,20 +50,46 @@ class ScopeTicketStore:
         if ticket.prior_artifact_versions is not None:
             item["prior_artifact_versions"] = {"S": json.dumps(ticket.prior_artifact_versions)}
 
+        run_lock_item = {
+            "pk": {"S": _run_lock_pk(ticket.run_id)},
+            "run_id": {"S": ticket.run_id},
+            "broker_token": {"S": ticket.pk},
+            "exp": {"N": str(ticket.exp)},
+        }
+
         now = int(time.time())
         try:
-            self._client.put_item(
-                TableName=self._table_name,
-                Item=item,
-                ConditionExpression="attribute_not_exists(pk) OR exp < :now",
-                ExpressionAttributeValues={":now": {"N": str(now)}},
+            self._client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self._table_name,
+                            "Item": item,
+                            "ConditionExpression": "attribute_not_exists(pk) OR exp < :now",
+                            "ExpressionAttributeValues": {":now": {"N": str(now)}},
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self._table_name,
+                            "Item": run_lock_item,
+                            "ConditionExpression": "attribute_not_exists(pk) OR exp < :now",
+                            "ExpressionAttributeValues": {":now": {"N": str(now)}},
+                        }
+                    },
+                ]
             )
         except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                raise TicketAlreadyExistsError(f"Ticket already exists for pk={ticket.pk}") from e
+            code = e.response["Error"]["Code"]
+            if code in ("TransactionCanceledException", "ConditionalCheckFailedException"):
+                raise TicketAlreadyExistsError(
+                    f"Ticket already exists for pk={ticket.pk} or run_id={ticket.run_id}"
+                ) from e
             raise
 
     def get_ticket(self, broker_token: str) -> ScopeTicket | None:
+        if broker_token.startswith(RUN_LOCK_PK_PREFIX):
+            return None
         response = self._client.get_item(
             TableName=self._table_name,
             Key={"pk": {"S": broker_token}},
@@ -90,4 +123,22 @@ class ScopeTicketStore:
         self._client.delete_item(
             TableName=self._table_name,
             Key={"pk": {"S": broker_token}},
+        )
+
+    def delete_ticket_and_run_lock(self, broker_token: str, run_id: str) -> None:
+        self._client.transact_write_items(
+            TransactItems=[
+                {
+                    "Delete": {
+                        "TableName": self._table_name,
+                        "Key": {"pk": {"S": broker_token}},
+                    }
+                },
+                {
+                    "Delete": {
+                        "TableName": self._table_name,
+                        "Key": {"pk": {"S": _run_lock_pk(run_id)}},
+                    }
+                },
+            ]
         )

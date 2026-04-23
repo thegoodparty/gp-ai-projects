@@ -19,7 +19,7 @@ ROW_CAP = 50000
 
 class QueryRequest(BaseModel):
     sql: str
-    parameters: dict = {}
+    parameters: dict[str, str | int | float | bool | None] = {}
 
 
 class QueryResponse(BaseModel):
@@ -111,14 +111,13 @@ async def databricks_query(
             detail={"reason_code": exc.reason_code, "detail": exc.detail},
         )
 
-    if req.parameters:
-        try:
-            validate_parameters(result.sql, req.parameters)
-        except ScopeViolation as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={"reason_code": exc.reason_code, "detail": exc.detail},
-            )
+    try:
+        validate_parameters(result.sql, req.parameters or {})
+    except ScopeViolation as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"reason_code": exc.reason_code, "detail": exc.detail},
+        )
 
     try:
         # The databricks-sql connector is sync-only. Run it on a worker thread so
