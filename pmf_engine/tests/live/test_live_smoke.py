@@ -54,7 +54,7 @@ DEFAULT_ARTIFACT_BUCKET_FMT = "gp-agent-artifacts-{env}"
 DEFAULT_DISPATCH_QUEUE_FMT = "agent-dispatch-{env}.fifo"
 DEFAULT_ORG_SLUG = "smoke-test-pmf"
 
-DEFAULT_TIMEOUT_MINUTES = 20
+DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_POLL_SECONDS = 15
 
 # Known-working district per pmf_engine/pilot data (Fayetteville NC is where

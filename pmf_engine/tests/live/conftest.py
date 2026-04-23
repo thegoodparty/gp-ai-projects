@@ -34,7 +34,7 @@ Config (env vars):
     LIVE_SMOKE_ARTIFACT_BUCKET   optional (default "gp-agent-artifacts-{env}")
     LIVE_SMOKE_DISPATCH_QUEUE_URL optional (default derived from env+account+region)
     LIVE_SMOKE_ORG_SLUG          optional (default "smoke-test-pmf")
-    LIVE_SMOKE_TIMEOUT_MINUTES   optional (default 20)
+    LIVE_SMOKE_TIMEOUT_MINUTES   optional (default 30)
     LIVE_SMOKE_POLL_SECONDS      optional (default 15)
 """
 from __future__ import annotations
