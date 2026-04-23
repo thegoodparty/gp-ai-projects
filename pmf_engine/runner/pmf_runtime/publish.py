@@ -1,3 +1,48 @@
+import logging
+import time
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE_SECONDS = 1.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ),
+    )
+
+
+def _with_retry(call_name: str, fn):
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == _MAX_ATTEMPTS - 1 or not _is_retryable(exc):
+                raise
+            delay = _BACKOFF_BASE_SECONDS * (2**attempt)
+            logger.warning(
+                f"{call_name} failed (attempt {attempt + 1}/{_MAX_ATTEMPTS}): "
+                f"{type(exc).__name__}: {exc}; retrying in {delay}s"
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def publish(artifact: dict) -> dict:
     from .config import get_config
     response = get_config().client.post("/artifact/publish", json={"artifact": artifact})
@@ -20,16 +65,17 @@ def report_status(
         body["duration_seconds"] = duration_seconds
     if cost_usd is not None:
         body["cost_usd"] = cost_usd
-    response = get_config().client.post("/internal/run-status", json=body)
-    response.raise_for_status()
-    return response.json()
+
+    def _call() -> dict:
+        response = get_config().client.post("/internal/run-status", json=body)
+        response.raise_for_status()
+        return response.json()
+
+    return _with_retry("report_status", _call)
 
 
 def upload_logs(files: dict[str, bytes]) -> dict:
     from .config import get_config
-    # Every part must use form field name "files" — the broker declares
-    # `files: list[UploadFile] = File(...)` which only binds parts named "files".
-    # Using the filename as the field name yields 422 Unprocessable Entity.
     file_parts = [("files", (name, data)) for name, data in files.items()]
     response = get_config().client.post("/internal/upload-logs", files=file_parts)
     response.raise_for_status()

@@ -167,8 +167,14 @@ async def run_agent(
     pending_tool_spans: dict[str, object] = {}
 
     def _log_jsonl(record: dict):
-        with open(conversation_jsonl, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        try:
+            with open(conversation_jsonl, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception as log_err:
+            logger.warning(
+                f"conversation.jsonl write failed (session={session_id}): "
+                f"{type(log_err).__name__}: {log_err}"
+            )
 
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):

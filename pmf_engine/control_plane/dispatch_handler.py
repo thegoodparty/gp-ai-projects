@@ -78,22 +78,25 @@ def send_error_callback(
     error: str,
     callback_queue_url: str,
     dedup_id: str | None = None,
-):
+) -> bool:
     """Send a `failed` callback to gp-api's results queue.
 
+    Returns True if the SQS send succeeded, False otherwise (missing queue
+    URL, SQS outage, or IAM regression). Callers use the return value to
+    decide whether to add to `batch_item_failures`: if the callback did NOT
+    reach gp-api, the dispatch message itself must be retried so we can try
+    the callback again — otherwise the run row is stuck PENDING forever.
+
     Wire format MUST match what the broker's CallbackSender emits so gp-api's
-    AgentExperimentResultSchema (zod) parses it — otherwise the message hits
-    the DLQ and the ExperimentRun row stays PENDING forever.
-
-    Envelope: `{type: "agentExperimentResult", data: {experimentId, runId,
-    organizationSlug, status, error, reasonCode, detail}}` — camelCase, enveloped.
-
-    Dedup IDs align with the broker (`{run_id}-{status}`) + MessageGroupId
-    matches (`agentExperiments`) so a dispatch-error-then-runner-success race
-    is eligible for FIFO dedupe.
+    AgentExperimentResultSchema (zod) parses it.
     """
     if not callback_queue_url:
-        return
+        logger.error(
+            "send_error_callback: no callback_queue_url configured; "
+            "cannot notify gp-api of dispatch failure for run %s",
+            message.get("run_id", "unknown"),
+        )
+        return False
     try:
         run_id = message.get("run_id", "unknown")
         body = json.dumps({
@@ -115,8 +118,10 @@ def send_error_callback(
             MessageDeduplicationId=dedup_id or f"{run_id}-failed",
         )
         logger.info(f"Sent error callback for run {run_id}: {error}")
+        return True
     except Exception as e:
         logger.exception(f"Failed to send error callback: {e}")
+        return False
 
 ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 ECS_TASK_DEFINITION = os.environ.get("ECS_TASK_DEFINITION", "")
@@ -149,6 +154,36 @@ def _missing_critical_config() -> list[str]:
 
 MAX_PARAMS_JSON_BYTES = 6000
 
+import re
+
+_PRIOR_ARTIFACT_VALUE_RE = re.compile(
+    r"^[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_-]{1,64}/artifact\.json$"
+)
+
+
+_PRIOR_ARTIFACT_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _validate_prior_artifact_versions(versions) -> None:
+    if versions is None:
+        return
+    if not isinstance(versions, dict):
+        raise ValueError(
+            f"prior_artifact_versions must be an object, got {type(versions).__name__}"
+        )
+    for key, value in versions.items():
+        if not isinstance(key, str) or not _PRIOR_ARTIFACT_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"prior_artifact_versions key must match "
+                f"[A-Za-z0-9_-]{{1,64}}: got {key!r}"
+            )
+        if not isinstance(value, str) or not _PRIOR_ARTIFACT_VALUE_RE.fullmatch(value):
+            raise ValueError(
+                f"prior_artifact_versions[{key!r}] must match "
+                f"'<experiment_id>/<run_id>/artifact.json' pattern "
+                f"(segments [A-Za-z0-9_-]{{1,64}}): got {value!r}"
+            )
+
 
 def parse_dispatch_message(body: str) -> dict:
     try:
@@ -162,6 +197,8 @@ def parse_dispatch_message(body: str) -> dict:
 
     if data.get("params") is None:
         data["params"] = {}
+
+    _validate_prior_artifact_versions(data.get("prior_artifact_versions"))
     return data
 
 
@@ -258,12 +295,14 @@ def handler(event: dict, context) -> dict:
                 f"got {type_name}, expected object"
             )
             emit_dispatch_metric("InvalidParamsType", experiment_id)
-            send_error_callback(
+            sent = send_error_callback(
                 message,
                 f"params must be a JSON object, got {type_name}",
                 RESULTS_QUEUE_URL,
                 dedup_id=f"invalid-params-type-{message['run_id']}",
             )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         params_json = json.dumps(message["params"])
@@ -275,12 +314,14 @@ def handler(event: dict, context) -> dict:
                 f"{params_bytes} bytes > {MAX_PARAMS_JSON_BYTES}"
             )
             emit_dispatch_metric("ParamsTooLarge", experiment_id)
-            send_error_callback(
+            sent = send_error_callback(
                 message,
                 f"Experiment parameters exceed size limit ({params_bytes} > {MAX_PARAMS_JSON_BYTES} bytes)",
                 RESULTS_QUEUE_URL,
                 dedup_id=f"params-too-large-{message['run_id']}",
             )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         required = experiment.get("required_params", [])
@@ -292,12 +333,14 @@ def handler(event: dict, context) -> dict:
                 f"{missing}"
             )
             emit_dispatch_metric("MissingRequiredParams", experiment_id)
-            send_error_callback(
+            sent = send_error_callback(
                 message,
                 f"Missing required params for {experiment_id}: {missing}",
                 RESULTS_QUEUE_URL,
                 dedup_id=f"missing-params-{message['run_id']}",
             )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         scope = derive_scope(experiment_id, message["params"])
@@ -315,16 +358,30 @@ def handler(event: dict, context) -> dict:
             )
         except BrokerError as e:
             logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
-            send_error_callback(
+            sent = send_error_callback(
                 message,
                 e.user_safe_message or "Broker rejected the request",
                 RESULTS_QUEUE_URL,
                 dedup_id=f"broker-rejected-{message['run_id']}",
             )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
-        except (httpx.HTTPError, Exception) as e:
+        except httpx.HTTPError as e:
+            logger.warning(
+                f"Transient network error during mint for run {message.get('run_id')}: {e}"
+            )
+            batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+        except Exception as e:
             logger.exception(
-                f"Transient error during mint for run {message.get('run_id')}: {e}"
+                f"Unexpected error during mint for run {message.get('run_id')}: {e}"
+            )
+            send_error_callback(
+                message,
+                f"Unexpected dispatch error: {type(e).__name__}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"mint-exception-{message.get('run_id', 'unknown')}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
@@ -339,6 +396,8 @@ def handler(event: dict, context) -> dict:
         )
 
         logger.info(f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})")
+
+        minted_broker_token = mint_result["broker_token"]
 
         try:
             response = get_ecs_client().run_task(
@@ -361,6 +420,7 @@ def handler(event: dict, context) -> dict:
             if failures or not tasks:
                 failure_reasons = [f.get("reason", "unknown") for f in failures]
                 logger.error(f"ECS RunTask failed for {message_id}: {failure_reasons}")
+                _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
                 send_error_callback(
                     message,
                     f"ECS RunTask failed: {failure_reasons}",
@@ -375,6 +435,7 @@ def handler(event: dict, context) -> dict:
 
         except Exception as e:
             logger.exception(f"ECS RunTask exception for {message_id}: {e}")
+            _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
             send_error_callback(
                 message,
                 f"ECS RunTask exception: {e}",
@@ -384,3 +445,13 @@ def handler(event: dict, context) -> dict:
             batch_item_failures.append({"itemIdentifier": message_id})
 
     return {"batchItemFailures": batch_item_failures}
+
+
+def _cleanup_minted_token(broker, broker_token: str, run_id: str) -> None:
+    try:
+        broker.delete_run_token(broker_token=broker_token, run_id=run_id)
+    except Exception as e:
+        logger.warning(
+            f"Failed to delete run-token for run {run_id} after ECS failure: "
+            f"{type(e).__name__}: {e}. Ticket + run-lock will expire via TTL."
+        )

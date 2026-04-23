@@ -6,6 +6,45 @@ import pytest
 from pmf_engine.control_plane.broker_client import BrokerClient, BrokerError
 
 
+class TestDeleteRunToken:
+    """Covers CRITICAL #1 companion: after ecs.run_task fails following a
+    successful mint, dispatch_handler must call DELETE to free the run-lock
+    so the same run_id can be re-dispatched without falsely 409-ing."""
+
+    def test_posts_to_internal_delete_run_token(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 204
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response) as mock_post:
+            client = BrokerClient("https://broker.example.com", "svc-token-xyz")
+            client.delete_run_token(broker_token="tok-abc", run_id="run-001")
+
+        url = mock_post.call_args.args[0]
+        assert url == "https://broker.example.com/internal/delete-run-token"
+        body = mock_post.call_args.kwargs["json"]
+        assert body["broker_token"] == "tok-abc"
+        assert body["run_id"] == "run-001"
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer svc-token-xyz"
+
+    def test_raises_broker_error_on_401(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+
+        with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response):
+            client = BrokerClient("https://broker.example.com", "bad-token")
+            with pytest.raises(BrokerError) as exc_info:
+                client.delete_run_token("tok-abc", "run-001")
+            assert exc_info.value.status_code == 401
+
+    def test_accepts_204_as_success(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 204
+        with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response):
+            client = BrokerClient("https://broker.example.com", "tok")
+            client.delete_run_token("tok-abc", "run-001")
+
+
 class TestMintRunTokenSuccess:
     def test_returns_dict_with_broker_token(self):
         mock_response = MagicMock()

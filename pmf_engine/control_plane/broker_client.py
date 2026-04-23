@@ -50,3 +50,16 @@ class BrokerClient:
             raise BrokerError(409, "Duplicate run_id")
         response.raise_for_status()
         return response.json()
+
+    def delete_run_token(self, broker_token: str, run_id: str) -> None:
+        response = httpx.post(
+            f"{self.broker_url}/internal/delete-run-token",
+            json={"broker_token": broker_token, "run_id": run_id},
+            headers={"Authorization": f"Bearer {self.service_token}"},
+            timeout=10.0,
+        )
+        if response.status_code in (200, 204):
+            return
+        if response.status_code == 401:
+            raise BrokerError(401, "Invalid service token")
+        response.raise_for_status()

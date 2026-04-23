@@ -107,6 +107,86 @@ class TestReportStatus:
         assert captured["body"]["cost_usd"] == 0.37
 
 
+class TestReportStatusRetry:
+    def setup_method(self):
+        import pmf_engine.runner.pmf_runtime.config as config_mod
+        config_mod._config = None
+
+    def test_report_status_retries_on_transient_5xx(self, monkeypatch):
+        attempts = {"count": 0}
+        sleeps: list[float] = []
+
+        def handler(request):
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                return httpx.Response(502, json={"detail": "broker restarting"})
+            return httpx.Response(200, json={"ack": True})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", sleeps.append
+        )
+
+        result = report_status("failed", reason_code="x")
+        assert result["ack"] is True
+        assert attempts["count"] == 3
+        assert len(sleeps) == 2
+        assert sleeps == [1.0, 2.0]
+
+    def test_report_status_retries_on_connect_error(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            if attempts["count"] <= 1:
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(200, json={"ack": True})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        result = report_status("running")
+        assert result["ack"] is True
+        assert attempts["count"] == 2
+
+    def test_report_status_does_not_retry_on_4xx(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            return httpx.Response(401, json={"detail": "scope_ticket_missing"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            report_status("running")
+        assert attempts["count"] == 1, (
+            "4xx must fail fast — retrying on auth/client errors wastes "
+            "time and makes the error visible later"
+        )
+
+    def test_report_status_exhausts_retries_and_re_raises(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            return httpx.Response(503, json={"detail": "service unavailable"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            report_status("failed")
+        assert attempts["count"] == 3
+
+
 class TestUploadLogs:
     def setup_method(self):
         import pmf_engine.runner.pmf_runtime.config as config_mod

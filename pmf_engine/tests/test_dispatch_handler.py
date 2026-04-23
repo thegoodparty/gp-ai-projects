@@ -926,3 +926,340 @@ class TestTransientBrokerErrors:
         assert result["batchItemFailures"] == []
         mock_send_error_callback.assert_called_once()
         mock_get_ecs.return_value.run_task.assert_not_called()
+
+
+class TestDispatchHandlerErrorPathResilience:
+    """Covers CRITICAL #3: ensure non-HTTPError exceptions during mint land
+    an error callback AND a batch_item_failures entry (so gp-api sees the
+    failure immediately AND SQS retries eventually reach the DLQ alarm).
+    Also covers: if send_error_callback fails at the SQS layer, the caller
+    must add to batch_item_failures so the message is re-delivered."""
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_programmer_error_during_mint_sends_callback_and_retries(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        mock_broker_cls.side_effect = KeyError("missing config key somewhere")
+        mock_send_error_callback.return_value = True
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-prog-err",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        call_args = mock_send_error_callback.call_args
+        assert "run-prog-err" in str(call_args) or "run-prog-err" in call_args.kwargs.get(
+            "dedup_id", ""
+        )
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_validation_error_with_failed_callback_adds_to_batch_item_failures(
+        self, mock_get_ecs, mock_send_error_callback
+    ):
+        mock_send_error_callback.return_value = False
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-missing-params",
+            "params": {},
+        })
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}], (
+            "When the SQS send of the error callback fails, the message must "
+            "be retried so gp-api isn't left in PENDING forever"
+        )
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_validation_error_with_successful_callback_does_not_retry(
+        self, mock_get_ecs, mock_send_error_callback
+    ):
+        mock_send_error_callback.return_value = True
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-missing-params-ok",
+            "params": {},
+        })
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        assert result["batchItemFailures"] == [], (
+            "A successful error callback means gp-api is already aware of "
+            "the FAILED state; SQS retry would spam duplicate callbacks"
+        )
+
+
+class TestSendErrorCallbackReturnValue:
+    """send_error_callback signals success (True) or failure (False) so
+    callers can decide whether to retry via batch_item_failures."""
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    def test_returns_true_on_successful_sqs_send(self, mock_get_sqs):
+        from pmf_engine.control_plane.dispatch_handler import send_error_callback
+
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.return_value = {"MessageId": "ok"}
+        mock_get_sqs.return_value = mock_sqs
+
+        result = send_error_callback(
+            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            "err",
+            "https://sqs.example.com/q.fifo",
+        )
+        assert result is True
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    def test_returns_false_on_sqs_failure(self, mock_get_sqs):
+        from pmf_engine.control_plane.dispatch_handler import send_error_callback
+
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = RuntimeError("SQS unavailable")
+        mock_get_sqs.return_value = mock_sqs
+
+        result = send_error_callback(
+            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            "err",
+            "https://sqs.example.com/q.fifo",
+        )
+        assert result is False
+
+    def test_returns_false_when_queue_url_is_empty(self):
+        from pmf_engine.control_plane.dispatch_handler import send_error_callback
+
+        result = send_error_callback(
+            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            "err",
+            "",
+        )
+        assert result is False, (
+            "Empty queue URL means the callback went nowhere; caller must "
+            "retry via batch_item_failures rather than silently ACK"
+        )
+
+
+class TestPriorArtifactVersionsValidation:
+    """Covers CRITICAL #9: a malicious/compromised SQS producer must not be
+    able to pin cross-org or path-traversal artifact keys via
+    prior_artifact_versions. The broker's artifact_read trusts the ticket's
+    prior_artifact_versions for dependency reads, so dispatch must validate
+    the shape before minting a ticket with untrusted values.
+
+    Allowed pattern: `{experiment_id}/{run_id}/artifact.json` where each
+    segment is `[A-Za-z0-9_-]{1,64}`.
+    """
+
+    def test_rejects_path_traversal_in_value(self):
+        body = {
+            "experiment_id": "peer_city_benchmarking",
+            "organization_slug": "acme",
+            "run_id": "run-1",
+            "params": {},
+            "prior_artifact_versions": {
+                "district_intel": "../../etc/passwd",
+            },
+        }
+        with pytest.raises(ValueError, match="prior_artifact_versions"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_cross_org_artifact_key(self):
+        body = {
+            "experiment_id": "peer_city_benchmarking",
+            "organization_slug": "acme",
+            "run_id": "run-2",
+            "params": {},
+            "prior_artifact_versions": {
+                "district_intel": "district_intel/other-org-run-id/artifact.json/../secrets.txt",
+            },
+        }
+        with pytest.raises(ValueError, match="prior_artifact_versions"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_wrong_file_suffix(self):
+        body = {
+            "experiment_id": "peer_city_benchmarking",
+            "organization_slug": "acme",
+            "run_id": "run-3",
+            "params": {},
+            "prior_artifact_versions": {
+                "district_intel": "district_intel/abc-123/latest.json",
+            },
+        }
+        with pytest.raises(ValueError, match="prior_artifact_versions"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_empty_segment(self):
+        body = {
+            "experiment_id": "peer_city_benchmarking",
+            "organization_slug": "acme",
+            "run_id": "run-4",
+            "params": {},
+            "prior_artifact_versions": {
+                "district_intel": "/abc-123/artifact.json",
+            },
+        }
+        with pytest.raises(ValueError, match="prior_artifact_versions"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_accepts_valid_prior_artifact_key(self):
+        body = {
+            "experiment_id": "peer_city_benchmarking",
+            "organization_slug": "acme",
+            "run_id": "run-5",
+            "params": {},
+            "prior_artifact_versions": {
+                "district_intel": "district_intel/d188bc17-87bd-4fe0-9b45-d34d3b301d98/artifact.json",
+            },
+        }
+        result = parse_dispatch_message(json.dumps(body))
+        assert result["prior_artifact_versions"] == body["prior_artifact_versions"]
+
+    def test_accepts_absent_prior_artifact_versions(self):
+        body = {
+            "experiment_id": "district_intel",
+            "organization_slug": "acme",
+            "run_id": "run-6",
+            "params": {},
+        }
+        result = parse_dispatch_message(json.dumps(body))
+        assert "prior_artifact_versions" not in result or result["prior_artifact_versions"] is None
+
+    def test_rejects_non_dict_prior_artifact_versions(self):
+        body = {
+            "experiment_id": "district_intel",
+            "organization_slug": "acme",
+            "run_id": "run-7",
+            "params": {},
+            "prior_artifact_versions": "not-a-dict",
+        }
+        with pytest.raises(ValueError, match="prior_artifact_versions"):
+            parse_dispatch_message(json.dumps(body))
+
+
+class TestRunTaskFailureCleansUpMintedTicket:
+    """Covers CRITICAL #1 companion: when ecs.run_task fails after a
+    successful mint, the freshly-issued broker_token + run-lock must be
+    deleted so (a) the token can't be reused from logs/CloudWatch and (b)
+    the same run_id is free to be re-dispatched immediately.
+
+    Without this, a retry of the same run_id 409s against the stale
+    run-lock until the lock's TTL expires (~4h)."""
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_ecs_run_task_returns_failures_triggers_delete_run_token(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        mock_broker = _mock_broker_success("tok-to-clean")
+        mock_broker_cls.return_value = mock_broker
+        mock_get_ecs.return_value.run_task.return_value = {
+            "failures": [{"reason": "CAPACITY_EXHAUSTED"}],
+            "tasks": [],
+        }
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-ecs-cap",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        handler(event, None)
+
+        mock_broker.delete_run_token.assert_called_once_with(
+            broker_token="tok-to-clean", run_id="run-ecs-cap"
+        )
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_ecs_run_task_raises_triggers_delete_run_token(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        mock_broker = _mock_broker_success("tok-to-clean-exc")
+        mock_broker_cls.return_value = mock_broker
+        mock_get_ecs.return_value.run_task.side_effect = RuntimeError(
+            "ECS control plane transient"
+        )
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-ecs-boom",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        handler(event, None)
+
+        mock_broker.delete_run_token.assert_called_once_with(
+            broker_token="tok-to-clean-exc", run_id="run-ecs-boom"
+        )
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_delete_run_token_failure_does_not_prevent_error_callback(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        mock_broker = _mock_broker_success("tok-doomed")
+        mock_broker.delete_run_token.side_effect = RuntimeError("broker unreachable")
+        mock_broker_cls.return_value = mock_broker
+        mock_get_ecs.return_value.run_task.side_effect = RuntimeError(
+            "ECS transient"
+        )
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-double-fail",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}], (
+            "delete_run_token failing must NOT mask the primary ECS failure — "
+            "the error callback + batch_item_failures must still fire"
+        )
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_successful_run_task_does_not_call_delete_run_token(
+        self, mock_get_ecs, mock_broker_cls
+    ):
+        mock_broker = _mock_broker_success("tok-good")
+        mock_broker_cls.return_value = mock_broker
+        mock_get_ecs.return_value.run_task.return_value = {
+            "failures": [],
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+        }
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-x",
+            "run_id": "run-ok",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        handler(event, None)
+
+        mock_broker.delete_run_token.assert_not_called()

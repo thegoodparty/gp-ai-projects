@@ -530,6 +530,65 @@ async def test_system_prompt_contains_injection_warning():
 
 
 @pytest.mark.asyncio
+async def test_log_jsonl_does_not_crash_agent_on_disk_failure():
+    import logging
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from pmf_engine.runner.harness import claude_sdk as claude_sdk_module
+
+    async def fake_query(prompt, options):
+        yield AssistantMessage(
+            model="sonnet",
+            content=[TextBlock(text="hello from the agent")],
+        )
+        yield _make_result_message(
+            result="Done", total_cost_usd=0.07, num_turns=2, session_id="sess-disk-full"
+        )
+
+    real_open = open
+
+    def failing_open(path, *args, **kwargs):
+        if isinstance(path, str) and path.endswith("conversation.jsonl"):
+            raise OSError("No space left on device")
+        return real_open(path, *args, **kwargs)
+
+    warning_records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warning_records.append(record)
+
+    capture_handler = _Capture(level=logging.WARNING)
+    claude_sdk_module.logger.addHandler(capture_handler)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = os.path.join(tmpdir, "output")
+            os.makedirs(output_dir)
+            with open(os.path.join(output_dir, "result.json"), "w") as f:
+                json.dump({"ok": True}, f)
+
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query), \
+                 patch("builtins.open", side_effect=failing_open):
+                harness = ClaudeSdkHarness()
+                result = await harness.run(
+                    instruction="Do stuff",
+                    model="sonnet",
+                    max_turns=5,
+                    workspace_dir=tmpdir,
+                    params={},
+                )
+    finally:
+        claude_sdk_module.logger.removeHandler(capture_handler)
+
+    assert result.cost_usd == 0.07
+    assert result.session_id == "sess-disk-full"
+    warning_text = " ".join(r.getMessage() for r in warning_records)
+    assert "OSError" in warning_text or "No space" in warning_text, (
+        f"Expected an OSError warning from _log_jsonl, got: {warning_text!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_params_wrapped_in_untrusted_data_delimiter():
     captured = {}
 
