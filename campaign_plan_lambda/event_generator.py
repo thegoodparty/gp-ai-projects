@@ -107,11 +107,16 @@ class CampaignEventTask(BaseModel):
 
 
 def _or_not_available(v: Optional[str]) -> str:
-    """Return the value or the 'not available' sentinel. Empty strings count as missing."""
+    """Return the value or the 'not available' sentinel. Empty/whitespace
+    strings count as missing. Angle brackets are HTML-escaped so untrusted
+    content (e.g. a city value containing `</city>`) cannot break out of the
+    XML-style wrapper tags in the prompt."""
     if v is None:
         return NOT_AVAILABLE
     stripped = v.strip()
-    return stripped if stripped else NOT_AVAILABLE
+    if not stripped:
+        return NOT_AVAILABLE
+    return stripped.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _build_prompt_variables(

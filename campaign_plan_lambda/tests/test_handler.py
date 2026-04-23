@@ -136,6 +136,24 @@ class TestInputValidation:
         assert body.officeLevel is None
         assert body.primaryElectionDate is None
 
+    def test_whitespace_only_optional_fields_normalize_to_none(self):
+        # Same as empty strings — a whitespace-only value on a date field would
+        # otherwise trip the ISO-format check and DLQ the message.
+        body = SqsMessageBody(
+            campaignId=123,
+            electionDate="2026-11-04",
+            state="   ",
+            city="\t\n ",
+            officeName="  ",
+            officeLevel=" ",
+            primaryElectionDate="   ",
+        )
+        assert body.state is None
+        assert body.city is None
+        assert body.officeName is None
+        assert body.officeLevel is None
+        assert body.primaryElectionDate is None
+
     def test_empty_election_date_still_rejected(self):
         # electionDate is required — "" is a real validation error, not a fallback trigger.
         with pytest.raises(ValidationError):

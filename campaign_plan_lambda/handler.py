@@ -59,16 +59,19 @@ class SqsMessageBody(BaseModel):
     officeLevel: Optional[str] = None
     primaryElectionDate: Optional[str] = None
 
-    # Empty strings from gp-api collapse to None so the "not available" fallback
-    # fires uniformly downstream. electionDate is excluded — it's required, so
-    # "" is a real validation error.
+    # Blank optional strings from gp-api collapse to None so the "not available"
+    # fallback fires uniformly downstream. Whitespace-only strings count as
+    # blank. electionDate is excluded — it's required, so blank input is a real
+    # validation error.
     @field_validator(
         "state", "city", "officeName", "officeLevel", "primaryElectionDate",
         mode="before",
     )
     @classmethod
-    def _empty_string_to_none(cls, v):
-        return None if v == "" else v
+    def _blank_string_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @field_validator("electionDate")
     @classmethod
