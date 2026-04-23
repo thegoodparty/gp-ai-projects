@@ -92,23 +92,23 @@ class TestInputValidation:
         assert body.campaignId == 123
 
     def test_missing_campaign_id_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(**{"electionDate": "2026-11-04"})
 
     def test_missing_election_date_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(**{"campaignId": 123})
 
     def test_invalid_campaign_id_type_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(**{"campaignId": "not-a-number", "electionDate": "2026-11-04"})
 
     def test_invalid_election_date_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(**{"campaignId": 123, "electionDate": "not-a-date"})
 
     def test_invalid_primary_election_date_rejected(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(
                 campaignId=123, electionDate="2026-11-04", primaryElectionDate="not-a-date"
             )
@@ -138,7 +138,7 @@ class TestInputValidation:
 
     def test_empty_election_date_still_rejected(self):
         # electionDate is required — "" is a real validation error, not a fallback trigger.
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SqsMessageBody(campaignId=123, electionDate="")
 
     def test_invalid_json_raises(self):
