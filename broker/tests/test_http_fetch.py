@@ -295,21 +295,21 @@ class TestSSRFRedirectReValidation:
 
     def test_validate_url_called_for_initial_url_and_every_redirect_hop(self, monkeypatch):
         """Regression guard against a refactor that drops per-hop validation.
-        Without this assertion, a refactor that moves _validate_url back out of
+        Without this assertion, a refactor that moves validate_url back out of
         the loop (or sets follow_redirects=True) could pass the existing tests
         because they only check the FINAL outcome — not that the SSRF guard
         actually ran on each hop's URL.
         """
-        from broker.endpoints import http_fetch as mod
+        from broker import ssrf_guard
 
         validated: list[str] = []
-        real_validate = mod._validate_url
+        real_validate = ssrf_guard.validate_url
 
         async def spy_validate(url: str) -> None:
             validated.append(url)
             await real_validate(url)
 
-        monkeypatch.setattr(mod, "_validate_url", spy_validate)
+        monkeypatch.setattr(ssrf_guard, "validate_url", spy_validate)
 
         app = self._create_app_with_redirects([
             self._redirect_response("https://example.com/hop-1"),

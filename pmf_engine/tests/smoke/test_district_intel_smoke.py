@@ -292,6 +292,64 @@ def test_district_intel_contract_violation_path(broker_client, aws):
     assert data["error"] == "artifact.issues[0].title is required"
 
 
+def test_http_fetch_follows_relative_redirect(broker_client, aws, fake_http):
+    """Deterministic coverage for the round-3 `urljoin` fix — exercise the
+    relative-redirect path through the full broker → resolve_redirects →
+    SSRF re-validate → final GET chain that live smoke can't hit reliably.
+
+    Pre-fix: the broker's redirect loop assigned `current_url = location`
+    directly, so a relative Location like `/agendas/council.html` became an
+    argument to `_validate_url` with scheme="" → 400 "URL must use https
+    scheme". The `urljoin` fix resolves relative Location against the
+    current URL before re-validation, restoring RFC 7231 conformance.
+    """
+    run_id = "smoke-district-intel-redirect-001"
+
+    broker_token = mint_ticket(
+        broker_client,
+        experiment_id="district_intel",
+        run_id=run_id,
+        organization_slug="test-org-smoke",
+        params=DISTRICT_INTEL_PARAMS,
+        scope=DISTRICT_INTEL_SCOPE,
+        timeout_seconds=600,
+    )
+
+    redirect_from = "https://city.example.gov/agenda"
+    fake_http(
+        broker_client,
+        {
+            redirect_from: {
+                "status": 302,
+                "body": "",
+                "headers": {"location": "/agendas/council-2026-04.html"},
+            },
+            CANNED_AGENDA_URL: {
+                "status": 200,
+                "body": CANNED_AGENDA_HTML,
+                "headers": {"content-type": "text/html; charset=utf-8"},
+            },
+        },
+    )
+
+    resp = broker_client.post(
+        "/http/fetch",
+        headers={"x-broker-token": broker_token},
+        json={"url": redirect_from, "purpose": "council-agenda-research-via-redirect"},
+    )
+
+    assert resp.status_code == 200, (
+        f"relative redirect should follow cleanly via urljoin, got "
+        f"{resp.status_code} {resp.text}"
+    )
+    body = resp.json()
+    assert body["status"] == 200
+    assert body["source_url"] == CANNED_AGENDA_URL, (
+        f"final source_url must be the resolved absolute URL, got {body['source_url']!r}"
+    )
+    assert "Fayetteville City Council" in body["body"]
+
+
 def test_district_intel_artifact_uses_real_contract_schema():
     """Guardrail against local smoke-test drift.
 

@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call
@@ -642,3 +643,147 @@ class TestArtifactPublishTrackerCleanup:
         assert resp.status_code == 200
         assert tracker.get(ticket.pk) == 0
         assert ticket.pk not in tracker._counts
+
+
+class TestArtifactPublishLatestJsonFailureIsBestEffort:
+    """The archive at {experiment_id}/{run_id}/artifact.json is AUTHORITATIVE —
+    callback + gp-api use the run-scoped key. latest.json is a documented
+    legacy convenience pointer (CLI / debug), eventually consistent by design.
+
+    If latest.json's put transiently fails after the archive succeeded,
+    re-raising 500 triggers runner-level retry. Attempt 2 hits IfNoneMatch=*
+    on the archive → 412 → mapped to 409 → non-retryable → agent reports
+    FAILED → ticket cleaned up. Result: archive exists in S3 with no
+    ExperimentRun row pointing at it (orphan).
+
+    Fix: latest.json failures are logged and swallowed. Callback proceeds
+    with the run-scoped key.
+    """
+
+    def _latest_only_error(self, archive_key: str, latest_key: str):
+        from botocore.exceptions import ClientError
+
+        latest_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == latest_key:
+                raise latest_error
+            return {}
+
+        return side_effect, latest_error
+
+    def test_latest_json_failure_does_not_abort_publish(self):
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-run-latest-flake",
+        )
+        archive_key = "district_intel/di-run-latest-flake/artifact.json"
+        latest_key = "district_intel/42/latest.json"
+
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        side_effect, _ = self._latest_only_error(archive_key, latest_key)
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["artifact_key"] == archive_key
+        assert body["callback_sent"] is True
+
+        mock_sender.send_result.assert_called_once()
+        call_kwargs = mock_sender.send_result.call_args.kwargs
+        assert call_kwargs["artifact_key"] == archive_key
+        assert call_kwargs["status"] == "success"
+
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-run-latest-flake"
+        )
+
+    def test_latest_json_failure_logs_warning_with_context(self, caplog):
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-run-latest-log",
+        )
+        archive_key = "district_intel/di-run-latest-log/artifact.json"
+        latest_key = "district_intel/42/latest.json"
+        bucket = "gp-agent-artifacts-dev"
+
+        app, mock_s3, _, _ = _create_app(ticket=ticket, bucket=bucket)
+        side_effect, _ = self._latest_only_error(archive_key, latest_key)
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        with caplog.at_level(logging.WARNING, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact()},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == "broker.endpoints.artifact_publish"
+        ]
+        assert len(warning_records) >= 1, (
+            f"expected warning from artifact_publish, got: "
+            f"{[(r.name, r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        msg = warning_records[0].getMessage()
+        assert "di-run-latest-log" in msg
+        assert latest_key in msg
+        assert bucket in msg
+
+    def test_archive_write_failure_still_aborts_publish(self):
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-run-archive-flake",
+        )
+        archive_key = "district_intel/di-run-archive-flake/artifact.json"
+
+        from botocore.exceptions import ClientError
+
+        archive_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == archive_key:
+                raise archive_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 500
+        mock_sender.send_result.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()

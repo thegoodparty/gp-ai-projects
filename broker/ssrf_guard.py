@@ -18,9 +18,12 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import httpx
 from fastapi import HTTPException
+
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 async def validate_url(url: str) -> None:
@@ -77,3 +80,49 @@ def reject_if_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None
             status_code=400,
             detail=f"URL resolves to blocked address range: {ip}",
         )
+
+
+async def resolve_redirects(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    timeout: float,
+    max_redirects: int = 5,
+) -> tuple[httpx.Response, str]:
+    """Resolve HTTP redirects manually with per-hop SSRF re-validation.
+
+    Returns (final_response, final_url). Each hop's URL is validated via
+    `validate_url()` BEFORE the request is issued, so an upstream 302 into
+    169.254.169.254 / 10.x.x.x / non-https cannot reach the network.
+
+    Relative and protocol-relative Location headers are resolved against
+    the current URL via `urllib.parse.urljoin`.
+
+    Raises HTTPException on:
+      - 3xx response missing Location header -> 502
+      - Hop count exceeding max_redirects -> 400
+      - SSRF violations (via validate_url) -> 400
+    """
+    current_url = url
+    request = getattr(client, method.lower())
+    for hop in range(max_redirects + 1):
+        await validate_url(current_url)
+        resp = await request(current_url, timeout=timeout, follow_redirects=False)
+        if resp.status_code not in _REDIRECT_STATUSES:
+            return resp, current_url
+        location = resp.headers.get("location")
+        if not location:
+            raise HTTPException(
+                status_code=502,
+                detail="redirect response missing Location header",
+            )
+        if hop == max_redirects:
+            raise HTTPException(
+                status_code=400,
+                detail=f"too many redirects (max {max_redirects})",
+            )
+        current_url = urljoin(current_url, location)
+    raise HTTPException(
+        status_code=400,
+        detail=f"too many redirects (max {max_redirects})",
+    )

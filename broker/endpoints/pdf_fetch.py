@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,8 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from broker.dynamodb_client import ScopeTicket
-from broker.ssrf_guard import reject_if_private as _reject_if_private
-from broker.ssrf_guard import validate_url as _validate_url
+from broker.ssrf_guard import resolve_redirects
 
 logger = logging.getLogger(__name__)
 
@@ -42,31 +40,10 @@ async def pdf_fetch(
     ticket: ScopeTicket = Depends(get_scope_ticket),
     client: httpx.AsyncClient = Depends(get_httpx_client),
 ):
-    # Manual redirect loop with per-hop SSRF re-validation. Using
-    # follow_redirects=True would let a 302 into 169.254.169.254 or 10.x.x.x
-    # bypass the initial _validate_url check.
-    current_url = req.url
-    head = None
     try:
-        for hop in range(MAX_REDIRECTS + 1):
-            await _validate_url(current_url)
-            head = await client.head(
-                current_url, timeout=HEAD_TIMEOUT, follow_redirects=False
-            )
-            if head.status_code not in (301, 302, 303, 307, 308):
-                break
-            location = head.headers.get("location")
-            if not location:
-                raise HTTPException(
-                    status_code=502,
-                    detail="redirect response missing Location header",
-                )
-            if hop == MAX_REDIRECTS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"too many redirects (max {MAX_REDIRECTS})",
-                )
-            current_url = urljoin(current_url, location)
+        head, current_url = await resolve_redirects(
+            client, "HEAD", req.url, HEAD_TIMEOUT, MAX_REDIRECTS
+        )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"HEAD request failed: {e}")
 

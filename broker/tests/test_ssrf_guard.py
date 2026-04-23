@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
-from broker.ssrf_guard import reject_if_private, validate_url
+from broker.ssrf_guard import reject_if_private, resolve_redirects, validate_url
 
 
 def _fake_getaddrinfo_factory(ip_literal: str):
@@ -182,3 +183,145 @@ class TestRejectIfPrivate:
 
     def test_reject_if_private_accepts_public_ipv6(self):
         reject_if_private(ipaddress.ip_address("2001:4860:4860::8888"))
+
+
+def _response(status: int, headers: dict[str, str] | None = None, method: str = "GET", url: str = "https://example.com/") -> httpx.Response:
+    return httpx.Response(
+        status_code=status,
+        headers=headers or {},
+        request=httpx.Request(method, url),
+    )
+
+
+def _make_client_returning(responses_by_url: dict[str, httpx.Response]) -> MagicMock:
+    client = MagicMock(spec=httpx.AsyncClient)
+
+    async def _dispatch(url, timeout, follow_redirects):
+        return responses_by_url[url]
+
+    client.get = AsyncMock(side_effect=_dispatch)
+    client.head = AsyncMock(side_effect=_dispatch)
+    return client
+
+
+def _make_client_sequence(responses: list[httpx.Response]) -> MagicMock:
+    client = MagicMock(spec=httpx.AsyncClient)
+    it = iter(responses)
+
+    async def _next(url, timeout, follow_redirects):
+        return next(it)
+
+    client.get = AsyncMock(side_effect=_next)
+    client.head = AsyncMock(side_effect=_next)
+    return client
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    async def fake_getaddrinfo(host, port, proto=0):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port)),
+        ]
+
+    mock = MagicMock()
+    mock.return_value.getaddrinfo = fake_getaddrinfo
+    monkeypatch.setattr("asyncio.get_running_loop", mock)
+    return mock
+
+
+class TestResolveRedirects:
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_returns_response_on_first_hop_for_non_redirect(self, public_dns):
+        url = "https://example.com/thing"
+        client = _make_client_returning({url: _response(200, {"content-type": "text/html"}, "GET", url)})
+
+        resp, final_url = await resolve_redirects(client, "GET", url, timeout=30.0, max_redirects=5)
+
+        assert resp.status_code == 200
+        assert final_url == url
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_follows_relative_location_via_urljoin(self, public_dns):
+        start = "https://example.com/a/b"
+        final = "https://example.com/c"
+        client = _make_client_sequence([
+            _response(302, {"location": "/c"}, "GET", start),
+            _response(200, {}, "GET", final),
+        ])
+
+        resp, final_url = await resolve_redirects(client, "GET", start, timeout=30.0, max_redirects=5)
+
+        assert resp.status_code == 200
+        assert final_url == final
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_follows_protocol_relative_location(self, public_dns):
+        start = "https://example.com/x"
+        client = _make_client_sequence([
+            _response(302, {"location": "//other.example.com/y"}, "GET", start),
+            _response(200, {}, "GET", "https://other.example.com/y"),
+        ])
+
+        resp, final_url = await resolve_redirects(client, "GET", start, timeout=30.0, max_redirects=5)
+
+        assert resp.status_code == 200
+        assert final_url == "https://other.example.com/y"
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_rejects_missing_location_header(self, public_dns):
+        start = "https://example.com/"
+        client = _make_client_sequence([_response(302, {}, "GET", start)])
+
+        with pytest.raises(HTTPException) as exc:
+            await resolve_redirects(client, "GET", start, timeout=30.0, max_redirects=5)
+
+        assert exc.value.status_code == 502
+        assert "location" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_rejects_too_many_hops(self, public_dns):
+        start = "https://example.com/"
+        responses = [
+            _response(302, {"location": f"/hop{i}"}, "GET", start)
+            for i in range(10)
+        ]
+        client = _make_client_sequence(responses)
+
+        with pytest.raises(HTTPException) as exc:
+            await resolve_redirects(client, "GET", start, timeout=30.0, max_redirects=3)
+
+        assert exc.value.status_code == 400
+        assert "redirect" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_re_validates_each_hop_for_ssrf(self, public_dns):
+        start = "https://example.com/"
+        client = _make_client_sequence([
+            _response(302, {"location": "https://169.254.169.254/latest/meta-data/"}, "GET", start),
+        ])
+
+        with pytest.raises(HTTPException) as exc:
+            await resolve_redirects(client, "GET", start, timeout=30.0, max_redirects=5)
+
+        assert exc.value.status_code == 400
+        assert "blocked" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_respects_http_method_get(self, public_dns):
+        url = "https://example.com/"
+        client = _make_client_returning({url: _response(200, {}, "GET", url)})
+
+        await resolve_redirects(client, "GET", url, timeout=30.0, max_redirects=5)
+
+        assert client.get.await_count == 1
+        assert client.head.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_resolve_redirects_respects_http_method_head(self, public_dns):
+        url = "https://example.com/"
+        client = _make_client_returning({url: _response(200, {}, "HEAD", url)})
+
+        await resolve_redirects(client, "HEAD", url, timeout=10.0, max_redirects=5)
+
+        assert client.head.await_count == 1
+        assert client.get.await_count == 0

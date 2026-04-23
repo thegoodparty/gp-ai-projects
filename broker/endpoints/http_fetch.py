@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from broker.dynamodb_client import ScopeTicket
-from broker.ssrf_guard import reject_if_private as _reject_if_private
-from broker.ssrf_guard import validate_url as _validate_url
+from broker.ssrf_guard import resolve_redirects
 
 logger = logging.getLogger(__name__)
 
@@ -47,31 +45,10 @@ async def http_fetch(
     ticket: ScopeTicket = Depends(get_scope_ticket),
     client: httpx.AsyncClient = Depends(get_httpx_client),
 ):
-    # Manual redirect loop with per-hop SSRF re-validation. httpx's
-    # follow_redirects=True would transparently follow a 302 into
-    # 169.254.169.254 or 10.x.x.x, bypassing the pre-request _validate_url.
-    current_url = req.url
-    resp = None
     try:
-        for hop in range(MAX_REDIRECTS + 1):
-            await _validate_url(current_url)
-            resp = await client.get(
-                current_url, timeout=FETCH_TIMEOUT, follow_redirects=False
-            )
-            if resp.status_code not in (301, 302, 303, 307, 308):
-                break
-            location = resp.headers.get("location")
-            if not location:
-                raise HTTPException(
-                    status_code=502,
-                    detail="redirect response missing Location header",
-                )
-            if hop == MAX_REDIRECTS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"too many redirects (max {MAX_REDIRECTS})",
-                )
-            current_url = urljoin(current_url, location)
+        resp, current_url = await resolve_redirects(
+            client, "GET", req.url, FETCH_TIMEOUT, MAX_REDIRECTS
+        )
     except httpx.HTTPError as e:
         logger.warning(
             "http_fetch upstream error run_id=%s url=%s: %s",

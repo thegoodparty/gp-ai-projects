@@ -116,7 +116,7 @@ def broker_client(broker_env, aws):
         return None
 
     with patch(
-        "broker.endpoints.http_fetch._validate_url",
+        "broker.ssrf_guard.validate_url",
         side_effect=_allow_all_urls,
     ):
         with TestClient(app) as client:

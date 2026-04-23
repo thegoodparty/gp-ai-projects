@@ -173,12 +173,21 @@ def artifact_publish(
                     ),
                 )
             raise
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=latest_key,
-            Body=artifact_json,
-            ContentType="application/json",
-        )
+        try:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=latest_key,
+                Body=artifact_json,
+                ContentType="application/json",
+            )
+        except Exception as latest_err:
+            logger.warning(
+                "latest.json update failed run_id=%s experiment_id=%s key=%s bucket=%s: %s. "
+                "Archive write succeeded; callback carries run-scoped key. latest.json is "
+                "a best-effort convenience pointer and is eventually consistent.",
+                ticket.run_id, ticket.experiment_id, latest_key, bucket, latest_err,
+                exc_info=True,
+            )
     except HTTPException:
         raise
     except Exception:
