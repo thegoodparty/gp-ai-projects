@@ -116,9 +116,21 @@ async def proxy_messages(
             async for chunk in upstream_response.aiter_bytes():
                 yield chunk
         except httpx.HTTPError as e:
-            logger.warning(
-                "anthropic upstream stream error run_id=%s model=%s exc_type=%s",
-                ticket.run_id, parsed_body.get("model", "?"), type(e).__name__,
+            exc_type = type(e).__name__
+            model = parsed_body.get("model", "?")
+            logger.error(
+                "anthropic upstream stream truncated run_id=%s org=%s model=%s exc_type=%s: %s",
+                ticket.run_id, ticket.organization_slug, model, exc_type, e,
+                exc_info=True,
+            )
+            # Yield a synthetic SSE error event so the downstream SDK fails
+            # loudly instead of silently treating a truncated stream as a
+            # complete assistant turn. 200 is already on the wire; this is
+            # the only way to signal failure mid-stream.
+            yield (
+                b'event: error\n'
+                b'data: {"type":"error","error":{"type":"upstream_stream_truncated",'
+                b'"message":"upstream stream ended unexpectedly"}}\n\n'
             )
         finally:
             await upstream_response.aclose()

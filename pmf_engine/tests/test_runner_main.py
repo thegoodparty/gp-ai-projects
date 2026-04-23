@@ -32,6 +32,70 @@ def _make_config(**overrides):
     return RunnerConfig(**defaults)
 
 
+class TestUploadLogsObservability:
+    """R8 fix: `_upload_logs` used to swallow failures silently with a WARN
+    log that had no run_id, no experiment_id, and no stack trace. On a
+    terminal failure path, the operator has no way to debug the failed run
+    if the log-upload itself also failed — double blind spot.
+
+    Fix: require `run_id` + `experiment_id` kwargs, log exc_type + exc_info,
+    keep the swallow (terminal callback is more important than logs) but
+    make it observable.
+    """
+
+    import logging as _logging  # class-local to avoid top-of-file churn
+
+    def test_upload_logs_failure_warns_with_run_id_experiment_id_and_stacktrace(
+        self, tmp_path
+    ):
+        """`shared.logger` disables propagation (propagate=False), so pytest's
+        caplog can't see these records via the root logger. Attach a
+        BufferingHandler to the specific logger instead.
+        """
+        import logging
+        from pmf_engine.runner.main import _upload_logs
+        import pmf_engine.runner.main as _main_mod
+
+        workspace = tmp_path
+        (workspace / "conversation.jsonl").write_text('{"type":"assistant"}\n')
+
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        handler = _Capture(level=logging.WARNING)
+        _main_mod.logger.addHandler(handler)
+        try:
+            with patch(
+                "pmf_engine.runner.main.publish.upload_logs",
+                side_effect=RuntimeError("broker 503 from upload_logs"),
+            ):
+                # MUST NOT raise — log-upload failure is swallowed.
+                _upload_logs(
+                    str(workspace),
+                    run_id="run-upload-obs-001",
+                    experiment_id="district_intel",
+                )
+        finally:
+            _main_mod.logger.removeHandler(handler)
+
+        warns = [
+            r for r in captured
+            if r.levelno >= logging.WARNING and "upload" in r.getMessage().lower()
+        ]
+        assert warns, (
+            f"expected log-upload failure to warn from pmf_engine.runner.main.logger; "
+            f"got: {[(r.levelname, r.getMessage()) for r in captured]}"
+        )
+        msg = warns[0].getMessage()
+        assert "run-upload-obs-001" in msg, f"expected run_id in log, got: {msg}"
+        assert "district_intel" in msg, f"expected experiment_id in log, got: {msg}"
+        assert "RuntimeError" in msg, f"expected exc_type in log, got: {msg}"
+        assert warns[0].exc_info is not None, "expected exc_info=True so stacktrace is preserved"
+
+
 def test_get_harness_returns_claude_sdk():
     harness = get_harness("claude_sdk")
     from pmf_engine.runner.harness.claude_sdk import ClaudeSdkHarness

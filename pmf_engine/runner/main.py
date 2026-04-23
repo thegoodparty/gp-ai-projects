@@ -205,14 +205,24 @@ def _collect_log_files(workspace_dir: str) -> dict[str, bytes]:
     return files
 
 
-def _upload_logs(workspace_dir: str) -> None:
+def _upload_logs(workspace_dir: str, *, run_id: str, experiment_id: str) -> None:
     try:
         files = _collect_log_files(workspace_dir)
         if files:
             publish.upload_logs(files)
-            logger.info(f"Uploaded {len(files)} log files via broker")
+            logger.info(
+                "log upload ok run_id=%s experiment_id=%s files=%d",
+                run_id, experiment_id, len(files),
+            )
     except Exception as e:
-        logger.warning(f"Failed to upload logs via broker: {e}")
+        # Swallow intentionally — terminal callback is more important than logs.
+        # But upgrade context: run_id + experiment_id for correlation, exc_type
+        # for alerting grep patterns, exc_info=True so the stack trace isn't lost.
+        logger.warning(
+            "log upload failed run_id=%s experiment_id=%s exc_type=%s: %s",
+            run_id, experiment_id, type(e).__name__, e,
+            exc_info=True,
+        )
 
 
 async def run_experiment(
@@ -256,7 +266,7 @@ async def run_experiment(
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Harness failed for run {config.run_id}: {e}")
-                _upload_logs(workspace_dir)
+                _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
@@ -276,7 +286,7 @@ async def run_experiment(
             except ContractViolation as e:
                 duration = time.monotonic() - start_time
                 logger.error(f"Contract violation for run {config.run_id}: {e}")
-                _upload_logs(workspace_dir)
+                _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
                 # ContractViolation fires for Invalid-JSON too, so json.loads
                 # would JSONDecodeError — silently skipping the callback and
                 # leaving the run PENDING forever. Preserve the raw bytes
@@ -317,7 +327,7 @@ async def run_experiment(
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Validator error for run {config.run_id}: {e}")
-                _upload_logs(workspace_dir)
+                _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
@@ -334,7 +344,7 @@ async def run_experiment(
             except (json.JSONDecodeError, TypeError) as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Artifact not valid JSON for run {config.run_id}: {e}")
-                _upload_logs(workspace_dir)
+                _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
                 publish.report_status(
                     "failed",
                     reason_code="InvalidJSON",
@@ -345,7 +355,7 @@ async def run_experiment(
                 _mark_callback_sent()
                 raise
 
-            _upload_logs(workspace_dir)
+            _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
 
             duration = time.monotonic() - start_time
             try:
@@ -485,7 +495,7 @@ async def main():
                     f"{drain_err}",
                     exc_info=True,
                 )
-        _upload_logs(workspace_dir)
+        _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
         publish.report_status(
             "failed",
             reason_code="Timeout",
@@ -496,7 +506,7 @@ async def main():
 
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
-        _upload_logs(workspace_dir)
+        _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
         publish.report_status(
             "failed",
             reason_code="Signal",
