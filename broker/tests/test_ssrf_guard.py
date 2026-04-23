@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -11,13 +11,50 @@ from fastapi import HTTPException
 from broker.ssrf_guard import reject_if_private, resolve_redirects, validate_url
 
 
-def _fake_getaddrinfo_factory(ip_literal: str):
-    async def fake(host, port, proto=0):
+@pytest.fixture
+def public_dns(monkeypatch):
+    """DNS that resolves any hostname to a public IP (example.com's real IP)."""
+
+    async def fake_getaddrinfo(host, port, proto=0):
         return [
-            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip_literal, port)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port)),
         ]
 
-    return fake
+    mock = MagicMock()
+    mock.return_value.getaddrinfo = fake_getaddrinfo
+    monkeypatch.setattr("asyncio.get_running_loop", mock)
+    return mock
+
+
+@pytest.fixture
+def private_dns_factory(monkeypatch):
+    """Factory fixture — installs a DNS stub that resolves any hostname to `ip`."""
+
+    def _install(ip: str):
+        async def fake_getaddrinfo(host, port, proto=0):
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, port)),
+            ]
+
+        mock = MagicMock()
+        mock.return_value.getaddrinfo = fake_getaddrinfo
+        monkeypatch.setattr("asyncio.get_running_loop", mock)
+        return mock
+
+    return _install
+
+
+@pytest.fixture
+def failing_dns(monkeypatch):
+    """DNS that raises gaierror for every lookup — simulates unresolvable host."""
+
+    async def fake_getaddrinfo(host, port, proto=0):
+        raise socket.gaierror("nodename nor servname provided")
+
+    mock = MagicMock()
+    mock.return_value.getaddrinfo = fake_getaddrinfo
+    monkeypatch.setattr("asyncio.get_running_loop", mock)
+    return mock
 
 
 class TestValidateUrlSchemeAndHostname:
@@ -88,45 +125,25 @@ class TestValidateUrlIPLiterals:
 
 class TestValidateUrlDNSResolution:
     @pytest.mark.asyncio
-    async def test_validate_url_resolves_dns_and_rejects_private(self):
+    async def test_validate_url_resolves_dns_and_rejects_private(self, private_dns_factory):
         """Public-looking hostname resolves to a private IP - must be rejected."""
-
-        async def fake_getaddrinfo(host, port, proto=0):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", port)),
-            ]
-
-        with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value.getaddrinfo = fake_getaddrinfo
-            with pytest.raises(HTTPException) as exc:
-                await validate_url("https://evil.example.com/")
-            assert exc.value.status_code == 400
-            assert "blocked" in exc.value.detail.lower()
+        private_dns_factory("10.0.0.5")
+        with pytest.raises(HTTPException) as exc:
+            await validate_url("https://evil.example.com/")
+        assert exc.value.status_code == 400
+        assert "blocked" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_validate_url_accepts_public_http(self):
+    async def test_validate_url_accepts_public_http(self, public_dns):
         """Public hostname resolving to a public IP passes."""
-
-        async def fake_getaddrinfo(host, port, proto=0):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port)),
-            ]
-
-        with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value.getaddrinfo = fake_getaddrinfo
-            await validate_url("https://example.com/path")
+        await validate_url("https://example.com/path")
 
     @pytest.mark.asyncio
-    async def test_validate_url_raises_on_dns_failure(self):
-        async def fake_getaddrinfo(host, port, proto=0):
-            raise socket.gaierror("nodename nor servname provided")
-
-        with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value.getaddrinfo = fake_getaddrinfo
-            with pytest.raises(HTTPException) as exc:
-                await validate_url("https://unresolvable.example.com/")
-            assert exc.value.status_code == 400
-            assert "dns" in exc.value.detail.lower()
+    async def test_validate_url_raises_on_dns_failure(self, failing_dns):
+        with pytest.raises(HTTPException) as exc:
+            await validate_url("https://unresolvable.example.com/")
+        assert exc.value.status_code == 400
+        assert "dns" in exc.value.detail.lower()
 
 
 class TestRejectIfPrivate:
@@ -216,19 +233,6 @@ def _make_client_sequence(responses: list[httpx.Response]) -> MagicMock:
     return client
 
 
-@pytest.fixture
-def public_dns(monkeypatch):
-    async def fake_getaddrinfo(host, port, proto=0):
-        return [
-            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port)),
-        ]
-
-    mock = MagicMock()
-    mock.return_value.getaddrinfo = fake_getaddrinfo
-    monkeypatch.setattr("asyncio.get_running_loop", mock)
-    return mock
-
-
 class TestResolveRedirects:
     @pytest.mark.asyncio
     async def test_resolve_redirects_returns_response_on_first_hop_for_non_redirect(self, public_dns):
@@ -307,21 +311,43 @@ class TestResolveRedirects:
         assert "blocked" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_resolve_redirects_respects_http_method_get(self, public_dns):
-        url = "https://example.com/"
-        client = _make_client_returning({url: _response(200, {}, "GET", url)})
+    async def test_resolve_redirects_sends_get_request_on_the_wire(self, public_dns):
+        """The wire-level method reaching the transport must be GET when
+        caller requests GET. Assert on the Request.method the transport
+        observed — that's what a downstream server sees, not the Python
+        dispatch attribute. Survives refactors to client.request(method, ...).
+        """
+        observed: list[str] = []
 
-        await resolve_redirects(client, "GET", url, timeout=30.0, max_redirects=5)
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed.append(request.method)
+            return httpx.Response(200, headers={})
 
-        assert client.get.await_count == 1
-        assert client.head.await_count == 0
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await resolve_redirects(
+                client, "GET", "https://example.com/", timeout=30.0, max_redirects=5
+            )
+        finally:
+            await client.aclose()
+
+        assert observed == ["GET"]
 
     @pytest.mark.asyncio
-    async def test_resolve_redirects_respects_http_method_head(self, public_dns):
-        url = "https://example.com/"
-        client = _make_client_returning({url: _response(200, {}, "HEAD", url)})
+    async def test_resolve_redirects_sends_head_request_on_the_wire(self, public_dns):
+        """Wire-level method for HEAD — see the GET variant's docstring."""
+        observed: list[str] = []
 
-        await resolve_redirects(client, "HEAD", url, timeout=10.0, max_redirects=5)
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed.append(request.method)
+            return httpx.Response(200, headers={})
 
-        assert client.head.await_count == 1
-        assert client.get.await_count == 0
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await resolve_redirects(
+                client, "HEAD", "https://example.com/", timeout=10.0, max_redirects=5
+            )
+        finally:
+            await client.aclose()
+
+        assert observed == ["HEAD"]

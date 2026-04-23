@@ -350,6 +350,121 @@ def test_http_fetch_follows_relative_redirect(broker_client, aws, fake_http):
     assert "Fayetteville City Council" in body["body"]
 
 
+def test_artifact_publish_tolerates_latest_json_transient_failure(broker_client, aws):
+    """Smoke-tier regression guard for the R5 `latest.json swallow` fix.
+
+    Scenario this protects against: the archive write at
+    `{experiment_id}/{run_id}/artifact.json` succeeds but the mutable
+    `{experiment_id}/{org}/latest.json` pointer put transiently fails
+    (bucket-policy flap, S3 partial outage, etc.). Pre-R5, this re-raised
+    500 from /artifact/publish → runner retry → IfNoneMatch=* → 412 →
+    mapped to 409 non-retryable → agent FAILED → archive orphaned with no
+    ExperimentRun SUCCESS pointing at it.
+
+    Post-R5, latest.json failures are logged and swallowed — publish returns
+    200, the callback carries the run-scoped (authoritative) key, and the
+    ticket is cleaned up. A future refactor that reinstates the pre-R5 500
+    path (e.g., someone restructures the nested try/except and lets the
+    latest.json exception escape) would flip this test red.
+
+    The unit-tier class TestArtifactPublishLatestJsonFailureIsBestEffort
+    already asserts handler-level contract; this test extends coverage
+    through the full booted broker (real FastAPI DI, real moto S3 + SQS +
+    DDB, real callback send) to catch wiring regressions the unit tier
+    can't see.
+    """
+    from botocore.exceptions import ClientError
+
+    from broker.endpoints.artifact_publish import (
+        get_s3_client as publish_get_s3_client,
+    )
+
+    run_id = "smoke-district-intel-latest-json-flake-001"
+    org_slug = "test-org-smoke"
+
+    broker_token = mint_ticket(
+        broker_client,
+        experiment_id="district_intel",
+        run_id=run_id,
+        organization_slug=org_slug,
+        params=DISTRICT_INTEL_PARAMS,
+        scope=DISTRICT_INTEL_SCOPE,
+        timeout_seconds=600,
+    )
+
+    real_s3 = aws["s3"]
+
+    class _LatestJsonFailingS3:
+        """Proxy over moto's S3 client — `put_object` raises InternalError
+        when Key ends with `/latest.json`, delegates everything else.
+        """
+
+        def put_object(self, **kwargs):
+            if kwargs.get("Key", "").endswith("/latest.json"):
+                raise ClientError(
+                    error_response={
+                        "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                        "ResponseMetadata": {"HTTPStatusCode": 500},
+                    },
+                    operation_name="PutObject",
+                )
+            return real_s3.put_object(**kwargs)
+
+        def __getattr__(self, name):
+            return getattr(real_s3, name)
+
+    failing_s3 = _LatestJsonFailingS3()
+    broker_client.app.dependency_overrides[publish_get_s3_client] = lambda: failing_s3
+
+    try:
+        publish_resp = broker_client.post(
+            "/artifact/publish",
+            headers={"x-broker-token": broker_token},
+            json={"artifact": _minimal_valid_district_intel_artifact()},
+        )
+    finally:
+        broker_client.app.dependency_overrides.pop(publish_get_s3_client, None)
+
+    run_key = f"district_intel/{run_id}/artifact.json"
+
+    assert publish_resp.status_code == 200, (
+        f"latest.json transient failure must NOT abort publish (archive succeeded, "
+        f"callback still carries the run-scoped key); got "
+        f"{publish_resp.status_code} {publish_resp.text}"
+    )
+    pub_body = publish_resp.json()
+    assert pub_body["callback_sent"] is True
+    assert pub_body["artifact_key"] == run_key, (
+        "callback payload must carry the run-scoped (authoritative) archive key, "
+        "not latest.json — this is the STALE-invariant contract"
+    )
+    assert pub_body["artifact_bucket"] == ARTIFACT_BUCKET
+
+    # Archive exists at the run-scoped key — even though latest.json failed.
+    head = real_s3.head_object(Bucket=ARTIFACT_BUCKET, Key=run_key)
+    assert head["ContentType"] == "application/json"
+
+    # Ticket was deleted — the post-publish cleanup path runs to completion
+    # even when latest.json fails.
+    assert not ticket_exists(aws, broker_token), (
+        "publish-cleanup must still run after latest.json swallow — "
+        "a leaked token after a partial failure is a security regression"
+    )
+
+    # Exactly one success callback on the results queue with the run-scoped key.
+    callbacks = drain_callbacks(aws)
+    assert len(callbacks) == 1, (
+        f"exactly one success callback expected even when latest.json fails "
+        f"(got {len(callbacks)})"
+    )
+    data = callbacks[0]["data"]
+    assert data["status"] == "success"
+    assert data["runId"] == run_id
+    assert data["artifactKey"] == run_key, (
+        "callback artifactKey must be the run-scoped archive, not latest.json"
+    )
+
+
 def test_district_intel_artifact_uses_real_contract_schema():
     """Guardrail against local smoke-test drift.
 
