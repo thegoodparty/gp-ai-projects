@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -70,7 +71,7 @@ async def http_fetch(
                     status_code=400,
                     detail=f"too many redirects (max {MAX_REDIRECTS})",
                 )
-            current_url = location
+            current_url = urljoin(current_url, location)
     except httpx.HTTPError as e:
         logger.warning(
             "http_fetch upstream error run_id=%s url=%s: %s",

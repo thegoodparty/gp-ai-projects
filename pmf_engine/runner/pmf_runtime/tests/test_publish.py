@@ -187,6 +187,104 @@ class TestReportStatusRetry:
         assert attempts["count"] == 3
 
 
+class TestPublishRetry:
+    def setup_method(self):
+        import pmf_engine.runner.pmf_runtime.config as config_mod
+        config_mod._config = None
+
+    def test_publish_retries_on_transient_5xx(self, monkeypatch):
+        attempts = {"count": 0}
+        sleeps: list[float] = []
+
+        def handler(request):
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                return httpx.Response(502, json={"detail": "broker restarting"})
+            return httpx.Response(200, json={"id": "art-9", "status": "accepted"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", sleeps.append
+        )
+
+        result = publish({"score": 0.5})
+        assert result["id"] == "art-9"
+        assert attempts["count"] == 3
+        assert len(sleeps) == 2
+        assert sleeps == [1.0, 2.0]
+
+    def test_publish_retries_on_connect_error(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            if attempts["count"] <= 1:
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(200, json={"id": "art-1", "status": "accepted"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        result = publish({"score": 0.5})
+        assert result["id"] == "art-1"
+        assert attempts["count"] == 2
+
+    def test_publish_does_not_retry_on_400_raises_value_error(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            return httpx.Response(400, json={"detail": "schema mismatch"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        with pytest.raises(ValueError, match="Artifact rejected: schema mismatch"):
+            publish({"bad": "data"})
+        assert attempts["count"] == 1, (
+            "contract rejection (400) must fail fast — retrying will not "
+            "fix a schema violation"
+        )
+
+    def test_publish_does_not_retry_on_409(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            return httpx.Response(409, json={"detail": "already published"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            publish({"score": 0.5})
+        assert attempts["count"] == 1, (
+            "4xx must fail fast — caller handles 409 duplicate semantics"
+        )
+
+    def test_publish_exhausts_retries_and_re_raises(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def handler(request):
+            attempts["count"] += 1
+            return httpx.Response(503, json={"detail": "service unavailable"})
+
+        _inject_client(handler)
+        monkeypatch.setattr(
+            "pmf_engine.runner.pmf_runtime.publish.time.sleep", lambda s: None
+        )
+
+        with pytest.raises(httpx.HTTPStatusError):
+            publish({"score": 0.5})
+        assert attempts["count"] == 3
+
+
 class TestUploadLogs:
     def setup_method(self):
         import pmf_engine.runner.pmf_runtime.config as config_mod

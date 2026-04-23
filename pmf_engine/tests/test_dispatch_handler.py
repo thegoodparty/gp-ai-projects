@@ -310,7 +310,8 @@ class TestHandler:
         mock_send_error_callback.assert_called_once()
         call_args = mock_send_error_callback.call_args
         assert call_args[0][0]["run_id"] == "run-001"
-        assert "RESOURCE:MEMORY" in call_args[0][1]
+        assert call_args[0][1].startswith("ECS RunTask failed:")
+        assert "RESOURCE:MEMORY" not in call_args[0][1]
 
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_reports_failure_on_invalid_message(self, mock_get_ecs):
@@ -411,7 +412,8 @@ class TestHandler:
         mock_send_error_callback.assert_called_once()
         call_args = mock_send_error_callback.call_args
         assert call_args[0][0]["run_id"] == "run-001"
-        assert "Network timeout" in call_args[0][1]
+        assert call_args[0][1] == "ECS RunTask exception: Exception"
+        assert "Network timeout" not in call_args[0][1]
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -1151,6 +1153,142 @@ class TestPriorArtifactVersionsValidation:
         }
         with pytest.raises(ValueError, match="prior_artifact_versions"):
             parse_dispatch_message(json.dumps(body))
+
+
+class TestEcsErrorCallbackDoesNotLeakRawDetail:
+    """Security: raw ECS failure reasons and exception messages often contain
+    IAM role ARNs, account IDs, and policy details (e.g.,
+    'AccessDeniedException: User: arn:aws:iam::333022194791:role/...'). These
+    land in gp-api's ExperimentRun.error field and surface to users. The
+    dispatcher must log the full detail server-side but pass a SANITIZED
+    generic message to send_error_callback.
+    """
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_ecs_run_task_failure_callback_does_not_leak_raw_reason(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        mock_broker_cls.return_value = _mock_broker_success()
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [],
+            "failures": [
+                {
+                    "reason": (
+                        "AccessDeniedException: User: "
+                        "arn:aws:iam::333022194791:role/test-dispatch-role is "
+                        "not authorized to perform: ecs:RunTask on resource: "
+                        "arn:aws:ecs:us-west-2:333022194791:task-definition/pmf-engine:42"
+                    )
+                }
+            ],
+        }
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-123",
+            "run_id": "run-iam-leak",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        error_str = mock_send_error_callback.call_args[0][1]
+        assert "arn:aws:iam" not in error_str, (
+            f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
+        )
+        assert "333022194791" not in error_str, (
+            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
+        )
+        assert "ECS RunTask failed" in error_str
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_ecs_run_task_exception_callback_does_not_leak_raw_exception_message(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        from botocore.exceptions import ClientError
+        mock_broker_cls.return_value = _mock_broker_success()
+        mock_get_ecs.return_value.run_task.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "AccessDeniedException",
+                    "Message": (
+                        "User: arn:aws:iam::333022194791:role/test-dispatch-role "
+                        "is not authorized to perform: ecs:RunTask"
+                    ),
+                }
+            },
+            "RunTask",
+        )
+
+        event = _make_sqs_event({
+            "experiment_id": "voter_targeting",
+            "organization_slug": "org-123",
+            "run_id": "run-iam-exc-leak",
+            "params": dict(VALID_L2_PARAMS),
+        })
+
+        handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        error_str = mock_send_error_callback.call_args[0][1]
+        assert "arn:aws:iam" not in error_str, (
+            f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
+        )
+        assert "333022194791" not in error_str, (
+            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
+        )
+        assert "ClientError" in error_str, (
+            f"Expected exception type name in sanitized message, got: {error_str!r}"
+        )
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_ecs_run_task_failure_logs_full_detail_server_side(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
+    ):
+        import pmf_engine.control_plane.dispatch_handler as dh
+        mock_broker_cls.return_value = _mock_broker_success()
+        raw_reason = (
+            "AccessDeniedException: User: "
+            "arn:aws:iam::333022194791:role/test-role not authorized"
+        )
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [],
+            "failures": [{"reason": raw_reason}],
+        }
+
+        records: list[logging.LogRecord] = []
+
+        class CollectingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        collector = CollectingHandler(level=logging.DEBUG)
+        original_level = dh.logger.level
+        dh.logger.addHandler(collector)
+        dh.logger.setLevel(logging.DEBUG)
+        try:
+            event = _make_sqs_event({
+                "experiment_id": "voter_targeting",
+                "organization_slug": "org-123",
+                "run_id": "run-log-detail",
+                "params": dict(VALID_L2_PARAMS),
+            })
+            handler(event, None)
+        finally:
+            dh.logger.removeHandler(collector)
+            dh.logger.setLevel(original_level)
+
+        combined = " ".join(r.getMessage() for r in records if r.levelno >= logging.ERROR)
+        assert "arn:aws:iam::333022194791" in combined, (
+            f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
+        )
 
 
 class TestRunTaskFailureCleansUpMintedTicket:

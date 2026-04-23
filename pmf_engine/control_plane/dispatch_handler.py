@@ -419,11 +419,16 @@ def handler(event: dict, context) -> dict:
 
             if failures or not tasks:
                 failure_reasons = [f.get("reason", "unknown") for f in failures]
-                logger.error(f"ECS RunTask failed for {message_id}: {failure_reasons}")
+                logger.error(
+                    f"ECS RunTask failed for {message_id} "
+                    f"(experiment={experiment_id}, run={message['run_id']}): "
+                    f"{failure_reasons}"
+                )
                 _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+                safe_summary = _classify_ecs_failure_reasons(failure_reasons)
                 send_error_callback(
                     message,
-                    f"ECS RunTask failed: {failure_reasons}",
+                    f"ECS RunTask failed: {safe_summary}",
                     RESULTS_QUEUE_URL,
                     dedup_id=f"runtask-failed-{message['run_id']}",
                 )
@@ -434,17 +439,32 @@ def handler(event: dict, context) -> dict:
             logger.info(f"Started Fargate task: {task_arn}")
 
         except Exception as e:
-            logger.exception(f"ECS RunTask exception for {message_id}: {e}")
+            logger.exception(
+                f"ECS RunTask exception for {message_id} "
+                f"(experiment={experiment_id}, run={message['run_id']}, "
+                f"exception_type={type(e).__name__}): {e}"
+            )
             _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
             send_error_callback(
                 message,
-                f"ECS RunTask exception: {e}",
+                f"ECS RunTask exception: {type(e).__name__}",
                 RESULTS_QUEUE_URL,
                 dedup_id=f"runtask-exception-{message['run_id']}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})
 
     return {"batchItemFailures": batch_item_failures}
+
+
+def _classify_ecs_failure_reasons(reasons: list[str]) -> str:
+    joined_upper = " ".join(str(r).upper() for r in reasons)
+    if "CAPACITY" in joined_upper or "RESOURCE:" in joined_upper:
+        return "capacity exhausted (see server logs for detail)"
+    if "ACCESSDENIED" in joined_upper or "NOT AUTHORIZED" in joined_upper or "IAM" in joined_upper:
+        return "permission error (see server logs for detail)"
+    if "THROTTL" in joined_upper:
+        return "throttled by AWS (see server logs for detail)"
+    return "capacity or permission error (see server logs for detail)"
 
 
 def _cleanup_minted_token(broker, broker_token: str, run_id: str) -> None:

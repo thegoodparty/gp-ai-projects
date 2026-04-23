@@ -181,6 +181,90 @@ class TestContentGuards:
         assert resp.status_code == 200
 
 
+class TestRelativeRedirects:
+    """RFC 7231 permits relative Location values. The redirect loop must
+    resolve them against the current URL (urljoin), otherwise valid upstream
+    behavior breaks: raw assignment treats `/foo` as a scheme-less URL that
+    the SSRF guard rejects with 400 'URL must use https scheme'."""
+
+    def _redirect_head(self, location: str) -> httpx.Response:
+        return httpx.Response(
+            status_code=302,
+            headers={"location": location, "content-length": "0"},
+            request=httpx.Request("HEAD", "https://legistar.granicus.com/x.pdf"),
+        )
+
+    def _create_app_with_head_redirects(
+        self,
+        head_responses: list[httpx.Response],
+    ) -> FastAPI:
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[get_scope_ticket] = lambda: _make_ticket()
+
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client.head = AsyncMock(side_effect=head_responses)
+
+        body = b"%PDF-1.4 bytes"
+        def _stream(method, url, **kw):
+            class _Ctx:
+                async def __aenter__(self_):
+                    resp = MagicMock()
+                    resp.status_code = 200
+                    resp.headers = {
+                        "content-type": "application/pdf",
+                        "content-length": str(len(body)),
+                    }
+                    resp.aclose = AsyncMock(return_value=None)
+                    async def _iter(chunk_size=8192):
+                        for i in range(0, len(body), chunk_size):
+                            yield body[i:i + chunk_size]
+                    resp.aiter_bytes = _iter
+                    resp.raise_for_status = lambda: None
+                    return resp
+                async def __aexit__(self_, *a):
+                    return False
+            return _Ctx()
+        mock_client.stream = _stream
+
+        app.dependency_overrides[get_httpx_client] = lambda: mock_client
+        return app
+
+    def test_relative_location_header_follows_correctly(self):
+        app = self._create_app_with_head_redirects([
+            self._redirect_head("/redirected/report.pdf"),
+            _build_head(),
+        ])
+        client = TestClient(app)
+
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": "https://legistar.granicus.com/initial.pdf"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, (
+            f"expected 200 following relative redirect, got {resp.status_code} "
+            f"detail={resp.text}"
+        )
+
+    def test_protocol_relative_location_header_follows_correctly(self):
+        app = self._create_app_with_head_redirects([
+            self._redirect_head("//www.example.com/report.pdf"),
+            _build_head(),
+        ])
+        client = TestClient(app)
+
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": "https://legistar.granicus.com/initial.pdf"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, (
+            f"expected 200 following protocol-relative redirect, got {resp.status_code} "
+            f"detail={resp.text}"
+        )
+
+
 class TestStreamingProxy:
     def test_returns_pdf_bytes_and_headers(self):
         payload = b"%PDF-1.4 body bytes here"

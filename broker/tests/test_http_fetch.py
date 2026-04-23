@@ -249,6 +249,50 @@ class TestSSRFRedirectReValidation:
         assert resp.status_code == 400
         assert "redirect" in resp.json()["detail"].lower()
 
+    def test_relative_location_header_follows_correctly(self):
+        """RFC 7231 permits relative Location values. Raw assignment treats
+        `/redirected/path` as a full URL, losing the scheme+host — the next
+        _validate_url call then 400s with 'URL must use https scheme'.
+        urljoin(current_url, location) resolves root-relative against the
+        current URL's scheme+host."""
+        app = self._create_app_with_redirects([
+            self._redirect_response("/redirected/path"),
+            self._ok_response(),
+        ])
+        client = TestClient(app)
+
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/initial"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, (
+            f"expected 200 following relative redirect, got {resp.status_code} "
+            f"detail={resp.json().get('detail')}"
+        )
+        assert resp.json()["source_url"] == "https://example.com/redirected/path"
+
+    def test_protocol_relative_location_header_follows_correctly(self):
+        """Protocol-relative Location (`//other.example.com/foo`) must inherit
+        the scheme of the current URL. urljoin handles this; raw assignment
+        produces a schemeless URL that the SSRF guard rejects."""
+        app = self._create_app_with_redirects([
+            self._redirect_response("//www.example.com/foo"),
+            self._ok_response(),
+        ])
+        client = TestClient(app)
+
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/initial"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, (
+            f"expected 200 following protocol-relative redirect, got {resp.status_code} "
+            f"detail={resp.json().get('detail')}"
+        )
+        assert resp.json()["source_url"] == "https://www.example.com/foo"
+
     def test_validate_url_called_for_initial_url_and_every_redirect_hop(self, monkeypatch):
         """Regression guard against a refactor that drops per-hop validation.
         Without this assertion, a refactor that moves _validate_url back out of

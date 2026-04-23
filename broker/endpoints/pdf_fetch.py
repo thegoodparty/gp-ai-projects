@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -65,7 +66,7 @@ async def pdf_fetch(
                     status_code=400,
                     detail=f"too many redirects (max {MAX_REDIRECTS})",
                 )
-            current_url = location
+            current_url = urljoin(current_url, location)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"HEAD request failed: {e}")
 
