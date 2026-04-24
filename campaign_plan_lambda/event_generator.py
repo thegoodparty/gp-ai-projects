@@ -33,7 +33,7 @@ RULES:
 - Prioritize events where the candidate can speak to or meet voters
 - Include a mix of formal meetings and community events
 - Dates must be in YYYY-MM-DD format
-- Title should be the event name
+- Title should be the event name in sentence case: capitalize only the first word and proper nouns (city names, organization names, named events/festivals). Examples: "Boston Pride Festival" (entire title is a named event, all words capitalized); "Community town hall in Cambridge" (generic event — only the first word and the proper noun "Cambridge" are capitalized).
 - Description should explain why this event helps the campaign (one sentence)
 - Include the direct URL to the event page if one is present in the data
 
