@@ -421,15 +421,6 @@ async def main():
         logger.exception(f"Failed to initialize broker config: {e}")
         sys.exit(1)
 
-    try:
-        publish.report_status("running")
-    except Exception as e:
-        logger.warning(
-            f"Initial report_status('running') failed after retries for run "
-            f"{config.run_id} (broker outage?): {type(e).__name__}: {e}. "
-            f"Continuing — terminal callback will re-attempt when broker recovers."
-        )
-
     timeout = config.timeout_seconds
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")
 

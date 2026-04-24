@@ -59,38 +59,38 @@ VALID_L2_PARAMS = {
 class TestParseDispatchMessage:
     def test_parses_valid_message(self):
         body = {
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": {"topic": "education"},
         }
         result = parse_dispatch_message(json.dumps(body))
-        assert result["experiment_id"] == "voter_targeting"
+        assert result["experiment_type"] == "voter_targeting"
         assert result["organization_slug"] == "org-123"
         assert result["run_id"] == "run-001"
         assert result["params"] == {"topic": "education"}
 
     def test_defaults_params_to_empty_dict(self):
         body = {
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
         }
         result = parse_dispatch_message(json.dumps(body))
         assert result["params"] == {}
 
-    def test_raises_on_missing_experiment_id(self):
+    def test_raises_on_missing_experiment_type(self):
         body = {"organization_slug": "org-123", "run_id": "run-001"}
-        with pytest.raises(ValueError, match="experiment_id"):
+        with pytest.raises(ValueError, match="experiment_type"):
             parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_missing_organization_slug(self):
-        body = {"experiment_id": "voter_targeting", "run_id": "run-001"}
+        body = {"experiment_type": "voter_targeting", "run_id": "run-001"}
         with pytest.raises(ValueError, match="organization_slug"):
             parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_missing_run_id(self):
-        body = {"experiment_id": "voter_targeting", "organization_slug": "org-123"}
+        body = {"experiment_type": "voter_targeting", "organization_slug": "org-123"}
         with pytest.raises(ValueError, match="run_id"):
             parse_dispatch_message(json.dumps(body))
 
@@ -111,7 +111,7 @@ class TestBuildContainerOverrides:
             "memory": "2048",
         }
         message = {
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": {"district": "CA-12"},
@@ -145,7 +145,7 @@ class TestBuildContainerOverrides:
             "contract": {"type": "json", "s3_key_template": "t"},
         }
         message = {
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": {},
@@ -175,7 +175,7 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -203,7 +203,7 @@ class TestHandler:
         mock_ecs = mock_get_ecs.return_value
 
         event = _make_sqs_event({
-            "experiment_id": "nonexistent",
+            "experiment_type": "nonexistent",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": {},
@@ -224,7 +224,7 @@ class TestHandler:
         mock_ecs = mock_get_ecs.return_value
 
         event = _make_sqs_event({
-            "experiment_id": "nonexistent",
+            "experiment_type": "nonexistent",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": {},
@@ -253,7 +253,7 @@ class TestHandler:
         dh.logger.setLevel(logging.DEBUG)
         try:
             event = _make_sqs_event({
-                "experiment_id": "nonexistent",
+                "experiment_type": "nonexistent",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
                 "params": {},
@@ -298,7 +298,7 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -343,7 +343,7 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -374,7 +374,7 @@ class TestHandler:
         dh.logger.addHandler(collector)
         try:
             message = {
-                "experiment_id": "voter_targeting",
+                "experiment_type": "voter_targeting",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
             }
@@ -400,7 +400,7 @@ class TestHandler:
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -423,7 +423,7 @@ class TestHandler:
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -446,7 +446,7 @@ class TestBrokerFlow:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -472,7 +472,7 @@ class TestBrokerFlow:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -494,7 +494,7 @@ class TestBrokerFlow:
         mock_broker.mint_run_token.side_effect = BrokerError(401, "Invalid service token")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -515,7 +515,7 @@ class TestBrokerFlow:
         mock_broker.mint_run_token.side_effect = BrokerError(400, "Some detail", "")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": dict(VALID_L2_PARAMS),
@@ -534,7 +534,7 @@ class TestNonDictParamsGuard:
         self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
     ):
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": "not a dict",
@@ -556,7 +556,7 @@ class TestNonDictParamsGuard:
         self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
     ):
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": [1, 2, 3],
@@ -581,7 +581,7 @@ class TestNonDictParamsGuard:
         mock_ecs = mock_get_ecs.return_value
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": None,
@@ -609,7 +609,7 @@ class TestErrorCallbackStableDedup:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": dict(VALID_L2_PARAMS),
@@ -629,7 +629,7 @@ class TestErrorCallbackStableDedup:
         mock_get_ecs.return_value.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": dict(VALID_L2_PARAMS),
@@ -651,7 +651,7 @@ class TestErrorCallbackStableDedup:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": dict(VALID_L2_PARAMS),
@@ -678,7 +678,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": {},
@@ -707,7 +707,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": {},
@@ -730,7 +730,7 @@ class TestParamsSizeLimit:
         oversized = {f"key_{i}": "x" * 900 for i in range(12)}
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-big",
             "params": oversized,
@@ -760,7 +760,7 @@ class TestParamsSizeLimit:
         small = {**VALID_L2_PARAMS, "note": "x" * 100}
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": small,
@@ -788,7 +788,7 @@ class TestRequiredParamsValidation:
         mock_broker_cls.return_value = _mock_broker_success()
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-missing-state",
             "params": {"city": "Yakima", "l2DistrictType": "City", "l2DistrictName": "YAKIMA CITY"},
@@ -817,7 +817,7 @@ class TestRequiredParamsValidation:
         mock_broker_cls.return_value = _mock_broker_success()
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-no-district",
             "run_id": "run-no-l2",
             "params": {"state": "NC", "city": "Fayetteville"},
@@ -840,7 +840,7 @@ class TestRequiredParamsValidation:
         mock_broker_cls.return_value = _mock_broker_success()
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-empty",
             "run_id": "run-empty-strings",
             "params": {"state": "", "city": "Fayetteville", "l2DistrictType": "", "l2DistrictName": ""},
@@ -863,7 +863,7 @@ class TestRequiredParamsValidation:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-ok",
             "run_id": "run-ok",
             "params": {
@@ -891,7 +891,7 @@ class TestTransientBrokerErrors:
         mock_broker.mint_run_token.side_effect = httpx.ConnectError("DNS failed")
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-transient",
             "params": dict(VALID_L2_PARAMS),
@@ -917,7 +917,7 @@ class TestTransientBrokerErrors:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-terminal",
             "params": dict(VALID_L2_PARAMS),
@@ -947,7 +947,7 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = True
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-prog-err",
             "params": dict(VALID_L2_PARAMS),
@@ -971,7 +971,7 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = False
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-missing-params",
             "params": {},
@@ -994,7 +994,7 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = True
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-missing-params-ok",
             "params": {},
@@ -1022,7 +1022,7 @@ class TestSendErrorCallbackReturnValue:
         mock_get_sqs.return_value = mock_sqs
 
         result = send_error_callback(
-            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            {"experiment_type": "x", "organization_slug": "y", "run_id": "r1"},
             "err",
             "https://sqs.example.com/q.fifo",
         )
@@ -1037,7 +1037,7 @@ class TestSendErrorCallbackReturnValue:
         mock_get_sqs.return_value = mock_sqs
 
         result = send_error_callback(
-            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            {"experiment_type": "x", "organization_slug": "y", "run_id": "r1"},
             "err",
             "https://sqs.example.com/q.fifo",
         )
@@ -1047,7 +1047,7 @@ class TestSendErrorCallbackReturnValue:
         from pmf_engine.control_plane.dispatch_handler import send_error_callback
 
         result = send_error_callback(
-            {"experiment_id": "x", "organization_slug": "y", "run_id": "r1"},
+            {"experiment_type": "x", "organization_slug": "y", "run_id": "r1"},
             "err",
             "",
         )
@@ -1070,7 +1070,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_path_traversal_in_value(self):
         body = {
-            "experiment_id": "peer_city_benchmarking",
+            "experiment_type": "peer_city_benchmarking",
             "organization_slug": "acme",
             "run_id": "run-1",
             "params": {},
@@ -1083,7 +1083,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_cross_org_artifact_key(self):
         body = {
-            "experiment_id": "peer_city_benchmarking",
+            "experiment_type": "peer_city_benchmarking",
             "organization_slug": "acme",
             "run_id": "run-2",
             "params": {},
@@ -1096,7 +1096,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_wrong_file_suffix(self):
         body = {
-            "experiment_id": "peer_city_benchmarking",
+            "experiment_type": "peer_city_benchmarking",
             "organization_slug": "acme",
             "run_id": "run-3",
             "params": {},
@@ -1109,7 +1109,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_empty_segment(self):
         body = {
-            "experiment_id": "peer_city_benchmarking",
+            "experiment_type": "peer_city_benchmarking",
             "organization_slug": "acme",
             "run_id": "run-4",
             "params": {},
@@ -1122,7 +1122,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_accepts_valid_prior_artifact_key(self):
         body = {
-            "experiment_id": "peer_city_benchmarking",
+            "experiment_type": "peer_city_benchmarking",
             "organization_slug": "acme",
             "run_id": "run-5",
             "params": {},
@@ -1135,7 +1135,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_accepts_absent_prior_artifact_versions(self):
         body = {
-            "experiment_id": "district_intel",
+            "experiment_type": "district_intel",
             "organization_slug": "acme",
             "run_id": "run-6",
             "params": {},
@@ -1145,7 +1145,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_non_dict_prior_artifact_versions(self):
         body = {
-            "experiment_id": "district_intel",
+            "experiment_type": "district_intel",
             "organization_slug": "acme",
             "run_id": "run-7",
             "params": {},
@@ -1186,7 +1186,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-iam-leak",
             "params": dict(VALID_L2_PARAMS),
@@ -1226,7 +1226,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-123",
             "run_id": "run-iam-exc-leak",
             "params": dict(VALID_L2_PARAMS),
@@ -1275,7 +1275,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         dh.logger.setLevel(logging.DEBUG)
         try:
             event = _make_sqs_event({
-                "experiment_id": "voter_targeting",
+                "experiment_type": "voter_targeting",
                 "organization_slug": "org-123",
                 "run_id": "run-log-detail",
                 "params": dict(VALID_L2_PARAMS),
@@ -1314,7 +1314,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-ecs-cap",
             "params": dict(VALID_L2_PARAMS),
@@ -1339,7 +1339,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-ecs-boom",
             "params": dict(VALID_L2_PARAMS),
@@ -1365,7 +1365,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
         )
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-double-fail",
             "params": dict(VALID_L2_PARAMS),
@@ -1392,7 +1392,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
         }
 
         event = _make_sqs_event({
-            "experiment_id": "voter_targeting",
+            "experiment_type": "voter_targeting",
             "organization_slug": "org-x",
             "run_id": "run-ok",
             "params": dict(VALID_L2_PARAMS),

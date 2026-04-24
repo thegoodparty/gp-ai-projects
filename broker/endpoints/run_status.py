@@ -17,10 +17,10 @@ router = APIRouter(prefix="/internal", tags=["internal"])
 # Agent may report any of these via /run-status. `success` is NOT in this set
 # — success must only flow through /artifact/publish so the data-required
 # guard (DataQueryTracker) can't be bypassed. `timeout` is accepted here but
-# translated to `failed` + reason_code="timeout" before the callback is sent,
-# because gp-api's zod consumer only accepts the five canonical states.
+# translated to `failed` before the callback is sent, because gp-api's zod
+# consumer only accepts `success | failed | contract_violation`.
 AgentReportableStatus = Literal[
-    "running", "failed", "contract_violation", "timeout"
+    "failed", "contract_violation", "timeout"
 ]
 
 # Statuses the broker forwards to gp-api on the callback wire. Must stay in

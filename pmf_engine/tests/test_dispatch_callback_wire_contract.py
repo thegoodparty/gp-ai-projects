@@ -32,7 +32,7 @@ class TestSendErrorCallbackWireFormat:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_id": "voter_targeting",
+                    "experiment_type": "voter_targeting",
                     "run_id": "run-err-1",
                     "organization_slug": "org-1",
                 },
@@ -59,7 +59,7 @@ class TestSendErrorCallbackWireFormat:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_id": "district_intel",
+                    "experiment_type": "district_intel",
                     "run_id": "run-err-2",
                     "organization_slug": "org-2",
                 },
@@ -88,7 +88,7 @@ class TestSendErrorCallbackDedupKey:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_id": "voter_targeting",
+                    "experiment_type": "voter_targeting",
                     "run_id": "run-xyz",
                     "organization_slug": "org-1",
                 },

@@ -127,12 +127,12 @@ class TestCallbackSenderFailureCarriesDurationAndCost:
 
 
 class TestCallbackSenderErrorFieldBackCompat:
-    """gp-api's queue consumer still reads `data.error` to populate the
+    """gp-api's queue consumer reads `data.error` to populate the
     ExperimentRun.error column (the only user-visible failure message in the
     webapp). The runner stopped sending `error` when it switched to
-    reason_code/detail — every failure callback now loses its error text in
-    the UI. This test locks in that the callback body always carries `error`
-    for back-compat until gp-api is updated to read `detail`.
+    reason_code/detail — every failure callback lost its error text in the UI.
+    This test locks in that the callback body always carries `error` populated
+    with detail.
     """
 
     def test_failed_callback_includes_error_field_for_backcompat(self):
@@ -151,7 +151,8 @@ class TestCallbackSenderErrorFieldBackCompat:
         body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
         # gp-api reads data.error; keep populated with the same text as detail.
         assert body["data"]["error"] == "Agent exceeded 600s limit"
-        # New structured fields still present for when gp-api upgrades.
+        # Structured fields still present — gp-api's current schema ignores
+        # them but they're on the wire for future consumption.
         assert body["data"]["reasonCode"] == "Timeout"
         assert body["data"]["detail"] == "Agent exceeded 600s limit"
 

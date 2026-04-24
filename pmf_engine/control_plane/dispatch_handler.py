@@ -102,7 +102,7 @@ def send_error_callback(
         body = json.dumps({
             "type": "agentExperimentResult",
             "data": {
-                "experimentId": message.get("experiment_id", "unknown"),
+                "experimentId": message.get("experiment_type", "unknown"),
                 "runId": run_id,
                 "organizationSlug": message.get("organization_slug", "unknown"),
                 "status": "failed",
@@ -191,7 +191,7 @@ def parse_dispatch_message(body: str) -> dict:
     except (json.JSONDecodeError, TypeError) as e:
         raise ValueError(f"Invalid message body: {e}")
 
-    for field in ("experiment_id", "organization_slug", "run_id"):
+    for field in ("experiment_type", "organization_slug", "run_id"):
         if not data.get(field):
             raise ValueError(f"Missing required field: {field}")
 
@@ -217,7 +217,7 @@ def build_container_overrides(
             {
                 "name": container_name,
                 "environment": [
-                    {"name": "EXPERIMENT_ID", "value": message["experiment_id"]},
+                    {"name": "EXPERIMENT_ID", "value": message["experiment_type"]},
                     {"name": "RUN_ID", "value": message["run_id"]},
                     {"name": "ORGANIZATION_SLUG", "value": message["organization_slug"]},
                     {"name": "HARNESS", "value": experiment["harness"]},
@@ -264,7 +264,7 @@ def handler(event: dict, context) -> dict:
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
-        experiment_id = message["experiment_id"]
+        experiment_id = message["experiment_type"]
         experiment = DISPATCH_REGISTRY.get(experiment_id)
 
         if experiment is None:

@@ -29,7 +29,7 @@ def _env_list_to_map(env_list: list[dict]) -> dict[str, str]:
 
 def _base_message(experiment_id: str) -> dict:
     return {
-        "experiment_id": experiment_id,
+        "experiment_type": experiment_id,
         "run_id": f"run-{experiment_id}-abc123",
         "organization_slug": f"organization-{experiment_id}",
         "params": {

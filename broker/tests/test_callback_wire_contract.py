@@ -9,6 +9,12 @@ PENDING/RUNNING forever.
 When gp-api's schema changes, this Pydantic mirror must be updated in
 lock-step. Keeping the duplicate is the cost; the alternative is silent prod
 breakage from a unit-test green build.
+
+gp-api's new contract (2026-04-24) only reads `runId`, `status`, `artifactKey`,
+`artifactBucket`, `durationSeconds`, `error`. The broker still emits the
+richer structured set (experimentId, organizationSlug, costUsd, reasonCode,
+detail) for future consumption — Zod strips unknown fields by default, so
+emitting extras is safe. This mirror uses `extra="allow"` to reflect that.
 """
 
 import json
@@ -22,21 +28,17 @@ from broker.callback_sender import CallbackSender
 
 
 class GpApiAgentExperimentResultData(BaseModel):
-    """Mirror of gp-api's AgentExperimentResultSchema (zod). Required vs
-    optional, status enum, and field naming MUST match exactly. Last synced
-    from gp-api/src/queue/queue.types.ts on 2026-04-21.
+    """Mirror of gp-api's AgentExperimentResultSchema (zod). The required /
+    optional / enum shape MUST match gp-api — extras are allowed (Zod's
+    default strip behavior). Last synced from gp-api/src/queue/queue.types.ts
+    on 2026-04-24.
     """
 
-    experimentId: str
     runId: str
-    organizationSlug: str
-    status: Literal["running", "success", "failed", "contract_violation", "stale"]
+    status: Literal["success", "failed", "contract_violation"]
     artifactKey: str | None = None
     artifactBucket: str | None = None
     durationSeconds: float | None = None
-    costUsd: float | None = None
-    reasonCode: str | None = None
-    detail: str | None = None
     error: str | None = None
 
     model_config = ConfigDict(extra="allow")
@@ -81,7 +83,6 @@ class TestSuccessCallbackParsesAtGpApi:
         assert msg.data.artifactKey == "district_intel/run-2/artifact.json"
         assert msg.data.artifactBucket == "gp-agent-artifacts-dev"
         assert msg.data.durationSeconds == 183.4
-        assert msg.data.costUsd == 0.42
 
 
 class TestFailureCallbackParsesAtGpApi:
@@ -95,8 +96,6 @@ class TestFailureCallbackParsesAtGpApi:
             detail="Agent exceeded 600s limit",
         )
         assert msg.data.status == "failed"
-        assert msg.data.reasonCode == "Timeout"
-        assert msg.data.detail == "Agent exceeded 600s limit"
         # error field carries detail for back-compat — must parse.
         assert msg.data.error == "Agent exceeded 600s limit"
 
@@ -111,17 +110,6 @@ class TestFailureCallbackParsesAtGpApi:
         )
         assert msg.data.status == "contract_violation"
         assert msg.data.error == "Missing required field: voters[0].address"
-
-
-class TestRunningCallbackParsesAtGpApi:
-    def test_running_status(self):
-        msg = _send_and_parse(
-            run_id="run-5",
-            organization_slug="org-5",
-            experiment_id="meeting_briefing",
-            status="running",
-        )
-        assert msg.data.status == "running"
 
 
 class TestSchemaRejectsInvalid:
@@ -145,11 +133,25 @@ class TestSchemaRejectsInvalid:
         with pytest.raises(ValidationError):
             GpApiAgentExperimentResultMessage.model_validate(body)
 
+    def test_running_status_rejected(self):
+        # gp-api's new contract dropped `running` and `stale` from the status
+        # enum. The agent no longer reports `running`; if it ever did again,
+        # gp-api's Zod would reject and the message would dead-letter.
+        sqs = MagicMock()
+        sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/q.fifo")
+        sender.send_result(
+            run_id="run-7",
+            organization_slug="org-7",
+            experiment_id="voter_targeting",
+            status="running",
+        )
+        body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
+        with pytest.raises(ValidationError):
+            GpApiAgentExperimentResultMessage.model_validate(body)
+
     def test_missing_required_field_rejected(self):
         with pytest.raises(ValidationError):
             GpApiAgentExperimentResultMessage.model_validate({
                 "type": "agentExperimentResult",
-                "data": {
-                    "runId": "x", "organizationSlug": "y", "status": "success",
-                },  # missing experimentId
+                "data": {"status": "success"},  # missing runId
             })

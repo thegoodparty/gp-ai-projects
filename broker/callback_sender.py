@@ -35,10 +35,11 @@ class CallbackSender:
                 "costUsd": cost_usd,
                 "reasonCode": reason_code,
                 "detail": detail,
-                # gp-api's queue consumer still reads data.error to populate
+                # gp-api's queue consumer reads data.error to populate
                 # ExperimentRun.error (the user-visible failure text). Keep
-                # populated with detail until gp-api is updated to read detail
-                # directly.
+                # populated with detail; gp-api's new schema ignores the
+                # structured detail/reasonCode/costUsd fields but they stay
+                # on the wire for future gp-api consumption.
                 "error": detail,
             },
         }

@@ -71,8 +71,12 @@ def _create_app(
     return app, mock_s3, mock_sender, mock_store
 
 
-class TestRunStatusRunning:
-    def test_running_sends_callback_does_not_delete_ticket(self):
+class TestRunStatusRunningRejected:
+    def test_running_rejected_at_pydantic_boundary(self):
+        """gp-api's new contract drops `running` from the result status enum
+        — the agent no longer reports it, and the broker rejects it at the
+        Pydantic boundary before any callback or ticket mutation can occur.
+        """
         app, _, mock_sender, mock_store = _create_app()
         client = TestClient(app)
 
@@ -82,13 +86,8 @@ class TestRunStatusRunning:
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
 
-        assert resp.status_code == 200
-        assert resp.json()["callback_sent"] is True
-
-        mock_sender.send_result.assert_called_once()
-        call_kwargs = mock_sender.send_result.call_args[1]
-        assert call_kwargs["status"] == "running"
-
+        assert resp.status_code == 422
+        mock_sender.send_result.assert_not_called()
         mock_store.delete_ticket_and_run_lock.assert_not_called()
 
 
@@ -258,10 +257,10 @@ class TestRunStatusSuccessRejected:
 
 
 class TestRunStatusTimeoutTranslated:
-    """gp-api's Zod schema accepts `running/success/failed/contract_violation
-    /stale` — NOT `timeout`. A literal `timeout` callback hits gp-api's DLQ
-    and the run stays stuck RUNNING forever. Broker must translate `timeout`
-    → `failed` with reason_code="timeout" so the callback parses.
+    """gp-api's Zod schema accepts `success/failed/contract_violation` — NOT
+    `timeout`. A literal `timeout` callback hits gp-api's DLQ and the run
+    stays stuck RUNNING forever. Broker must translate `timeout` → `failed`
+    so the callback parses.
     """
 
     def test_timeout_translates_to_failed_with_reason_code(self):
@@ -369,27 +368,6 @@ class TestRunStatusTrackerCleanup:
 
         assert resp.status_code == 200
         assert tracker.get(ticket.pk) == 0
-
-    def test_tracker_not_cleared_on_running_status(self):
-        ticket = _make_ticket()
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-        tracker.increment(ticket.pk)
-        tracker.increment(ticket.pk)
-        assert tracker.get(ticket.pk) == 3
-
-        app, _, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/internal/run-status",
-            json={"status": "running"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert tracker.get(ticket.pk) == 3
-
 
 class TestRunStatusClearsRunLock:
     """Terminal run-status must delete BOTH the ticket row and the run-lock
