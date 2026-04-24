@@ -105,6 +105,15 @@ resource "aws_iam_role_policy" "github_actions_ecr_push" {
         Resource = [
           "arn:aws:ecr:us-west-2:${data.aws_caller_identity.current.account_id}:repository/gp-ai-projects"
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:UpdateFunctionCode"
+        ]
+        Resource = [
+          "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:clickup-bot-*"
+        ]
       }
     ]
   })
@@ -122,7 +131,8 @@ resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
         Effect = "Allow"
         Action = [
           "lambda:UpdateFunctionCode",
-          "lambda:GetFunction"
+          "lambda:GetFunction",
+          "lambda:GetFunctionConfiguration"
         ]
         Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
       }
