@@ -26,6 +26,7 @@ class StorageBackend(Protocol):
     def read_bytes(self, key: str) -> bytes: ...
     def exists(self, key: str) -> bool: ...
     def list_keys(self, prefix: str) -> list[str]: ...
+    def delete(self, key: str) -> None: ...
     def get_size(self, key: str) -> int: ...
     def append_line(self, key: str, line: str) -> None: ...
 
@@ -89,6 +90,17 @@ class S3StorageBackend:
                 keys.append(obj["Key"])
         return keys
 
+    def delete(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
     def append_line(self, key: str, line: str) -> None:
         # Logs are not written to S3 — no-op intentionally.
         pass
+
+    def get_presigned_url(self, key: str, expiry_seconds: int = 300) -> str:
+        """Return a presigned URL for reading an S3 object."""
+        return self.s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expiry_seconds,
+        )

@@ -152,6 +152,32 @@ def load_novus_meetings(city_slug: str, from_date: str, storage, sources_prefix:
     return [m for m in meetings if m.get("date", "") >= from_date]
 
 
+def load_generic_meetings(city_slug: str, from_date: str, storage, sources_prefix: str) -> list[dict]:
+    """Returns generic_direct meetings after from_date (platform=unknown cities)."""
+    meetings_key = f"{sources_prefix}/{city_slug}/data/generic/meetings.json"
+    if not storage.exists(meetings_key):
+        return []
+    meetings = storage.read_json(meetings_key)
+    return [m for m in meetings if m.get("date", "") >= from_date]
+
+
+def format_generic_meeting(m: dict) -> dict:
+    """Format a generic_direct meeting (platform=unknown, downloaded via direct PDF URL)."""
+    agenda_files = m.get("agenda_files", [])
+    has_agenda = bool(agenda_files)
+    status = "agenda_ready" if has_agenda else "agenda_not_posted"
+    return {
+        "date": m.get("date", ""),
+        "title": m.get("title", "City Council Meeting"),
+        "body": m.get("body", "City Council"),
+        "platform": "generic_direct",
+        "status": status,
+        "source_url": m.get("source_url", ""),
+        "agenda_files": agenda_files,
+        "notes": "",
+    }
+
+
 def format_boarddocs_meeting(e: dict, base_url: str, has_matters: bool) -> dict:
     # base_url from source.json is the /Public URL; strip it to get the NSF base
     nsf_url = base_url.removesuffix("/Public").removesuffix("/public") if base_url else ""
@@ -526,6 +552,11 @@ def main():
             raw_meetings = load_novus_meetings(city_slug, from_date, storage, cfg.sources_prefix)
             for m in raw_meetings:
                 meetings.append(format_novus_meeting(m))
+
+        elif platform == "unknown":
+            raw_meetings = load_generic_meetings(city_slug, from_date, storage, cfg.sources_prefix)
+            for m in raw_meetings:
+                meetings.append(format_generic_meeting(m))
 
         else:
             skipped.append({**official, "reason": f"platform '{platform}' not yet supported in queue"})

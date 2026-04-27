@@ -41,7 +41,13 @@ TODAY = date.today().isoformat()
 TERRY_CSV = _ROOT / "Terry Users2.csv"
 STATUS_CSV = _ROOT / "terry-cities-status.csv"
 
-SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe", "granicus"}
+# Platforms the pipeline can actively collect from — must stay in sync with
+# LOADABLE_PLATFORMS in run_serve_users_pipeline.py
+SUPPORTED_PLATFORMS = {
+    "legistar", "civicplus", "civicclerk", "granicus", "swagit",
+    "escribe", "boarddocs", "municode", "novus",
+    "unknown", "generic_html",
+}
 
 # Columns managed by this script (in order after "Pipeline Last Meeting")
 PIPELINE_COLUMNS = [
@@ -83,16 +89,6 @@ def get_qa_result(storage, slug: str, briefing_date: str) -> str:
         except Exception:
             pass
     return ""
-    try:
-        data = storage.read_json(key)
-        status = data.get("delivery_status", "")
-        if status == "OK":
-            return "Pass"
-        if status == "Block":
-            return "Block"
-        return status
-    except Exception:
-        return ""
 
 
 def list_briefing_keys(storage, briefings_prefix: str, slug: str) -> list[str]:

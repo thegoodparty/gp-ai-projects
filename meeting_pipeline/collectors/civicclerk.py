@@ -57,6 +57,9 @@ class CivicClerkConfig:
         "board of mayor",
         "town board",
         "village council",
+        "board of commissioners",   # e.g. Davidson NC — must match before fallback "commission" exclusion
+        "select board",             # e.g. New England towns
+        "board of selectmen",
     ])
     download_pdfs: bool = True
     request_timeout: int = 30
@@ -272,6 +275,29 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                         print(f"     Downloaded: {filename} ({len(pdf_resp.content) // 1024}KB)")
                     except Exception as e:
                         print(f"     WARNING: Failed to download fileId={file_id}: {e}")
+
+            # Firecrawl fallback: scrape portal event page when API returns no files
+            elif config.download_pdfs and not agenda_files and event.get("hasAgenda"):
+                try:
+                    from meeting_pipeline.collection_agent.firecrawl_utils import scrape_civicclerk_event_files
+                    portal_base = f"https://{config.tenant}.portal.civicclerk.com"
+                    print(f"     [civicclerk] API returned 0 files for event {event_id} — trying Firecrawl")
+                    pdf_urls = scrape_civicclerk_event_files(portal_base, str(event_id))
+                    for pdf_url in pdf_urls[:3]:
+                        try:
+                            resp = await client.get(pdf_url, timeout=30, follow_redirects=True)
+                            resp.raise_for_status()
+                            if len(resp.content) > 5000:
+                                date_str = event["eventDate"][:10]
+                                filename = pdf_url.split("/")[-1].split("?")[0] or f"{date_str}_{event_id}.pdf"
+                                pdf_key = f"{config.output_prefix}/pdfs/{filename}"
+                                config.storage.write_bytes(pdf_key, resp.content)
+                                pdf_count += 1
+                                print(f"     [civicclerk] Firecrawl fallback downloaded: {filename}")
+                        except Exception as e:
+                            print(f"     [civicclerk] Firecrawl fallback download failed: {e}")
+                except ImportError:
+                    pass  # Firecrawl not installed — skip fallback
 
             if i % 5 == 0 and i > 0:
                 print(f"     Processed {i + 1}/{len(recent_events)} events...")

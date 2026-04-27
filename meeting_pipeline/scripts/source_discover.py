@@ -53,12 +53,39 @@ from meeting_pipeline.body_validation import validate_body_for_city, VALIDATABLE
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+# ── Cost tracking ─────────────────────────────────────────────────────────────
+# Counters are module-level so async tasks can increment them safely
+# (single-threaded event loop — no locking needed).
+_COST = {
+    "exa_searches": 0,
+    "tavily_searches": 0,
+    # Firecrawl: tracked by call type because credit cost varies significantly:
+    #   validate_agenda_page() → scrape(formats=["markdown","links"]) → ~1 credit
+    #   scrape_civicclerk_event_files() → scrape(actions=[...]) → likely 5+ credits (rendered)
+    # Check https://firecrawl.dev/app for actual credit consumption.
+    "firecrawl_scrape_basic": 0,    # validate_agenda_page calls
+    "firecrawl_scrape_actions": 0,  # calls with browser actions (civicclerk event pages)
+    "serper_searches": 0,            # Serper.dev search calls ($1/1k; 2500 free credits on signup)
+}
+# Per-call costs (USD).
+# Exa search_and_contents: $7/1k (search) + $1/1k × 5 pages (contents) = $0.012/call
+# Tavily: $0.01/search (basic plan — unconfirmed, update with actual plan pricing)
+# Firecrawl: credit cost per call type is uncertain — see dashboard for actuals
+_COST_PER_CALL = {
+    "exa_searches": 0.012,          # $7/1k search + $1/1k × 5 pages contents
+    "tavily_searches": 0.01,        # basic search (unconfirmed)
+    "firecrawl_scrape_basic": None, # unknown — check Firecrawl dashboard
+    "firecrawl_scrape_actions": None,
+}
+
 # ── Paths (module-level) ───────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PIPELINE_DIR = _SCRIPT_DIR.parent
 SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
 if not SERVE_CSV.exists():
     SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+if not SERVE_CSV.exists():
+    SERVE_CSV = _PIPELINE_DIR / "Terry Users2.csv"
 _DOTGOV_CSV_PATH = _PIPELINE_DIR / "config" / "dotgov.csv"
 
 # ── State name → abbreviation (mirrors collect_haystaq_batch.py) ──────────────
@@ -519,6 +546,34 @@ REJECT_URL_PATTERNS = [
     "nbcsports.com/",
 ]
 
+# Domain-name suffixes that indicate local news/media sites.
+# Applied to the domain label (before TLD) for .com domains only
+# (.gov/.us/.org are always treated as official and bypass this check).
+# e.g., "evanstonroundtable" ends with "roundtable" → news site.
+_NEWS_DOMAIN_SUFFIXES = {
+    # Newspaper / print journalism words
+    "roundtable", "tribune", "chronicle", "courier", "sentinel", "bulletin",
+    "advertiser", "examiner", "ledger", "dispatch", "herald", "gazette",
+    "register", "observer", "reporter", "journal", "dailynews", "weeklynews",
+    "newsroom", "newspost", "newstimes",
+    # Online-native local news patterns
+    "thread",   # "{city}thread.com" pattern
+    "reader",   # "{city}reader.com" pattern
+    "live",     # "{city}live.com" pattern (safe — .gov exempted from check)
+    "wire",     # "{city}wire.com" pattern
+    "today",    # "{city}today.com" pattern (common local news brand)
+    "now",      # "{city}now.com" pattern
+    "insider",  # "{city}insider.com" pattern
+    "indy",     # "{city}indy.com" — independent news
+    "talk",     # "{city}talk.com" — community news/radio
+}
+
+import re as _re
+# US broadcast station callsign pattern: 3–4 letters starting with K or W.
+# Covers kiow.com, ktiv.com, wkrc.com, etc. Note: longer callsigns (5+ chars)
+# or those that spell a real word are excluded to avoid false positives.
+_BROADCAST_CALLSIGN_RE = _re.compile(r"^[kw][a-z]{2,3}\.(com|tv|org)$")
+
 PILOT_CITIES = [
     # NC
     {"city": "Apex", "state": "NC"},
@@ -668,6 +723,20 @@ def get_serve_csv_cities() -> list[dict]:
         meeting_url = row.get("Meeting URL", row.get("meeting_url", "")).strip()
         if meeting_url and meeting_url.startswith("http"):
             entry["csv_meeting_url"] = meeting_url
+        # Extract the governing body name from the Role column.
+        # Role is like "Fultondale City Council - Place 1" or "Bennington Town Select Board".
+        # Strip the seat/ward/district suffix to get the body name.
+        role = (row.get("Role") or row.get("role") or row.get("Office") or "").strip()
+        if role:
+            # Remove seat/ward/district suffixes: "City Council - Ward 1" → "City Council"
+            body = re.sub(r'\s*[-–]\s*(Ward|District|Place|Seat|At Large|Position|Post).*$', '', role, flags=re.IGNORECASE).strip()
+            # Remove city name prefix if present: "Fultondale City Council" → "City Council"
+            # But keep it if removing it leaves nothing meaningful
+            body_no_city = re.sub(r'^' + re.escape(city) + r'\s+', '', body, flags=re.IGNORECASE).strip()
+            if body_no_city and len(body_no_city) > 3:
+                body = body_no_city
+            if body:
+                entry["expected_body"] = body
         cities.append(entry)
     return cities
 
@@ -952,11 +1021,28 @@ def is_non_agenda_url(url: str) -> bool:
     for pat in REJECT_URL_PATTERNS:
         if pat in url_lower:
             return True
-    # Reject .tv domains (local TV stations) unless explicitly government
+
     parsed = urlparse(url)
-    netloc = parsed.netloc.lower()
+    netloc = parsed.netloc.lower().removeprefix("www.")
+
+    # Reject .tv domains (local TV stations) unless explicitly government
     if netloc.endswith(".tv") or ".tv/" in url_lower:
         return True
+
+    # Reject US broadcast station call signs (K/W + 2-4 letters)
+    # e.g. kiow.com, ktiv.com, wkrc.com — radio/TV stations, not gov sources
+    if _BROADCAST_CALLSIGN_RE.match(netloc):
+        return True
+
+    # Reject news/media sites by domain suffix.
+    # Only applies to .com domains — .gov/.us/.org are always official.
+    if netloc.endswith(".com"):
+        # Strip the TLD, check if the domain label ends with a news-site word.
+        domain_label = netloc[: -len(".com")]  # e.g. "evanstonroundtable"
+        for suffix in _NEWS_DOMAIN_SUFFIXES:
+            if domain_label.endswith(suffix):
+                return True
+
     return False
 
 
@@ -1139,6 +1225,44 @@ def _search_results_to_candidates(
             if _city_slug not in _domain_clean and city.lower() not in _domain_clean:
                 continue  # CivicPlus/Novus site belongs to a different city
 
+        # Foreign-TLD rejection for US cities.
+        # Brockton MA → brockton.ca is a Canadian municipality, not Brockton MA.
+        _US_STATES = {
+            "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
+            "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
+            "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
+            "TX","UT","VT","VA","WA","WV","WI","WY","DC",
+        }
+        _FOREIGN_TLDS = {".ca", ".uk", ".au", ".nz", ".ie", ".in", ".de", ".fr"}
+        if state and state.upper() in _US_STATES:
+            _netloc_raw = urlparse(url).netloc.lower()
+            if any(_netloc_raw.endswith(tld) or f"{tld}/" in url.lower() for tld in _FOREIGN_TLDS):
+                continue
+
+        # CivicClerk tenant validation.
+        # CivicClerk is multi-tenant so the city-in-domain check is skipped for it.
+        # But the tenant slug (e.g. "pageaz" in pageaz.portal.civicclerk.com) should
+        # contain at least one meaningful token from the city name.
+        if platform == "civicclerk" and city:
+            _cc_netloc = urlparse(url).netloc.lower()
+            if ".portal.civicclerk.com" in _cc_netloc:
+                _tenant = _cc_netloc.split(".portal.civicclerk.com")[0]
+                _city_tokens = [t for t in city.lower().split() if len(t) > 2]
+                if _city_tokens and not any(tok in _tenant for tok in _city_tokens):
+                    continue  # tenant slug doesn't match city — wrong portal
+
+        # County / township domain rejection.
+        # When searching for a city, skip domains that belong to a county or township
+        # government unless the city itself is named after the county/township.
+        if city:
+            _netloc_check = urlparse(url).netloc.lower()
+            _city_lower = city.lower()
+            if "county" in _netloc_check and "county" not in _city_lower:
+                continue
+            if ("township" in _netloc_check or "twp" in _netloc_check.split(".")[0]) and \
+               "township" not in _city_lower and "twp" not in _city_lower:
+                continue
+
         # For all other unknown-platform results, require the city name to appear
         # in the domain OR in the page title. Content is too noisy (adjacent cities
         # mention each other), but domain+title is reliable.
@@ -1249,6 +1373,7 @@ async def discover_from_exa(
     try:
         from exa_py import Exa  # type: ignore
         exa = Exa(api_key=api_key)
+        _COST["exa_searches"] += 1
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 exa.search_and_contents,
@@ -1277,6 +1402,716 @@ async def discover_from_exa(
     return candidates, query
 
 
+async def discover_from_firecrawl(city: str, state: str) -> list[dict]:
+    """
+    Use Firecrawl search + extract to find a city council agenda page.
+    Returns a list of candidate dicts (same shape as other discover_from_* functions).
+    Only runs when FIRECRAWL_API_KEY is set.
+    """
+    if not os.environ.get("FIRECRAWL_API_KEY"):
+        return []
+    try:
+        from meeting_pipeline.collection_agent.firecrawl_utils import (
+            search_agenda_page,
+            extract_meeting_links,
+        )
+    except ImportError:
+        return []
+
+    url = search_agenda_page(city, state)
+    if not url:
+        return []
+
+    cand = make_candidate(url=url, platform="generic_html", source="firecrawl")
+    meetings = extract_meeting_links(url, city, state)
+    if meetings:
+        cand["body_match"] = True
+        cand["notes"] = f"firecrawl: found {len(meetings)} city council meeting(s)"
+    else:
+        cand["body_match"] = False
+        cand["notes"] = "firecrawl: url found but no council meetings extracted"
+    return [cand]
+
+
+# ── Constants for Serper-based discovery ──────────────────────────────────────
+
+# Domains that should never be accepted as a city government source
+FETCH_BLOCKLIST = frozenset({
+    "en.wikipedia.org", "wikipedia.org", "youtube.com", "facebook.com",
+    "twitter.com", "x.com", "linkedin.com", "nextdoor.com", "yelp.com",
+    "google.com",
+})
+
+# City name prefixes/suffixes that indicate a different municipality
+CITY_NAME_PREFIXES = ("north", "south", "east", "west", "new", "old", "upper",
+                      "lower", "mount", "fort", "port", "lake", "grand")
+CITY_NAME_SUFFIXES = ("ville", "town", "burg", "field", "dale", "view", "wood")
+
+
+# ── Serper discovery helper functions ─────────────────────────────────────────
+
+def serper_search(query: str, api_key: str) -> list[dict]:
+    """Run one Serper.dev search. Returns list of {url, title} dicts (top 5).
+    Raises RuntimeError on rate limit."""
+    _COST["serper_searches"] += 1
+    try:
+        resp = httpx.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "gl": "us", "num": 10},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        organic = resp.json().get("organic", [])
+        return [
+            {"url": r.get("link", ""), "title": r.get("title", "")}
+            for r in organic[:5]
+            if r.get("link")
+        ]
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "quota" in msg.lower():
+            raise RuntimeError(f"serper_rate_limited: {msg[:120]}")
+        return []
+
+
+def validate_domain_for_city(domain: str, city: str, state: str) -> tuple[bool, str]:
+    """
+    Fetch a domain's root page and check it mentions the city and state.
+    Used to validate Serper results — catches wrong-city confusions
+    (e.g. Clear Lake CA vs Clear Lake IA, North Logan vs Logan).
+
+    Returns (valid: bool, reason: str).
+    """
+    try:
+        state_full = _STATE_NAMES.get(state.upper(), state)
+
+        if domain in FETCH_BLOCKLIST:
+            return False, "blocklisted_domain→rejected"
+
+        # Domain-level wrong-state check (before fetching)
+        domain_lower = domain.lower()
+        first_segment = domain_lower.split(".")[0]
+        correct_state_full = state_full.lower()
+        city_clean = city.lower().replace(" ", "")
+
+        for abbrev, _sname in _STATE_NAMES.items():
+            if abbrev == state.upper():
+                continue
+            ab = abbrev.lower()
+            # Pattern 1: state abbrev as suffix of first segment (camdennj → nj)
+            # Skip if state full name or city name ends with this abbrev
+            if first_segment.endswith(ab) and len(first_segment) > len(ab):
+                if not correct_state_full.endswith(ab) and not city_clean.endswith(ab):
+                    return False, f"domain_encodes_wrong_state:{abbrev}→rejected"
+            # Pattern 2: state abbrev as delimited segment (clearlake-ca.municode → ca)
+            if re.search(r'(?:^|[-.])' + ab + r'(?:[.-]|$)', domain_lower):
+                return False, f"domain_encodes_wrong_state:{abbrev}→rejected"
+
+        # Wrong-city check: "North Logan" contains "Logan" but is a different city
+        domain_clean = domain_lower.replace("-", "").replace(".", "")
+        first_seg_clean = first_segment.replace("-", "")
+
+        for prefix in CITY_NAME_PREFIXES:
+            if prefix + city_clean in domain_clean and prefix not in city_clean:
+                return False, f"domain_is_different_city:{prefix}{city_clean}→rejected"
+
+        for suffix in CITY_NAME_SUFFIXES:
+            if city_clean + suffix in first_seg_clean and suffix not in city_clean:
+                return False, f"domain_is_different_city:{city_clean}{suffix}→rejected"
+
+        # Fetch the page and check for city + state mentions
+        for url in [f"https://www.{domain}", f"https://{domain}"]:
+            try:
+                with httpx.Client(follow_redirects=True, timeout=8.0) as hc:
+                    r = hc.get(url)
+                    if r.status_code == 200 and len(r.text) > 500:
+                        text = r.text.lower()
+                        city_lower = city.lower()
+                        city_words = city_lower.split()
+                        city_found = all(w in text for w in city_words)
+                        state_found = (
+                            bool(re.search(r'\b' + re.escape(state.lower()) + r'\b', text))
+                            or state_full.lower() in text
+                        )
+
+                        if city_found and state_found:
+                            return True, "city+state_found→accepted"
+                        if city_found and not state_found:
+                            if city_clean in domain_clean:
+                                return True, "city_in_domain→accepted"
+                            return False, f"state_not_found({state}/{state_full})→rejected"
+                        if not city_found:
+                            missing = [w for w in city_words if w not in text]
+                            return False, f"city_words_missing:{missing}→rejected"
+            except Exception:
+                continue
+
+        return True, "fetch_failed→optimistic"
+    except Exception as e:
+        return True, f"exception→optimistic:{str(e)[:60]}"
+
+
+# Platform signals in PDF URLs — used by discover_from_pdf_search
+PDF_PLATFORM_SIGNALS = {
+    "legistar": ["legistar.com", "legistar1.com"],
+    "civicclerk": ["civicclerk.com", "civicclerk.blob"],
+    "granicus": ["granicus.com", "swagit.com", "swagit-attachments"],
+    "municode": ["municode.com", "municodemeetings.com"],
+    "boarddocs": ["boarddocs.com"],
+    "novus": ["novusagenda.com"],
+    "escribe": ["escribemeetings.com"],
+    "primegov": ["primegov.com"],
+}
+
+
+def discover_from_pdf_search(city: str, state: str, body_term: str) -> list[dict]:
+    """
+    Search Google for agenda PDFs via Serper filetype:pdf.
+    Parses platform signals from result URLs to discover Legistar, CivicClerk, etc.
+    Returns list of candidate dicts for any platforms found.
+
+    Cost: 1 Serper search (~$0.001).
+    """
+    api_key = os.environ.get("SERPER_API_KEY")
+    if not api_key:
+        return []
+
+    _COST["serper_searches"] = _COST.get("serper_searches", 0) + 1
+    query = f'"{city}" "{state}" "{body_term}" agenda filetype:pdf {TODAY.year}'
+
+    try:
+        resp = httpx.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "gl": "us", "num": 5},
+            timeout=15.0,
+        )
+        results = resp.json().get("organic", [])
+    except Exception:
+        return []
+
+    candidates = []
+    city_lower = city.lower()
+
+    for pr in results[:5]:
+        pdf_url = pr.get("link", "")
+        pdf_url_lower = pdf_url.lower()
+
+        # Verify city name in result
+        combined_text = f"{pr.get('title', '')} {pr.get('snippet', '')}".lower()
+        if city_lower not in combined_text:
+            continue
+
+        for platform_name, signals in PDF_PLATFORM_SIGNALS.items():
+            if not any(sig in pdf_url_lower for sig in signals):
+                continue
+
+            parsed = urlparse(pdf_url)
+            host = parsed.netloc.lower()
+
+            if platform_name == "legistar" and "legistar" in host:
+                slug = host.split(".")[0]
+                cand = make_candidate(
+                    url=f"https://webapi.legistar.com/v1/{slug}/events?$top=3&$orderby=EventDate+desc",
+                    platform="legistar", source="pdf_search",
+                    display_url=f"https://{slug}.legistar.com",
+                    config={"legistar_slug": slug},
+                    notes=f"pdf_search→{slug}.legistar.com",
+                )
+            elif platform_name == "civicclerk" and "civicclerk" in host:
+                slug = host.split(".")[0]
+                cand = make_candidate(
+                    url=f"https://{slug}.portal.civicclerk.com",
+                    platform="civicclerk", source="pdf_search",
+                    notes=f"pdf_search→{slug}.civicclerk.com",
+                )
+            elif platform_name == "granicus":
+                slug = host.split(".")[0] if "granicus.com" in host else (
+                    parsed.path.strip("/").split("/")[0] if parsed.path.strip("/") else ""
+                )
+                if not slug:
+                    continue
+                cand = make_candidate(
+                    url=f"https://{slug}.granicus.com/ViewPublisher.php?view_id=1",
+                    platform="granicus", source="pdf_search",
+                    notes=f"pdf_search→{slug}.granicus.com",
+                )
+            else:
+                cand = make_candidate(
+                    url=pdf_url, platform=platform_name, source="pdf_search",
+                    notes=f"pdf_search→{platform_name}",
+                )
+
+            candidates.append(cand)
+            print(f"  [pdf_search] Found {platform_name}: {cand['url'][:60]}")
+            break  # one platform per result
+
+    return candidates
+
+
+def firecrawl_crawl_for_agenda(
+    start_url: str, city: str, state: str,
+    expected_body: str = "", max_hops: int = 4,
+) -> str | None:
+    """
+    Follow links from start_url up to max_hops to find the actual agenda page.
+    At each hop: scrape with JS rendering, check for meeting content.
+    If found → return that URL. If not → follow the best matching link.
+
+    Cost: ~5 Firecrawl credits per hop. Stops as soon as content is found.
+    """
+    fc_key = os.environ.get("FIRECRAWL_API_KEY")
+    if not fc_key:
+        return None
+    try:
+        from firecrawl import FirecrawlApp as _FC
+        from meeting_pipeline.body_validation import REJECT_KEYWORDS
+        fc = _FC(api_key=fc_key)
+
+        body_words = [w.lower() for w in expected_body.split() if len(w) > 2] if expected_body else []
+        domain = urlparse(start_url).netloc.lower()
+        visited = {start_url.rstrip("/")}
+        current_url = start_url
+
+        for hop in range(max_hops):
+            result = fc.scrape(
+                current_url,
+                formats=["markdown", "links"],
+                actions=[{"type": "wait", "milliseconds": 3000}],
+            )
+            markdown = getattr(result, "markdown", "") or ""
+            links = list(getattr(result, "links", None) or [])
+            pdf_links = [l for l in links if ".pdf" in l.lower()]
+
+            # Check: does this page have meeting content for the right body?
+            if len(pdf_links) >= 3 or len(markdown) > 5000:
+                md_lower = markdown.lower()
+                reject_score = sum(1 for kw in REJECT_KEYWORDS if kw in md_lower)
+
+                wrong_body = False
+                if expected_body and reject_score >= 2:
+                    header_area = md_lower[:2000]
+                    body_in_header = any(w in header_area for w in body_words)
+                    if not body_in_header:
+                        wrong_body = True
+
+                if wrong_body:
+                    print(f"  [crawl] Hop {hop+1}: Page has content but wrong body — continuing")
+                else:
+                    print(f"  [crawl] Hop {hop+1}: Found agenda page ({len(pdf_links)} PDFs, {len(markdown)} chars): {current_url[:70]}")
+                    return current_url
+
+            if not links:
+                print(f"  [crawl] Hop {hop+1}: No links found on {current_url[:60]}")
+                return None
+
+            # Parse link text from markdown for scoring
+            link_texts = {}
+            for m in re.finditer(r'\[([^\]]+)\]\(([^)]+)\)', markdown):
+                link_texts[m.group(2)] = m.group(1).lower()
+
+            # Score links: prefer body-matching, agenda-related links
+            scored = []
+            for link in links:
+                link_lower = link.lower()
+                if domain not in urlparse(link).netloc.lower():
+                    continue
+                if link_lower.endswith(".pdf"):
+                    continue
+                if link.rstrip("/") in visited:
+                    continue
+                if "#" in link and link.split("#")[0].rstrip("/") in visited:
+                    continue
+
+                anchor = link_texts.get(link, "")
+                combined = f"{link_lower} {anchor}"
+                score = 0
+
+                if body_words:
+                    score += sum(5 for bw in body_words if bw in combined)
+                if "agenda" in combined: score += 3
+                if "council" in combined or "commission" in combined: score += 2
+                if "meeting" in combined: score += 1
+                if "minute" in combined: score += 1
+                if str(TODAY.year) in combined: score += 2
+                if any(rk in combined for rk in REJECT_KEYWORDS):
+                    score -= 10
+                if score > 0:
+                    scored.append((score, link))
+
+            if not scored:
+                print(f"  [crawl] Hop {hop+1}: No matching links on {current_url[:60]}")
+                return None
+
+            scored.sort(reverse=True)
+            next_url = scored[0][1]
+            visited.add(next_url.rstrip("/"))
+            print(f"  [crawl] Hop {hop+1}: Following → {next_url[:80]}")
+            current_url = next_url
+
+        return None
+    except Exception as e:
+        print(f"  [crawl] Error: {str(e)[:80]}")
+        return None
+
+
+def firecrawl_map_agenda(base_url: str) -> str | None:
+    """
+    Run Firecrawl map_url() on a domain to find the agenda sub-page.
+
+    Filtering: prefers URLs with "agenda" + "council"/"meeting" in path.
+    Validates the winner by fetching it and checking for agenda content.
+    Returns the best agenda URL, or None.
+    """
+    fc_key = os.environ.get("FIRECRAWL_API_KEY")
+    if not fc_key:
+        return None
+    try:
+        from firecrawl import V1FirecrawlApp
+        fc = V1FirecrawlApp(api_key=fc_key)
+        result = fc.map_url(base_url, search="city council agenda")
+        links = getattr(result, "links", None) or []
+
+        # Filter out PDFs and known non-agenda domains
+        _non_agenda = {"facebook.com", "twitter.com", "youtube.com", "wikipedia.org"}
+        links = [
+            l for l in links
+            if not urlparse(l).netloc.lower().removeprefix("www.") in _non_agenda
+            and not l.split("?")[0].lower().endswith(".pdf")
+        ]
+
+        # Primary: "agenda" + ("council" or "meeting") in URL
+        agenda_links = [
+            l for l in links
+            if "agenda" in l.lower()
+            and ("council" in l.lower() or "meeting" in l.lower())
+        ]
+        if not agenda_links:
+            agenda_links = [l for l in links if "agenda" in l.lower()]
+        if not agenda_links:
+            return None
+
+        # Score: prefer listing pages (shorter paths, no dates) over specific meetings
+        _date_re = re.compile(
+            r'\d{4}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4}'
+            r'|\bjanuary\b|\bfebruary\b|\bmarch\b|\bapril\b|\bmay\b|\bjune\b'
+            r'|\bjuly\b|\baugust\b|\bseptember\b|\boctober\b|\bnovember\b|\bdecember\b',
+            re.I
+        )
+
+        def _score(url: str) -> tuple:
+            path = url.split("?")[0].rstrip("/")
+            last = path.split("/")[-1].lower()
+            return (last.endswith(".pdf"), bool(_date_re.search(last)), len(path))
+
+        agenda_links.sort(key=_score)
+        best_url = agenda_links[0]
+
+        # Validate: does the page look like an agenda listing?
+        try:
+            with httpx.Client(follow_redirects=True, timeout=8.0) as hc:
+                r = hc.get(best_url)
+                if r.status_code == 200:
+                    text = r.text.lower()
+                    agenda_count = text.count("agenda")
+                    date_count = len(re.findall(
+                        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2},?\s+20\d{2}',
+                        text, re.I
+                    ))
+                    pdf_count = text.count(".pdf")
+                    if agenda_count >= 3 or date_count >= 2 or pdf_count >= 2:
+                        return best_url
+                    return None
+        except Exception:
+            return best_url  # fetch failed — return optimistically
+
+        return best_url
+    except Exception:
+        return None
+
+
+async def discover_from_serper(
+    city: str,
+    state: str,
+    expected_body: str = "",
+) -> tuple[list[dict], str]:
+    """
+    Use Serper.dev (real Google Search results) to find the official city council agenda URL.
+
+    Strategy:
+    1. Search Serper for "{city} {state_full} city council agenda"
+    2. For each result: validate domain (right city/state), scan page for meetings
+    3. If page has no meetings: crawl sub-pages matching expected_body
+    4. If still nothing: try next Serper result (same domain preferred)
+    5. Fallback query with site:.gov/.org if primary query fails
+
+    Returns (candidates, query_used). Candidates have source="serper_search".
+    Only runs when SERPER_API_KEY is set.
+    """
+    api_key = os.environ.get("SERPER_API_KEY")
+    if not api_key:
+        return [], ""
+
+    # Helper functions are defined at module level above:
+    #   serper_search(), validate_domain_for_city(),
+    #   firecrawl_map_agenda(), firecrawl_crawl_for_agenda()
+
+    # (Nested helper functions were extracted to module level — see above)
+
+    # ── Primary query ─────────────────────────────────────────────────────────
+    state_full = _STATE_NAMES.get(state.upper(), state)
+    primary_q = f"{city} {state_full} city council agenda"
+    try:
+        results = await asyncio.to_thread(serper_search, primary_q, api_key)
+    except RuntimeError as e:
+        print(f"  [serper] {city}, {state}: {e}")
+        raise
+    query_used = primary_q
+    rejection_log: list[str] = []  # track all rejected results for diagnostics
+
+    validated_domain: str | None = None
+    serper_url: str | None = None  # full URL from Serper (may already point to specific page)
+    valid_serper_urls: list[tuple[str, str]] = []  # (url, domain) — all valid results, not just first
+
+    for r in results:
+        url = r["url"]
+        if not url:
+            continue
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        if not domain:
+            continue
+        if is_non_agenda_url(url):
+            rejection_log.append(f"q1:{domain}→non_agenda_url")
+            continue
+        valid, reason = await asyncio.to_thread(validate_domain_for_city, domain, city, state)
+        if valid:
+            if not validated_domain:
+                validated_domain = domain
+                serper_url = url
+            valid_serper_urls.append((url, domain))
+            rejection_log.append(f"q1:{domain}→{reason}")
+        else:
+            rejection_log.append(f"q1:{domain}→{reason}")
+
+    # ── Fallback query if primary validation failed ───────────────────────────
+    if not validated_domain:
+        fallback_q = f"{city} {state_full} city council agenda site:.gov OR site:.org"
+        try:
+            results2 = await asyncio.to_thread(serper_search, fallback_q, api_key)
+        except RuntimeError as e:
+            print(f"  [serper] {city}, {state} fallback: {e}")
+            raise
+        query_used = f"{primary_q} | {fallback_q}"
+        for r in results2:
+            url = r["url"]
+            if not url:
+                continue
+            domain = urlparse(url).netloc.lower().removeprefix("www.")
+            if not domain:
+                continue
+            if is_non_agenda_url(url):
+                rejection_log.append(f"q2:{domain}→non_agenda_url")
+                continue
+            valid, reason = await asyncio.to_thread(validate_domain_for_city, domain, city, state)
+            if valid:
+                validated_domain = domain
+                serper_url = url
+                rejection_log.append(f"q2:{domain}→{reason}")
+                break
+            else:
+                rejection_log.append(f"q2:{domain}→{reason}")
+
+    if not validated_domain:
+        rejection_summary = " | ".join(rejection_log) if rejection_log else "no_results_returned"
+        print(f"  [serper] {city}, {state}: all rejected — {rejection_summary}")
+        return [], query_used
+
+    # ── Find the best URL that actually produces meeting data ──────────────
+    # For each valid Serper result (in order):
+    #   1. Try the URL directly (scan it for meetings)
+    #   2. If no meetings: crawl from that URL to find a deeper page
+    #   3. If still no meetings: try the next Serper result
+    # This mirrors how a human would search: click result #1, look around,
+    # if nothing useful, go back to Google and try result #2.
+    #
+    # For known platform URLs (Legistar, CivicPlus, etc), skip this —
+    # the platform-specific scanner handles them.
+    fc_key = os.environ.get("FIRECRAWL_API_KEY")
+    drill_note = ""
+    agenda_url = None  # set if Firecrawl map found a sub-page
+    final_url = serper_url
+
+    if fc_key and detect_platform(serper_url) in ("unknown", "generic_html", None, ""):
+        found = False
+        from meeting_pipeline.shared.generic_agenda_scanner import scan_generic as scan_generic_firecrawl
+
+        tried_domains: set[str] = set()  # skip same-domain results after crawl
+        first_domain = valid_serper_urls[0][1] if valid_serper_urls else ""
+
+        for idx, (candidate_url, candidate_domain) in enumerate(valid_serper_urls):
+            # ── Pre-filter: skip URLs that are obviously not going to work ────
+            # Skip same domain if we already crawled it (crawl covers sub-pages)
+            if candidate_domain in tried_domains:
+                print(f"  [discover] Result #{idx+1}: skip (already crawled {candidate_domain})")
+                continue
+
+            # For results #2+, if the domain is different from #1, verify the
+            # actual page mentions both city AND state to avoid wrong-city matches
+            # (e.g. Norfolk VA vs Norfolk NE, Ocean Township vs Ocean City)
+            if idx > 0 and candidate_domain != first_domain:
+                import httpx as _httpx
+                try:
+                    with _httpx.Client(follow_redirects=True, timeout=8,
+                                       headers={"User-Agent": "Mozilla/5.0"}) as _hc:
+                        _r = _hc.get(candidate_url)
+                        if _r.status_code in (403, 404, 500):
+                            print(f"  [discover] Result #{idx+1}: skip (HTTP {_r.status_code})")
+                            continue
+                        if len(_r.text) < 500:
+                            print(f"  [discover] Result #{idx+1}: skip (empty page)")
+                            continue
+                        # Verify city AND state on the actual page
+                        _page_lower = _r.text.lower()
+                        _city_lower = city.lower()
+                        _state_full = _STATE_NAMES.get(state.upper(), state).lower()
+                        import re as _re2
+                        _city_found = all(w in _page_lower for w in _city_lower.split())
+                        _state_found = (bool(_re2.search(r'\b' + _re2.escape(state.lower()) + r'\b', _page_lower))
+                                       or _state_full in _page_lower)
+                        if not (_city_found and _state_found):
+                            print(f"  [discover] Result #{idx+1}: skip (different domain, city/state not confirmed on page)")
+                            continue
+                except Exception:
+                    print(f"  [discover] Result #{idx+1}: skip (unreachable)")
+                    continue
+            else:
+                # Same domain as #1 or first result — quick HTTP check only
+                try:
+                    import httpx as _httpx
+                    with _httpx.Client(follow_redirects=True, timeout=8,
+                                       headers={"User-Agent": "Mozilla/5.0"}) as _hc:
+                        _r = _hc.get(candidate_url)
+                        if _r.status_code in (403, 404, 500):
+                            print(f"  [discover] Result #{idx+1}: skip (HTTP {_r.status_code})")
+                            continue
+                        if len(_r.text) < 500:
+                            print(f"  [discover] Result #{idx+1}: skip (empty page)")
+                            continue
+                except Exception:
+                    print(f"  [discover] Result #{idx+1}: skip (unreachable)")
+                    continue
+
+            # Step 1: Try Firecrawl map on the domain to find a specific agenda sub-page
+            candidate_path = urlparse(candidate_url).path.lower() if candidate_url else ""
+            has_agenda_path = "agenda" in candidate_path
+
+            if has_agenda_path:
+                test_url = candidate_url
+            else:
+                base = f"https://{candidate_domain}"
+                mapped = await asyncio.to_thread(firecrawl_map_agenda, base)
+                test_url = mapped or candidate_url
+                if mapped:
+                    agenda_url = mapped
+
+            # Step 2: Scan the URL — does it produce meetings?
+            try:
+                test_meetings = await scan_generic_firecrawl(test_url, city, state)
+                if test_meetings:
+                    # For cross-domain results, verify the page is for the right city.
+                    # Check: city name in meeting titles OR in the domain itself.
+                    # Also verify state via the domain (e.g. springville.org is UT not AL).
+                    if idx > 0 and candidate_domain != first_domain:
+                        city_lower = city.lower()
+                        state_lower = state.lower()
+                        state_full_lower = _STATE_NAMES.get(state.upper(), state).lower()
+                        titles = " ".join(m.get("title", "") for m in test_meetings).lower()
+                        city_in_domain = city_lower.replace(" ", "") in candidate_domain.replace("-", "")
+                        city_in_titles = city_lower in titles
+                        # State check: domain should encode the state or state shouldn't conflict
+                        state_in_domain = state_lower in candidate_domain or state_full_lower.replace(" ", "") in candidate_domain
+                        if not (city_in_domain or city_in_titles):
+                            print(f"  [discover] Result #{idx+1}: meetings found but city '{city}' not confirmed — skip")
+                            continue
+                        if not state_in_domain and not city_in_domain:
+                            # Different domain, city only in titles but state not in domain — risky
+                            print(f"  [discover] Result #{idx+1}: city in titles but state not in domain — skip")
+                            continue
+
+                    final_url = test_url
+                    validated_domain = candidate_domain
+                    if idx > 0:
+                        drill_note = f"→serper_result#{idx+1}:{test_url}"
+                    found = True
+                    print(f"  [discover] Result #{idx+1} produced {len(test_meetings)} meetings: {test_url[:60]}")
+                    break
+            except Exception:
+                pass
+
+            # Step 3: Crawl from this URL to find a deeper page
+            if not found:
+                tried_domains.add(candidate_domain)
+                try:
+                    deeper = await asyncio.to_thread(
+                        firecrawl_crawl_for_agenda,test_url, city, state, expected_body
+                    )
+                    if deeper:
+                        # Validate the deeper page also produces meetings
+                        try:
+                            deep_meetings = await scan_generic_firecrawl(deeper, city, state)
+                            if deep_meetings:
+                                # Cross-domain: verify city in meeting titles
+                                if idx > 0 and candidate_domain != first_domain:
+                                    city_lower = city.lower()
+                                    titles = " ".join(m.get("title", "") for m in deep_meetings).lower()
+                                    if city_lower not in titles and city_lower.replace(" ", "") not in candidate_domain:
+                                        print(f"  [discover] Crawl from #{idx+1}: meetings found but city '{city}' not in titles — skip")
+                                        continue
+
+                                final_url = deeper
+                                validated_domain = candidate_domain
+                                drill_note = f"→crawl:{deeper}"
+                                found = True
+                                print(f"  [discover] Crawl from #{idx+1} found {len(deep_meetings)} meetings: {deeper[:60]}")
+                                break
+                        except Exception:
+                            pass  # Don't accept optimistically for cross-domain
+                except Exception:
+                    pass
+
+            if not found and idx < len(valid_serper_urls) - 1:
+                print(f"  [discover] Result #{idx+1} produced 0 meetings, trying next")
+
+        if not found:
+            # None of the Serper results worked — use the first URL as best guess
+            final_url = serper_url
+            print(f"  [discover] No Serper results produced meetings — using #{1} as fallback")
+    else:
+        # Known platform — use Firecrawl map for sub-page but skip scan validation
+        serper_path = urlparse(serper_url).path.lower() if serper_url else ""
+        has_agenda_path = "agenda" in serper_path
+        if not has_agenda_path:
+            base_url = f"https://{validated_domain}"
+            agenda_url = await asyncio.to_thread(firecrawl_map_agenda, base_url)
+            final_url = agenda_url or serper_url or base_url
+
+    platform = detect_platform(final_url) or "generic_html"
+    rejection_summary = " | ".join(rejection_log) if rejection_log else ""
+    cand = make_candidate(
+        url=final_url,
+        platform=platform,
+        source="serper_search",
+        notes=(
+            f"serper→{validated_domain}"
+            + (f"→map:{agenda_url}" if agenda_url else "")
+            + drill_note
+            + (f" | validations:[{rejection_summary}]" if rejection_summary else "")
+        ),
+    )
+    return [cand], query_used
+
+
 async def discover_from_tavily(
     city: str,
     state: str,
@@ -1288,6 +2123,7 @@ async def discover_from_tavily(
     if query is None:
         query = f"{city} {state} city council meeting agendas minutes"
     try:
+        _COST["tavily_searches"] += 1
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 tavily.search,
@@ -1850,12 +2686,19 @@ async def discover_from_probes(
     state_lower = state.lower()
     domain = known.get("domain") or known.get("civicplus_domain")
 
-    # Legistar slug candidates: full city name without spaces, then first word only.
-    # Some cities register under a shortened slug (e.g. "pompano" for Pompano Beach).
+    # Legistar slug candidates: try multiple patterns since cities register
+    # under different conventions (e.g. "sandyutah", "pompano", "cityofrochester").
     city_first_word = city.split()[0].lower().replace(".", "")
-    legistar_slug_candidates = [city_nospace]
+    state_full_lower = _STATE_NAMES.get(state.upper(), state).lower().replace(" ", "")
+    legistar_slug_candidates = [
+        city_nospace,                          # sandyut, rogersar
+        f"{city_nospace}{state_full_lower}",   # sandyutah, rogersarkansas
+        f"cityof{city_nospace}",               # cityofsandy, cityofrogers
+    ]
     if city_first_word != city_nospace and len(city.split()) > 1:
-        legistar_slug_candidates.append(city_first_word)
+        legistar_slug_candidates.append(city_first_word)  # sandy, rogers
+    # Deduplicate while preserving order
+    legistar_slug_candidates = list(dict.fromkeys(legistar_slug_candidates))
 
     probe_specs: list[tuple[str, str, dict]] = []
     for lg_slug in legistar_slug_candidates:
@@ -1948,8 +2791,15 @@ async def discover_from_probes(
 
     # Granicus multi-view probe: enumerate view_id=1..20 to find City Council view.
     # (Hardcoding view_id=1 is wrong — council may be at any ID, e.g. Greenville NC=10.)
+    # Try multiple subdomain patterns: citystate (acworthga), city-state (acworth-ga),
+    # cityofcity (cityofacworth).
+    gran_result = {}
     granicus_sub = city_nospace
-    gran_result = await probe_granicus_views(granicus_sub, http)
+    for gran_slug in [city_nospace, f"{city_nospace.rstrip(state_lower)}-{state_lower}" if city_nospace.endswith(state_lower) else f"{city_nospace}-{state_lower}", f"cityof{city_nospace}"]:
+        gran_result = await probe_granicus_views(gran_slug, http)
+        if gran_result.get("view_id"):
+            granicus_sub = gran_slug
+            break
     if gran_result.get("view_id"):
         gran_body = gran_result.pop("_body", "")
         c = make_candidate(
@@ -2217,6 +3067,31 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient, city: str =
             candidate["notes"] = f"fetch error {fetch_status}"
             return candidate
 
+    # Platform upgrade: unknown/generic_html CivicPlus CMS pages
+    # CivicPlus sites often have a CMS page (e.g. /273/Agendas-Minutes) that links TO
+    # the AgendaCenter rather than being the AgendaCenter itself. If the fetched body
+    # contains an /AgendaCenter href, upgrade the candidate to civicplus + correct URL.
+    # Also catches CivicPlus Archive Center pages (/Archive.aspx?AMID=N) that are used
+    # for document archives instead of the live AgendaCenter.
+    if platform in ("unknown", "generic_html"):
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        upgrade_url = None
+        if "/AgendaCenter" in body:
+            upgrade_url = f"{base}/AgendaCenter"
+        elif "/Archive.aspx" in body or "ArchiveCenter" in body:
+            # CivicPlus Archive Center — try to find the AMID from the body
+            amid_m = re.search(r'/Archive\.aspx\?AMID=(\d+)', body)
+            upgrade_url = f"{base}/Archive.aspx?AMID={amid_m.group(1)}" if amid_m else f"{base}/Archive.aspx"
+        if upgrade_url:
+            ac_status, ac_body = await safe_fetch(http, upgrade_url, timeout=12.0)
+            if ac_status == 200 and ac_body and len(ac_body) > 300:
+                candidate["url"] = upgrade_url
+                candidate["platform"] = "civicplus"
+                candidate["notes"] = (candidate.get("notes") or "") + " upgraded:civicplus_cms_link"
+                platform = "civicplus"
+                body = ac_body
+
     # Novus: body must not contain Application_Error
     if platform == "novus":
         if "Application_Error" in body:
@@ -2407,11 +3282,12 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient, city: str =
 # Scoring weights
 FRESHNESS_SCORE = {
     "fresh": 100, "unknown_spa": 55, "stale_warning": 35,
-    "stale": 15, "unknown": 5, "empty": 0, "blocked": 0,
-    "wrong_entity": 0,  # school district / library / etc — never wins
+    "stale": 15, "unknown": 5, "empty": -300, "blocked": -300,
+    "wrong_entity": -500,  # school district / library / etc — never wins
 }
-# empty and blocked score 0 — they should never win over any real candidate,
-# and a Legistar "unknown" (5 + 20 = 25) beats a CivicClerk "empty" (0 + 12 = 12).
+# empty and blocked score -300 — must NEVER win over any candidate with content.
+# Max non-freshness bonus is ~107 (platform 22 + source 10 + body 10 + authority 65),
+# so -300 ensures empty/blocked always loses regardless of other bonuses.
 #
 # PLATFORM_TIER reflects scanning capability — supported/scannable platforms must
 # outrank unsupported ones so discovery never downgrades a working scannable source
@@ -2422,18 +3298,22 @@ FRESHNESS_SCORE = {
 #   Tier D (4):    Unknown
 PLATFORM_TIER = {
     "legistar": 22,    # REST API — fully supported
-    "civicclerk": 20,  # OData API — fully supported (was 12, granicus was 16: the bug)
-    "civicplus": 20,   # AJAX scraper — fully supported (was 16)
-    "escribe": 18,     # POST API — fully supported (was 14)
-    "boarddocs": 18,   # POST API — fully supported (was 14)
-    "granicus": 8,     # HTML scrape only — not auto-scannable (was 16)
-    "municode": 8,     # HTML scrape only — not auto-scannable (was 12)
-    "primegov": 8,     # SPA — not auto-scannable (was 12)
-    "novus": 6,        # HTML scrape only — not auto-scannable (was 10)
-    "diligent": 6,     # HTML scrape only — not auto-scannable (was 10)
-    "unknown": 4,      # Unknown (unchanged)
+    "civicclerk": 20,  # OData API — fully supported
+    "civicplus": 20,   # AJAX scraper — fully supported
+    "escribe": 18,     # POST API — fully supported
+    "boarddocs": 18,   # POST API — fully supported
+    "granicus": 8,     # HTML scrape only
+    "municode": 8,     # HTML scrape only
+    "primegov": 8,     # SPA — not auto-scannable
+    "novus": 6,        # HTML scrape only
+    "diligent": 6,     # HTML scrape only
+    "unknown": 4,
+    "generic_html": 4,
 }
-SOURCE_BONUS = {"known": 10, "known_probe": 2, "tavily": 3, "ddg": 0, "probe": 0}
+SOURCE_BONUS = {
+    "known": 10, "known_probe": 2, "tavily": 3, "ddg": 0, "probe": 0,
+    "serper_search": 3, "pdf_search": 2, "firecrawl": 1, "exa": 2,
+}
 
 # Known government meeting platform domains — always receive full trust
 _GOV_PLATFORM_DOMAINS = [
@@ -2455,6 +3335,7 @@ _CONTENT_SITE_DOMAIN_KEYWORDS = [
     "weather", "accuweather",
     "tiktok", "youtube", "facebook", "instagram", "twitter",
     "forum", "patch", "blog",
+    "directory", "yellowpages", "whitepages", "yelp", "mapquest",
 ]
 
 # URL path fragments that structurally indicate content/media pages
@@ -2505,6 +3386,11 @@ def classify_domain_trust(url: str, city: str = "", state: str = "") -> float:
     if netloc.endswith(".tv") or domain_base.endswith("tv") or domain_base.startswith("tv"):
         return 0.1
 
+    # "online" suffix in SLD → news/media blog (e.g. clarksvilleonline.com)
+    # Government sites never end in "online"; news aggregators often do.
+    if domain_base.endswith("online"):
+        return 0.1
+
     # County government domain → reduced trust when searching for a city.
     # Pattern: co.{county}.{state}.us  or  {county}county.gov/  or county.{name}.gov
     # County agendas are for county commissioners, not city council.
@@ -2551,18 +3437,24 @@ def agenda_authority_score(c: dict) -> int:
     if platform in ("legistar", "civicclerk", "civicplus", "escribe", "boarddocs"):
         score += 25
 
-    # Strong URL path signals
-    if "/agendacenter" in url_lower or "/agenda-center" in url_lower:
+    # Strong URL path signals — match both slash-separated (/agendas) and
+    # dash-separated path segments (-agendas- or -agenda-) since cities use both
+    # conventions (e.g. /gov-agendas-citycouncil/, /agendas-and-minutes/).
+    _path = (url_lower.split("?")[0])  # strip query string
+    def _in_path(kw: str) -> bool:
+        return f"/{kw}" in _path or f"-{kw}" in _path or _path.endswith(f"/{kw}")
+
+    if _in_path("agendacenter") or _in_path("agenda-center"):
         score += 20
-    elif "/agendas" in url_lower or "/agenda" in url_lower:
+    elif _in_path("agendas") or _in_path("agenda"):
         score += 15
-    if "/minutes" in url_lower:
+    if _in_path("minutes"):
         score += 10
-    if "/citycouncil" in url_lower or "/city-council" in url_lower:
+    if _in_path("citycouncil") or _in_path("city-council"):
         score += 8
-    elif "/council" in url_lower:
+    elif _in_path("council"):
         score += 5
-    if "/meetings" in url_lower or "/meeting" in url_lower:
+    if _in_path("meetings") or _in_path("meeting"):
         score += 5
 
     # Content signals from search snippet / notes
@@ -2584,6 +3476,19 @@ def candidate_score(c: dict, city: str = "", state: str = "") -> int:
     # Trust multiplier: prevents content sites (news, TV, travel) that happen to have
     # fresh publication dates from outscoring government agenda pages.
     trust = classify_domain_trust(c.get("url") or "", city, state)
+
+    # Gov-domain floor: when a .gov domain has strong URL agenda signals (e.g.
+    # city.gov/agendas-citycouncil), treat its freshness score as if it were
+    # stale_warning (35) rather than unknown (5) for ranking purposes only.
+    # Rationale: we trust .gov domains host real city council agendas — when
+    # httpx/Playwright can't confirm dates (captcha, JS), we should still prefer
+    # them over third-party aggregator sites that happen to have fresh pub dates.
+    # Only applies to unverified states (unknown/blocked/unknown_spa) — NOT to
+    # "empty" (confirmed to have no meetings) or any state already above the floor.
+    _unverified = c.get("freshness") in ("unknown", "unknown_spa")
+    if trust >= 1.0 and _unverified and f < FRESHNESS_SCORE["stale_warning"] and a >= 20:
+        f = FRESHNESS_SCORE["stale_warning"]
+
     return int(f * trust) + p + s + b + a
 
 
@@ -3201,18 +4106,30 @@ async def run_source_discover(
     known_cands = await discover_from_known_sources(effective_known, http)
     seen_urls: set[str] = {c["url"] for c in known_cands}
 
-    # Strategy B: Search — DDG (primary) → Exa → Tavily (fallbacks).
-    # DDG runs first: no API key needed and has broad government site coverage.
-    # Exa runs if DDG returns nothing and EXA_API_KEY is set.
-    # Tavily is the final fallback and also handles domain discovery in retry 2.
-    # Use expected_body from the manifest for more targeted queries.
+    # Strategy B: Search — Serper.dev (primary) → DDG → Exa → Tavily (fallbacks).
+    # Serper runs first when SERPER_API_KEY is set: returns real Google Search results,
+    # validates the domain via HTTP, and uses the Serper URL directly when it already
+    # points to an agenda page (skipping Firecrawl). Falls back to DDG/Exa/Tavily.
     body_term = expected_body or "city council"
     state_name = _STATE_NAMES.get(state.upper(), state)
     search_query = f"{city} {state_name} {body_term} agenda minutes"
 
-    ddg_cands, ddg_query = await discover_from_duckduckgo(city, state, query=search_query)
-    tavily_queries.append(f"[ddg] {ddg_query}")
-    search_cands = ddg_cands
+    search_cands: list[dict] = []
+
+    if os.environ.get("SERPER_API_KEY"):
+        try:
+            grounding_cands, grounding_query = await discover_from_serper(city, state, expected_body=expected_body)
+            tavily_queries.append(f"[serper] {grounding_query}")
+            search_cands = grounding_cands
+        except RuntimeError as e:
+            # Rate limited — fall through to DDG/Tavily, log it
+            tavily_queries.append(f"[serper_skipped] {e}")
+            search_cands = []
+
+    if not search_cands:
+        ddg_cands, ddg_query = await discover_from_duckduckgo(city, state, query=search_query)
+        tavily_queries.append(f"[ddg] {ddg_query}")
+        search_cands = ddg_cands
 
     if not search_cands and os.environ.get("EXA_API_KEY"):
         exa_cands, exa_query = await discover_from_exa(city, state, query=search_query)
@@ -3243,6 +4160,24 @@ async def run_source_discover(
             if c["url"] not in seen_urls:
                 seen_urls.add(c["url"])
                 all_phase1.append(c)
+
+    # Strategy D: PDF search — find platforms via Google-indexed agenda PDFs
+    has_recognized_after_probes = any(
+        c["platform"] != "unknown" and c.get("http_status") == 200
+        for c in all_phase1
+    )
+    if not has_recognized_after_probes and os.environ.get("SERPER_API_KEY"):
+        try:
+            pdf_cands = await asyncio.to_thread(
+                discover_from_pdf_search, city, state, body_term
+            )
+            for cand in pdf_cands:
+                if cand["url"] not in seen_urls:
+                    seen_urls.add(cand["url"])
+                    all_phase1.append(cand)
+                    tavily_queries.append(f"[pdf_search] {cand['platform']}:{cand['url'][:60]}")
+        except Exception as e:
+            tavily_queries.append(f"[pdf_search_err] {str(e)[:40]}")
 
     # Tag candidates whose title/content/notes contain the expected body name.
     # This boosts the score of sources that are explicitly for the right body.
@@ -3427,6 +4362,92 @@ async def run_source_discover(
         ranked = rank_candidates(verified, city=city, state=state)
         best = ranked[0] if ranked else None
 
+    # Firecrawl body validation: if best has body_match=False, use cheap Firecrawl
+    # scrape (1 credit) to confirm or reject it before spending Playwright budget
+    # on the wrong entity. Plain scrape is sufficient — we just need agenda keywords.
+    if (
+        best
+        and not best.get("body_match")
+        and best.get("freshness") in ("fresh", "stale_warning", "unknown_spa")
+        and os.environ.get("FIRECRAWL_API_KEY")
+    ):
+        try:
+            from meeting_pipeline.collection_agent.firecrawl_utils import validate_agenda_page
+            _COST["firecrawl_scrape_basic"] += 1
+            fc = validate_agenda_page(best["url"], city, state)
+            if fc.get("valid"):
+                best["body_match"] = True
+                best["body_match_source"] = "firecrawl_scrape"
+            else:
+                best["freshness"] = "wrong_entity"
+                best["wrong_entity_reason"] = "firecrawl_scrape found no city council agenda signals"
+                ranked = rank_candidates(verified, city=city, state=state)
+                best = ranked[0] if ranked else None
+        except Exception:
+            pass  # Firecrawl validation failed — accept candidate as-is
+
+    # ── Phase 4b: Firecrawl rescue for high-trust blocked candidates ──────────
+    # When a .gov domain or city-name-in-domain candidate has freshness=unknown/
+    # blocked (often because Playwright or httpx hit a captcha), try Firecrawl
+    # to validate it actually hosts city council meeting content with PDFs.
+    # On success, upgrades freshness to fresh so it beats aggregator sites that
+    # rank higher purely because they have parseable publication dates.
+    #
+    # Only runs when: (a) FIRECRAWL_API_KEY is set, (b) current best is not fresh
+    # OR there are high-trust blocked candidates that could beat the current best.
+    _has_high_trust_blocked = any(
+        c.get("freshness") in ("unknown", "blocked", "unknown_spa")
+        and classify_domain_trust(c.get("url") or "", city, state) >= 0.7
+        for c in verified
+    )
+    if os.environ.get("FIRECRAWL_API_KEY") and (
+        not best
+        or best.get("freshness") not in ("fresh",)
+        or _has_high_trust_blocked
+    ):
+        rescue_targets = [
+            c for c in verified
+            if c.get("freshness") in ("unknown", "blocked", "unknown_spa")
+            and classify_domain_trust(c.get("url") or "", city, state) >= 0.7
+            and not (c.get("url") or "").lower().endswith(".pdf")  # PDF docs are not agenda index pages
+        ]
+        # Probe highest-trust / highest-score candidates first
+        rescue_targets.sort(
+            key=lambda c: candidate_score(c, city, state), reverse=True
+        )
+        for target in rescue_targets[:3]:  # cap Firecrawl API calls
+            try:
+                # Use cheap scrape (1 credit) not LLM extract (~15-30 credits) —
+                # we only need to confirm this is a real agenda page, not extract data.
+                from meeting_pipeline.collection_agent.firecrawl_utils import validate_agenda_page
+                _COST["firecrawl_scrapes"] += 1
+                fc = validate_agenda_page(target["url"], city, state)
+                if fc.get("valid"):
+                    # Use the page's own modification date if available
+                    date_str = fc.get("most_recent_date")
+                    if date_str:
+                        try:
+                            most_recent = datetime.fromisoformat(date_str[:10]).date()
+                            if date(2020, 1, 1) <= most_recent <= date(2030, 12, 31):
+                                target["most_recent_date"] = most_recent.isoformat()
+                                target["days_since_update"] = (TODAY - most_recent).days
+                                target["freshness"] = classify_freshness(most_recent)
+                            else:
+                                target["freshness"] = "fresh"
+                        except Exception:
+                            target["freshness"] = "fresh"
+                    else:
+                        target["freshness"] = "fresh"
+                    pdf_count = len(fc.get("pdf_urls") or [])
+                    existing_notes = (target.get("notes") or "").strip()
+                    target["notes"] = f"{existing_notes} firecrawl_rescue:valid({pdf_count}pdfs)".strip()
+                    ranked = rank_candidates(verified, city=city, state=state)
+                    best = ranked[0]
+                    if best.get("freshness") == "fresh" and classify_domain_trust(best.get("url") or "", city, state) >= 0.7:
+                        break  # high-trust fresh source found — stop
+            except Exception:
+                pass  # Firecrawl rescue failed — continue to Playwright
+
     # ── Phase 5: Playwright Browser Rendering ─────────────────────────────────
     # Last resort: render JS-heavy pages with a real headless browser.
     # Targets cities still stuck (not fresh) after all other phases.
@@ -3533,6 +4554,22 @@ async def run_source_discover(
                     if consecutive_no_content >= 2:
                         break  # domain not serving accessible agenda pages
 
+    # ── Phase 6: Firecrawl search + extract ───────────────────────────────────
+    # Last resort for cities with no fresh source after all Playwright attempts.
+    if (not best or best.get("freshness") not in ("fresh",)) and os.environ.get("FIRECRAWL_API_KEY"):
+        fc_cands = await discover_from_firecrawl(city, state)
+        for c in fc_cands:
+            if c["url"] not in seen_urls:
+                seen_urls.add(c["url"])
+                try:
+                    vc = await verify_freshness(c, http, city=city)
+                except Exception:
+                    vc = c
+                verified.append(vc)
+        if fc_cands:
+            ranked = rank_candidates(verified, city=city, state=state)
+            best = ranked[0] if ranked else best
+
     # ── Build output ──────────────────────────────────────────────────────────
     elapsed = round(time.monotonic() - start, 1)
 
@@ -3577,6 +4614,7 @@ async def run_source_discover(
             "collection_method": COLLECTION_METHODS.get(best["platform"], "fetch_and_parse"),
             "config": best.get("config") or {},
             "notes": best.get("notes") or "",
+            "source": best.get("source") or "",
         }
 
     # All candidates output (top 10, _body already stripped by verify_freshness)
@@ -3595,10 +4633,20 @@ async def run_source_discover(
             entry["body_match"] = c["body_match"]
         all_candidates_out.append(entry)
 
+    # Extract public_agenda_url: the human-facing agenda page URL from Serper
+    # (the page a resident would find via Google). Distinct from best_source.url
+    # which may be a platform API endpoint or portal subdomain.
+    public_agenda_url = ""
+    for c in all_candidates_out:
+        if c.get("source") == "serper_search" and c.get("url"):
+            public_agenda_url = c["url"]
+            break
+
     return {
         "city": city,
         "state": state,
         "discovered_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "public_agenda_url": public_agenda_url,
         "best_source": best_source,
         "all_candidates": all_candidates_out,
         "migration_detected": migration_detected,
@@ -3641,7 +4689,16 @@ async def process_city(
                 bs = existing.get("best_source") or {}
                 freshness = bs.get("freshness", "")
                 rerun_freshnesses = {"empty", "wrong_entity", "stale"} if skip_existing else {"empty"}
-                if freshness not in rerun_freshnesses:
+                # Always skip manually-set sources — never overwrite with automated discovery.
+                if bs.get("source") == "manual":
+                    print(
+                        f"  [skip] {city:<20s} {state}  (manual source — protected)"
+                    )
+                    return existing
+                # Also re-run if platform is unknown/generic — source was found but
+                # not on a supported platform. Re-running may discover a better URL.
+                platform_is_unsupported = bs.get("platform", "") in ("unknown", "generic_html", "")
+                if freshness not in rerun_freshnesses and not platform_is_unsupported:
                     print(
                         f"  [skip] {city:<20s} {state}  (existing: {bs.get('platform','?')}  {freshness})"
                     )
@@ -3738,8 +4795,7 @@ async def process_city(
                             print(f"  [body] UNRESOLVED for {bs_platform} — {bv.get('reason', '')}")
                             for alt in (result.get("all_candidates") or [])[1:]:
                                 alt_platform = alt.get("platform", "")
-                                if alt_platform not in VALIDATABLE_PLATFORMS:
-                                    continue
+                                alt_freshness = alt.get("freshness", "")
                                 alt_source = {
                                     **result,
                                     "best_source": {
@@ -3755,6 +4811,22 @@ async def process_city(
                                         "notes": alt.get("notes") or "",
                                     },
                                 }
+                                if alt_platform not in VALIDATABLE_PLATFORMS:
+                                    # Non-validatable platforms (unknown, generic_html) can't be
+                                    # body-checked, but if they're fresh/stale accept them as
+                                    # fallback — better than staying on a broken validated source.
+                                    if alt_freshness in ("fresh", "stale"):
+                                        print(
+                                            f"  [body] fallback OK: switched to non-validatable "
+                                            f"{alt_platform} ({alt_freshness}) ({alt.get('url', '')})"
+                                        )
+                                        result = alt_source
+                                        try:
+                                            storage.write_json(s3_key, result)
+                                        except Exception:
+                                            pass
+                                        break
+                                    continue
                                 try:
                                     alt_bv = await validate_body_for_city(
                                         f"{slug}-{state}", alt_source, s3_key, http, storage
@@ -3774,6 +4846,18 @@ async def process_city(
                                     break
                             else:
                                 print(f"  [body] no fallback candidate resolved — body unresolved")
+                                # Downgrade best_source to wrong_entity so the city
+                                # is not treated as fresh and will be re-discovered
+                                # next time instead of silently producing bad briefings.
+                                if result.get("best_source"):
+                                    result["best_source"]["freshness"] = "wrong_entity"
+                                    result["best_source"]["wrong_entity_reason"] = (
+                                        bv.get("reason", "body unresolved — no matching governing body found")
+                                    )
+                                    try:
+                                        storage.write_json(s3_key, result)
+                                    except Exception:
+                                        pass
                         elif bv_status not in ("skip", "ok"):
                             print(f"  [body] {bv_status}: {bv.get('reason', '')}")
                     except Exception as e:
@@ -3897,6 +4981,37 @@ async def run_batch(
     else:
         print(f"\n  [warn] No storage backend — summary not persisted")
 
+    # Cost report
+    exa_cost = _COST["exa_searches"] * _COST_PER_CALL["exa_searches"]
+    tav_cost = _COST["tavily_searches"] * _COST_PER_CALL["tavily_searches"]
+    known_total = exa_cost + tav_cost
+    fc_basic = _COST["firecrawl_scrape_basic"]
+    fc_actions = _COST["firecrawl_scrape_actions"]
+
+    serper_cost = _COST["serper_searches"] * 0.001  # $1/1k
+    print(f"\n  DISCOVERY COST:")
+    print(f"    Serper.dev:             {_COST['serper_searches']:3d} searches   × $0.0010 = ${serper_cost:.4f}  ($1/1k; 2500 free credits)")
+    print(f"    Exa:                    {_COST['exa_searches']:3d} searches   × $0.0120 = ${exa_cost:.4f}  (search+contents, 5 pages)")
+    print(f"    Tavily:                 {_COST['tavily_searches']:3d} searches   × $0.0100 = ${tav_cost:.4f}  (unconfirmed)")
+    print(f"    Firecrawl:              {fc_basic:3d} basic + {fc_actions} action scrapes — see firecrawl.dev/app for credits")
+    print(f"    Subtotal (Exa+Tavily):  ${known_total:.4f}")
+
+    if storage is not None:
+        cost_report = {
+            "phase": "discovery",
+            "exa_searches": _COST["exa_searches"],
+            "tavily_searches": _COST["tavily_searches"],
+            "firecrawl_scrape_basic": fc_basic,
+            "firecrawl_scrape_actions": fc_actions,
+            "estimated_usd": round(known_total, 6),  # Exa+Tavily only; Firecrawl credits tracked separately
+            "cities_processed": len(cities),
+        }
+        output_prefix = sources_prefix.replace("/sources", "/output")
+        try:
+            storage.write_json(f"{output_prefix}/cost_reports/discovery.json", cost_report)
+        except Exception:
+            pass
+
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -3945,7 +5060,10 @@ def main() -> None:
         sys.exit(1)
 
     exa_key = os.environ.get("EXA_API_KEY")
-    if exa_key:
+    serper_key = os.environ.get("SERPER_API_KEY")
+    if serper_key:
+        print("  [search backend] Serper.dev (primary) → DDG → Exa → Tavily (fallbacks)")
+    elif exa_key:
         print("  [search backend] DDG (primary) → Exa → Tavily (fallbacks)")
     else:
         print("  [search backend] DDG (primary) → Tavily (fallback; set EXA_API_KEY to also enable Exa)")
@@ -3984,8 +5102,14 @@ def main() -> None:
     if args.city:
         filtered = [c for c in all_cities if c["city"].lower() == args.city.lower()]
         if not filtered:
-            print(f"ERROR: '{args.city}' not found in {city_source}")
-            sys.exit(1)
+            if args.state:
+                # Ad-hoc city not in registry — create entry on the fly so phase_verify
+                # can re-discover any city without requiring it in PILOT_CITIES.
+                print(f"  [discover] '{args.city}' not in {city_source} — running ad-hoc discovery for {args.city}, {args.state.upper()}")
+                filtered = [{"city": args.city, "state": args.state.upper()}]
+            else:
+                print(f"ERROR: '{args.city}' not found in {city_source}")
+                sys.exit(1)
         cities = filtered
     elif args.state:
         filtered = [c for c in all_cities if c["state"].upper() == args.state.upper()]

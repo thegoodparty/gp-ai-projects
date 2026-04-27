@@ -25,6 +25,8 @@ REJECT_KEYWORDS = [
     "bza", "pzc", "board of appeals", "board of adjustment", "board of review",
     "board of zoning", "ethics", "civil service", "merit", "pension",
     "beautification", "arts", "senior", "youth", "animal", "cemetery",
+    "cultural", "sustainability", "tree committee", "museum",
+    "pedestrian", "bicycle", "design review",
 ]
 
 # Keywords that indicate a governing body — positive signal
@@ -34,9 +36,13 @@ GOVERNING_KEYWORDS = [
     "municipal council", "common council", "board of commissioners",
     "board of trustees", "city board", "council of the city",
     # Additional governing body forms used across states
-    "town board",       # NY townships (e.g. "Town Board of Horseheads")
-    "select board",     # New England towns (MA, VT, NH)
-    "borough council",  # PA boroughs (e.g. "Borough Council of West Mifflin")
+    "town board",               # NY townships (e.g. "Town Board of Horseheads")
+    "select board",             # New England towns (MA, VT, NH)
+    "borough council",          # PA boroughs (e.g. "Borough Council of West Mifflin")
+    "board of mayor",           # Manchester NH uses "Board of Mayor and Aldermen"
+    "aldermanic",               # "Aldermanic Council", "Board of Mayor and Aldermen"
+    "board of alderpersons",    # gender-neutral variant
+    "board of selectmen",       # older New England form
 ]
 
 # Platforms that support body validation

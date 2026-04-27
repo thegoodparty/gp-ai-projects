@@ -76,6 +76,18 @@ def validate_against_manifest(
             )
 
         # At least one name must fuzzy-match the expected body
+        _GOVERNING_BODY_SYNONYMS = [
+            "city council", "town council", "village council", "common council",
+            "board of aldermen", "board of alderpersons",
+            "board of mayor",       # "Board of Mayor and Aldermen" (Manchester NH)
+            "aldermanic",
+            "city commission", "town commission", "village commission",
+            "municipal council", "board of commissioners", "board of trustees",
+            "city board", "council of the city",
+            "town board", "select board", "board of selectmen",
+            "borough council",
+        ]
+
         def matches_expected(name: str) -> bool:
             # Direct substring match
             if expected_lower in name:
@@ -83,6 +95,12 @@ def validate_against_manifest(
             # "Mayor" also matches "Mayoral", "Mayor's", etc.
             if expected_lower == "mayor" and "mayor" in name:
                 return True
+            # Governing body synonym: if expected was "City Council" but collected name
+            # is another recognized governing body (e.g. "Board of Mayor and Aldermen"),
+            # accept it — don't reject valid governments for not using the default name.
+            if any(kw in expected_lower for kw in _GOVERNING_BODY_SYNONYMS):
+                if any(kw in name for kw in _GOVERNING_BODY_SYNONYMS):
+                    return True
             return False
 
         if not any(matches_expected(n) for n in names_lower):

@@ -111,17 +111,13 @@ async def _collect_with_agent(
     """
     import os
     try:
-        from browser_use import Agent, ChatGoogle
+        from browser_use import Agent
         from browser_use.browser import BrowserProfile
-    except ImportError:
+        from langchain_anthropic import ChatAnthropic
+    except ImportError as e:
         raise RuntimeError(
-            "browser_use is not available in this environment "
-            "(optional dependency not installed)"
+            f"browser_use or langchain_anthropic not available: {e}"
         )
-
-    # ChatGoogle reads GOOGLE_API_KEY; alias from GEMINI_API_KEY if needed
-    if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
-        os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     goal = _AGENT_GOAL.format(
@@ -131,13 +127,10 @@ async def _collect_with_agent(
         cutoff_date=cutoff,
     )
 
-    # Use browser-use's native ChatGoogle — no langchain wrapper needed.
-    # ChatGoogle uses SchemaOptimizer to flatten Pydantic schemas for Gemini's
-    # JSON schema mode, fixing the "items" structured output validation errors
-    # that occurred with the langchain-google-genai approach.
-    llm = ChatGoogle(
-        model="gemini-2.5-flash-lite",
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-6",
         temperature=0.0,
+        api_key=os.environ.get("ANTHROPIC_API_KEY"),
     )
 
     profile = BrowserProfile(
@@ -198,33 +191,10 @@ async def _collect_with_vision_fallback(
     download_pdfs: bool,
     output_dir: Path,
 ) -> tuple[list[dict], int]:
-    """
-    Legacy Playwright + Gemini vision fallback for when the agent fails.
-    Returns (events, pdfs_downloaded).
-    Raises RuntimeError if the module is not installed or collection fails.
-    """
-    try:
-        from meeting_pipeline.collectors.playwright_llm_scraper import (
-            PlaywrightLLMConfig,
-            collect_with_llm_vision,
-        )
-    except ImportError:
-        raise RuntimeError(
-            "playwright_llm_scraper is not available in this environment "
-            "(optional dependency not installed)"
-        )
-
-    cfg = PlaywrightLLMConfig(
-        url=url,
-        city_name=city_name,
-        output_dir=output_dir,
-        lookback_days=lookback_days,
-        download_pdfs=download_pdfs,
+    """Vision fallback removed — browser-use agent is the primary path."""
+    raise RuntimeError(
+        "Vision fallback is not available. Ensure browser-use agent is working."
     )
-    result = await collect_with_llm_vision(cfg)
-    if result.error:
-        raise RuntimeError(result.error)
-    return result.events, result.pdfs_downloaded
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -320,16 +290,25 @@ async def collect_with_reason(
         with open(output_dir / "events_rejected.json", "w") as f:
             json.dump(rejected, f, indent=2)
 
-    # Download PDFs if we used the agent (vision fallback already downloads)
+    # Download PDFs if we used the agent
     if used_agent and cfg.download_pdfs and valid_events:
-        try:
-            from meeting_pipeline.collectors.playwright_llm_scraper import _download_agendas
-            pdfs_downloaded = await _download_agendas(valid_events, output_dir)
-        except ImportError:
-            print(
-                "  [agent] playwright_llm_scraper not available — skipping PDF download "
-                "(install optional dependency to enable)"
-            )
+        import httpx
+        for ev in valid_events:
+            agenda_url = ev.get("agendaUrl", "")
+            if not agenda_url or not agenda_url.lower().endswith(".pdf"):
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as dl:
+                    resp = await dl.get(agenda_url)
+                    resp.raise_for_status()
+                date_str = ev.get("date", "unknown")
+                filename = agenda_url.split("/")[-1].split("?")[0] or f"{date_str}_agenda.pdf"
+                pdf_key = f"{cfg.sources_prefix}/{city_slug}/agentic_browser/pdfs/{filename}"
+                storage.write_bytes(pdf_key, resp.content)
+                pdfs_downloaded += 1
+                print(f"  [agent] Downloaded: {filename} ({len(resp.content) // 1024}KB)")
+            except Exception as e:
+                print(f"  [agent] PDF download failed for {agenda_url[:60]}: {e}")
 
     # ── Step 5: Derive and save nav_config for future replay ──────────────────
     nav = _derive_nav_config(valid_events, entry_url)

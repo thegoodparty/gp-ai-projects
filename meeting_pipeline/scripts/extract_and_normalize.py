@@ -268,6 +268,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Skip LLM extraction, just show what would be processed")
     parser.add_argument("--force", action="store_true", help="Re-extract even if normalized file already exists")
+    parser.add_argument("--city", action="append", metavar="SLUG",
+                        help="Only process this city slug (repeatable, e.g. --city hampton-GA --city davidson-NC)")
+    parser.add_argument("--queue", metavar="S3_KEY",
+                        help="Override the default queue S3 key (e.g. to use a pilot queue instead of serve_users queue)")
     args = parser.parse_args()
 
     from shared.llm_gemini import GeminiClient, GeminiModelType  # lazy — shared has heavy deps
@@ -276,7 +280,7 @@ def main():
     storage = get_storage(cfg)
     gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 
-    queue_key = f"{cfg.output_prefix}/meeting_queue.json"
+    queue_key = args.queue if args.queue else f"{cfg.output_prefix}/meeting_queue.json"
     if not storage.exists(queue_key):
         print(f"Queue file not found: {queue_key}")
         print("Run generate_meeting_queue.py first.")
@@ -288,10 +292,15 @@ def main():
     all_normalized = []
     errors = []
 
+    city_filter = set(args.city) if args.city else None
+
     for entry in queue["queue"]:
         official = entry["official"]
         platform = entry["platform"]
         city_slug = entry["city_slug"]
+
+        if city_filter and city_slug not in city_filter:
+            continue
 
         # Include agenda_posted_no_files if a PDF exists in storage for that date
         ready = []
@@ -343,10 +352,21 @@ def main():
                 print(f"  ⚠ {truncation_warning}")
 
             if len(text.strip()) < 500 and pdf_size > 5000:
-                err = f"PDF appears to be scanned/image-only: {len(text.strip())} chars from {pdf_size // 1024}KB file"
-                print(f"  ✗ {err}")
-                errors.append({"label": label, "error": err})
-                continue
+                print(f"  ⚠ PDF appears scanned ({len(text.strip())} chars from {pdf_size // 1024}KB) — trying Firecrawl OCR")
+                try:
+                    from meeting_pipeline.collection_agent.firecrawl_utils import scrape_pdf_text
+                    presigned = storage.get_presigned_url(pdf_key, expiry_seconds=300)
+                    fc_text = scrape_pdf_text(presigned)
+                    if fc_text and len(fc_text.strip()) > 200:
+                        text = fc_text
+                        print(f"  ✓ Firecrawl OCR succeeded: {len(text.split())} words")
+                    else:
+                        raise ValueError("Firecrawl returned insufficient text")
+                except Exception as fc_err:
+                    err = f"PDF appears to be scanned/image-only and OCR failed: {fc_err}"
+                    print(f"  ✗ {err}")
+                    errors.append({"label": label, "error": err})
+                    continue
 
             # LLM extraction with exponential backoff retry
             import time as _time
@@ -401,6 +421,21 @@ def main():
             print(f"    {e['label']}: {e['error']}")
         print(f"  LLM cost:   ${stats.get('total_cost', 0):.4f} ({stats.get('api_call_count', 0)} calls)")
         print(f"\nOutput: {normalized_prefix}/")
+
+        # Write cost report so the pipeline orchestrator can aggregate it
+        try:
+            cost_report = {
+                "phase": "normalize",
+                "gemini_calls": stats.get("api_call_count", 0),
+                "input_tokens": stats.get("total_input_tokens", 0),
+                "output_tokens": stats.get("total_output_tokens", 0),
+                "estimated_usd": round(stats.get("total_cost", 0.0), 6),
+                "meetings_normalized": len(all_normalized),
+            }
+            output_prefix = normalized_prefix.rsplit("/", 1)[0]
+            storage.write_json(f"{output_prefix}/cost_reports/normalize.json", cost_report)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

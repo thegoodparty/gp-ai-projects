@@ -16,6 +16,10 @@ dependencies = [
     "exa-py>=2.11.0",
     "duckduckgo-search>=8.1.1",
     "ddgs>=9.13.1",
+    "browser-use>=0.12.6",
+    "langchain-anthropic>=0.3.0",
+    "anthropic>=0.40.0",
+    "firecrawl-py>=1.0.0",
 ]
 
 [tool.uv.sources]

@@ -44,8 +44,11 @@ Usage:
 
 import argparse
 import asyncio
+import json
+import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,7 +77,37 @@ from meeting_pipeline.body_validation import (
 
 LOOKAHEAD_DAYS = 90   # How many days ahead to look for meetings
 LOOKBACK_DAYS = 60    # How many days back to include (for last meeting date)
-SUPPORTED_PLATFORMS = {"legistar", "civicplus", "boarddocs", "civicclerk", "escribe", "granicus"}
+SUPPORTED_PLATFORMS = {"legistar", "civicplus", "boarddocs", "civicclerk", "escribe", "granicus", "unknown", "generic_html"}
+
+# ── Cost tracking ─────────────────────────────────────────────────────────────
+# Firecrawl credit cost per call type varies — track separately.
+# validate_agenda_page() → scrape(markdown+links) → likely 1 credit (basic)
+# Check https://firecrawl.dev/app for actual credit consumption.
+# Known platform domains embedded via iframes on city pages
+IFRAME_PLATFORM_DOMAINS = frozenset([
+    "swagit.com", "granicus.com", "legistar.com", "civicclerk.com",
+    "civicweb.net", "primegov.com", "municode.com", "boarddocs.com",
+    "novusagenda.com",
+])
+
+# Generic meeting title keywords — titles matching these are kept even when
+# score_body_match returns 0 (no explicit body match)
+GENERIC_MEETING_TITLES = [
+    "regular meeting", "work session", "special meeting",
+    "budget", "public hearing", "goal setting", "retreat",
+    "workshop", "agenda", "commission meeting", "council",
+    "governing board",
+]
+
+    # build_meetings_from_llm moved to shared/generic_agenda_scanner.py
+
+
+_COST = {
+    "firecrawl_scrape_basic": 0,    # basic scrape (~1 credit)
+    "firecrawl_scrape_js": 0,       # scrape with JS rendering (~5 credits)
+    "firecrawl_llm_extract": 0,     # Firecrawl extract API (~5-30 credits)
+    "gemini_extract": 0,            # Gemini LLM calls for meeting extraction
+}
 
 # ============================================================================
 # PER-PLATFORM LIGHTWEIGHT SCANNERS
@@ -340,6 +373,10 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
             date_raw = ev.get("MeetingStartDate", ev.get("EventDate", ""))
             title = ev.get("Name", ev.get("EventName", city))
             agenda_url = ev.get("AgendaFile") or ev.get("AgendaUrl") or None
+            # Mark agenda_posted if we have a URL OR if the platform says the agenda
+            # was posted (AgendaPostedDate). The collection step knows how to fetch
+            # the actual PDF even without a direct URL — it queries the event detail
+            # API or scrapes the portal page via Firecrawl.
             agenda_posted = bool(agenda_url) or bool(ev.get("AgendaPostedDate"))
             event_id = str(ev.get("EventId", ev.get("Id", "")))
 
@@ -563,6 +600,29 @@ async def scan_escribe(city: str, config: dict, source_url: str, client: httpx.A
 
 
 # ============================================================================
+# GENERIC FIRECRAWL SCANNER (platform=unknown)
+# ============================================================================
+
+async def scan_generic_firecrawl(source_url: str, city: str, state: str) -> list[dict]:
+    """Scan a non-platform agenda page. Delegates to shared/generic_agenda_scanner.
+    See that module for the three-tier approach (basic scrape → JS render → Gemini)."""
+    from meeting_pipeline.shared.generic_agenda_scanner import scan_generic, cost as scanner_cost
+
+    meetings = await scan_generic(source_url, city, state)
+
+    # Sync cost tracking
+    _COST["firecrawl_scrape_basic"] += scanner_cost["firecrawl_basic"]
+    _COST["firecrawl_scrape_js"] += scanner_cost["firecrawl_js"]
+    _COST["gemini_extract"] += scanner_cost["gemini_extract"]
+    _COST["firecrawl_llm_extract"] += scanner_cost["firecrawl_llm_extract"]
+    # Reset scanner costs so they don't double-count on next call
+    for k in scanner_cost:
+        scanner_cost[k] = 0
+
+    return meetings
+
+
+# ============================================================================
 # MAIN SCAN DISPATCHER
 # ============================================================================
 
@@ -582,8 +642,15 @@ async def scan_city(
     city = source.get("city", slug)
     state = source.get("state", "")
 
-    # Derive body name from source
+    # Derive body name: manifest.json (from CSV) → source.json → empty
     body = best.get("expected_body", config.get("expected_body", ""))
+    if not body:
+        manifest_key = source_key.replace("/source.json", "/manifest.json")
+        try:
+            manifest = storage.read_json(manifest_key)
+            body = manifest.get("expected_body", "")
+        except Exception as e:
+            pass  # manifest not found — body stays empty, filter will be lenient
 
     # ── Stage 1: Body validation (before any PDF downloads) ──────────────
     body_validation: dict = {}
@@ -665,15 +732,32 @@ async def scan_city(
         upcoming = await scan_escribe(city, config, source_url, client)
     elif platform == "granicus":
         upcoming = await scan_granicus(city, config, source_url, client)
+    elif platform in ("unknown", "generic_html"):
+        # Generic Firecrawl scan: scrape the agenda page (1 credit), extract PDF
+        # links, parse meeting dates from filenames. Falls back to LLM extract
+        # (~5-30 credits) when filename parsing finds nothing. No browser-use needed.
+        if source_url and os.environ.get("FIRECRAWL_API_KEY"):
+            upcoming = await scan_generic_firecrawl(source_url, city, state)
+        else:
+            upcoming = []
     else:
         # Unsupported platform — record that we know it exists but can't scan
         pass
 
-    # ── Body filter: drop events that don't match the validated governing body ──
-    # For platforms that return events from multiple bodies (Legistar, CivicClerk),
-    # filter to only events whose title matches the expected body. Events with no
-    # title or a score of 0 (no match) are kept only if body is not configured —
-    # a score < 0 (hard reject: advisory, planning, zoning, etc.) is always dropped.
+    # ── Fallback for platform failures: try the public_agenda_url via generic scanner.
+    # This handles CivicPlus 403s, SSL errors, etc. where the platform scanner
+    # failed but the city's public website might still have agenda content.
+    if not upcoming and os.environ.get("FIRECRAWL_API_KEY"):
+        public_url = source.get("public_agenda_url", "")
+        fallback_url = public_url or source_url
+        if fallback_url and platform not in ("unknown", "generic_html"):
+            upcoming = await scan_generic_firecrawl(fallback_url, city, state)
+
+    # ── Body filter: drop events that don't match the governing body ────────
+    # Uses score_body_match against the expected body from manifest.json.
+    # Events scoring < 0 (REJECT_KEYWORDS hit) are always dropped.
+    # Events scoring 0 (no match) are dropped when body is known.
+    # Events with no title are kept.
     if body and upcoming:
         filtered = []
         dropped = []
@@ -686,18 +770,21 @@ async def scan_city(
             if sc < 0:
                 # Hard reject — advisory board, planning commission, etc.
                 dropped.append(title)
-            elif sc == 0:
-                # No match — only keep if title exactly equals the body name
-                # (catches cases where expected_body is very generic)
-                if title.lower() == body.lower():
+            elif sc > 0:
+                filtered.append(m)
+            else:
+                # score == 0: no match. Keep only if title is very generic
+                # (e.g. "Regular Meeting", "Work Session") which likely IS the
+                # governing body meeting but uses a generic title.
+                title_lower = title.lower()
+                is_generic = any(kw in title_lower for kw in GENERIC_MEETING_TITLES)
+                if is_generic:
                     filtered.append(m)
                 else:
                     dropped.append(title)
-            else:
-                filtered.append(m)
         if dropped:
             unique_dropped = sorted(set(dropped))
-            print(f"    Body filter dropped {len(dropped)} events for non-matching bodies: {unique_dropped}")
+            print(f"    Body filter dropped {len(dropped)} events: {unique_dropped[:5]}{'...' if len(unique_dropped) > 5 else ''}")
         upcoming = filtered
 
     return {
@@ -849,6 +936,29 @@ async def run_batch(
             print("\nNo newly-posted agendas detected.")
 
         print("=" * 60)
+
+        # Cost report — Firecrawl calls counted but credit cost varies by call type;
+        # see firecrawl.dev/app for actual credit consumption.
+        fc_basic = _COST["firecrawl_scrape_basic"]
+        fc_js = _COST["firecrawl_scrape_js"]
+        fc_llm = _COST["firecrawl_llm_extract"]
+        gemini = _COST["gemini_extract"]
+        print(f"\n  SCAN COST:")
+        print(f"    Firecrawl: {fc_basic:3d} basic, {fc_js:3d} JS renders, {fc_llm:3d} LLM extracts")
+        print(f"    Gemini:    {gemini:3d} extraction calls")
+
+        cost_report = {
+            "phase": "scan",
+            "firecrawl_scrape_basic": fc_basic,
+            "firecrawl_scrape_js": fc_js,
+            "firecrawl_llm_extract": fc_llm,
+            "gemini_extract": gemini,
+            "cities_scanned": results["scanned"],
+        }
+        try:
+            storage.write_json(f"{cfg.output_prefix}/cost_reports/scan.json", cost_report)
+        except Exception:
+            pass
 
 
 # ============================================================================

@@ -58,10 +58,17 @@ async def _collect_legistar(
 
     legistar_slug = best.get("config", {}).get("legistar_slug", "")
     if not legistar_slug:
-        # Try to extract from URL: https://webapi.legistar.com/v1/{slug}/events
         url = best.get("url", "")
-        parts = urlparse(url).path.strip("/").split("/")
-        legistar_slug = parts[1] if len(parts) > 1 else ""
+        parsed_url = urlparse(url)
+        # Pattern 1: https://webapi.legistar.com/v1/{slug}/events
+        parts = parsed_url.path.strip("/").split("/")
+        if len(parts) > 1 and parts[0] == "v1":
+            legistar_slug = parts[1]
+        # Pattern 2: https://{slug}.legistar.com/...
+        elif "legistar.com" in parsed_url.netloc:
+            subdomain = parsed_url.netloc.split(".")[0]
+            if subdomain and subdomain != "webapi":
+                legistar_slug = subdomain
 
     if not legistar_slug:
         return CollectionResult.error_result(city, state, "legistar", "Could not determine Legistar slug")
@@ -432,6 +439,101 @@ async def _collect_boarddocs(
     )
 
 
+# ── Generic direct-download collector (platform=unknown with PDF URLs) ────────
+
+async def _collect_generic_direct(
+    event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
+) -> CollectionResult:
+    """
+    Direct httpx PDF downloader for platform=unknown cities.
+
+    Reads upcoming_meetings.json (produced by scan_generic_firecrawl during scan),
+    downloads each agenda PDF directly, and writes meetings.json in the same
+    shape as other collectors so extract_and_normalize can process them.
+
+    Only runs when:
+      - platform == "unknown"
+      - upcoming_meetings.json exists with at least one meeting having an agenda_url
+    """
+    import httpx
+    from datetime import datetime, timezone
+
+    city = event["city"]
+    state = event["state"]
+    city_slug = city_to_slug(city, state)
+
+    upcoming_key = f"{cfg.sources_prefix}/{city_slug}/upcoming_meetings.json"
+    if not storage.exists(upcoming_key):
+        return CollectionResult.error_result(city, state, "generic_direct", "No upcoming_meetings.json found")
+
+    try:
+        upcoming_data = storage.read_json(upcoming_key)
+    except Exception as e:
+        return CollectionResult.error_result(city, state, "generic_direct", f"Could not read upcoming_meetings.json: {e}")
+
+    meetings_with_pdfs = [
+        m for m in upcoming_data.get("upcoming", [])
+        if m.get("agenda_url") and m["agenda_url"].lower().endswith(".pdf")
+    ]
+
+    if not meetings_with_pdfs:
+        return CollectionResult.error_result(city, state, "generic_direct", "No PDF agenda URLs in upcoming_meetings.json")
+
+    output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/generic"
+    pdf_count = 0
+    meetings_out = []
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for m in meetings_with_pdfs:
+            date = m.get("date", "")
+            pdf_url = m["agenda_url"]
+            filename = f"{date}_agenda.pdf"
+            pdf_key = f"{output_prefix}/pdfs/{filename}"
+
+            if storage.exists(pdf_key):
+                print(f"  [generic_direct] Already downloaded: {filename}")
+                pdf_count += 1
+            else:
+                try:
+                    resp = await client.get(pdf_url)
+                    resp.raise_for_status()
+                    if len(resp.content) < 5000:
+                        print(f"  [generic_direct] PDF too small ({len(resp.content)}B), skipping: {pdf_url}")
+                        continue
+                    storage.write_bytes(pdf_key, resp.content)
+                    pdf_count += 1
+                    print(f"  [generic_direct] Downloaded: {filename} ({len(resp.content) // 1024}KB)")
+                except Exception as e:
+                    print(f"  [generic_direct] Failed to download {pdf_url}: {e}")
+                    continue
+
+            meetings_out.append({
+                "date": date,
+                "title": m.get("title", "City Council Meeting"),
+                "body": "City Council",
+                "hasAgenda": True,
+                "agenda_files": [{"name": filename, "type": "Agenda", "url": pdf_url}],
+                "source_url": source.get("best_source", {}).get("url", ""),
+                "platform": "generic_direct",
+                "collected_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+    if not meetings_out:
+        return CollectionResult.error_result(city, state, "generic_direct", "All PDF downloads failed")
+
+    storage.write_json(f"{output_prefix}/meetings.json", meetings_out)
+    print(f"  [generic_direct] Saved {len(meetings_out)} meetings, {pdf_count} PDFs")
+
+    return CollectionResult(
+        city=city,
+        state=state,
+        platform="generic_direct",
+        events_found=len(meetings_out),
+        pdfs_downloaded=pdf_count,
+        events=[],
+    )
+
+
 # ── Platform → collector function map ────────────────────────────────────────
 
 # Platforms that have dedicated Lambda-safe collectors
@@ -521,7 +623,24 @@ async def route_city(
             print(f"[router] Dedicated collector for {city} raised: {e}, trying misc fallback")
         # Fall through to misc fallback below
 
-    # ── Step 1b: Reason-only platforms (Playwright, no replay fallback) ───────
+    # ── Step 1b: platform=unknown with PDF URLs from scan ────────────────────
+    elif platform == "unknown":
+        try:
+            result = await _collect_generic_direct(event, source, storage, cfg)
+            if result.error is None:
+                notification_log.log_event(
+                    notification_log.COLLECTION_SUCCESS, city, state,
+                    storage=storage, logs_prefix=cfg.logs_prefix,
+                    platform="generic_direct", events_found=result.events_found,
+                    pdfs_downloaded=result.pdfs_downloaded,
+                )
+                return result
+            print(f"[router] generic_direct for {city} failed ({result.error}), trying misc fallback")
+        except Exception as e:
+            print(f"[router] generic_direct for {city} raised: {e}, trying misc fallback")
+        # Fall through to misc fallback below
+
+    # ── Step 1c: Reason-only platforms (Playwright, no replay fallback) ───────
     elif platform in REASON_ONLY_PLATFORMS:
         try:
             result = await collect_with_reason(event, source, storage, cfg)

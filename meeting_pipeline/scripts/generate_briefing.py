@@ -1136,7 +1136,8 @@ def generate_briefing_for_meeting(
 def main():
     parser = argparse.ArgumentParser(description="Generate council meeting briefings")
     parser.add_argument("--file", help="Storage key for a normalized meeting JSON (e.g. meeting_pipeline/output/normalized/johnstown-OH_2026-04-07.json)")
-    parser.add_argument("--city", help="City slug (e.g. johnstown-OH) — uses most recent normalized file")
+    parser.add_argument("--city", action="append", metavar="SLUG",
+                        help="City slug (e.g. johnstown-OH). With --batch, filters to these cities (repeatable). Without --batch, uses most recent normalized file for the first slug.")
     parser.add_argument("--batch", action="store_true", help="Generate for all normalized meetings")
     parser.add_argument("--from-date", help="Only process meetings on or after this date (YYYY-MM-DD). Applies to --batch mode.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be generated, no LLM calls")
@@ -1152,15 +1153,16 @@ def main():
 
     if args.file:
         target_keys = [args.file]
-    elif args.city:
+    elif args.city and not args.batch:
+        # Single-city mode: most recent normalized file for the first slug
         all_keys = storage.list_keys(normalized_prefix)
-        city_slug = args.city.lower().replace(" ", "-")
+        city_slug = args.city[0].lower().replace(" ", "-")
         matches = sorted(
             k for k in all_keys
             if k.split("/")[-1].lower().startswith(city_slug) and k.endswith(".json")
         )
         if not matches:
-            print(f"No normalized files found for city: {args.city}")
+            print(f"No normalized files found for city: {args.city[0]}")
             print(f"  Looked in: {normalized_prefix}")
             sys.exit(1)
         target_keys = [matches[-1]]
@@ -1171,6 +1173,16 @@ def main():
             k for k in all_keys
             if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
         )
+        # Filter by --city slugs if specified in batch mode
+        if args.city:
+            city_filter = set(s.lower().replace(" ", "-") for s in args.city)
+            before = len(target_keys)
+            target_keys = [
+                k for k in target_keys
+                if any(k.split("/")[-1].lower().startswith(slug) for slug in city_filter)
+            ]
+            print(f"City filter {sorted(city_filter)}: {len(target_keys)} of {before} files")
+
         # Filter by --from-date if specified (extracts date from filename)
         if args.from_date:
             before_filter = len(target_keys)
@@ -1251,6 +1263,17 @@ def main():
         log_key = f"{cfg.output_prefix}/run_logs/briefing_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
         storage.write_json(log_key, run_log)
         print(f"  Run log: {log_key}")
+
+        # Write cost report so the pipeline orchestrator can aggregate it
+        try:
+            cost_report = {
+                "phase": "briefing",
+                "estimated_usd": round(total_cost, 6),
+                "briefings_generated": ok_count,
+            }
+            storage.write_json(f"{cfg.output_prefix}/cost_reports/briefing.json", cost_report)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
