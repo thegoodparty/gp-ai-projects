@@ -96,31 +96,12 @@ _COST = {
 }
 
 # ============================================================================
-# GENERIC FIRECRAWL SCANNER (platform=unknown)
+# SCAN DISPATCHER — delegates to stages/scan/process.py
 # ============================================================================
 
-async def scan_generic_firecrawl(source_url: str, city: str, state: str) -> list[dict]:
-    """Scan a non-platform agenda page. Delegates to shared/generic_agenda_scanner.
-    See that module for the three-tier approach (basic scrape → JS render → Gemini)."""
-    from meeting_pipeline.shared.generic_agenda_scanner import scan_generic, cost as scanner_cost
+# Import the real implementation from stages
+from meeting_pipeline.stages.scan.process import process_one_city as _scan_impl
 
-    meetings = await scan_generic(source_url, city, state)
-
-    # Sync cost tracking
-    _COST["firecrawl_scrape_basic"] += scanner_cost["firecrawl_basic"]
-    _COST["firecrawl_scrape_js"] += scanner_cost["firecrawl_js"]
-    _COST["gemini_extract"] += scanner_cost["gemini_extract"]
-    _COST["firecrawl_llm_extract"] += scanner_cost["firecrawl_llm_extract"]
-    # Reset scanner costs so they don't double-count on next call
-    for k in scanner_cost:
-        scanner_cost[k] = 0
-
-    return meetings
-
-
-# ============================================================================
-# MAIN SCAN DISPATCHER
-# ============================================================================
 
 async def scan_city(
     slug: str,
@@ -130,169 +111,12 @@ async def scan_city(
     storage,
     skip_body_validation: bool = False,
 ) -> dict | None:
-    """Scan one city's upcoming meetings. Returns the upcoming_meetings record."""
-    best = source.get("best_source") or {}
-    platform = best.get("platform", "")
-    config = best.get("config", {})
-    source_url = best.get("url", "")
-    city = source.get("city", slug)
-    state = source.get("state", "")
-
-    # Derive body name: manifest.json (from CSV) → source.json → empty
-    body = best.get("expected_body", config.get("expected_body", ""))
-    if not body:
-        manifest_key = source_key.replace("/source.json", "/manifest.json")
-        try:
-            manifest = storage.read_json(manifest_key)
-            body = manifest.get("expected_body", "")
-        except Exception as e:
-            pass  # manifest not found — body stays empty, filter will be lenient
-
-    # ── Stage 1: Body validation (before any PDF downloads) ──────────────
-    body_validation: dict = {}
-    if not skip_body_validation and platform in SUPPORTED_PLATFORMS:
-        body_validation = await validate_body_for_city(slug, source, source_key, client, storage)
-
-        status = body_validation.get("status", "skip")
-        validated_body = body_validation.get("validated_body")
-
-        if status == "unresolved":
-            # Try next-ranked supported candidate from all_candidates before giving up
-            print(f"\n      ⚠ BODY MISMATCH ({platform}): {body_validation.get('reason')}")
-            from meeting_pipeline.shared.constants import PLATFORM_TIER, COLLECTION_METHODS
-            for alt in (source.get("all_candidates") or [])[1:]:
-                alt_platform = alt.get("platform", "")
-                if alt_platform not in SUPPORTED_PLATFORMS:
-                    continue
-                alt_source = {
-                    **source,
-                    "best_source": {
-                        "platform": alt_platform,
-                        "url": alt.get("url", ""),
-                        "display_url": alt.get("url", ""),
-                        "freshness": alt.get("freshness"),
-                        "most_recent_date": alt.get("most_recent_date"),
-                        "collection_method": COLLECTION_METHODS.get(alt_platform, "fetch_and_parse"),
-                        "config": alt.get("config") or {},
-                        "notes": alt.get("notes") or "",
-                    },
-                }
-                try:
-                    alt_bv = await validate_body_for_city(slug, alt_source, source_key, client, storage)
-                except Exception:
-                    continue
-                if alt_bv.get("status") in ("ok", "corrected"):
-                    print(f"\n      ↳ Switched to {alt_platform} ({alt.get('url', '')})")
-                    source = alt_source
-                    best = alt_source["best_source"]
-                    platform = alt_platform
-                    config = best.get("config", {})
-                    source_url = best.get("url", "")
-                    body_validation = alt_bv
-                    status = alt_bv.get("status", "ok")
-                    # Persist the better source so future scans use it
-                    try:
-                        storage.write_json(source_key, alt_source)
-                    except Exception:
-                        pass
-                    break
-            else:
-                print(f"\n      No fallback candidate resolved body — scan may return wrong body")
-        elif status == "corrected":
-            print(f"\n      ✓ BODY CORRECTED: {body_validation.get('correction_note')}")
-            # Re-read updated config (source.json was patched in-place)
-            try:
-                source = storage.read_json(source_key)
-                best = source.get("best_source") or {}
-                config = best.get("config") or {}
-            except Exception:
-                pass
-            # Use the validated body name
-            if validated_body:
-                body = validated_body
-        elif status == "ok" and validated_body:
-            body = validated_body
-
-    # ── Stage 2: Scan for upcoming meetings ──────────────────────────────
-    upcoming: list[dict] = []
-
-    if platform == "legistar":
-        upcoming = await scan_legistar(city, config, client, source_url=source_url)
-    elif platform == "civicplus":
-        upcoming = await scan_civicplus(city, config, source_url, client)
-    elif platform == "boarddocs":
-        upcoming = await scan_boarddocs(city, config, source_url, client)
-    elif platform == "civicclerk":
-        upcoming = await scan_civicclerk(city, config, source_url, client)
-    elif platform == "escribe":
-        upcoming = await scan_escribe(city, config, source_url, client)
-    elif platform == "granicus":
-        upcoming = await scan_granicus(city, config, source_url, client)
-    elif platform in ("unknown", "generic_html"):
-        # Generic Firecrawl scan: scrape the agenda page (1 credit), extract PDF
-        # links, parse meeting dates from filenames. Falls back to LLM extract
-        # (~5-30 credits) when filename parsing finds nothing. No browser-use needed.
-        if source_url and os.environ.get("FIRECRAWL_API_KEY"):
-            upcoming = await scan_generic_firecrawl(source_url, city, state)
-        else:
-            upcoming = []
-    else:
-        # Unsupported platform — record that we know it exists but can't scan
-        pass
-
-    # ── Fallback for platform failures: try the public_agenda_url via generic scanner.
-    # This handles CivicPlus 403s, SSL errors, etc. where the platform scanner
-    # failed but the city's public website might still have agenda content.
-    if not upcoming and os.environ.get("FIRECRAWL_API_KEY"):
-        public_url = source.get("public_agenda_url", "")
-        fallback_url = public_url or source_url
-        if fallback_url and platform not in ("unknown", "generic_html"):
-            upcoming = await scan_generic_firecrawl(fallback_url, city, state)
-
-    # ── Body filter: drop events that don't match the governing body ────────
-    # Uses score_body_match against the expected body from manifest.json.
-    # Events scoring < 0 (REJECT_KEYWORDS hit) are always dropped.
-    # Events scoring 0 (no match) are dropped when body is known.
-    # Events with no title are kept.
-    if body and upcoming:
-        filtered = []
-        dropped = []
-        for m in upcoming:
-            title = m.get("title", "")
-            if not title:
-                filtered.append(m)
-                continue
-            sc = score_body_match(title, body)
-            if sc < 0:
-                # Hard reject — advisory board, planning commission, etc.
-                dropped.append(title)
-            elif sc > 0:
-                filtered.append(m)
-            else:
-                # score == 0: no match. Keep only if title is very generic
-                # (e.g. "Regular Meeting", "Work Session") which likely IS the
-                # governing body meeting but uses a generic title.
-                title_lower = title.lower()
-                is_generic = any(kw in title_lower for kw in GENERIC_MEETING_TITLES)
-                if is_generic:
-                    filtered.append(m)
-                else:
-                    dropped.append(title)
-        if dropped:
-            unique_dropped = sorted(set(dropped))
-            print(f"    Body filter dropped {len(dropped)} events: {unique_dropped[:5]}{'...' if len(unique_dropped) > 5 else ''}")
-        upcoming = filtered
-
-    return {
-        "city_slug": slug,
-        "city": city,
-        "state": state,
-        "body": body,
-        "platform": platform,
-        "scanned_at": datetime.now(timezone.utc).isoformat(),
-        "body_validation": body_validation,
-        "upcoming": upcoming,
-    }
+    """Scan one city. Delegates to stages/scan/process.py."""
+    return await _scan_impl(
+        slug, source, source_key,
+        http_client=client, storage=storage,
+        skip_body_validation=skip_body_validation,
+    )
 
 
 # ============================================================================

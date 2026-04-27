@@ -1,20 +1,23 @@
 """
 process.py — Single-meeting extraction entry point.
 
-Provides process_one_meeting() which downloads the agenda PDF,
-extracts text, runs Gemini structured extraction, and returns
-a normalized meeting JSON dict.
+Downloads the agenda PDF, extracts text, runs Gemini structured extraction,
+and returns a normalized meeting JSON dict.
 """
 
 from typing import Optional
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
+from meeting_pipeline.stages.extract.normalize import (
+    find_best_pdf, extract_pdf_text, extract_with_gemini, normalize_meeting,
+)
 
 
 def process_one_meeting(
+    official: dict,
+    meeting: dict,
     city_slug: str,
-    date: str,
-    meeting_entry: dict,
+    platform: str,
     cfg: Optional[AgentConfig] = None,
     storage=None,
 ) -> dict | None:
@@ -22,56 +25,56 @@ def process_one_meeting(
     Extract and normalize one meeting's agenda.
 
     Args:
+        official: dict with name, city, state, role
+        meeting: dict from meeting_queue with date, source_url, agenda_files, etc.
         city_slug: e.g. "chapel-hill-NC"
-        date: e.g. "2026-04-28"
-        meeting_entry: dict from meeting_queue.json with city, state, platform, etc.
+        platform: e.g. "legistar"
         cfg: AgentConfig (created from env if not provided)
-        storage: StorageBackend (created from cfg if not provided)
+        storage: StorageBackend (created if not provided)
 
     Returns:
         Normalized meeting dict, or None if extraction failed.
     """
-    from meeting_pipeline.scripts.extract_and_normalize import (
-        find_best_pdf, extract_pdf_text, extract_with_gemini, normalize_meeting,
-    )
-
     if cfg is None:
         cfg = AgentConfig.from_env()
     if storage is None:
         storage = get_storage(cfg)
 
-    city = meeting_entry.get("city", city_slug.rsplit("-", 1)[0].replace("-", " ").title())
-    state = meeting_entry.get("state", city_slug.rsplit("-", 1)[1] if "-" in city_slug else "")
-    platform = meeting_entry.get("platform", "unknown")
+    date = meeting.get("date", "")
+    city = official.get("city", "")
+    state = official.get("state", "")
 
-    # Find and download the PDF
-    pdf_key, pdf_url = find_best_pdf(city_slug, date, platform, storage, cfg.sources_prefix)
+    # Find the best PDF
+    pdf_key, pdf_label = find_best_pdf(city_slug, date, platform, storage, cfg.sources_prefix)
     if not pdf_key:
         print(f"  No PDF found for {city_slug} {date}")
         return None
 
+    # Extract text
     try:
         pdf_bytes = storage.read_bytes(pdf_key)
     except Exception as e:
         print(f"  Failed to read PDF {pdf_key}: {e}")
         return None
 
-    # Extract text
     text = extract_pdf_text(pdf_bytes)
     if not text or len(text) < 100:
-        print(f"  PDF text too short ({len(text)} chars) for {city_slug} {date}")
+        print(f"  PDF text too short ({len(text or '')} chars) for {city_slug} {date}")
         return None
 
     # LLM extraction
-    import os
-    from google import genai
-    gemini = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+    from shared.llm_gemini import GeminiClient
+    gemini = GeminiClient()
 
-    extraction = extract_with_gemini(text, city, state, date, gemini)
+    try:
+        extraction = extract_with_gemini(text, city, state, date, gemini)
+    except Exception as e:
+        print(f"  Gemini extraction failed for {city_slug} {date}: {e}")
+        return None
+
     if not extraction or not extraction.items:
-        print(f"  Gemini extraction returned no items for {city_slug} {date}")
+        print(f"  No items extracted for {city_slug} {date}")
         return None
 
     # Normalize
-    normalized = normalize_meeting(extraction, city, state, date, platform, pdf_url or "")
-    return normalized
+    return normalize_meeting(official, meeting, extraction, pdf_key, pdf_label, city_slug, platform)
