@@ -1,0 +1,20 @@
+# Dependency manifest for the Braintrust sandbox eval bundle.
+#
+# The rest of this project uses uv + pyproject.toml as the source of truth
+# for dependencies. This file exists because `braintrust push --requirements`
+# expects a plain pip-style requirements.txt to ship into the hosted sandbox
+# runtime. It does NOT understand uv lockfiles or pyproject groups.
+#
+# Keep this list minimal: only the runtime deps `evals.py` (and the
+# campaign_plan_lambda / shared modules it imports) actually need inside
+# the sandbox. The bundler installs these into an isolated venv that gets
+# uploaded to Braintrust's Lambda runtime.
+#
+# When updating: bump versions here AND in pyproject.toml's
+# `campaign-plan-lambda` group so local runs and sandbox runs resolve to
+# compatible versions.
+
+braintrust>=0.12.1
+google-genai>=1.56.0
+pydantic>=2.0.0
+python-dotenv>=1.1.1
