@@ -108,7 +108,7 @@ async def run_collection(platform: str, city_slug: str, city: str, state: str) -
     print(f"STEP 2 — Collection ({platform})")
     print(f"{'─'*60}")
 
-    from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+    from meeting_pipeline.shared.config import AgentConfig, get_storage
     from meeting_pipeline.collection_agent.router import route_city
 
     cfg = AgentConfig(download_pdfs=True)

@@ -20,7 +20,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.scripts.source_discover import candidate_score, rank_candidates
 
 SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe"}
@@ -32,7 +32,7 @@ TERRY_CSV = _ROOT / "Terry Users2.csv"
 
 def load_terry_slugs() -> list[str]:
     """Load all city slugs from Terry Users2.csv."""
-    from meeting_pipeline.collection_agent.config import city_to_slug
+    from meeting_pipeline.shared.config import city_to_slug
     slugs = []
     with open(TERRY_CSV) as f:
         reader = csv.DictReader(f)

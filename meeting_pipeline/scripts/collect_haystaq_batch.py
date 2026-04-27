@@ -41,7 +41,7 @@ from shared.databricks_client import DatabricksClient
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_slug
 
 SERVE_CSV = _ROOT / "serve_users_unified.csv"

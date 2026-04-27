@@ -62,7 +62,7 @@ _PROJECT_ROOT = _ROOT.parent
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.body_validation import (
     REJECT_KEYWORDS,
     GOVERNING_KEYWORDS,

@@ -588,7 +588,7 @@ def main() -> None:
     else:
         print("  [search backend] DDG (primary) → Tavily (fallback; set EXA_API_KEY to also enable Exa)")
 
-    from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+    from meeting_pipeline.shared.config import AgentConfig, get_storage
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
     registry = storage.read_json(REGISTRY_S3_KEY)

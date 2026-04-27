@@ -35,7 +35,7 @@ _PROJECT_ROOT = _ROOT.parent
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.collection_agent.config import AgentConfig, city_to_slug, get_storage
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 
 TODAY = date.today().isoformat()
 TERRY_CSV = _ROOT / "Terry Users2.csv"

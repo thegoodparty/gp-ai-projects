@@ -36,7 +36,7 @@ import httpx
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS
 
 # ============================================================================
