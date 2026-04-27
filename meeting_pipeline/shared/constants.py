@@ -220,9 +220,73 @@ BOARDDOCS_WRONG_ENTITY_KEYWORDS = [
 
 
 # ── URL Reject Patterns ──────────────────────────────────────────────────────
-# These are checked against URLs to filter out non-agenda sites.
-# The full REJECT_URL_PATTERNS list is large — it stays in source_discover.py
-# for now and will be moved here or to a config file in a future phase.
+# URL fragments that indicate non-agenda sites. Checked by is_non_agenda_url().
+
+REJECT_URL_PATTERNS = [
+    # Social media
+    "facebook.com/", "youtube.com/watch", "youtube.com/@", "youtube.com/channel",
+    "youtube.com/user", "youtu.be/", "twitter.com/", "x.com/", "nextdoor.com/",
+    "instagram.com/", "linkedin.com/", "reddit.com/", "tiktok.com/",
+    # News / journalism
+    "patch.com/", "ballotpedia.org/", "govtech.com/", "politico.com/",
+    "nytimes.com/", "washingtonpost.com/", "foxnews.com/", "nbcnews.com/",
+    "abcnews.go.com/", "cbsnews.com/", "usatoday.com/", "apnews.com/",
+    "reuters.com/", "mlive.com/", "cleveland.com/", "dispatch.com/",
+    "documenters.org/", "hickoryrecord.com/", "journaltimes.com/",
+    "jsonline.com/", "racinecountyeye.com/", "thebuckeyeflame.com/",
+    "cantonrep.com/", "mchenrytimes.com/", "shawlocal.com/",
+    "dailyherald.com/", "triblocal.com/", "suburbanchicagoland.com/",
+    "daytondailynews.com/", "cincinnaticitybeat.com/",
+    # Local TV stations
+    "wmtv15news.com/", "wtmj.com/", "fox6now.com/", "wisn.com/", "witi.com/",
+    "tmj4.com/", "wkow.com/", "channel3000.com/", "wbay.com/", "weau.com/",
+    "waow.com/", "wfrv.com/", "wgba.com/", "wearegreenbay.com/", "wsaw.com/",
+    "wkbt.com/", "wqow.com/", "wxow.com/", "wlax.com/", "nbc15.com/",
+    "abc27.com/", "local3news.com/", "local10.com/", "kxan.com/", "kvue.com/",
+    "khou.com/", "click2houston.com/", "abc13.com/", "cbsaustin.com/",
+    "wfaa.com/", "nbcdfw.com/", "cbslocal.com/", "myfoxny.com/", "wral.com/",
+    "abc11.com/", "wcnc.com/", "wsoc-tv.com/", "wbtv.com/", "wccb.com/",
+    "wtvd.com/", "wbns10tv.com/", "nbc4i.com/", "10tv.com/", "local12.com/",
+    "fox19.com/", "wkrc.com/", "wcpo.com/", "wlwt.com/", "whio.com/",
+    # Travel / lifestyle
+    "tripadvisor.com/", "travelchannel.com/", "airbnb.com/", "expedia.com/",
+    "booking.com/", "hotels.com/", "agoda.com/", "kayak.com/", "travelocity.com/",
+    "orbitz.com/", "familydestinationsguide.com/", "roadtrippers.com/",
+    # Real estate
+    "zillow.com/", "realtor.com/", "trulia.com/", "redfin.com/", "movoto.com/",
+    # Data / directory / lookup
+    "zip-codes.com/", "unitedstateszipcodes.org/", "city-data.com/",
+    "bestplaces.net/", "niche.com/", "areavibes.com/", "neighborhoodscout.com/",
+    "homefacts.com/", "datausa.io/", "census.gov/", "wikipedia.org/",
+    "yellowpages.com/", "whitepages.com/", "mapquest.com/", "yelp.com/",
+    # Tech / corporate
+    "microsoft.com/", "apple.com/", "google.com/", "amazon.com/",
+    "indeed.com/", "glassdoor.com/", "quora.com/", "stackoverflow.com/",
+    "github.com/", "slideshare.net/", "scribd.com/",
+    # Archive / academic
+    "archive.org/details/",
+    # Aggregators / content farms
+    "yahoo.com/news", "yahoo.com/local", "msn.com/", "aol.com/",
+    "readkong.com/", "grokipedia.com/",
+    # Petition / crowdfunding
+    "change.org/", "gofundme.com/",
+    # Other
+    "citizenportal.ai/", "espn.com/", "nbcsports.com/",
+    "onlyinyourstate.com/", "towleroad.com/",
+]
+
+# Domain-name suffixes indicating local news/media (.com domains only)
+NEWS_DOMAIN_SUFFIXES = {
+    "roundtable", "tribune", "chronicle", "courier", "sentinel", "bulletin",
+    "advertiser", "examiner", "ledger", "dispatch", "herald", "gazette",
+    "register", "observer", "reporter", "journal", "dailynews", "weeklynews",
+    "newsroom", "newspost", "newstimes",
+    "thread", "reader", "live", "wire", "today", "now", "insider", "indy", "talk",
+}
+
+# US broadcast callsign pattern: K/W + 2-3 letters (kiow.com, wkrc.com, etc.)
+import re as _re
+BROADCAST_CALLSIGN_RE = _re.compile(r"^[kw][a-z]{2,3}\.(com|tv|org)$")
 
 
 # ── Government Platform Trust Domains ─────────────────────────────────────────
@@ -234,9 +298,4 @@ GOV_PLATFORM_DOMAINS = [
     "primegov.com", "diligentoneplatform.com",
 ]
 
-# News/content domain suffixes — lower trust than .gov domains
-NEWS_DOMAIN_SUFFIXES = {
-    "news", "times", "herald", "tribune", "journal", "gazette",
-    "observer", "post", "press", "daily", "weekly", "patch.com",
-    "newsbreak.com",
-}
+# (NEWS_DOMAIN_SUFFIXES defined above in URL Reject Patterns section)

@@ -13,6 +13,9 @@ from meeting_pipeline.shared.constants import (
     WRONG_CITY_PATTERNS,
     WRONG_ENTITY_PATTERNS,
     WRONG_DOMAIN_PATTERNS,
+    REJECT_URL_PATTERNS,
+    NEWS_DOMAIN_SUFFIXES,
+    BROADCAST_CALLSIGN_RE,
 )
 
 
@@ -115,5 +118,33 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
                             return True
             except Exception:
                 pass
+
+    return False
+
+
+def is_non_agenda_url(url: str) -> bool:
+    """Return True if the URL is clearly not an official municipal agenda source."""
+    url_lower = url.lower()
+    for pat in REJECT_URL_PATTERNS:
+        if pat in url_lower:
+            return True
+
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower().removeprefix("www.")
+
+    # Reject .tv domains (local TV stations)
+    if netloc.endswith(".tv") or ".tv/" in url_lower:
+        return True
+
+    # Reject US broadcast station call signs
+    if BROADCAST_CALLSIGN_RE.match(netloc):
+        return True
+
+    # Reject news/media sites by domain suffix (.com only)
+    if netloc.endswith(".com"):
+        domain_label = netloc[:-len(".com")]
+        for suffix in NEWS_DOMAIN_SUFFIXES:
+            if domain_label.endswith(suffix):
+                return True
 
     return False
