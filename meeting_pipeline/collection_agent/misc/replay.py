@@ -13,8 +13,6 @@ from pathlib import Path
 
 # Ensure meeting_pipeline is importable
 _BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-if str(_BRIEFING_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BRIEFING_ROOT))
 
 from meeting_pipeline.collectors.generic_html_scraper import GenericScraperConfig, collect_generic
 from ..models import CollectionResult, NavConfig

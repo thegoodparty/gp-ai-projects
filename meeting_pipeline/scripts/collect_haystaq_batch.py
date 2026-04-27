@@ -36,12 +36,11 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from shared.databricks_client import DatabricksClient
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_slug
 

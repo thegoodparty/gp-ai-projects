@@ -18,9 +18,6 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-for p in [str(_ROOT), str(_PROJECT_ROOT)]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 

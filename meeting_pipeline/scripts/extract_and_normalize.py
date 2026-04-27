@@ -30,8 +30,6 @@ from meeting_pipeline.prompts.extraction import build_extraction_prompt
 load_dotenv()
 
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(_ROOT.parent))
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 

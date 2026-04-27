@@ -335,7 +335,6 @@ async def _main_cli():
 
     _ROOT = Path(__file__).resolve().parent.parent
     if str(_ROOT.parent) not in sys.path:
-        sys.path.insert(0, str(_ROOT.parent))
 
     from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 

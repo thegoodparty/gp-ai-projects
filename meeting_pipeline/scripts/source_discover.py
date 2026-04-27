@@ -50,6 +50,9 @@ import httpx
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from meeting_pipeline.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
+# NOTE: shared/constants.py is the canonical source for constants.
+# source_discover.py still has local definitions that will be removed in Phase 2
+# when this file is split into stages/discover/ modules.
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 

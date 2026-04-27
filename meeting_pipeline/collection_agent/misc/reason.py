@@ -25,8 +25,6 @@ from pathlib import Path
 from typing import Optional
 
 _BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-if str(_BRIEFING_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BRIEFING_ROOT))
 
 from ..models import CollectionResult, NavConfig
 from ..storage import StorageBackend

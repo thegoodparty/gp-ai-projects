@@ -35,10 +35,6 @@ import httpx
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS

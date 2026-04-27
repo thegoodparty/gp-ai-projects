@@ -58,8 +58,9 @@ import httpx
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_PROJECT_ROOT))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 from meeting_pipeline.body_validation import (
@@ -75,29 +76,10 @@ from meeting_pipeline.body_validation import (
     validate_body_for_city,
 )
 
-LOOKAHEAD_DAYS = 90   # How many days ahead to look for meetings
-LOOKBACK_DAYS = 60    # How many days back to include (for last meeting date)
-SUPPORTED_PLATFORMS = {"legistar", "civicplus", "boarddocs", "civicclerk", "escribe", "granicus", "unknown", "generic_html"}
-
-# ── Cost tracking ─────────────────────────────────────────────────────────────
-# Firecrawl credit cost per call type varies — track separately.
-# validate_agenda_page() → scrape(markdown+links) → likely 1 credit (basic)
-# Check https://firecrawl.dev/app for actual credit consumption.
-# Known platform domains embedded via iframes on city pages
-IFRAME_PLATFORM_DOMAINS = frozenset([
-    "swagit.com", "granicus.com", "legistar.com", "civicclerk.com",
-    "civicweb.net", "primegov.com", "municode.com", "boarddocs.com",
-    "novusagenda.com",
-])
-
-# Generic meeting title keywords — titles matching these are kept even when
-# score_body_match returns 0 (no explicit body match)
-GENERIC_MEETING_TITLES = [
-    "regular meeting", "work session", "special meeting",
-    "budget", "public hearing", "goal setting", "retreat",
-    "workshop", "agenda", "commission meeting", "council",
-    "governing board",
-]
+from meeting_pipeline.shared.constants import (
+    LOOKAHEAD_DAYS, LOOKBACK_DAYS, SUPPORTED_PLATFORMS,
+    IFRAME_PLATFORM_DOMAINS, GENERIC_MEETING_TITLES,
+)
 
     # build_meetings_from_llm moved to shared/generic_agenda_scanner.py
 
@@ -663,7 +645,7 @@ async def scan_city(
         if status == "unresolved":
             # Try next-ranked supported candidate from all_candidates before giving up
             print(f"\n      ⚠ BODY MISMATCH ({platform}): {body_validation.get('reason')}")
-            from meeting_pipeline.scripts.source_discover import PLATFORM_TIER, COLLECTION_METHODS
+            from meeting_pipeline.shared.constants import PLATFORM_TIER, COLLECTION_METHODS
             for alt in (source.get("all_candidates") or [])[1:]:
                 alt_platform = alt.get("platform", "")
                 if alt_platform not in SUPPORTED_PLATFORMS:

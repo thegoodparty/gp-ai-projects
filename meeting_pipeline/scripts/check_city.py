@@ -26,10 +26,6 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 SOURCES_DIR = _ROOT / "sources"
 

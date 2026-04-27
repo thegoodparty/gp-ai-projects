@@ -26,8 +26,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(_ROOT.parent))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
 from meeting_pipeline.pilot_registry import PILOT_OFFICIALS

@@ -30,8 +30,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.collection_agent.router import route_city

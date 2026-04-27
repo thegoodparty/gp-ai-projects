@@ -26,8 +26,6 @@ import sys
 from pathlib import Path
 
 _BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(_BRIEFING_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BRIEFING_ROOT))
 
 from meeting_pipeline.collection_agent.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.collection_agent.router import route_city

@@ -6,7 +6,6 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(_ROOT.parent))
 
 from meeting_pipeline.scripts.extract_and_normalize import find_best_pdf
 
