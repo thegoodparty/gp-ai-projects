@@ -90,6 +90,33 @@ def _create_app(
     return app, mock_s3, mock_sender, mock_store
 
 
+class TestArtifactPublishCarriesDurationAndCost:
+    """gp-api's ExperimentRun.durationSeconds / .costUsd were always 0 on
+    successful runs because /artifact/publish accepted only `artifact` and the
+    handler called send_result without duration/cost. Lock in that the
+    success-path callback now carries the runner's measured values."""
+
+    def test_publish_forwards_duration_and_cost_to_callback(self):
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "duration_seconds": 73.4,
+                "cost_usd": 0.18,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        mock_sender.send_result.assert_called_once()
+        call_kwargs = mock_sender.send_result.call_args.kwargs
+        assert call_kwargs["duration_seconds"] == 73.4
+        assert call_kwargs["cost_usd"] == 0.18
+
+
 class TestArtifactPublishSuccess:
     def test_valid_artifact_publishes_to_s3_and_sends_callback(self):
         app, mock_s3, mock_sender, mock_store = _create_app()
@@ -374,6 +401,8 @@ class TestArtifactPublishVoterTargeting:
             organization_slug="4",
             experiment_id="voter_targeting",
             status="success",
+            duration_seconds=0,
+            cost_usd=0,
             artifact_key="voter_targeting/331e5b56-e316-45a3-bdb3-08f81c7fad00/artifact.json",
             artifact_bucket="gp-agent-artifacts-dev",
         )

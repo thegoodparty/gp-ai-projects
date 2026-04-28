@@ -43,11 +43,21 @@ def _with_retry(call_name: str, fn):
     raise last_exc
 
 
-def publish(artifact: dict) -> dict:
+def publish(
+    artifact: dict,
+    duration_seconds: float = 0,
+    cost_usd: float = 0,
+) -> dict:
     from .config import get_config
 
+    body = {
+        "artifact": artifact,
+        "duration_seconds": duration_seconds,
+        "cost_usd": cost_usd,
+    }
+
     def _call() -> dict:
-        response = get_config().client.post("/artifact/publish", json={"artifact": artifact})
+        response = get_config().client.post("/artifact/publish", json=body)
         if response.status_code == 400:
             data = response.json()
             raise ValueError(f"Artifact rejected: {data.get('detail', data.get('error', 'unknown'))}")

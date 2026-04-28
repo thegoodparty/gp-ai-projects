@@ -54,6 +54,22 @@ class TestPublish:
         with pytest.raises(ValueError, match="Artifact rejected: unknown"):
             publish({})
 
+    def test_publish_forwards_duration_seconds_and_cost_usd(self):
+        """Success callbacks must carry real duration/cost so gp-api's
+        ExperimentRun.durationSeconds / .costUsd aren't 0 for every
+        successful run."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=42.5, cost_usd=0.37)
+        assert captured["body"]["artifact"] == {"score": 0.95}
+        assert captured["body"]["duration_seconds"] == 42.5
+        assert captured["body"]["cost_usd"] == 0.37
+
 
 class TestReportStatus:
     def setup_method(self):

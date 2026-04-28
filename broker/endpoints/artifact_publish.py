@@ -36,6 +36,8 @@ _FENCE_BREAKOUT_RE = re.compile(r"</?untrusted_web_content\b", re.IGNORECASE)
 
 class PublishRequest(BaseModel):
     artifact: dict
+    duration_seconds: float = 0
+    cost_usd: float = 0
 
 
 class PublishResponse(BaseModel):
@@ -209,6 +211,8 @@ def artifact_publish(
         status="success",
         artifact_key=run_key,
         artifact_bucket=bucket,
+        duration_seconds=req.duration_seconds,
+        cost_usd=req.cost_usd,
     )
 
     try:

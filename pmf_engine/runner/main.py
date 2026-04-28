@@ -359,7 +359,11 @@ async def run_experiment(
 
             duration = time.monotonic() - start_time
             try:
-                publish.publish(artifact)
+                publish.publish(
+                    artifact,
+                    duration_seconds=duration,
+                    cost_usd=result.cost_usd,
+                )
                 logger.info(f"Published artifact via broker for run {config.run_id}")
             except Exception as e:
                 logger.exception(f"Broker publish failed for run {config.run_id}: {e}")
