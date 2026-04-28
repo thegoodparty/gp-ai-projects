@@ -190,7 +190,7 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
     total_meetings = 0
     total_posted = 0
 
-    async def scan_one(city_info: dict, http: httpx.AsyncClient):
+    async def scan_one(city_info: dict):
         nonlocal ok_count, err_count, skip_count, total_meetings, total_posted
         slug = city_info["slug"]
         source_key = f"{cfg.sources_prefix}/{slug}/source.json"
@@ -205,33 +205,34 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
             return
 
         async with sem:
-            try:
-                source = storage.read_json(source_key)
-                platform = (source.get("best_source") or {}).get("platform", "?")
+            # Each task gets its own httpx client to avoid connection pool contention
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
+                follow_redirects=True, timeout=20,
+            ) as http:
+                try:
+                    source = storage.read_json(source_key)
+                    platform = (source.get("best_source") or {}).get("platform", "?")
 
-                record = await process_one_city(slug, source, source_key, http_client=http, storage=storage)
-                if record:
-                    storage.write_json(um_key, record)
-                    meetings = record.get("upcoming", [])
-                    future = [m for m in meetings if m.get("status") != "past"]
-                    posted = [m for m in future if m.get("agenda_posted")]
-                    total_meetings += len(meetings)
-                    total_posted += len(posted)
-                    ok_count += 1
-                    print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): {len(meetings)} meetings, {len(posted)} posted")
-                else:
-                    ok_count += 1
-                    print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): no result")
-            except Exception as e:
-                err_count += 1
-                print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug}: ERROR {str(e)[:60]}")
+                    record = await process_one_city(slug, source, source_key, http_client=http, storage=storage)
+                    if record:
+                        storage.write_json(um_key, record)
+                        meetings = record.get("upcoming", [])
+                        future = [m for m in meetings if m.get("status") != "past"]
+                        posted = [m for m in future if m.get("agenda_posted")]
+                        total_meetings += len(meetings)
+                        total_posted += len(posted)
+                        ok_count += 1
+                        print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): {len(meetings)} meetings, {len(posted)} posted")
+                    else:
+                        ok_count += 1
+                        print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): no result")
+                except Exception as e:
+                    err_count += 1
+                    print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug}: ERROR {str(e)[:60]}")
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
-        follow_redirects=True, timeout=20,
-    ) as http:
-        tasks = [scan_one(c, http) for c in cities]
-        await asyncio.gather(*tasks)
+    tasks = [scan_one(c) for c in cities]
+    await asyncio.gather(*tasks)
 
     print(f"\n  Scan: {ok_count} OK, {err_count} errors, {skip_count} skipped")
     print(f"  Total: {total_meetings} meetings, {total_posted} with posted agendas")
