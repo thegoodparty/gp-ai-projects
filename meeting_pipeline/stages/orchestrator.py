@@ -27,6 +27,13 @@ from typing import Optional
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
 
+# Default concurrency limits per stage
+CONCURRENCY_DISCOVER = 3   # Serper + Firecrawl rate limits
+CONCURRENCY_SCAN = 10      # API calls are fast
+CONCURRENCY_COLLECT = 5    # PDF downloads, some platforms rate-limited
+CONCURRENCY_EXTRACT = 5    # Gemini has high rate limits
+CONCURRENCY_BRIEFING = 3   # Each briefing = 5-10 LLM calls
+
 
 # ── City loading ─────────────────────────────────────────────────────────────
 
@@ -97,10 +104,32 @@ def filter_cities(
     return [c for c in cities if c["slug"].lower() in slug_set]
 
 
+# ── Concurrent task runner ───────────────────────────────────────────────────
+
+async def _run_concurrent(tasks, concurrency: int, label: str = ""):
+    """Run async tasks with bounded concurrency. Returns list of results."""
+    sem = asyncio.Semaphore(concurrency)
+    completed = 0
+    total = len(tasks)
+
+    async def _wrapped(coro):
+        nonlocal completed
+        async with sem:
+            result = await coro
+            completed += 1
+            return result
+
+    results = await asyncio.gather(
+        *[_wrapped(t) for t in tasks],
+        return_exceptions=True,
+    )
+    return results
+
+
 # ── Stage runners ────────────────────────────────────────────────────────────
 
 async def run_discover(cities: list[dict], cfg: AgentConfig):
-    """Run discovery for a list of cities."""
+    """Run discovery for a list of cities (concurrent)."""
     from meeting_pipeline.stages.discover.process import process_one_city
     import httpx
     import os
@@ -112,17 +141,18 @@ async def run_discover(cities: list[dict], cfg: AgentConfig):
         from tavily import TavilyClient
         tavily = TavilyClient(api_key=tavily_key)
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
-        follow_redirects=True, timeout=20,
-    ) as http:
-        for i, city_info in enumerate(cities):
-            city = city_info["city"]
-            state = city_info["state"]
-            expected_body = city_info.get("expected_body", "")
-            slug = city_info.get("slug") or city_to_slug(city, state)
+    sem = asyncio.Semaphore(CONCURRENCY_DISCOVER)
+    ok_count = 0
+    err_count = 0
 
-            print(f"[{i+1}/{len(cities)}] Discovering {city}, {state}...", end=" ", flush=True)
+    async def discover_one(i: int, city_info: dict, http: httpx.AsyncClient):
+        nonlocal ok_count, err_count
+        city = city_info["city"]
+        state = city_info["state"]
+        expected_body = city_info.get("expected_body", "")
+        slug = city_info.get("slug") or city_to_slug(city, state)
+
+        async with sem:
             try:
                 result = await process_one_city(
                     city, state, expected_body=expected_body,
@@ -131,39 +161,53 @@ async def run_discover(cities: list[dict], cfg: AgentConfig):
                 platform = result.get("best_source", {}).get("platform", "?")
                 freshness = result.get("best_source", {}).get("freshness", "?")
                 storage.write_json(f"{cfg.sources_prefix}/{slug}/source.json", result)
-                print(f"[{platform}/{freshness}]")
+                ok_count += 1
+                print(f"  [{ok_count + err_count}/{len(cities)}] {city}, {state} [{platform}/{freshness}]")
             except Exception as e:
-                print(f"ERROR: {str(e)[:60]}")
-
-
-async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
-    """Run scan for cities with source.json."""
-    from meeting_pipeline.stages.scan.process import process_one_city
-    import httpx
-
-    storage = get_storage(cfg)
+                err_count += 1
+                print(f"  [{ok_count + err_count}/{len(cities)}] {city}, {state} ERROR: {str(e)[:60]}")
 
     async with httpx.AsyncClient(
         headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
         follow_redirects=True, timeout=20,
     ) as http:
-        for i, city_info in enumerate(cities):
-            slug = city_info["slug"]
-            source_key = f"{cfg.sources_prefix}/{slug}/source.json"
+        tasks = [discover_one(i, c, http) for i, c in enumerate(cities)]
+        await asyncio.gather(*tasks)
 
-            if not storage.exists(source_key):
-                print(f"[{i+1}/{len(cities)}] {slug}: no source.json, skip")
-                continue
+    print(f"\n  Discovery: {ok_count} OK, {err_count} errors")
 
-            um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
-            if not force and storage.exists(um_key):
-                print(f"[{i+1}/{len(cities)}] {slug}: already scanned, skip (--force to re-scan)")
-                continue
 
+async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
+    """Run scan for cities with source.json (concurrent)."""
+    from meeting_pipeline.stages.scan.process import process_one_city
+    import httpx
+
+    storage = get_storage(cfg)
+    sem = asyncio.Semaphore(CONCURRENCY_SCAN)
+    ok_count = 0
+    err_count = 0
+    skip_count = 0
+    total_meetings = 0
+    total_posted = 0
+
+    async def scan_one(city_info: dict, http: httpx.AsyncClient):
+        nonlocal ok_count, err_count, skip_count, total_meetings, total_posted
+        slug = city_info["slug"]
+        source_key = f"{cfg.sources_prefix}/{slug}/source.json"
+
+        if not storage.exists(source_key):
+            skip_count += 1
+            return
+
+        um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
+        if not force and storage.exists(um_key):
+            skip_count += 1
+            return
+
+        async with sem:
             try:
                 source = storage.read_json(source_key)
                 platform = (source.get("best_source") or {}).get("platform", "?")
-                print(f"[{i+1}/{len(cities)}] Scanning {slug} ({platform})...", end=" ", flush=True)
 
                 record = await process_one_city(slug, source, source_key, http_client=http, storage=storage)
                 if record:
@@ -171,15 +215,30 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
                     meetings = record.get("upcoming", [])
                     future = [m for m in meetings if m.get("status") != "past"]
                     posted = [m for m in future if m.get("agenda_posted")]
-                    print(f"{len(meetings)} meetings ({len(future)} future, {len(posted)} posted)")
+                    total_meetings += len(meetings)
+                    total_posted += len(posted)
+                    ok_count += 1
+                    print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): {len(meetings)} meetings, {len(posted)} posted")
                 else:
-                    print("no result")
+                    ok_count += 1
+                    print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug} ({platform}): no result")
             except Exception as e:
-                print(f"ERROR: {str(e)[:60]}")
+                err_count += 1
+                print(f"  [{ok_count + err_count}/{len(cities) - skip_count}] {slug}: ERROR {str(e)[:60]}")
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
+        follow_redirects=True, timeout=20,
+    ) as http:
+        tasks = [scan_one(c, http) for c in cities]
+        await asyncio.gather(*tasks)
+
+    print(f"\n  Scan: {ok_count} OK, {err_count} errors, {skip_count} skipped")
+    print(f"  Total: {total_meetings} meetings, {total_posted} with posted agendas")
 
 
 async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = True):
-    """Run collection for cities (download PDFs)."""
+    """Run collection for cities (concurrent PDF downloads)."""
     from meeting_pipeline.stages.collect.process import process_one_city
 
     storage = get_storage(cfg)
@@ -209,21 +268,37 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
         print("  No cities to collect (none with posted agendas)")
         return
 
-    print(f"Collecting {len(cities_to_collect)} cities...")
-    for i, c in enumerate(cities_to_collect):
-        print(f"[{i+1}/{len(cities_to_collect)}] {c['city']}, {c['state']}...", end=" ", flush=True)
-        try:
-            result = await process_one_city(c["city"], c["state"], cfg=cfg, storage=storage)
-            if isinstance(result, dict):
-                ok = result.get("ok", False)
-                pdfs = result.get("pdfs_downloaded", 0)
-                print(f"{'OK' if ok else 'FAILED'} ({pdfs} PDFs)")
-            else:
-                # CollectionResult object
-                ok = not result.error
-                print(f"{'OK' if ok else 'FAILED'} ({result.events_found} events, {result.pdfs_downloaded} PDFs)")
-        except Exception as e:
-            print(f"ERROR: {str(e)[:60]}")
+    print(f"  Collecting {len(cities_to_collect)} cities (concurrency={CONCURRENCY_COLLECT})...")
+
+    sem = asyncio.Semaphore(CONCURRENCY_COLLECT)
+    ok_count = 0
+    err_count = 0
+
+    async def collect_one(i: int, c: dict):
+        nonlocal ok_count, err_count
+        async with sem:
+            try:
+                result = await process_one_city(c["city"], c["state"], cfg=cfg, storage=storage)
+                if isinstance(result, dict):
+                    ok = result.get("ok", False)
+                    pdfs = result.get("pdfs_downloaded", 0)
+                    status = f"OK ({pdfs} PDFs)" if ok else f"FAILED"
+                else:
+                    ok = not result.error
+                    status = f"OK ({result.events_found} events, {result.pdfs_downloaded} PDFs)" if ok else f"FAILED: {result.error}"
+                if ok:
+                    ok_count += 1
+                else:
+                    err_count += 1
+                print(f"  [{ok_count + err_count}/{len(cities_to_collect)}] {c['city']}, {c['state']}: {status}")
+            except Exception as e:
+                err_count += 1
+                print(f"  [{ok_count + err_count}/{len(cities_to_collect)}] {c['city']}, {c['state']}: ERROR {str(e)[:60]}")
+
+    tasks = [collect_one(i, c) for i, c in enumerate(cities_to_collect)]
+    await asyncio.gather(*tasks)
+
+    print(f"\n  Collect: {ok_count} OK, {err_count} errors")
 
 
 async def run_extract(
@@ -232,11 +307,7 @@ async def run_extract(
     force: bool = False,
     dry_run: bool = False,
 ):
-    """Extract agenda items from PDFs for cities with posted agendas.
-
-    Reads upcoming_meetings.json per city, finds PDFs, runs LLM extraction.
-    Replaces the old meeting_queue.json-based approach.
-    """
+    """Extract agenda items from PDFs (concurrent LLM extraction)."""
     from meeting_pipeline.stages.extract.normalize import (
         extract_pdf_text, find_best_pdf, extract_with_gemini, normalize_meeting,
     )
@@ -247,12 +318,16 @@ async def run_extract(
     # Lazy import — heavy deps
     gemini = None
     if not dry_run:
+        import sys as _sys
+        _project_root = str(Path(__file__).resolve().parent.parent.parent)
+        if _sys.path[0] != _project_root:
+            _sys.path.insert(0, _project_root)
         from shared.llm_gemini import GeminiClient, GeminiModelType
         gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 
-    extracted = 0
+    # Build list of (city_info, meeting) pairs to extract
+    work_items = []
     skipped = 0
-    errors = []
 
     for city_info in cities:
         slug = city_info["slug"]
@@ -267,7 +342,6 @@ async def run_extract(
         state = um.get("state", "")
         body = um.get("body", "")
 
-        # Find meetings with posted agendas
         posted = [
             m for m in um.get("upcoming", [])
             if m.get("agenda_posted") and m.get("status") != "past"
@@ -278,111 +352,122 @@ async def run_extract(
         for meeting in posted:
             meeting_date = meeting.get("date", "")
             out_key = f"{normalized_prefix}/{slug}_{meeting_date}.json"
-            label = f"{city}, {state} — {meeting_date}"
 
             if not force and storage.exists(out_key):
                 skipped += 1
                 continue
 
-            # Find PDF
             pdf_key, pdf_label = find_best_pdf(slug, meeting_date, platform, storage, cfg.sources_prefix)
             if not pdf_key:
                 continue
 
-            if dry_run:
-                pdf_size = storage.get_size(pdf_key)
-                print(f"  [dry-run] {label}: would extract from {pdf_key.split('/')[-1]} ({pdf_size // 1024}KB)")
-                continue
+            work_items.append({
+                "slug": slug, "city": city, "state": state, "body": body,
+                "platform": platform, "meeting": meeting, "meeting_date": meeting_date,
+                "pdf_key": pdf_key, "pdf_label": pdf_label, "out_key": out_key,
+            })
 
-            print(f"\n  Extracting: {label}")
-            pdf_size = storage.get_size(pdf_key)
-            print(f"    PDF: {pdf_key.split('/')[-1]} ({pdf_size // 1024}KB)")
+    if skipped:
+        print(f"  Skipping {skipped} already extracted (--force to redo)")
 
+    if not work_items:
+        if not dry_run:
+            print("  No meetings to extract")
+        return
+
+    if dry_run:
+        for w in work_items:
+            pdf_size = storage.get_size(w["pdf_key"])
+            print(f"  [dry-run] {w['city']}, {w['state']} — {w['meeting_date']}: {w['pdf_key'].split('/')[-1]} ({pdf_size // 1024}KB)")
+        return
+
+    print(f"  Extracting {len(work_items)} meetings (concurrency={CONCURRENCY_EXTRACT})...")
+
+    sem = asyncio.Semaphore(CONCURRENCY_EXTRACT)
+    extracted = 0
+    errors = []
+
+    async def extract_one(w: dict):
+        nonlocal extracted
+        label = f"{w['city']}, {w['state']} — {w['meeting_date']}"
+
+        async with sem:
             try:
-                pdf_bytes = storage.read_bytes(pdf_key)
+                pdf_bytes = storage.read_bytes(w["pdf_key"])
                 text = extract_pdf_text(pdf_bytes)
-                print(f"    {len(text.split())} words extracted")
 
                 truncation_warning = None
                 if len(text) > 100_000:
                     truncation_warning = f"Text truncated: {len(text):,} chars -> 100,000"
-                    print(f"    Warning: {truncation_warning}")
 
-                if len(text.strip()) < 500 and pdf_size > 5000:
-                    print(f"    PDF appears scanned — trying Firecrawl OCR")
+                if len(text.strip()) < 500 and storage.get_size(w["pdf_key"]) > 5000:
                     try:
                         from meeting_pipeline.shared.firecrawl_client import scrape_pdf_text
-                        presigned = storage.get_presigned_url(pdf_key, expiry_seconds=300)
+                        presigned = storage.get_presigned_url(w["pdf_key"], expiry_seconds=300)
                         fc_text = scrape_pdf_text(presigned)
                         if fc_text and len(fc_text.strip()) > 200:
                             text = fc_text
-                            print(f"    Firecrawl OCR: {len(text.split())} words")
                         else:
                             raise ValueError("Insufficient text from OCR")
                     except Exception as e:
                         errors.append({"label": label, "error": f"OCR failed: {e}"})
-                        continue
+                        return
 
                 # LLM extraction with retry
                 import time as _time
                 extraction = None
                 for attempt in range(3):
                     try:
-                        extraction = extract_with_gemini(text, city, state, meeting_date, gemini)
-                        print(f"    {len(extraction.items)} agenda items extracted")
+                        extraction = extract_with_gemini(text, w["city"], w["state"], w["meeting_date"], gemini)
                         break
                     except Exception as e:
                         if attempt < 2:
-                            wait = 2 ** attempt
-                            print(f"    Attempt {attempt + 1} failed: {e} — retrying in {wait}s")
-                            _time.sleep(wait)
+                            await asyncio.sleep(2 ** attempt)
                         else:
                             errors.append({"label": label, "error": str(e)})
 
                 if extraction is None:
-                    continue
+                    return
 
-                # Build official dict from scan data (no CSV dependency)
-                official = {"name": "", "city": city, "state": state, "role": body or "City Council"}
-
-                # Build meeting dict compatible with normalize_meeting
+                official = {"name": "", "city": w["city"], "state": w["state"], "role": w["body"] or "City Council"}
                 meeting_for_norm = {
-                    "date": meeting_date,
-                    "title": meeting.get("title", ""),
-                    "body": body,
-                    "source_url": meeting.get("agenda_url", ""),
+                    "date": w["meeting_date"],
+                    "title": w["meeting"].get("title", ""),
+                    "body": w["body"],
+                    "source_url": w["meeting"].get("agenda_url", ""),
                     "agenda_files": [],
                 }
-                if meeting.get("agenda_url"):
+                if w["meeting"].get("agenda_url"):
                     meeting_for_norm["agenda_files"] = [
-                        {"name": "Agenda", "type": "Agenda", "url": meeting["agenda_url"]}
+                        {"name": "Agenda", "type": "Agenda", "url": w["meeting"]["agenda_url"]}
                     ]
 
                 normalized = normalize_meeting(
-                    official=official,
-                    meeting=meeting_for_norm,
-                    extraction=extraction,
-                    pdf_key=pdf_key,
-                    pdf_label=pdf_label,
-                    city_slug=slug,
-                    platform=platform,
+                    official=official, meeting=meeting_for_norm, extraction=extraction,
+                    pdf_key=w["pdf_key"], pdf_label=w["pdf_label"],
+                    city_slug=w["slug"], platform=w["platform"],
                 )
                 if truncation_warning:
                     normalized.setdefault("agenda", {})["truncation_warning"] = truncation_warning
 
-                storage.write_json(out_key, normalized)
-                print(f"    Saved: {out_key.split('/')[-1]}")
+                storage.write_json(w["out_key"], normalized)
                 extracted += 1
+                print(f"  [{extracted}/{len(work_items)}] {label}: {len(extraction.items)} items")
 
             except Exception as e:
                 errors.append({"label": label, "error": str(e)})
 
+    tasks = [extract_one(w) for w in work_items]
+    await asyncio.gather(*tasks)
+
     print(f"\n  Extract: {extracted} normalized, {skipped} skipped, {len(errors)} errors")
     if errors:
-        for e in errors:
+        for e in errors[:10]:
             print(f"    {e['label']}: {e['error']}")
+        if len(errors) > 10:
+            print(f"    ... and {len(errors) - 10} more")
 
-    if gemini and not dry_run:
+    if gemini:
         stats = gemini.get_usage_stats()
         print(f"  LLM cost: ${stats.get('total_cost', 0):.4f} ({stats.get('api_call_count', 0)} calls)")
 
@@ -393,7 +478,7 @@ async def run_briefing(
     force: bool = False,
     dry_run: bool = False,
 ):
-    """Generate briefings for cities with normalized meeting data."""
+    """Generate briefings for cities with normalized meeting data (concurrent)."""
     from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting
 
     storage = get_storage(cfg)
@@ -407,7 +492,6 @@ async def run_briefing(
         if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
     )
 
-    # Filter to target cities if specified
     if cities:
         slug_set = set(c["slug"] for c in cities)
         norm_keys = [
@@ -415,7 +499,6 @@ async def run_briefing(
             if any(k.split("/")[-1].startswith(slug) for slug in slug_set)
         ]
 
-    # Skip existing briefings unless --force
     if not force:
         existing = set(storage.list_keys(briefing_prefix))
         before = len(norm_keys)
@@ -431,17 +514,24 @@ async def run_briefing(
         print("  No normalized meetings to brief")
         return
 
+    print(f"  Generating {len(norm_keys)} briefings (concurrency={CONCURRENCY_BRIEFING})...")
+
+    sem = asyncio.Semaphore(CONCURRENCY_BRIEFING)
     results = []
-    for key in norm_keys:
+
+    async def brief_one(key: str):
         filename = key.split("/")[-1]
-        print(f"\n  Briefing: {filename}")
-        try:
-            result = generate_briefing_for_meeting(key, storage, cfg, dry_run=dry_run)
-        except Exception as e:
-            print(f"    Failed: {e}")
-            result = {"status": "error", "error": str(e), "cost": 0}
-        result["file"] = filename
-        results.append(result)
+        async with sem:
+            try:
+                result = generate_briefing_for_meeting(key, storage, cfg, dry_run=dry_run)
+            except Exception as e:
+                print(f"    {filename}: FAILED {e}")
+                result = {"status": "error", "error": str(e), "cost": 0}
+            result["file"] = filename
+            results.append(result)
+
+    tasks = [brief_one(k) for k in norm_keys]
+    await asyncio.gather(*tasks)
 
     ok = sum(1 for r in results if r.get("status") == "ok")
     errs = sum(1 for r in results if r.get("status") == "error")
@@ -470,15 +560,6 @@ async def run_pipeline(
         1. city_slugs — specific slugs to process
         2. csv_path — load cities from CSV file
         3. All cities with source.json in storage
-
-    Args:
-        phases: list of phase names to run (default: all)
-        cfg: AgentConfig (created from env if not provided)
-        city_slugs: filter to these city slugs
-        csv_path: load cities from this CSV
-        force: overwrite existing outputs
-        dry_run: preview without making changes
-        skip_existing: skip cities that already have outputs for each phase
     """
     if cfg is None:
         cfg = AgentConfig.from_env()
@@ -507,7 +588,7 @@ async def run_pipeline(
 
     if "discover" in phases:
         print(f"\n{'=' * 60}")
-        print(f"DISCOVER — {len(cities)} cities")
+        print(f"DISCOVER — {len(cities)} cities (concurrency={CONCURRENCY_DISCOVER})")
         print(f"{'=' * 60}")
         await run_discover(cities, cfg)
 
@@ -519,25 +600,25 @@ async def run_pipeline(
 
     if "scan" in phases:
         print(f"\n{'=' * 60}")
-        print(f"SCAN — {len(cities)} cities")
+        print(f"SCAN — {len(cities)} cities (concurrency={CONCURRENCY_SCAN})")
         print(f"{'=' * 60}")
         await run_scan(cities, cfg, force=force)
 
     if "collect" in phases:
         print(f"\n{'=' * 60}")
-        print(f"COLLECT — {len(cities)} cities (posted agendas only)")
+        print(f"COLLECT (posted agendas only, concurrency={CONCURRENCY_COLLECT})")
         print(f"{'=' * 60}")
         await run_collect(cities, cfg, posted_only=True)
 
     if "extract" in phases:
         print(f"\n{'=' * 60}")
-        print(f"EXTRACT — PDF -> normalized JSON")
+        print(f"EXTRACT — PDF -> normalized JSON (concurrency={CONCURRENCY_EXTRACT})")
         print(f"{'=' * 60}")
         await run_extract(cities, cfg, force=force, dry_run=dry_run)
 
     if "briefing" in phases:
         print(f"\n{'=' * 60}")
-        print(f"BRIEFING — normalized -> briefing")
+        print(f"BRIEFING — normalized -> briefing (concurrency={CONCURRENCY_BRIEFING})")
         print(f"{'=' * 60}")
         await run_briefing(cities, cfg, force=force, dry_run=dry_run)
 
@@ -546,7 +627,6 @@ async def run_pipeline(
     print(f"PIPELINE COMPLETE — {elapsed:.0f}s")
     print(f"{'=' * 60}")
 
-    # Summary
     _print_summary(cities, cfg, storage)
 
 
@@ -554,7 +634,6 @@ def _print_summary(cities: list[dict], cfg: AgentConfig, storage):
     """Print pipeline run summary."""
     slug_set = set(c["slug"] for c in cities)
 
-    # Count outputs
     source_count = 0
     scan_count = 0
     posted_count = 0
