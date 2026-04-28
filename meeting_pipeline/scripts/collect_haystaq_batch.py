@@ -29,13 +29,9 @@ Storage:
 
 import argparse
 import csv
-import json
 import sys
 import time
 from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT = _ROOT.parent
 
 from shared.databricks_client import DatabricksClient
 from dotenv import load_dotenv

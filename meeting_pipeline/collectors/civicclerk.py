@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from meeting_pipeline.collection_agent.storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # ============================================================================
@@ -279,7 +279,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             # Firecrawl fallback: scrape portal event page when API returns no files
             elif config.download_pdfs and not agenda_files and event.get("hasAgenda"):
                 try:
-                    from meeting_pipeline.collection_agent.firecrawl_utils import scrape_civicclerk_event_files
+                    from meeting_pipeline.shared.firecrawl_client import scrape_civicclerk_event_files
                     portal_base = f"https://{config.tenant}.portal.civicclerk.com"
                     print(f"     [civicclerk] API returned 0 files for event {event_id} — trying Firecrawl")
                     pdf_urls = scrape_civicclerk_event_files(portal_base, str(event_id))

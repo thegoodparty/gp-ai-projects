@@ -21,12 +21,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.scripts.source_discover import candidate_score, rank_candidates
+from meeting_pipeline.stages.discover.scoring import candidate_score, rank_candidates, PLATFORM_TIER as _PLATFORM_TIER
 
 SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe"}
-
-# Used to gate upgrades — only apply if new platform tier > old platform tier
-from meeting_pipeline.scripts.source_discover import PLATFORM_TIER as _PLATFORM_TIER
 TERRY_CSV = _ROOT / "Terry Users2.csv"
 
 

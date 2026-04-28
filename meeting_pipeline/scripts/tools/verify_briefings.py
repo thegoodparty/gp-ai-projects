@@ -23,18 +23,13 @@ Output:
 """
 
 import argparse
-import json
 import re
 import sys
 from collections import defaultdict
 from datetime import date, datetime
-from pathlib import Path
 from typing import Optional
 
 import httpx
-
-_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT = _ROOT.parent
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 

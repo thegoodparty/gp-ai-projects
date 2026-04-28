@@ -82,7 +82,7 @@ async def process_one_city(
         # ── Body validation (CivicPlus category correction etc.) ──────────
         body_validation: dict = {}
         if not skip_body_validation and platform in SUPPORTED_PLATFORMS:
-            from meeting_pipeline.body_validation import validate_body_for_city
+            from meeting_pipeline.shared.body_validation import validate_body_for_city
             body_validation = await validate_body_for_city(
                 slug, source, source_key, http_client, storage
             )

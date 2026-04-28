@@ -43,7 +43,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from meeting_pipeline.collection_agent.storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # ============================================================================

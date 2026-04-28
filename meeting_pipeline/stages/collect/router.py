@@ -24,8 +24,8 @@ from urllib.parse import urlparse, parse_qs
 from meeting_pipeline.shared.models import CollectionResult
 from meeting_pipeline.shared.storage import StorageBackend
 from meeting_pipeline.shared.config import AgentConfig, city_to_slug, find_city_slug
-from meeting_pipeline.collection_agent import notification_log
-from meeting_pipeline.collection_agent.manifest import load_manifest, validate_against_manifest
+from meeting_pipeline.shared import notification_log
+from meeting_pipeline.shared.manifest import load_manifest, validate_against_manifest
 
 
 # ── Dedicated collector adapters ──────────────────────────────────────────────

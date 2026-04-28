@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 import httpx
 from bs4 import BeautifulSoup
 
-from meeting_pipeline.collection_agent.storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # ============================================================================

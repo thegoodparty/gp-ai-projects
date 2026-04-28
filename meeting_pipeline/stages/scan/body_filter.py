@@ -5,7 +5,7 @@ Drops events from planning commissions, school boards, library boards, etc.
 Uses score_body_match against the expected_body from the city's manifest.
 """
 
-from meeting_pipeline.body_validation import score_body_match
+from meeting_pipeline.shared.body_validation import score_body_match
 from meeting_pipeline.shared.constants import GENERIC_MEETING_TITLES
 
 

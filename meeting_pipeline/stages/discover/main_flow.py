@@ -13,14 +13,13 @@ import os
 import re
 import time
 from datetime import date, datetime, timezone
-from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 from tavily import TavilyClient
 
-from meeting_pipeline.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
+from meeting_pipeline.shared.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
 from meeting_pipeline.shared.constants import (
     STATE_NAMES as _STATE_NAMES, STATE_ABBREVS,
     PLATFORM_PATTERNS, COLLECTION_METHODS,
@@ -2668,7 +2667,7 @@ async def run_source_discover(
         and os.environ.get("FIRECRAWL_API_KEY")
     ):
         try:
-            from meeting_pipeline.collection_agent.firecrawl_utils import validate_agenda_page
+            from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
             _COST["firecrawl_scrape_basic"] += 1
             fc = validate_agenda_page(best["url"], city, state)
             if fc.get("valid"):
@@ -2715,7 +2714,7 @@ async def run_source_discover(
             try:
                 # Use cheap scrape (1 credit) not LLM extract (~15-30 credits) —
                 # we only need to confirm this is a real agenda page, not extract data.
-                from meeting_pipeline.collection_agent.firecrawl_utils import validate_agenda_page
+                from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
                 _COST["firecrawl_scrapes"] += 1
                 fc = validate_agenda_page(target["url"], city, state)
                 if fc.get("valid"):

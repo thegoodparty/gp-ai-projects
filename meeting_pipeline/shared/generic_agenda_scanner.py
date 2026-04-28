@@ -17,35 +17,8 @@ import re
 import time
 from datetime import date, datetime, timedelta
 
-# ── Date patterns in PDF filenames ────────────────────────────────────────────
-
-_FILENAME_DATE_PATTERNS = [
-    (r'(\d{2})-(\d{2})-(\d{4})', "mdy"),     # MM-DD-YYYY
-    (r'(\d{4})-(\d{2})-(\d{2})', "ymd"),     # YYYY-MM-DD
-    (r'(\d{1,2})\.(\d{1,2})\.(\d{4})', "mdy"),  # M.D.YYYY
-    (r'(\d{2})-(\d{2})-(\d{2})(?!\d)', "mdy2"),  # MM-DD-YY (2-digit year)
-]
-
-
-def parse_date_from_filename(filename: str) -> date | None:
-    """Extract a meeting date from a PDF filename. Returns None if no date found."""
-    for pattern, fmt in _FILENAME_DATE_PATTERNS:
-        m = re.search(pattern, filename)
-        if not m:
-            continue
-        try:
-            g = m.groups()
-            if fmt == "ymd":
-                d = date(int(g[0]), int(g[1]), int(g[2]))
-            elif fmt == "mdy2":
-                d = date(2000 + int(g[2]), int(g[0]), int(g[1]))
-            else:
-                d = date(int(g[2]), int(g[0]), int(g[1]))
-            if date(2020, 1, 1) <= d <= date(2030, 12, 31):
-                return d
-        except (ValueError, TypeError):
-            continue
-    return None
+from meeting_pipeline.shared.date_utils import parse_date_from_filename
+from meeting_pipeline.shared.constants import LOOKBACK_DAYS, LOOKAHEAD_DAYS
 
 
 def build_meetings_from_llm(
@@ -85,7 +58,7 @@ def build_meetings_from_llm(
 
 def _basic_scrape(source_url: str, city: str, state: str) -> dict:
     """Basic Firecrawl scrape (1 credit). Returns {valid, pdf_urls, markdown, ...}."""
-    from meeting_pipeline.collection_agent.firecrawl_utils import validate_agenda_page
+    from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
     return validate_agenda_page(source_url, city, state)
 
 
@@ -157,11 +130,6 @@ cost = {
     "gemini_extract": 0,
     "firecrawl_llm_extract": 0,
 }
-
-# Lookback/lookahead defaults (days)
-LOOKBACK_DAYS = 60
-LOOKAHEAD_DAYS = 90
-
 
 async def scan_generic(
     source_url: str,
@@ -252,7 +220,7 @@ async def scan_generic(
     # ── Tier 3b: Firecrawl LLM extract (last resort, no rendered content) ─
     if not meetings and len(markdown) <= 500:
         try:
-            from meeting_pipeline.collection_agent.firecrawl_utils import extract_meeting_links
+            from meeting_pipeline.shared.firecrawl_client import extract_meeting_links
             cost["firecrawl_llm_extract"] += 1
             llm_results = extract_meeting_links(source_url, city, state)
             meetings = build_meetings_from_llm(

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from meeting_pipeline.collection_agent.storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # ============================================================================

@@ -31,7 +31,7 @@ async def process_one_city(
     Returns:
         CollectionResult with ok, city, state, platform, events_found, pdfs_downloaded
     """
-    from meeting_pipeline.collection_agent.router import route_city
+    from meeting_pipeline.stages.collect.router import route_city
 
     if cfg is None:
         cfg = AgentConfig.from_env()

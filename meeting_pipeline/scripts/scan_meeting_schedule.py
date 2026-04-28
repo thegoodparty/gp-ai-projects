@@ -44,56 +44,15 @@ Usage:
 
 import argparse
 import asyncio
-import json
-import os
-import re
-import sys
-import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import httpx
-
-_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT = _ROOT.parent
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.body_validation import (
-    REJECT_KEYWORDS,
-    GOVERNING_KEYWORDS,
-    score_body_match,
-    best_body_match,
-    validate_legistar_body,
-    validate_civicplus_body,
-    validate_civicclerk_body,
-    validate_boarddocs_body,
-    apply_body_validation as _apply_body_validation,
-    validate_body_for_city,
-)
-
-from meeting_pipeline.shared.constants import (
-    LOOKAHEAD_DAYS, LOOKBACK_DAYS, SUPPORTED_PLATFORMS,
-    IFRAME_PLATFORM_DOMAINS, GENERIC_MEETING_TITLES,
-)
-from meeting_pipeline.stages.scan.platforms.legistar import scan_legistar
-from meeting_pipeline.stages.scan.platforms.civicplus import scan_civicplus
-from meeting_pipeline.stages.scan.platforms.boarddocs import scan_boarddocs
-from meeting_pipeline.stages.scan.platforms.civicclerk import scan_civicclerk
-from meeting_pipeline.stages.scan.platforms.granicus import scan_granicus
-from meeting_pipeline.stages.scan.platforms.escribe import scan_escribe
-
-
-_COST = {
-    "firecrawl_scrape_basic": 0,    # basic scrape (~1 credit)
-    "firecrawl_scrape_js": 0,       # scrape with JS rendering (~5 credits)
-    "firecrawl_llm_extract": 0,     # Firecrawl extract API (~5-30 credits)
-    "gemini_extract": 0,            # Gemini LLM calls for meeting extraction
-}
 
 # ============================================================================
 # SCAN DISPATCHER — delegates to stages/scan/process.py

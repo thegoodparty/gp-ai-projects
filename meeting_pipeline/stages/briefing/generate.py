@@ -32,20 +32,13 @@ Output:
     {output_prefix}/briefings/{city-slug}_{date}_briefing.json
 """
 
-import argparse
 import json
 import re
-import sys
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
-
-_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT = _ROOT.parent
-
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.prompts.briefing import (

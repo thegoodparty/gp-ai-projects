@@ -49,7 +49,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from dotenv import load_dotenv
 from tavily import TavilyClient
-from meeting_pipeline.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
+from meeting_pipeline.shared.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
 
 # ── Imports from extracted modules ────────────────────────────────────────────
 from meeting_pipeline.shared.constants import (
@@ -118,9 +118,7 @@ if not SERVE_CSV.exists():
     SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
 if not SERVE_CSV.exists():
     SERVE_CSV = _PIPELINE_DIR / "Terry Users2.csv"
-_DOTGOV_CSV_PATH = _PIPELINE_DIR / "config" / "dotgov.csv"
-
-# ── State name → abbreviation (mirrors collect_haystaq_batch.py) ──────────────
+# ── State name → abbreviation ──────────────────────────────────────────────────
 STATE_ABBREVS = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
     "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",

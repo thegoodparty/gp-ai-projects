@@ -20,9 +20,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Bootstrap path so we can import meeting_pipeline as a package ──────────────
-_ROOT = Path(__file__).resolve().parent.parent.parent
-
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 

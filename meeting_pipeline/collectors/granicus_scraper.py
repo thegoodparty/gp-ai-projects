@@ -37,7 +37,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from meeting_pipeline.collection_agent.storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # Granicus XML namespace used in RSS feeds
