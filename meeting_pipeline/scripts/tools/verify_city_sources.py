@@ -1043,10 +1043,6 @@ async def main():
             from dotenv import load_dotenv
             load_dotenv()
 
-            # Add project paths for imports
-            project_root = Path(__file__).resolve().parent.parent.parent
-            if str(project_root) not in sys.path:
-
             from shared.llm_gemini import GeminiClient, GeminiModelType
             gemini_client = GeminiClient(
                 default_model=GeminiModelType.FLASH,

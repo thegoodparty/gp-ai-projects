@@ -405,10 +405,7 @@ async def _main_cli():
     import argparse, sys
     from pathlib import Path
 
-    _ROOT = Path(__file__).resolve().parent.parent
-    if str(_ROOT.parent) not in sys.path:
-
-    from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+    from meeting_pipeline.shared.config import AgentConfig, get_storage
 
     parser = argparse.ArgumentParser(description="Collect Novus Agenda meeting data")
     parser.add_argument("--city-slug", required=True, help="e.g. lexington-MA")

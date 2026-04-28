@@ -1,13 +1,9 @@
-"""Tests for find_best_pdf() in extract_and_normalize.py"""
+"""Tests for find_best_pdf()"""
 import json
-import sys
 from pathlib import Path
 import pytest
 
-_ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT.parent) not in sys.path:
-
-from meeting_pipeline.scripts.extract_and_normalize import find_best_pdf
+from meeting_pipeline.stages.extract.normalize import find_best_pdf
 
 
 class _FilesystemStorageBackend:
