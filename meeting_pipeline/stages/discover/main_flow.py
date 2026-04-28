@@ -13,6 +13,7 @@ import os
 import re
 import time
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -50,6 +51,14 @@ from meeting_pipeline.stages.discover.search import (
 from meeting_pipeline.stages.discover.crawl import (
     validate_domain_for_city, firecrawl_map_agenda, firecrawl_crawl_for_agenda,
 )
+
+# ── DotGov index (CISA .gov domain registry) ────────────────────────────────
+_DOTGOV_CSV_PATH = Path(__file__).resolve().parent.parent / "config" / "dotgov.csv"
+_DOTGOV_INDEX: dict | None = None
+_DEPT_REJECT_KEYWORDS = [
+    "police", "fire", "sheriff", "court", "library", "school",
+    "water", "sewer", "utility", "transit", "housing", "airport",
+]
 
 
 def _load_dotgov_index() -> dict[tuple[str, str], list[dict]]:
