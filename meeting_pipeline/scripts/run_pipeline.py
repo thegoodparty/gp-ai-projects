@@ -32,10 +32,11 @@ import asyncio
 import sys
 from pathlib import Path
 
-# Ensure project root is on sys.path so top-level `shared/` package
+# Ensure project root is FIRST on sys.path so top-level `shared/` package
 # (llm_gemini, databricks_client) isn't shadowed by meeting_pipeline/shared/.
+# Must be index 0 because uv prepends the script directory.
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
-if _PROJECT_ROOT not in sys.path:
+if sys.path[0] != _PROJECT_ROOT:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from dotenv import load_dotenv
