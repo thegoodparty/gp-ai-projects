@@ -24,13 +24,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-_BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-
-from ..models import CollectionResult, NavConfig
-from ..storage import StorageBackend
-from ..config import AgentConfig, city_to_slug
-from .. import notification_log
-from ..document_verifier import verify_events
+from meeting_pipeline.shared.models import CollectionResult, NavConfig
+from meeting_pipeline.shared.storage import StorageBackend
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug
+from meeting_pipeline.collection_agent import notification_log
+from meeting_pipeline.collection_agent.document_verifier import verify_events
 
 
 class ReasonFailed(Exception):

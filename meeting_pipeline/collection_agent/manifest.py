@@ -6,7 +6,7 @@ expect the data source to be about. Validation is best-effort: if the manifest
 doesn't exist or can't be loaded, collection proceeds unblocked.
 """
 
-from .storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # Keywords that indicate a wrong-entity match (school district, not city council)

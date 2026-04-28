@@ -47,7 +47,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
 
-from meeting_pipeline.collection_agent.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.prompts.briefing import (
     EDITORIAL_RULES,
     build_pass1_prompt,

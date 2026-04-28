@@ -21,19 +21,15 @@ Platform map:
     unknown_spa→ misc/reason (Playwright required)
 """
 
-import sys
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-_BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent
-
-from .models import CollectionResult
-from .storage import StorageBackend
-from .config import AgentConfig, city_to_slug, find_city_slug
-from . import notification_log
-from .manifest import load_manifest, validate_against_manifest
-from .misc.replay import collect_with_replay, ReplayFailed
-from .misc.reason import collect_with_reason, ReasonFailed
+from meeting_pipeline.shared.models import CollectionResult
+from meeting_pipeline.shared.storage import StorageBackend
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, find_city_slug
+from meeting_pipeline.collection_agent import notification_log
+from meeting_pipeline.collection_agent.manifest import load_manifest, validate_against_manifest
+from meeting_pipeline.collection_agent.misc.replay import collect_with_replay, ReplayFailed
+from meeting_pipeline.collection_agent.misc.reason import collect_with_reason, ReasonFailed
 
 
 # ── Dedicated collector adapters ──────────────────────────────────────────────

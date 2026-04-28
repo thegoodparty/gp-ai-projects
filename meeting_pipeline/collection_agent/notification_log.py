@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from .storage import StorageBackend
+from meeting_pipeline.shared.storage import StorageBackend
 
 
 # Valid event types

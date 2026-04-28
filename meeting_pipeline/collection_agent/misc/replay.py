@@ -11,14 +11,11 @@ import sys
 from datetime import date
 from pathlib import Path
 
-# Ensure meeting_pipeline is importable
-_BRIEFING_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-
 from meeting_pipeline.collectors.generic_html_scraper import GenericScraperConfig, collect_generic
-from ..models import CollectionResult, NavConfig
-from ..storage import StorageBackend
-from ..config import AgentConfig, city_to_slug
-from .. import notification_log
+from meeting_pipeline.shared.models import CollectionResult, NavConfig
+from meeting_pipeline.shared.storage import StorageBackend
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug
+from meeting_pipeline.collection_agent import notification_log
 
 
 class ReplayFailed(Exception):

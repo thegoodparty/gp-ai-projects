@@ -29,7 +29,7 @@ async def process_one_city(
         storage: StorageBackend (created from cfg if not provided)
 
     Returns:
-        dict with ok, city, state, platform, events_found, pdfs_downloaded
+        CollectionResult with ok, city, state, platform, events_found, pdfs_downloaded
     """
     from meeting_pipeline.collection_agent.router import route_city
 
@@ -38,4 +38,5 @@ async def process_one_city(
     if storage is None:
         storage = get_storage(cfg)
 
-    return await route_city(city, state, storage, cfg)
+    event = {"city": city, "state": state}
+    return await route_city(event, storage, cfg)

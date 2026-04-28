@@ -311,7 +311,7 @@ async def run_extract(
                 if len(text.strip()) < 500 and pdf_size > 5000:
                     print(f"    PDF appears scanned — trying Firecrawl OCR")
                     try:
-                        from meeting_pipeline.collection_agent.firecrawl_utils import scrape_pdf_text
+                        from meeting_pipeline.shared.firecrawl_client import scrape_pdf_text
                         presigned = storage.get_presigned_url(pdf_key, expiry_seconds=300)
                         fc_text = scrape_pdf_text(presigned)
                         if fc_text and len(fc_text.strip()) > 200:
