@@ -8,7 +8,7 @@ No PDFs downloaded — that is the collection stage.
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 
