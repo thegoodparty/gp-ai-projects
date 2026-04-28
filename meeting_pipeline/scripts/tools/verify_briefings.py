@@ -37,7 +37,6 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.pilot_registry import PILOT_OFFICIALS
 
 # ============================================================================
 # CHECK F — CONTENT CONTAMINATION KEYWORDS
@@ -118,16 +117,34 @@ SUSPICIOUS_BODY_KEYWORDS = [
 # PILOT CITY REGISTRY — slug → expected city name + state
 # ============================================================================
 
-def _build_registry() -> dict[str, dict]:
-    """Build a slug→{city, state} lookup from the pilot registry."""
+def _build_registry(cfg: AgentConfig = None, storage=None) -> dict[str, dict]:
+    """Build a slug→{city, state} lookup from source.json files in storage."""
+    if cfg is None:
+        cfg = AgentConfig.from_env()
+    if storage is None:
+        storage = get_storage(cfg)
     registry: dict[str, dict] = {}
-    for o in PILOT_OFFICIALS:
-        slug = f"{o['city'].lower().replace(' ', '-')}-{o['state']}"
-        registry[slug] = {"city": o["city"], "state": o["state"]}
+    for key in storage.list_keys(cfg.sources_prefix):
+        if not key.endswith("/source.json"):
+            continue
+        slug = key.split("/")[-2]
+        try:
+            source = storage.read_json(key)
+            registry[slug] = {"city": source.get("city", ""), "state": source.get("state", "")}
+        except Exception:
+            pass
     return registry
 
 
-PILOT_REGISTRY = _build_registry()
+# Lazy-loaded on first use (needs AWS credentials at runtime, not import time)
+PILOT_REGISTRY: dict[str, dict] | None = None
+
+
+def _get_registry() -> dict[str, dict]:
+    global PILOT_REGISTRY
+    if PILOT_REGISTRY is None:
+        PILOT_REGISTRY = _build_registry()
+    return PILOT_REGISTRY
 
 
 # ============================================================================
@@ -234,7 +251,7 @@ def check_b_future_stub(slug: str, briefing: dict) -> Optional[dict]:
 
 def check_c_wrong_city(slug: str, briefing: dict) -> Optional[dict]:
     """Check C: city name or state in briefing doesn't match the slug."""
-    expected = PILOT_REGISTRY.get(slug)
+    expected = _get_registry().get(slug)
     if not expected:
         # Slug not in registry — skip city check but note it
         return None

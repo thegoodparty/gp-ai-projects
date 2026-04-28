@@ -42,7 +42,6 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
-from meeting_pipeline.pilot_registry import PILOT_OFFICIALS, city_slug as make_slug
 
 SERVE_CSV = _ROOT / "serve_users_unified.csv"
 # Fall back to old CSV if unified doesn't exist yet
@@ -101,23 +100,26 @@ SCHEMA = "dbt"
 
 
 # ============================================================================
-# CITY LIST (from pilot_registry)
+# CITY LIST
 # ============================================================================
 
 def get_pilot_cities() -> list[dict]:
-    """Return deduplicated pilot cities with slug, city, state from registry."""
-    seen = set()
+    """Return all cities with source.json in storage."""
+    cfg = AgentConfig.from_env()
+    storage = get_storage(cfg)
+    source_keys = [k for k in storage.list_keys(cfg.sources_prefix) if k.endswith("/source.json")]
     cities = []
-    for o in PILOT_OFFICIALS:
-        key = (o["city"], o["state"])
-        if key in seen:
-            continue
-        seen.add(key)
-        cities.append({
-            "slug": make_slug(o["city"], o["state"]),
-            "city": o["city"],
-            "state": o["state"],
-        })
+    for key in source_keys:
+        slug = key.split("/")[-2]
+        try:
+            source = storage.read_json(key)
+            cities.append({
+                "slug": slug,
+                "city": source.get("city", slug),
+                "state": source.get("state", ""),
+            })
+        except Exception:
+            pass
     return cities
 
 

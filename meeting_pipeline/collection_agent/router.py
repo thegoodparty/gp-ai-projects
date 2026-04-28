@@ -2,8 +2,8 @@
 router.py — Platform dispatcher: routes each city to the correct collector.
 
 Reads source.json via the storage backend, extracts the platform, and calls
-the appropriate collector function. Falls back to misc/replay then misc/reason
-for unknown platforms.
+the appropriate collector function. If collection fails, marks the city for
+rediscovery rather than trying expensive browser-based fallbacks.
 
 Platform map:
     legistar   → collect_legistar
@@ -11,16 +11,14 @@ Platform map:
     civicclerk → collect_civicclerk
     granicus   → collect_granicus (auto-detects classic vs swagit from URL)
     swagit     → collect_granicus (NEW_SWAGIT)
-    diligent   → misc/reason (Playwright required)
     escribe    → collect_escribe
     boarddocs  → collect_boarddocs
     novus      → collect_novus
     municode   → collect_municode
-    generic    → misc/replay → misc/reason
-    unknown    → misc/replay → misc/reason
-    unknown_spa→ misc/reason (Playwright required)
+    unknown    → generic_direct (download PDFs from scan URLs)
 """
 
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 from meeting_pipeline.shared.models import CollectionResult
@@ -28,8 +26,6 @@ from meeting_pipeline.shared.storage import StorageBackend
 from meeting_pipeline.shared.config import AgentConfig, city_to_slug, find_city_slug
 from meeting_pipeline.collection_agent import notification_log
 from meeting_pipeline.collection_agent.manifest import load_manifest, validate_against_manifest
-from meeting_pipeline.collection_agent.misc.replay import collect_with_replay, ReplayFailed
-from meeting_pipeline.collection_agent.misc.reason import collect_with_reason, ReasonFailed
 
 
 # ── Dedicated collector adapters ──────────────────────────────────────────────
@@ -44,7 +40,6 @@ async def _collect_legistar(
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
 
-    # Load manifest before collection so expected_body can guide filtering
     manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
     expected_body = (manifest or {}).get("expected_body", "")
     if expected_body:
@@ -54,11 +49,9 @@ async def _collect_legistar(
     if not legistar_slug:
         url = best.get("url", "")
         parsed_url = urlparse(url)
-        # Pattern 1: https://webapi.legistar.com/v1/{slug}/events
         parts = parsed_url.path.strip("/").split("/")
         if len(parts) > 1 and parts[0] == "v1":
             legistar_slug = parts[1]
-        # Pattern 2: https://{slug}.legistar.com/...
         elif "legistar.com" in parsed_url.netloc:
             subdomain = parsed_url.netloc.split(".")[0]
             if subdomain and subdomain != "webapi":
@@ -90,7 +83,6 @@ async def _collect_legistar(
         events=[],
     )
 
-    # Manifest validation (best-effort) — reuse manifest loaded above
     if manifest:
         bodies_key = f"{cfg.sources_prefix}/{city_slug}/data/legistar/bodies.json"
         try:
@@ -99,14 +91,9 @@ async def _collect_legistar(
             is_valid, reason = validate_against_manifest(manifest, body_names)
             if not is_valid:
                 print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
-                notification_log.log_event(
-                    notification_log.COLLECTION_FAILED, city, state,
-                    storage=storage, logs_prefix=cfg.logs_prefix,
-                    platform="legistar", error=f"manifest_mismatch: {reason}",
-                )
                 return CollectionResult.error_result(city, state, "legistar", f"manifest_mismatch: {reason}")
         except Exception:
-            pass  # manifest validation is best-effort
+            pass
 
     return collection_result
 
@@ -121,7 +108,6 @@ async def _collect_civicplus(
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
 
-    # Load manifest before collection so expected_body can guide category selection
     manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
     expected_body = (manifest or {}).get("expected_body", "")
     if expected_body:
@@ -172,8 +158,7 @@ async def _collect_civicclerk(
     best = source["best_source"]
 
     url = best.get("config", {}).get("civicclerk_url") or best.get("url", "")
-    # Extract tenant from https://{tenant}.portal.civicclerk.com
-    host = urlparse(url).netloc  # e.g. "claytonnc.portal.civicclerk.com"
+    host = urlparse(url).netloc
     tenant = host.split(".")[0] if host else ""
 
     if not tenant:
@@ -203,7 +188,6 @@ async def _collect_civicclerk(
         events=[],
     )
 
-    # Manifest validation (best-effort)
     manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
     if manifest:
         events_key = f"{cfg.sources_prefix}/{city_slug}/data/civicclerk/events.json"
@@ -213,14 +197,9 @@ async def _collect_civicclerk(
             is_valid, reason = validate_against_manifest(manifest, categories)
             if not is_valid:
                 print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
-                notification_log.log_event(
-                    notification_log.COLLECTION_FAILED, city, state,
-                    storage=storage, logs_prefix=cfg.logs_prefix,
-                    platform="civicclerk", error=f"manifest_mismatch: {reason}",
-                )
                 return CollectionResult.error_result(city, state, "civicclerk", f"manifest_mismatch: {reason}")
         except Exception:
-            pass  # manifest validation is best-effort
+            pass
 
     return collection_result
 
@@ -239,12 +218,11 @@ async def _collect_granicus(
 
     url = best.get("config", {}).get("granicus_url") or best.get("url", "")
     parsed = urlparse(url)
-    host = parsed.netloc  # e.g. "greenville.granicus.com" or "beaumonttx.new.swagit.com"
+    host = parsed.netloc
 
     output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/granicus"
 
     if "new.swagit.com" in host:
-        # New Swagit: subdomain from host
         subdomain = host.split(".")[0]
         granicus_cfg = GranicusConfig(
             platform=NEW_SWAGIT,
@@ -256,8 +234,7 @@ async def _collect_granicus(
             download_pdfs=cfg.download_pdfs,
         )
     else:
-        # Classic Granicus: extract subdomain and view_id from URL
-        subdomain = host.split(".")[0]  # e.g. "greenville"
+        subdomain = host.split(".")[0]
         qs = parse_qs(parsed.query)
         view_id = int(qs.get("view_id", ["1"])[0])
 
@@ -401,7 +378,6 @@ async def _collect_boarddocs(
     city_slug = city_to_slug(city, state)
     best = source["best_source"]
 
-    # Load manifest before collection so expected_body can guide committee filtering
     manifest = load_manifest(city_slug, storage, cfg.sources_prefix)
     expected_body = (manifest or {}).get("expected_body", "")
     if expected_body:
@@ -441,16 +417,10 @@ async def _collect_generic_direct(
     """
     Direct httpx PDF downloader for platform=unknown cities.
 
-    Reads upcoming_meetings.json (produced by scan_generic_firecrawl during scan),
-    downloads each agenda PDF directly, and writes meetings.json in the same
-    shape as other collectors so extract_and_normalize can process them.
-
-    Only runs when:
-      - platform == "unknown"
-      - upcoming_meetings.json exists with at least one meeting having an agenda_url
+    Reads upcoming_meetings.json (produced by scan during the scan stage),
+    downloads each agenda PDF directly.
     """
     import httpx
-    from datetime import datetime, timezone
 
     city = event["city"]
     state = event["state"]
@@ -530,27 +500,42 @@ async def _collect_generic_direct(
 
 # ── Platform → collector function map ────────────────────────────────────────
 
-# Platforms that have dedicated Lambda-safe collectors
 DEDICATED_COLLECTORS = {
     "legistar":   _collect_legistar,
     "civicplus":  _collect_civicplus,
     "civicclerk": _collect_civicclerk,
     "granicus":   _collect_granicus,
-    "swagit":     _collect_granicus,   # same collector, detects from URL
+    "swagit":     _collect_granicus,
     "escribe":    _collect_escribe,
     "boarddocs":  _collect_boarddocs,
     "municode":   _collect_municode,
     "novus":      _collect_novus,
 }
 
-# Platforms that skip replay and go straight to reason (Playwright required)
-REASON_ONLY_PLATFORMS = {"diligent", "unknown_spa"}
-
-# Platforms that route through misc (replay → reason)
-MISC_PLATFORMS = {"generic", "unknown", "destinyhosted"}
-
 
 # ── Main dispatch function ────────────────────────────────────────────────────
+
+def _flag_for_rediscovery(
+    city_slug: str, source: dict, error: str, storage: StorageBackend, cfg: AgentConfig,
+):
+    """
+    Mark a city's source.json as needing rediscovery.
+
+    Sets best_source.collection_failed=true so the next discovery run
+    knows to re-evaluate this city's source.
+    """
+    source_key = f"{cfg.sources_prefix}/{city_slug}/source.json"
+    try:
+        best = source.get("best_source", {})
+        best["collection_failed"] = True
+        best["collection_error"] = error
+        best["collection_failed_at"] = datetime.now(timezone.utc).isoformat()
+        source["best_source"] = best
+        storage.write_json(source_key, source)
+        print(f"  [router] Flagged {city_slug} for rediscovery: {error}")
+    except Exception as e:
+        print(f"  [router] Could not flag {city_slug} for rediscovery: {e}")
+
 
 async def route_city(
     event: dict,
@@ -560,8 +545,9 @@ async def route_city(
     """
     Route a city to the appropriate collector based on source.json platform.
 
-    Fallback chain:
-        dedicated collector → misc/replay → misc/reason → COLLECTION_FAILED
+    If collection fails, flags the city for rediscovery instead of attempting
+    expensive browser-based fallbacks. Discovery is the right place to find
+    the correct URL — collection just downloads from known sources.
 
     Args:
         event:   {"city": "...", "state": "..."}
@@ -575,10 +561,6 @@ async def route_city(
     city_slug = find_city_slug(city, state, cfg, storage)
     if not city_slug:
         msg = f"No source.json found for {city}, {state}"
-        notification_log.log_event(
-            notification_log.NO_PORTAL, city, state,
-            storage=storage, logs_prefix=cfg.logs_prefix, error=msg,
-        )
         return CollectionResult.error_result(city, state, "unknown", msg)
 
     source_key = f"{cfg.sources_prefix}/{city_slug}/source.json"
@@ -589,114 +571,40 @@ async def route_city(
 
     platform = source.get("best_source", {}).get("platform", "unknown")
 
-    # ── Freshness gate: block wrong_entity / wrong_city before wasting API calls ─
+    # ── Freshness gate: block wrong_entity / wrong_city ──────────────────
     freshness = source.get("best_source", {}).get("freshness", "")
     if freshness in ("wrong_entity", "wrong_city"):
-        msg = f"Source marked {freshness}: {source.get('best_source', {}).get('notes', '')}"
-        notification_log.log_event(
-            notification_log.COLLECTION_FAILED, city, state,
-            storage=storage, logs_prefix=cfg.logs_prefix,
-            platform=platform, error=msg,
-        )
+        msg = f"Source marked {freshness} — needs rediscovery"
         return CollectionResult.error_result(city, state, platform, msg)
 
-    # ── Step 1: Dedicated collector (Lambda-safe) ─────────────────────────────
+    # ── Dedicated collector ──────────────────────────────────────────────
     if platform in DEDICATED_COLLECTORS:
         try:
             result = await DEDICATED_COLLECTORS[platform](event, source, storage, cfg)
             if result.error is None:
-                notification_log.log_event(
-                    notification_log.COLLECTION_SUCCESS, city, state,
-                    storage=storage, logs_prefix=cfg.logs_prefix,
-                    platform=platform, events_found=result.events_found,
-                    pdfs_downloaded=result.pdfs_downloaded,
-                )
                 return result
-            print(f"[router] Dedicated collector for {city} failed: {result.error}, trying misc fallback")
+            # Collector returned an error — flag for rediscovery
+            _flag_for_rediscovery(city_slug, source, result.error, storage, cfg)
+            return result
         except Exception as e:
-            print(f"[router] Dedicated collector for {city} raised: {e}, trying misc fallback")
-        # Fall through to misc fallback below
+            error = f"Collector {platform} raised: {e}"
+            _flag_for_rediscovery(city_slug, source, error, storage, cfg)
+            return CollectionResult.error_result(city, state, platform, error)
 
-    # ── Step 1b: platform=unknown with PDF URLs from scan ────────────────────
-    elif platform == "unknown":
+    # ── Generic direct download (platform=unknown with PDF URLs) ─────────
+    if platform in ("unknown", "generic_html"):
         try:
             result = await _collect_generic_direct(event, source, storage, cfg)
             if result.error is None:
-                notification_log.log_event(
-                    notification_log.COLLECTION_SUCCESS, city, state,
-                    storage=storage, logs_prefix=cfg.logs_prefix,
-                    platform="generic_direct", events_found=result.events_found,
-                    pdfs_downloaded=result.pdfs_downloaded,
-                )
                 return result
-            print(f"[router] generic_direct for {city} failed ({result.error}), trying misc fallback")
+            _flag_for_rediscovery(city_slug, source, result.error, storage, cfg)
+            return result
         except Exception as e:
-            print(f"[router] generic_direct for {city} raised: {e}, trying misc fallback")
-        # Fall through to misc fallback below
+            error = f"Generic collector raised: {e}"
+            _flag_for_rediscovery(city_slug, source, error, storage, cfg)
+            return CollectionResult.error_result(city, state, platform, error)
 
-    # ── Step 1c: Reason-only platforms (Playwright, no replay fallback) ───────
-    elif platform in REASON_ONLY_PLATFORMS:
-        try:
-            result = await collect_with_reason(event, source, storage, cfg)
-            notification_log.log_event(
-                notification_log.COLLECTION_SUCCESS, city, state,
-                storage=storage, logs_prefix=cfg.logs_prefix,
-                platform="playwright_llm", events_found=result.events_found,
-                pdfs_downloaded=result.pdfs_downloaded,
-            )
-            return result
-        except ReasonFailed as e:
-            error_msg = str(e)
-            notification_log.log_event(
-                notification_log.COLLECTION_FAILED, city, state,
-                storage=storage, logs_prefix=cfg.logs_prefix,
-                platform=platform, error=error_msg,
-            )
-            return CollectionResult.error_result(city, state, platform, error_msg)
-
-    # ── Step 2 & 3: Misc fallback — replay → reason ───────────────────────────
-    # Reaches here when:
-    #   - platform is a misc/unknown platform (no dedicated collector), OR
-    #   - a dedicated collector failed and fell through above
-    if True:
-        # Step 1: Try replay if nav_config exists
-        has_nav_config = bool(source.get("best_source", {}).get("nav_config"))
-        if has_nav_config:
-            try:
-                result = await collect_with_replay(event, source, storage, cfg)
-                notification_log.log_event(
-                    notification_log.COLLECTION_SUCCESS, city, state,
-                    storage=storage, logs_prefix=cfg.logs_prefix,
-                    platform="replay", events_found=result.events_found,
-                    pdfs_downloaded=result.pdfs_downloaded,
-                )
-                return result
-            except (ReplayFailed, ValueError) as e:
-                print(f"[router] Replay failed for {city}: {e}, escalating to reason")
-
-        # Step 2: Reason mode (Playwright + LLM)
-        notification_log.log_event(
-            notification_log.COLLECTOR_NEEDED, city, state,
-            storage=storage, logs_prefix=cfg.logs_prefix,
-            platform=platform, has_nav_config=has_nav_config,
-        )
-        try:
-            result = await collect_with_reason(event, source, storage, cfg)
-            notification_log.log_event(
-                notification_log.COLLECTION_SUCCESS, city, state,
-                storage=storage, logs_prefix=cfg.logs_prefix,
-                platform="playwright_llm", events_found=result.events_found,
-                pdfs_downloaded=result.pdfs_downloaded,
-            )
-            return result
-        except ReasonFailed as e:
-            error_msg = str(e)
-            notification_log.log_event(
-                notification_log.COLLECTION_FAILED, city, state,
-                storage=storage, logs_prefix=cfg.logs_prefix,
-                platform=platform, error=error_msg,
-            )
-            return CollectionResult.error_result(city, state, platform, error_msg)
-
-    # Should not reach here
-    return CollectionResult.error_result(city, state, platform, f"No handler for platform '{platform}'")
+    # ── Unknown platform — flag for rediscovery ──────────────────────────
+    error = f"No collector for platform '{platform}'"
+    _flag_for_rediscovery(city_slug, source, error, storage, cfg)
+    return CollectionResult.error_result(city, state, platform, error)
