@@ -1,0 +1,129 @@
+{
+  "scoring_metadata": {
+    "scored_at": "2026-03-27T12:30:00Z",
+    "briefing_file": "briefing-content.md",
+    "target_eo": "Dr. Stephon Ferguson",
+    "meeting_date": "2026-03-23"
+  },
+  "dimensions": [
+    {
+      "id": "D1",
+      "name": "Legislative Record",
+      "weight": "HIGH",
+      "score": 8,
+      "max": 10,
+      "justification": "All 21 agenda items listed with formal file numbers (26-0174 through 26-0197), agenda numbers (7.0A1 through 12.03), item types, and vote requirements sourced from Legistar. Three items receive full decision-needed treatment, two get watch treatment, and all consent/presentation items are catalogued."
+    },
+    {
+      "id": "D2",
+      "name": "Fiscal Depth",
+      "weight": "HIGH",
+      "score": 7,
+      "max": 10,
+      "justification": "Budget quick-reference table provides 9 metrics with FY2024 values, year-over-year trends, and NC LINC/OSBM sourcing. Three-year property tax rate trend (2022-2024) included. The $13.6M contract is contextualized against $55.4M capital outlay. Deduction: no fund-balance data, no per-capita spending, and no comparison to peer NC cities."
+    },
+    {
+      "id": "D3",
+      "name": "Voter/Constituent Intelligence",
+      "weight": "HIGH",
+      "score": 7,
+      "max": 10,
+      "justification": "Community Signal scores provided for 5 agenda items (62, 54, 68, 58, 51) with demographic cross-tabs by age, homeownership, race, and income bracket. All scores labeled as modeled from voter attributes. Deduction: no actual voter registration counts for District 1, no party-affiliation breakdown, and issue signals in the district reference table lack methodology detail."
+    },
+    {
+      "id": "D4",
+      "name": "Gap Analysis",
+      "weight": "HIGH",
+      "score": 7,
+      "max": 10,
+      "justification": "The rezoning item (Signal 54) explicitly identifies the homeowner-renter divergence (38 vs 66). The McArthur Road item flags a 14-point homeowner-renter gap. The property-tax-rate trend is noted as potentially conflicting with Ferguson's campaign praise of low rates. Deduction: no explicit mapping of where council majority vs constituent sentiment diverge on specific votes."
+    },
+    {
+      "id": "D5",
+      "name": "Political Intelligence",
+      "weight": "MED-HIGH",
+      "score": 5,
+      "max": 10,
+      "justification": "The 7-3 Mayor Pro Tem split is documented with named members in each bloc (Greene, Hondros, McMillan, Jones vs Thompson/Colvin majority). Greene's prediction of frequent 6-4 votes is cited. Deduction: no prediction of how specific members will vote on Monday's items, no named allies or opposition on specific agenda items, and no coalition analysis beyond the single Pro Tem data point."
+    },
+    {
+      "id": "D6",
+      "name": "Strategic Roadmap",
+      "weight": "MED-HIGH",
+      "score": 7,
+      "max": 10,
+      "justification": "Each decision-needed item includes 2-4 specific 'Before Monday' action items framed as prep steps. The Community Safety section ties to the 90-day town hall promise. The strategic retreat debrief is flagged as shaping Ferguson's multi-year understanding. Deduction: no forward-looking calendar of upcoming votes or policy milestones beyond this meeting."
+    },
+    {
+      "id": "D7",
+      "name": "Procedural Guidance",
+      "weight": "MED",
+      "score": 5,
+      "max": 10,
+      "justification": "Items are correctly classified by type (consent, public hearing, resolution, ordinance, presentation). The consent agenda notes which items can be pulled. Public hearing is identified as requiring public testimony. Deduction: no explanation of voting procedures, no quorum requirements, no description of how consent agendas work for a first-term member, no guidance on parliamentary procedure for amending items."
+    },
+    {
+      "id": "D8",
+      "name": "Personal Tailoring",
+      "weight": "MED",
+      "score": 9,
+      "max": 10,
+      "justification": "The briefing directly references Ferguson's 5 campaign platform pillars, his specific campaign promises (contractor evaluation, local-contractor preference, town hall, neighborhood watch), his prior Planning Commission and Ethics Commission service, his stance on the Youth Curfew Ordinance, his Raleigh triple-bottom-line model, and the $6M contractor-abandonment precedent. Every decision item is framed through his specific platform language. This could not be mistaken for another council member's briefing."
+    },
+    {
+      "id": "D9",
+      "name": "News/Narrative Context",
+      "weight": "MED",
+      "score": 4,
+      "max": 10,
+      "justification": "The CityView NC article on the Mayor Pro Tem vote is referenced for council dynamics. Ferguson's campaign coverage from CityView NC and the Carolina Cabinet podcast informed the platform section. Deduction: no local news coverage of the specific agenda items on Monday's docket, no Fayetteville Observer or other outlet reporting on the rezoning or sports complex, no recent news narrative about Fayetteville municipal issues."
+    },
+    {
+      "id": "D10",
+      "name": "State Policy Integration",
+      "weight": "LOW-MED",
+      "score": 5,
+      "max": 10,
+      "justification": "Neutral score applied. No agenda items on this docket have obvious state-law implications. The annexation assessments follow NC General Statute procedures but the briefing does not cite the specific statutes. The property tax data comes from the state OSBM office, providing implicit state-level context."
+    },
+    {
+      "id": "D11",
+      "name": "Source Transparency",
+      "weight": "LOW-MED",
+      "score": 7,
+      "max": 10,
+      "justification": "The disclaimer paragraph names 6 data sources. The budget table cites NC LINC/OSBM for every row. The district reference table includes source columns. Community Signals are explicitly labeled as modeled. Deduction: individual agenda item sources are implied (Legistar) but not hyperlinked. Campaign platform claims are not individually sourced within the briefing body."
+    },
+    {
+      "id": "D12",
+      "name": "Accuracy Risk Management",
+      "weight": "LOW-MED",
+      "score": 8,
+      "max": 10,
+      "justification": "Community Signal scores consistently labeled as 'modeled from voter attributes, not survey results.' The disclaimer warns about potential errors and provides a correction channel. The revenue decline note flags uncertainty ('may reflect one-time transfers'). The registered-voter row explicitly states 'data not available.' The property tax rate contradiction with campaign claims is flagged as a monitoring item rather than asserted as fact."
+    }
+  ],
+  "total_score": 79,
+  "max_score": 120,
+  "percentage": 65.8,
+  "recommendation": "send",
+  "recommendation_rationale": "Score of 79/120 exceeds the 70-point send threshold. No dimension scores below 3 (minimum is 4 on News/Narrative Context). The briefing's strength is personal tailoring (9/10) and legislative record (8/10). The primary weakness is limited local news integration (4/10) and moderate political intelligence (5/10), both of which reflect data-availability constraints rather than analytical omissions.",
+  "dimension_flags": {
+    "below_5": ["D9_news_narrative_context"],
+    "at_5": ["D5_political_intelligence", "D7_procedural_guidance", "D10_state_policy_integration"],
+    "above_7": ["D1_legislative_record", "D2_fiscal_depth", "D3_voter_constituent_intelligence", "D4_gap_analysis", "D6_strategic_roadmap", "D8_personal_tailoring", "D11_source_transparency", "D12_accuracy_risk_management"]
+  },
+  "source_mix": {
+    "tier_1_government_records": 45,
+    "tier_2_modeled_data": 25,
+    "tier_3_news_media": 15,
+    "tier_4_llm_synthesis": 15,
+    "notes": "Tier 1 includes Legistar agenda data (21 items with file numbers) and NC LINC fiscal data (30+ variables across 3 years). Tier 2 covers all Community Signal scores and demographic cross-tabs. Tier 3 covers CityView NC reporting and Ballotpedia election data. Tier 4 covers strategic framing, action-item generation, and platform-to-agenda mapping."
+  },
+  "improvement_opportunities": [
+    "D9: Search local news outlets (Fayetteville Observer, FayToday, CityView NC) for reporting on specific agenda items, especially the McArthur Road Sports Complex and the Arbor Road rezoning.",
+    "D5: Review voting records from the March 9 meeting to identify emerging coalition patterns on land-use and capital-spending votes.",
+    "D7: Add a procedural sidebar explaining how consent agendas work, how to pull an item, and public-hearing testimony rules for a first-term council member.",
+    "D3: Obtain District 1 voter registration counts and party-affiliation data from the Cumberland County Board of Elections to ground the modeled issue signals."
+  ]
+}

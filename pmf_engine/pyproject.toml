@@ -1,0 +1,21 @@
+[project]
+name = "gp-pmf-engine"
+version = "0.1.0"
+description = "PMF engine: control plane + agent runner for candidate-facing experiments"
+requires-python = ">=3.11"
+dependencies = [
+    "gp-shared",
+    "claude-agent-sdk>=0.1.19",
+    "boto3>=1.40.50",
+    "fpdf2>=2.8.7",
+    "qrcode>=8.2",
+    "kmapper>=2.0.0",
+    "ripser>=0.6.0",
+    "networkx>=3.0",
+    "fastapi>=0.116.0",
+    "uvicorn>=0.35.0",
+    "sqlglot>=30.4.3",
+]
+
+[tool.uv.sources]
+gp-shared = { workspace = true }
