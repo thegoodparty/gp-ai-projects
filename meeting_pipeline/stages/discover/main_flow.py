@@ -52,6 +52,9 @@ from meeting_pipeline.stages.discover.crawl import (
     validate_domain_for_city, firecrawl_map_agenda, firecrawl_crawl_for_agenda,
 )
 
+# ── Module-level constants ───────────────────────────────────────────────────
+TODAY = date.today()
+
 # ── DotGov index (CISA .gov domain registry) ────────────────────────────────
 _DOTGOV_CSV_PATH = Path(__file__).resolve().parent.parent / "config" / "dotgov.csv"
 _DOTGOV_INDEX: dict | None = None
