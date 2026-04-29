@@ -63,11 +63,9 @@ print(f"L2 district: {l2_district_type} = {l2_district_name}")
 
 ## STEP 2: Research the governing body
 
-Use the **`WebSearch`** and **`WebFetch`** tools (Claude SDK built-ins) for web research. Follow this strategy:
+Use **`WebSearch`** (Claude SDK built-in) to discover URLs and **`pmf_runtime.http.get`** (broker proxy) to retrieve them. The runner has no direct internet egress — all URL fetches go through the broker. `WebFetch` is not available.
 
-### CRITICAL: WebFetch domain-verification failures
-
-If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (each attempt burns ~2 minutes). Fall back immediately to `pmf_runtime.http.get`, which routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification:
+### URL retrieval — use `pmf_runtime.http.get`
 
 ```python
 from pmf_runtime import http
@@ -76,15 +74,15 @@ r = http.get("https://city.gov/council-minutes")
 print(r["body"][:2000])
 ```
 
-Most `.gov` and municipal portal domains are already allowlisted. Use `pmf_runtime.http.get` whenever `WebFetch` errors, not as a second fallback after more `WebFetch` retries.
+`.gov` and municipal portal domains pass through the broker without an explicit allowlist (broker enforces SSRF guards instead).
 
 **2a. Find the municipality website**
 - `WebSearch({city} {state} city council)` — find the homepage
-- `WebFetch(homepage_url, prompt="find meeting minutes and agendas page")` — locate the minutes section
+- `pmf_runtime.http.get(homepage_url)` — locate the minutes section by scanning the returned HTML
 
 **2b. Pull recent meeting minutes/agendas**
 - Look for the last 3-6 months of meeting minutes or agendas
-- Meeting minutes are often PDFs or HTML pages. For PDFs, try `WebFetch` first (returns extracted text). If it fails or the PDF is large, use `pmf_runtime.pdf.download(url)` to pull raw bytes through the broker, then `pdftotext -layout /workspace/downloads/file.pdf -` to extract.
+- Meeting minutes are often PDFs or HTML pages. For HTML, use `pmf_runtime.http.get(url)`. For PDFs, use `pmf_runtime.pdf.download(url)` to pull raw bytes through the broker, then `pdftotext -layout /workspace/downloads/file.pdf -` to extract.
 - If the official site has a "meetings" or "agendas" section, start there
 
 **2c. Search for local news**

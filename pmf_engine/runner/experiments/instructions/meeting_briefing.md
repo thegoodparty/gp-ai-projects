@@ -42,17 +42,15 @@ touch /workspace/conversation.log
 - `/workspace/api_responses/` — saved API responses (Legistar events, agenda items, fiscal data)
 - `/workspace/conversation.log` — turn-by-turn log of every action taken
 
-**Save the content you extract.** The runner has narrow network egress and cannot `curl` arbitrary hosts. Three retrieval paths:
+**Save the content you extract.** The runner has no direct internet egress and cannot `curl` arbitrary hosts. Two retrieval paths through the broker, plus search:
 
-- **`WebFetch` (Claude SDK)** — HTML pages and short PDFs. Returns extracted text to your context. No disk write.
-- **`pmf_runtime.http.get(url)`** — HTTP GET through the broker. Returns `{"status", "headers", "body"}`. **Use this whenever `WebFetch` errors.**
-- **`pmf_runtime.pdf.download(url)`** — pulls PDFs through the broker and writes the raw bytes to `/workspace/downloads/`. Use this for staff reports, budget books, and any PDF too large or auth-walled for `WebFetch`.
+- **`WebSearch(query)`** (Claude SDK) — discover URLs and topical hits. Server-side at Anthropic, returns search results inline.
+- **`pmf_runtime.http.get(url)`** — HTTP GET through the broker. Returns `{"status", "headers", "body"}`. Use for HTML pages, JSON REST APIs (Legistar, LINC, etc.).
+- **`pmf_runtime.pdf.download(url)`** — pulls PDFs through the broker and writes raw bytes to `/workspace/downloads/`. Use for staff reports, budget books, attachment PDFs.
 
-### CRITICAL: WebFetch domain-verification failures
+`WebFetch` is **not** available — the runner SG denies direct egress to `claude.ai` (the SDK's safety pre-check endpoint). All URL retrieval goes through `pmf_runtime`.
 
-If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (it will fail the same way after ~2 minutes per attempt, burning your turn budget).
-
-Fall back immediately to `pmf_runtime.http.get`:
+### URL retrieval example
 
 ```python
 from pmf_runtime import http
@@ -61,7 +59,7 @@ r = http.get("https://hendersonvillenc.gov/council-meeting-agendas")
 print(r["body"][:2000])
 ```
 
-This routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification entirely. Most `.gov` and municipal portal domains are already allowlisted.
+`.gov` and municipal portal domains pass through the broker without an explicit allowlist (broker enforces SSRF guards instead).
 
 Example — download a staff report and extract the sections you need:
 
@@ -210,7 +208,7 @@ Do NOT guess the Legistar client name. Discover it.
    - `cityoffayetteville.legistar.com` → client = `cityoffayetteville`
    - `durhamnc.legistar.com` → client = `durhamnc`
    - `austintx.legistar.com` → client = `austintx`
-4. Verify the client works. Runner has no direct internet egress — use the broker's `pmf_runtime.http.get` for Legistar REST API calls (Claude's WebFetch refuses `webapi.legistar.com`):
+4. Verify the client works. Use the broker's `pmf_runtime.http.get` for Legistar REST API calls (the runner has no direct internet egress; all HTTP fetches go through the broker):
 
 ```python
 from pmf_runtime import http
@@ -311,11 +309,11 @@ if text:
 | Everything else with `EventItemRollCallFlag > 0` | `business` |
 | Everything else | `informational` |
 
-**PrimeGov cities:** PrimeGov hosts agendas at `https://{client}.primegov.com/Portal/Meeting?meetingTemplateId=XXX`. To find meetings, use `WebFetch` on the portal page to list upcoming meetings, then `pmf_runtime.pdf.download(url)` to pull the compiled meeting PDF. Extract agenda items with `pdftotext`. PrimeGov PDFs typically have numbered items with section headers (Consent Agenda, Public Hearings, Action Items, etc.).
+**PrimeGov cities:** PrimeGov hosts agendas at `https://{client}.primegov.com/Portal/Meeting?meetingTemplateId=XXX`. To find meetings, use `pmf_runtime.http.get` on the portal page to list upcoming meetings, then `pmf_runtime.pdf.download(url)` to pull the compiled meeting PDF. Extract agenda items with `pdftotext`. PrimeGov PDFs typically have numbered items with section headers (Consent Agenda, Public Hearings, Action Items, etc.).
 
-**eSCRIBE cities:** Use `WebFetch` on the meetings endpoint, parse for item titles, numbers, attachments. Mark items under "Consent Agenda" header as consent.
+**eSCRIBE cities:** Use `pmf_runtime.http.get` on the meetings endpoint, parse for item titles, numbers, attachments. Mark items under "Consent Agenda" header as consent.
 
-**CivicPlus AgendaCenter:** Use `WebFetch` on the AgendaCenter page to locate the agenda PDF URL, then `pmf_runtime.pdf.download(url)` to retrieve it, then `pdftotext` to extract text. Parse by numbered items and section headers.
+**CivicPlus AgendaCenter:** Use `pmf_runtime.http.get` on the AgendaCenter page to locate the agenda PDF URL, then `pmf_runtime.pdf.download(url)` to retrieve it, then `pdftotext` to extract text. Parse by numbered items and section headers.
 
 **Fallback:** Search `"[city]" "[state]" city council agenda [meeting date]` and extract what you can. Record `agenda_source: "web_search"`.
 
@@ -329,11 +327,11 @@ After identifying agenda items, look for downloadable PDF attachments — especi
 
 **Municode/CivicPlus cities:**
 
-The `adaHtmlDocument` HTML page links to PDFs on Azure blob storage (`mccmeetingspublic.blob.core.usgovcloudapi.net`). Pull the agenda HTML with `WebFetch`, scan the returned text for PDF URLs on that blob domain, and save the list to `/workspace/api_responses/attachments.txt`.
+The `adaHtmlDocument` HTML page links to PDFs on Azure blob storage (`mccmeetingspublic.blob.core.usgovcloudapi.net`). Pull the agenda HTML with `pmf_runtime.http.get`, scan the returned text for PDF URLs on that blob domain, and save the list to `/workspace/api_responses/attachments.txt`.
 
 **Legistar cities:**
 
-Legistar matter attachments are available via `WebFetch` on:
+Legistar matter attachments are available via `pmf_runtime.http.get` on:
 ```
 https://webapi.legistar.com/v1/{client}/matters/{matterId}/attachments
 ```
