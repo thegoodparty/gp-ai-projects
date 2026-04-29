@@ -58,6 +58,8 @@ def build_meetings_from_llm(
 
 def _basic_scrape(source_url: str, city: str, state: str) -> dict:
     """Basic Firecrawl scrape (1 credit). Returns {valid, pdf_urls, markdown, ...}."""
+    if not os.environ.get("FIRECRAWL_API_KEY"):
+        return {"valid": False, "pdf_urls": [], "error": "FIRECRAWL_API_KEY not set"}
     from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
     return validate_agenda_page(source_url, city, state)
 
@@ -65,6 +67,8 @@ def _basic_scrape(source_url: str, city: str, state: str) -> dict:
 def _js_scrape(source_url: str) -> dict | None:
     """JS-rendered Firecrawl scrape (~5 credits) with retry on timeout.
     Returns {markdown, links, pdf_urls} or None."""
+    if not os.environ.get("FIRECRAWL_API_KEY"):
+        return None
     from firecrawl import FirecrawlApp
     app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
 

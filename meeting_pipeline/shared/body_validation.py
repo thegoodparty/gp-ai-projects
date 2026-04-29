@@ -167,7 +167,10 @@ async def validate_civicplus_body(
 ) -> dict:
     """Fetch AgendaCenter categories via AJAX aria-labels and score."""
     from urllib.parse import urlparse
-    from meeting_pipeline.collectors.civicplus_scraper import discover_categories, _ensure_www
+    try:
+        from meeting_pipeline.collectors.civicplus_scraper import discover_categories, _ensure_www
+    except ImportError:
+        return {"status": "error", "reason": "civicplus_scraper module not available"}
 
     domain = config.get("domain", "") or urlparse(source_url).netloc.replace("www.", "")
     if not domain:
@@ -326,7 +329,10 @@ async def validate_boarddocs_body(
     slug: str, config: dict, source_url: str, expected_body: str, client: httpx.AsyncClient
 ) -> dict:
     """Fetch committees from BoardDocs and score."""
-    from meeting_pipeline.collectors.boarddocs import BoardDocsConfig, _fetch_committees
+    try:
+        from meeting_pipeline.collectors.boarddocs import BoardDocsConfig, _fetch_committees
+    except ImportError:
+        return {"status": "error", "reason": "boarddocs module not available"}
 
     match = re.search(r"(https://go\.boarddocs\.com/\w+/\w+/Board\.nsf)", source_url)
     base_url = match.group(1) if match else None
