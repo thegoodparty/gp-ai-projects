@@ -29,7 +29,7 @@ from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slu
 
 # Default concurrency limits per stage
 CONCURRENCY_DISCOVER = 3   # Serper + Firecrawl rate limits
-CONCURRENCY_SCAN = 5       # Keep low to avoid Firecrawl starving platform API calls
+CONCURRENCY_SCAN = 1       # Sequential to avoid Firecrawl starving platform API calls
 CONCURRENCY_COLLECT = 5    # PDF downloads, some platforms rate-limited
 CONCURRENCY_EXTRACT = 5    # Gemini has high rate limits
 CONCURRENCY_BRIEFING = 3   # Each briefing = 5-10 LLM calls
@@ -182,21 +182,31 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
     from meeting_pipeline.stages.scan.process import process_one_city
     import httpx
 
+    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
+
     storage = get_storage(cfg)
     sem = asyncio.Semaphore(CONCURRENCY_SCAN)
     ok_count = 0
     err_count = 0
     skip_count = 0
+    skipped_unverified = 0
     total_meetings = 0
     total_posted = 0
 
     async def scan_one(city_info: dict):
-        nonlocal ok_count, err_count, skip_count, total_meetings, total_posted
+        nonlocal ok_count, err_count, skip_count, skipped_unverified, total_meetings, total_posted
         slug = city_info["slug"]
         source_key = f"{cfg.sources_prefix}/{slug}/source.json"
 
         if not storage.exists(source_key):
             skip_count += 1
+            return
+
+        # Gate: only scan verified cities
+        source = storage.read_json(source_key)
+        verification = (source.get("best_source") or {}).get("verification", {})
+        if verification.get("status") not in VERIFIED_STATUSES:
+            skipped_unverified += 1
             return
 
         um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
@@ -211,7 +221,6 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
                 follow_redirects=True, timeout=20,
             ) as http:
                 try:
-                    source = storage.read_json(source_key)
                     platform = (source.get("best_source") or {}).get("platform", "?")
 
                     record = await process_one_city(slug, source, source_key, http_client=http, storage=storage)
@@ -234,6 +243,8 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
     tasks = [scan_one(c) for c in cities]
     await asyncio.gather(*tasks)
 
+    if skipped_unverified:
+        print(f"  Skipped {skipped_unverified} unverified cities")
     print(f"\n  Scan: {ok_count} OK, {err_count} errors, {skip_count} skipped")
     print(f"  Total: {total_meetings} meetings, {total_posted} with posted agendas")
 
@@ -244,11 +255,23 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
 
     storage = get_storage(cfg)
 
+    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
+
     cities_to_collect = []
+    skipped_unverified = 0
     for city_info in cities:
         slug = city_info["slug"]
         city = city_info.get("city", slug)
         state = city_info.get("state", "")
+
+        # Gate: only collect verified cities
+        source_key = f"{cfg.sources_prefix}/{slug}/source.json"
+        if storage.exists(source_key):
+            source = storage.read_json(source_key)
+            verification = (source.get("best_source") or {}).get("verification", {})
+            if verification.get("status") not in VERIFIED_STATUSES:
+                skipped_unverified += 1
+                continue
 
         if posted_only:
             um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
@@ -265,8 +288,11 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
 
         cities_to_collect.append({"city": city, "state": state, "slug": slug})
 
+    if skipped_unverified:
+        print(f"  Skipped {skipped_unverified} unverified cities")
+
     if not cities_to_collect:
-        print("  No cities to collect (none with posted agendas)")
+        print("  No cities to collect (none with verified + posted agendas)")
         return
 
     print(f"  Collecting {len(cities_to_collect)} cities (concurrency={CONCURRENCY_COLLECT})...")
@@ -331,11 +357,23 @@ async def run_extract(
         gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 
     # Build list of (city_info, meeting) pairs to extract
+    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
     work_items = []
     skipped = 0
+    skipped_unverified = 0
 
     for city_info in cities:
         slug = city_info["slug"]
+
+        # Gate: only extract for verified cities
+        source_key = f"{cfg.sources_prefix}/{slug}/source.json"
+        if storage.exists(source_key):
+            source = storage.read_json(source_key)
+            verification = (source.get("best_source") or {}).get("verification", {})
+            if verification.get("status") not in VERIFIED_STATUSES:
+                skipped_unverified += 1
+                continue
+
         um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
 
         if not storage.exists(um_key):
@@ -374,6 +412,8 @@ async def run_extract(
 
     if skipped:
         print(f"  Skipping {skipped} already extracted (--force to redo)")
+    if skipped_unverified:
+        print(f"  Skipping {skipped_unverified} unverified cities")
 
     if not work_items:
         if not dry_run:
@@ -490,7 +530,22 @@ async def run_briefing(
     normalized_prefix = f"{cfg.output_prefix}/normalized"
     briefing_prefix = f"{cfg.output_prefix}/briefings"
 
-    # Find normalized files for the target cities
+    # Build set of verified city slugs
+    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
+    verified_slugs = set()
+    for key in storage.list_keys(cfg.sources_prefix):
+        if not key.endswith("/source.json"):
+            continue
+        slug = key.split("/")[-2]
+        try:
+            src = storage.read_json(key)
+            v = (src.get("best_source") or {}).get("verification", {})
+            if v.get("status") in VERIFIED_STATUSES:
+                verified_slugs.add(slug)
+        except Exception:
+            pass
+
+    # Find normalized files for verified target cities only
     all_norm_keys = storage.list_keys(normalized_prefix)
     norm_keys = sorted(
         k for k in all_norm_keys
@@ -498,10 +553,15 @@ async def run_briefing(
     )
 
     if cities:
-        slug_set = set(c["slug"] for c in cities)
+        slug_set = set(c["slug"] for c in cities) & verified_slugs
         norm_keys = [
             k for k in norm_keys
             if any(k.split("/")[-1].startswith(slug) for slug in slug_set)
+        ]
+    else:
+        norm_keys = [
+            k for k in norm_keys
+            if any(k.split("/")[-1].startswith(slug) for slug in verified_slugs)
         ]
 
     if not force:
