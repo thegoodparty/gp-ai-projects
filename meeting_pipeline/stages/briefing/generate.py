@@ -876,7 +876,7 @@ def assemble_briefing(
             # Exclude storage_pdf entries (S3 keys, not public URLs)
             supporting_docs = [
                 f for f in meeting.get("agendaFiles", [])
-                if f.get("type") != "storage_pdf" and f.get("url", "").startswith("http")
+                if f.get("type") != "storage_pdf" and isinstance(f.get("url"), str) and f["url"].startswith("http")
             ]
             if meeting.get("sourceUrl"):
                 supporting_docs.append({"name": "Meeting agenda page", "url": meeting["sourceUrl"]})
