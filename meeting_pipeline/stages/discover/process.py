@@ -66,6 +66,47 @@ async def process_one_city(
             http=http_client,
             expected_body=expected_body,
         )
+
+        # Verify the discovered source can serve real agenda PDFs
+        best = result.get("best_source", {})
+        if best.get("url") and best.get("freshness") not in ("wrong_entity", "wrong_city", "blocked", "empty"):
+            from meeting_pipeline.shared.verify_source import verify_agenda_url
+            from meeting_pipeline.shared.config import city_to_slug
+
+            # Try to verify using the public_agenda_url or source URL
+            verify_url = result.get("public_agenda_url") or best.get("url", "")
+            if verify_url and ".pdf" in verify_url.lower():
+                verification = await verify_agenda_url(verify_url, client=http_client)
+            else:
+                # For platform cities, try to find an agenda via the platform API
+                from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+                platform = best.get("platform", "unknown")
+                config = best.get("config", {})
+                agenda_url = await _find_past_agenda_from_platform(
+                    platform, config, best.get("url", ""), http_client,
+                )
+                # For unknown platforms, try scraping the page for PDF links
+                if not agenda_url:
+                    from meeting_pipeline.shared.verify_source import _find_pdf_links_on_page
+                    source_url = best.get("url", "")
+                    if source_url:
+                        pdf_links = await _find_pdf_links_on_page(source_url, http_client)
+                        if pdf_links:
+                            agenda_url = pdf_links[0]
+
+                if agenda_url:
+                    verification = await verify_agenda_url(agenda_url, client=http_client)
+                else:
+                    from datetime import datetime, timezone
+                    verification = {
+                        "status": "unverified",
+                        "reason": "No agenda URL found to verify during discovery",
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    }
+
+            best["verification"] = verification
+            result["best_source"] = best
+
         return result
     finally:
         if owns_http:

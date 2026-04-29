@@ -325,6 +325,8 @@ GROUNDING RULE: Every factual claim in every field must be traceable to a word o
 
 DOLLAR AMOUNT RULE: Dollar amounts may only appear in any field if they appear verbatim in the SOURCE SECTIONS above. Do not infer, round, compute, or paraphrase amounts.
 
+COMBINING RULE: When summarizing multiple agenda items together, do not merge their details. Each item may have different funding sources, amounts, or conditions. State each item's details exactly as they appear in the source — do not generalize across items (e.g. do not say "both transfers from Free Cash" if only one is).
+
 ADDRESS AND NAME RULE: Street addresses, parcel numbers (PPN, APN, etc.), and individual person names may only appear if they appear verbatim in the SOURCE SECTIONS above.
 
 Write a detailed page with these sections. FOLLOW THE WORD COUNT TARGETS CLOSELY.
