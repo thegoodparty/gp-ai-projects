@@ -72,15 +72,17 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
         if is_portal:
             date_raw = ev.get("startDateTime", ev.get("eventDate", ""))
             title = ev.get("eventName", city)
-            agenda_url = ev.get("agendaFile") or None
-            agenda_posted = bool(agenda_url)  # hasAgenda=True without agendaFile means no downloadable document
+            raw_url = ev.get("agendaFile")
+            agenda_url = raw_url if isinstance(raw_url, str) and raw_url.startswith("http") else None
+            agenda_posted = bool(agenda_url)
             event_id = str(ev.get("id", ""))
         else:
             date_raw = ev.get("MeetingStartDate", ev.get("EventDate", ""))
             title = ev.get("Name", ev.get("EventName", city))
-            agenda_url = ev.get("AgendaFile") or ev.get("AgendaUrl") or None
-            # Only mark agenda_posted if we have a direct URL or a real posted date
-            # (not the CivicClerk default 0001-01-01 which means "scheduled but no file")
+            # AgendaFile can be a dict like {'agendaId': 0, 'fileName': None} — not a URL
+            raw_url = ev.get("AgendaFile") or ev.get("AgendaUrl") or ""
+            agenda_url = raw_url if isinstance(raw_url, str) and raw_url.startswith("http") else None
+            # Only mark posted if we have a real URL or a real posted date (not 0001-01-01)
             posted_date = ev.get("AgendaPostedDate") or ""
             has_real_posted_date = bool(posted_date) and not posted_date.startswith("0001")
             agenda_posted = bool(agenda_url) or has_real_posted_date
