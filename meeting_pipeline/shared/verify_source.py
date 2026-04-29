@@ -155,6 +155,120 @@ async def verify_agenda_url(
             await client.aclose()
 
 
+async def _find_past_agenda_from_platform(
+    platform: str, config: dict, source_url: str, client: httpx.AsyncClient,
+) -> str | None:
+    """Query platform API for the most recent past event with an agenda file."""
+    import re
+
+    if platform == "civicclerk":
+        match = re.search(r"https://(\w+)\.(?:api\.|portal\.)?civicclerk\.com", source_url)
+        if not match:
+            return None
+        tenant = match.group(1)
+        try:
+            # Get recent events — check multiple field names for agenda files
+            resp = await client.get(
+                f"https://{tenant}.api.civicclerk.com/v1/Events/",
+                params={"$top": "50"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            events = data.get("value", data) if isinstance(data, dict) else data
+            if isinstance(events, list):
+                for ev in events:
+                    for field in ("AgendaFile", "AgendaUrl", "agendaFile"):
+                        url = ev.get(field, "")
+                        if isinstance(url, str) and url.startswith("http"):
+                            return url
+        except Exception:
+            pass
+        return None
+
+    if platform == "granicus":
+        # Try RSS feed for past agendas
+        match = re.search(r"https://([^.]+)\.granicus\.com", source_url)
+        if not match:
+            return None
+        tenant = match.group(1)
+        try:
+            resp = await client.get(
+                f"https://{tenant}.granicus.com/ViewPublisherRSS.php",
+                params={"mode": "agendas"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(resp.text)
+                for item in root.iter("item"):
+                    enclosure = item.find("enclosure")
+                    if enclosure is not None:
+                        url = enclosure.get("url", "")
+                        if url and ".pdf" in url.lower():
+                            return url
+        except Exception:
+            pass
+        return None
+
+    if platform == "legistar":
+        slug = config.get("legistar_slug", "")
+        if not slug:
+            match = re.search(r"https?://([^.]+)\.legistar\.com", source_url)
+            if match:
+                slug = match.group(1)
+        if not slug:
+            return None
+        try:
+            resp = await client.get(
+                f"https://webapi.legistar.com/v1/{slug}/events",
+                params={"$orderby": "EventDate desc", "$top": "20"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for ev in resp.json():
+                url = ev.get("EventAgendaFile") or ""
+                if url and url.startswith("http"):
+                    return url
+        except Exception:
+            pass
+        return None
+
+    if platform in ("civicplus",):
+        # CivicPlus agenda URLs from scan would already be caught
+        # Can't easily query without the full scraper setup
+        return None
+
+    return None
+
+
+async def _find_pdf_links_on_page(url: str, client: httpx.AsyncClient) -> list[str]:
+    """Scrape a webpage and find PDF links that look like agendas."""
+    import re
+    try:
+        resp = await client.get(url, timeout=15)
+        if resp.status_code != 200:
+            return []
+        html = resp.text
+        # Find all href values ending in .pdf
+        pdf_links = re.findall(r'href=["\']([^"\']*\.pdf[^"\']*)', html, re.IGNORECASE)
+        # Filter to ones that look like agendas
+        agenda_pdfs = []
+        for link in pdf_links:
+            link_lower = link.lower()
+            if any(kw in link_lower for kw in ["agenda", "packet", "council", "meeting", "minutes"]):
+                # Make absolute URL
+                if link.startswith("http"):
+                    agenda_pdfs.append(link)
+                elif link.startswith("/"):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    agenda_pdfs.append(f"{parsed.scheme}://{parsed.netloc}{link}")
+        return agenda_pdfs[:10]
+    except Exception:
+        return []
+
+
 async def find_and_verify_source(
     slug: str,
     source: dict,
@@ -165,8 +279,11 @@ async def find_and_verify_source(
     """
     Find the most recent agenda URL for a city and verify it.
 
-    Checks upcoming_meetings.json for posted agendas. If none found,
-    checks the source URL directly.
+    Tries in order:
+    1. Future posted agenda URLs from upcoming_meetings.json
+    2. Past posted agenda URLs from upcoming_meetings.json
+    3. Source URL itself if it's a PDF
+    4. Scrape the source page for PDF links that look like agendas
 
     Args:
         slug: City slug
@@ -178,40 +295,65 @@ async def find_and_verify_source(
     Returns:
         Verification result dict.
     """
-    best = source.get("best_source", {})
-    platform = best.get("platform", "unknown")
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(
+            follow_redirects=True, timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+        )
 
-    # Try to find a posted agenda URL from scan results
-    um_key = f"{sources_prefix}/{slug}/upcoming_meetings.json"
-    agenda_url = None
+    try:
+        best = source.get("best_source", {})
 
-    if storage.exists(um_key):
-        try:
-            um = storage.read_json(um_key)
-            posted = [
-                m for m in um.get("upcoming", [])
-                if m.get("agenda_posted")
-                and isinstance(m.get("agenda_url"), str)
-                and m["agenda_url"].startswith("http")
-            ]
-            if posted:
-                # Most recent posted meeting
-                most_recent = sorted(posted, key=lambda m: m.get("date", ""), reverse=True)[0]
-                agenda_url = most_recent["agenda_url"]
-        except Exception:
-            pass
+        # Try to find a posted agenda URL from scan results (future first, then past)
+        um_key = f"{sources_prefix}/{slug}/upcoming_meetings.json"
+        agenda_url = None
 
-    # If no posted agenda from scan, check if source URL itself is a PDF
-    if not agenda_url:
-        source_url = best.get("url", "")
-        if source_url and ".pdf" in source_url.lower():
-            agenda_url = source_url
+        if storage.exists(um_key):
+            try:
+                um = storage.read_json(um_key)
+                posted = [
+                    m for m in um.get("upcoming", [])
+                    if m.get("agenda_posted")
+                    and isinstance(m.get("agenda_url"), str)
+                    and m["agenda_url"].startswith("http")
+                ]
+                if posted:
+                    most_recent = sorted(posted, key=lambda m: m.get("date", ""), reverse=True)[0]
+                    agenda_url = most_recent["agenda_url"]
+            except Exception:
+                pass
 
-    if not agenda_url:
-        return {
-            "status": "unverified",
-            "reason": "No agenda URL found to verify",
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
+        # If no posted agenda URL, try platform API for past agendas
+        if not agenda_url:
+            platform = best.get("platform", "unknown")
+            config = best.get("config", {})
+            source_url = best.get("url", "")
+            if platform not in ("unknown", "generic_html"):
+                agenda_url = await _find_past_agenda_from_platform(platform, config, source_url, client)
 
-    return await verify_agenda_url(agenda_url, client=client)
+        # If still nothing, check if source URL itself is a PDF
+        if not agenda_url:
+            source_url = best.get("url", "")
+            if source_url and ".pdf" in source_url.lower():
+                agenda_url = source_url
+
+        # If still nothing, scrape the source page for PDF links
+        if not agenda_url:
+            source_url = best.get("url", "")
+            if source_url:
+                pdf_links = await _find_pdf_links_on_page(source_url, client)
+                if pdf_links:
+                    agenda_url = pdf_links[0]
+
+        if not agenda_url:
+            return {
+                "status": "unverified",
+                "reason": "No agenda URL found to verify (no posted agendas, no PDFs on source page)",
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        return await verify_agenda_url(agenda_url, client=client)
+    finally:
+        if owns_client:
+            await client.aclose()

@@ -1,0 +1,49 @@
+# Discover stage — Fargate task with Playwright + Chromium
+# This is separate from Dockerfile.lambda because it needs heavy browser deps.
+
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+COPY uv.lock ./
+COPY pyproject.toml ./
+COPY shared/pyproject.toml ./shared/
+COPY meeting_pipeline/pyproject.toml ./meeting_pipeline/
+
+COPY shared/ ./shared/
+COPY meeting_pipeline/ ./meeting_pipeline/
+
+# Install ALL deps including discover extras (playwright, browser-use, etc.)
+RUN uv sync --frozen --no-dev --package meeting-pipeline --extra discover
+
+# Stage 2: Runtime with Chromium
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget gnupg libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+    libgbm1 libpango-1.0-0 libasound2 libxshmfence1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/shared /app/shared
+COPY --from=builder /app/meeting_pipeline /app/meeting_pipeline
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+
+# Install Playwright Chromium browser
+RUN playwright install chromium
+
+# Discover processes cities from SQS queue
+ENTRYPOINT ["python", "-m", "meeting_pipeline.lambda_handlers.discover"]

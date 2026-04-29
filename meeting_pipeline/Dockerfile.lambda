@@ -1,0 +1,52 @@
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy workspace files
+COPY uv.lock ./
+COPY pyproject.toml ./
+COPY shared/pyproject.toml ./shared/
+COPY meeting_pipeline/pyproject.toml ./meeting_pipeline/
+
+# Copy source code
+COPY shared/ ./shared/
+COPY meeting_pipeline/ ./meeting_pipeline/
+
+# Install dependencies for meeting-pipeline package only (no dev deps)
+# This pulls in all dependencies from meeting_pipeline/pyproject.toml + shared
+RUN uv sync --frozen --no-dev --package meeting-pipeline
+
+# Stage 2: Runtime
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy source code
+COPY --from=builder /app/shared /app/shared
+COPY --from=builder /app/meeting_pipeline /app/meeting_pipeline
+
+# Install Lambda Runtime Interface Client into the venv
+RUN /app/.venv/bin/pip install --no-cache-dir awslambdaric
+
+# Set environment
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+
+# Lambda runtime interface client entrypoint
+ENTRYPOINT ["python", "-m", "awslambdaric"]
+
+# Default handler — overridden per function in Terraform via image_config.command
+CMD ["meeting_pipeline.lambda_handlers.scan.handler"]
