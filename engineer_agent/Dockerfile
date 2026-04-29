@@ -77,6 +77,10 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/shared /app/shared
 COPY --from=builder /app/engineer_agent /app/engineer_agent
 
+# Bake in ai-rules from the submodule at repo root so the agent can read
+# rule files offline. Pinned by submodule SHA; bumping requires a PR here.
+COPY ai-rules/ /app/ai-rules/
+
 # Copy entrypoint
 COPY engineer_agent/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
