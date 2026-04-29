@@ -29,7 +29,7 @@ from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slu
 
 # Default concurrency limits per stage
 CONCURRENCY_DISCOVER = 3   # Serper + Firecrawl rate limits
-CONCURRENCY_SCAN = 10      # API calls are fast
+CONCURRENCY_SCAN = 5       # Keep low to avoid Firecrawl starving platform API calls
 CONCURRENCY_COLLECT = 5    # PDF downloads, some platforms rate-limited
 CONCURRENCY_EXTRACT = 5    # Gemini has high rate limits
 CONCURRENCY_BRIEFING = 3   # Each briefing = 5-10 LLM calls
@@ -275,11 +275,15 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
     ok_count = 0
     err_count = 0
 
+    # Only collect future meetings — override lookback to 0
+    collect_cfg = AgentConfig.from_env()
+    collect_cfg.lookback_days = 0
+
     async def collect_one(i: int, c: dict):
         nonlocal ok_count, err_count
         async with sem:
             try:
-                result = await process_one_city(c["city"], c["state"], cfg=cfg, storage=storage)
+                result = await process_one_city(c["city"], c["state"], cfg=collect_cfg, storage=storage)
                 if isinstance(result, dict):
                     ok = result.get("ok", False)
                     pdfs = result.get("pdfs_downloaded", 0)

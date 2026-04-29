@@ -51,7 +51,7 @@ async def scan_civicplus(city: str, config: dict, source_url: str, client: httpx
                 pass  # best-effort
 
     except Exception as e:
-        print(f"    CivicPlus fetch error for {domain}: {e}")
+        print(f"    CivicPlus fetch error for {domain}: {type(e).__name__}: {e}")
         return []
 
     upcoming = []

@@ -47,7 +47,7 @@ async def scan_legistar(city: str, config: dict, client: httpx.AsyncClient, sour
         resp.raise_for_status()
         events = resp.json()
     except Exception as e:
-        print(f"    Legistar fetch error for {slug}: {e}")
+        print(f"    Legistar fetch error for {slug}: {type(e).__name__}: {e}")
         return []
 
     upcoming = []

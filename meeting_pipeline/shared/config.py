@@ -33,7 +33,7 @@ class AgentConfig:
     s3_bucket: str | None = None
     lookback_days: int = 90
     download_pdfs: bool = True
-    agendas_only: bool = False  # If True, skip Legistar matter attachments — much faster
+    agendas_only: bool = True  # Skip Legistar matter attachments — only download agenda PDFs
 
     @classmethod
     def from_env(cls) -> "AgentConfig":

@@ -64,7 +64,7 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
         data = resp.json()
         events = data.get("value", data) if isinstance(data, dict) else data
     except Exception as e:
-        print(f"    CivicClerk fetch error for {tenant}: {e}")
+        print(f"    CivicClerk fetch error for {tenant}: {type(e).__name__}: {e}")
         return []
 
     upcoming = []
@@ -79,11 +79,11 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
             date_raw = ev.get("MeetingStartDate", ev.get("EventDate", ""))
             title = ev.get("Name", ev.get("EventName", city))
             agenda_url = ev.get("AgendaFile") or ev.get("AgendaUrl") or None
-            # Mark agenda_posted if we have a URL OR if the platform says the agenda
-            # was posted (AgendaPostedDate). The collection step knows how to fetch
-            # the actual PDF even without a direct URL — it queries the event detail
-            # API or scrapes the portal page via Firecrawl.
-            agenda_posted = bool(agenda_url) or bool(ev.get("AgendaPostedDate"))
+            # Only mark agenda_posted if we have a direct URL or a real posted date
+            # (not the CivicClerk default 0001-01-01 which means "scheduled but no file")
+            posted_date = ev.get("AgendaPostedDate") or ""
+            has_real_posted_date = bool(posted_date) and not posted_date.startswith("0001")
+            agenda_posted = bool(agenda_url) or has_real_posted_date
             event_id = str(ev.get("EventId", ev.get("Id", "")))
 
         date = date_raw[:10] if date_raw else None

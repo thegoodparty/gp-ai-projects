@@ -435,20 +435,21 @@ async def _collect_generic_direct(
     except Exception as e:
         return CollectionResult.error_result(city, state, "generic_direct", f"Could not read upcoming_meetings.json: {e}")
 
-    meetings_with_pdfs = [
+    # Accept any URL that looks like it could serve a document (PDF, dynamic download, etc.)
+    meetings_with_urls = [
         m for m in upcoming_data.get("upcoming", [])
-        if m.get("agenda_url") and m["agenda_url"].lower().endswith(".pdf")
+        if m.get("agenda_url") and m.get("status") != "past"
     ]
 
-    if not meetings_with_pdfs:
-        return CollectionResult.error_result(city, state, "generic_direct", "No PDF agenda URLs in upcoming_meetings.json")
+    if not meetings_with_urls:
+        return CollectionResult.error_result(city, state, "generic_direct", "No agenda URLs in upcoming_meetings.json")
 
     output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/generic"
     pdf_count = 0
     meetings_out = []
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as client:
-        for m in meetings_with_pdfs:
+        for m in meetings_with_urls:
             date = m.get("date", "")
             pdf_url = m["agenda_url"]
             filename = f"{date}_agenda.pdf"
@@ -461,8 +462,13 @@ async def _collect_generic_direct(
                 try:
                     resp = await client.get(pdf_url)
                     resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    is_pdf = "pdf" in content_type or resp.content[:5] == b"%PDF-"
+                    if not is_pdf:
+                        print(f"  [generic_direct] Not a PDF (content-type: {content_type[:40]}), skipping: {pdf_url[:60]}")
+                        continue
                     if len(resp.content) < 5000:
-                        print(f"  [generic_direct] PDF too small ({len(resp.content)}B), skipping: {pdf_url}")
+                        print(f"  [generic_direct] PDF too small ({len(resp.content)}B), skipping: {pdf_url[:60]}")
                         continue
                     storage.write_bytes(pdf_key, resp.content)
                     pdf_count += 1

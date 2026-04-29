@@ -48,7 +48,7 @@ async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.
             resp.raise_for_status()
             root = ET.fromstring(resp.text)
         except Exception as e:
-            print(f"    Granicus RSS fetch error for {tenant}: {e}")
+            print(f"    Granicus RSS fetch error for {tenant}: {type(e).__name__}: {e}")
             return []
 
         upcoming = []
@@ -94,7 +94,7 @@ async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.
             resp.raise_for_status()
             html = resp.text
         except Exception as e:
-            print(f"    Swagit fetch error for {netloc}: {e}")
+            print(f"    Swagit fetch error for {netloc}: {type(e).__name__}: {e}")
             return []
 
         upcoming = []
