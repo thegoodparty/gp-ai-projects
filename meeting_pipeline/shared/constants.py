@@ -7,6 +7,8 @@ reject/blocklist keywords, and configuration thresholds.
 Used by: discovery, scan, collection, extraction, briefing.
 """
 
+import re as _re
+
 # ── State Names & Abbreviations ───────────────────────────────────────────────
 
 STATE_ABBREVS = {
@@ -285,7 +287,6 @@ NEWS_DOMAIN_SUFFIXES = {
 }
 
 # US broadcast callsign pattern: K/W + 2-3 letters (kiow.com, wkrc.com, etc.)
-import re as _re
 BROADCAST_CALLSIGN_RE = _re.compile(r"^[kw][a-z]{2,3}\.(com|tv|org)$")
 
 

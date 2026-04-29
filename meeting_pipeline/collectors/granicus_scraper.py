@@ -134,8 +134,11 @@ async def _download_pdf(
         print(f"     Downloaded: {dest_key.split('/')[-1]} ({len(resp.content) // 1024}KB)")
         return True
     except Exception as e:
-        # Granicus S3 bucket has cert hostname mismatch — retry without SSL verification
+        # Granicus S3 bucket has cert hostname mismatch — retry without SSL verification.
+        # SECURITY NOTE: This only triggers after a specific SSL cert error, not by default.
+        # The Granicus CDN sometimes serves PDFs from S3 buckets with mismatched certs.
         if "CERTIFICATE_VERIFY_FAILED" in str(e) or "SSL" in str(e):
+            print(f"     WARNING: SSL cert error for {label}, retrying without verification")
             try:
                 async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=30) as insecure:
                     resp = await insecure.get(url)
