@@ -22,6 +22,25 @@ WRONG_ENTITY_KEYWORDS = [
 ]
 
 
+# Synonyms for governing bodies — used to accept equivalent names during validation
+_GOVERNING_BODY_SYNONYMS = [
+    "city council", "town council", "village council", "common council",
+    "board of aldermen", "board of alderpersons",
+    "board of mayor",       # "Board of Mayor and Aldermen" (Manchester NH)
+    "aldermanic",
+    "city commission", "town commission", "village commission",
+    "municipal council", "board of commissioners", "board of trustees",
+    "city board", "council of the city",
+    "town board", "select board", "board of selectmen",
+    "borough council",
+]
+
+
+def _is_wrong_entity(name: str) -> bool:
+    """Return True if the name contains a wrong-entity keyword (school district, etc.)."""
+    return any(kw in name for kw in WRONG_ENTITY_KEYWORDS)
+
+
 def load_manifest(city_slug: str, storage: StorageBackend, sources_prefix: str) -> dict | None:
     """
     Load manifest.json for a city from S3.
@@ -63,31 +82,15 @@ def validate_against_manifest(
         expected_lower = expected_body.lower()
         names_lower = [n.lower() for n in collected_body_names]
 
-        # Check if any collected name contains a wrong-entity keyword
-        def is_wrong_entity(name: str) -> bool:
-            return any(kw in name for kw in WRONG_ENTITY_KEYWORDS)
-
         # If ALL collected names are wrong-entity, reject
-        if all(is_wrong_entity(n) for n in names_lower):
-            offenders = [n for n in names_lower if is_wrong_entity(n)]
+        if all(_is_wrong_entity(n) for n in names_lower):
+            offenders = [n for n in names_lower if _is_wrong_entity(n)]
             return False, (
                 f"All collected bodies appear to be wrong entity (school/district): "
                 f"{offenders[:3]}"
             )
 
         # At least one name must fuzzy-match the expected body
-        _GOVERNING_BODY_SYNONYMS = [
-            "city council", "town council", "village council", "common council",
-            "board of aldermen", "board of alderpersons",
-            "board of mayor",       # "Board of Mayor and Aldermen" (Manchester NH)
-            "aldermanic",
-            "city commission", "town commission", "village commission",
-            "municipal council", "board of commissioners", "board of trustees",
-            "city board", "council of the city",
-            "town board", "select board", "board of selectmen",
-            "borough council",
-        ]
-
         def matches_expected(name: str) -> bool:
             # Direct substring match
             if expected_lower in name:

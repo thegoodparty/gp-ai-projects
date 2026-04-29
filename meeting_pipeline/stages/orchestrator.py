@@ -34,6 +34,15 @@ CONCURRENCY_COLLECT = 5    # PDF downloads, some platforms rate-limited
 CONCURRENCY_EXTRACT = 5    # Gemini has high rate limits
 CONCURRENCY_BRIEFING = 3   # Each briefing = 5-10 LLM calls
 
+# Verification statuses that gate pipeline stages
+VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
+
+# Magic-number constants
+MAX_TEXT_CHARS = 100_000       # Truncation limit for extracted PDF text
+MIN_EXTRACTABLE_TEXT = 500     # Below this, fall back to OCR
+MIN_PDF_SIZE = 5000            # Minimum PDF size (bytes) to attempt OCR
+PRESIGNED_URL_EXPIRY = 300     # Presigned URL lifetime in seconds
+
 
 # ── City loading ─────────────────────────────────────────────────────────────
 
@@ -54,8 +63,8 @@ def load_cities_from_sources(cfg: AgentConfig, storage=None) -> list[dict]:
                 "platform": (source.get("best_source") or {}).get("platform", ""),
                 "source_key": key,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  Warning: could not read {key}: {e}")
     return cities
 
 
@@ -102,28 +111,6 @@ def filter_cities(
         return cities
     slug_set = set(s.lower() for s in city_slugs)
     return [c for c in cities if c["slug"].lower() in slug_set]
-
-
-# ── Concurrent task runner ───────────────────────────────────────────────────
-
-async def _run_concurrent(tasks, concurrency: int, label: str = ""):
-    """Run async tasks with bounded concurrency. Returns list of results."""
-    sem = asyncio.Semaphore(concurrency)
-    completed = 0
-    total = len(tasks)
-
-    async def _wrapped(coro):
-        nonlocal completed
-        async with sem:
-            result = await coro
-            completed += 1
-            return result
-
-    results = await asyncio.gather(
-        *[_wrapped(t) for t in tasks],
-        return_exceptions=True,
-    )
-    return results
 
 
 # ── Stage runners ────────────────────────────────────────────────────────────
@@ -181,8 +168,6 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
     """Run scan for cities with source.json (concurrent)."""
     from meeting_pipeline.stages.scan.process import process_one_city
     import httpx
-
-    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
 
     storage = get_storage(cfg)
     sem = asyncio.Semaphore(CONCURRENCY_SCAN)
@@ -254,8 +239,6 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
     from meeting_pipeline.stages.collect.process import process_one_city
 
     storage = get_storage(cfg)
-
-    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
 
     cities_to_collect = []
     skipped_unverified = 0
@@ -357,7 +340,6 @@ async def run_extract(
         gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 
     # Build list of (city_info, meeting) pairs to extract
-    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
     work_items = []
     skipped = 0
     skipped_unverified = 0
@@ -442,13 +424,13 @@ async def run_extract(
                 text = extract_pdf_text(pdf_bytes)
 
                 truncation_warning = None
-                if len(text) > 100_000:
-                    truncation_warning = f"Text truncated: {len(text):,} chars -> 100,000"
+                if len(text) > MAX_TEXT_CHARS:
+                    truncation_warning = f"Text truncated: {len(text):,} chars -> {MAX_TEXT_CHARS:,}"
 
-                if len(text.strip()) < 500 and storage.get_size(w["pdf_key"]) > 5000:
+                if len(text.strip()) < MIN_EXTRACTABLE_TEXT and storage.get_size(w["pdf_key"]) > MIN_PDF_SIZE:
                     try:
                         from meeting_pipeline.shared.firecrawl_client import scrape_pdf_text
-                        presigned = storage.get_presigned_url(w["pdf_key"], expiry_seconds=300)
+                        presigned = storage.get_presigned_url(w["pdf_key"], expiry_seconds=PRESIGNED_URL_EXPIRY)
                         fc_text = scrape_pdf_text(presigned)
                         if fc_text and len(fc_text.strip()) > 200:
                             text = fc_text
@@ -531,7 +513,6 @@ async def run_briefing(
     briefing_prefix = f"{cfg.output_prefix}/briefings"
 
     # Build set of verified city slugs
-    VERIFIED_STATUSES = {"verified", "verified_ocr_needed", "verified_non_pdf"}
     verified_slugs = set()
     for key in storage.list_keys(cfg.sources_prefix):
         if not key.endswith("/source.json"):
@@ -542,8 +523,8 @@ async def run_briefing(
             v = (src.get("best_source") or {}).get("verification", {})
             if v.get("status") in VERIFIED_STATUSES:
                 verified_slugs.add(slug)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  Warning: could not read {key}: {e}")
 
     # Find normalized files for verified target cities only
     all_norm_keys = storage.list_keys(normalized_prefix)

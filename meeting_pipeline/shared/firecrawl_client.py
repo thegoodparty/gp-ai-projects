@@ -9,6 +9,7 @@ Metadata is a Pydantic model — access as dict via model_dump() or getattr.
 """
 from __future__ import annotations
 import os
+from datetime import date
 from typing import Optional
 
 
@@ -57,7 +58,7 @@ def search_agenda_page(city: str, state: str) -> Optional[str]:
     Returns the most likely URL or None.
     """
     app = _client()
-    query = f"{city} {state} city council meeting agenda 2026"
+    query = f"{city} {state} city council meeting agenda {date.today().year}"
     results = app.search(query, limit=5)
     docs = getattr(results, "web", None) or (results.get("data", []) if isinstance(results, dict) else [])
     for doc in docs:

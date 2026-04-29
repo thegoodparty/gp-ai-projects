@@ -16,14 +16,13 @@ import boto3
 
 from meeting_pipeline.lambda_handlers._secrets import inject_secrets
 from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.stages.discover.process import process_one_city
 
 sqs = boto3.client("sqs")
 DISCOVER_QUEUE_URL = os.environ.get("DISCOVER_QUEUE_URL", "")
 
 
 async def discover_one(city: str, state: str, cfg, storage):
-    from meeting_pipeline.stages.discover.process import process_one_city
-
     slug = city_to_slug(city, state)
     manifest_key = f"{cfg.sources_prefix}/{slug}/manifest.json"
     expected_body = ""

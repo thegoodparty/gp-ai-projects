@@ -29,7 +29,7 @@ async def process_one_city(
         storage: StorageBackend (created from cfg if not provided)
 
     Returns:
-        CollectionResult with ok, city, state, platform, events_found, pdfs_downloaded
+        CollectionResult from route_city()
     """
     from meeting_pipeline.stages.collect.router import route_city
 

@@ -92,8 +92,8 @@ async def _collect_legistar(
             if not is_valid:
                 print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
                 return CollectionResult.error_result(city, state, "legistar", f"manifest_mismatch: {reason}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [manifest] Warning: validation check failed: {e}")
 
     return collection_result
 
@@ -198,8 +198,8 @@ async def _collect_civicclerk(
             if not is_valid:
                 print(f"  [manifest] VALIDATION FAILED for {city}: {reason}")
                 return CollectionResult.error_result(city, state, "civicclerk", f"manifest_mismatch: {reason}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [manifest] Warning: validation check failed: {e}")
 
     return collection_result
 

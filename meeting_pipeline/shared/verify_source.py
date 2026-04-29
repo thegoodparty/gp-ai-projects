@@ -19,10 +19,19 @@ Results are stored in source.json as best_source.verification:
 
 from __future__ import annotations
 
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import httpx
 
+
+# ── Thresholds (avoid magic numbers in logic) ───────────────────────────────
+MIN_AGENDA_KEYWORDS = 3
+MIN_PDF_SIZE = 5000
+MIN_WORD_COUNT = 50
+MIN_SCANNED_PDF_SIZE = 10000
 
 AGENDA_KEYWORDS = [
     "agenda", "meeting", "council", "motion", "approve", "resolution",
@@ -45,8 +54,8 @@ def _check_pdf_content(content: bytes) -> dict:
             "pages": len(doc),
             "words": word_count,
             "keyword_hits": keyword_hits,
-            "is_agenda": keyword_hits >= 3 and word_count >= 50,
-            "is_scanned": word_count < 20 and len(doc) > 0 and len(content) > 10000,
+            "is_agenda": keyword_hits >= MIN_AGENDA_KEYWORDS and word_count >= MIN_WORD_COUNT,
+            "is_scanned": word_count < 20 and len(doc) > 0 and len(content) > MIN_SCANNED_PDF_SIZE,
         }
     except Exception as e:
         return {
@@ -117,7 +126,7 @@ async def verify_agenda_url(
             result["reason"] = f"Not a PDF (content-type: {content_type[:50]})"
             return result
 
-        if len(content) < 5000:
+        if len(content) < MIN_PDF_SIZE:
             result["status"] = "unverified"
             result["reason"] = f"PDF too small ({len(content)} bytes) — likely placeholder"
             return result
@@ -133,7 +142,7 @@ async def verify_agenda_url(
         elif pdf["is_scanned"]:
             result["status"] = "verified_ocr_needed"
             result["reason"] = f"Scanned PDF ({len(content) // 1024}KB, {pdf['pages']} pages, needs OCR)"
-        elif pdf["words"] > 50:
+        elif pdf["words"] > MIN_WORD_COUNT:
             result["status"] = "verified"
             result["reason"] = f"PDF with text ({pdf['words']} words, {pdf['keyword_hits']} agenda keywords — low but extractable)"
         else:
@@ -159,8 +168,6 @@ async def _find_past_agenda_from_platform(
     platform: str, config: dict, source_url: str, client: httpx.AsyncClient,
 ) -> str | None:
     """Query platform API for the most recent past event with an agenda file."""
-    import re
-
     if platform == "civicclerk":
         match = re.search(r"https://(\w+)\.(?:api\.|portal\.)?civicclerk\.com", source_url)
         if not match:
@@ -199,7 +206,6 @@ async def _find_past_agenda_from_platform(
                 timeout=15,
             )
             if resp.status_code == 200:
-                import xml.etree.ElementTree as ET
                 root = ET.fromstring(resp.text)
                 for item in root.iter("item"):
                     enclosure = item.find("enclosure")
@@ -244,7 +250,6 @@ async def _find_past_agenda_from_platform(
 
 async def _find_pdf_links_on_page(url: str, client: httpx.AsyncClient) -> list[str]:
     """Scrape a webpage and find PDF links that look like agendas."""
-    import re
     try:
         resp = await client.get(url, timeout=15)
         if resp.status_code != 200:
@@ -261,7 +266,6 @@ async def _find_pdf_links_on_page(url: str, client: httpx.AsyncClient) -> list[s
                 if link.startswith("http"):
                     agenda_pdfs.append(link)
                 elif link.startswith("/"):
-                    from urllib.parse import urlparse
                     parsed = urlparse(url)
                     agenda_pdfs.append(f"{parsed.scheme}://{parsed.netloc}{link}")
         return agenda_pdfs[:10]

@@ -49,6 +49,8 @@ def _process_meeting(slug, meeting_date, platform, cfg, storage):
     """Collect → Extract → Brief → QA for one meeting."""
 
     # ── Step 1: Collect PDF ──────────────────────────────────────────────
+    # Lazy imports: these pull in heavy dependencies (Gemini, Firecrawl,
+    # Playwright) that are expensive to load at module level in Lambda.
     from meeting_pipeline.stages.extract.normalize import (
         find_best_pdf, extract_pdf_text, extract_with_gemini, normalize_meeting,
     )

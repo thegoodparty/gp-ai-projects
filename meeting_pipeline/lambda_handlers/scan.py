@@ -13,6 +13,7 @@ import httpx
 
 from meeting_pipeline.lambda_handlers._secrets import inject_secrets
 from meeting_pipeline.shared.config import AgentConfig, get_storage
+from meeting_pipeline.stages.scan.process import process_one_city
 
 sqs = boto3.client("sqs")
 PROCESS_QUEUE_URL = os.environ.get("PROCESS_QUEUE_URL", "")
@@ -91,8 +92,6 @@ def handler(event, context=None):
 
 
 async def _scan(slug, source, source_key, storage):
-    from meeting_pipeline.stages.scan.process import process_one_city
-
     async with httpx.AsyncClient(
         headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
         follow_redirects=True,
