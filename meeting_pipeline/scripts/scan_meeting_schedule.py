@@ -54,21 +54,11 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage  # noqa: E402
 from meeting_pipeline.shared.constants import SUPPORTED_PLATFORMS  # noqa: E402
-
-# Cost tracking for scan phase
-_COST = {
-    "firecrawl_scrape_basic": 0,
-    "firecrawl_scrape_js": 0,
-    "firecrawl_llm_extract": 0,
-    "gemini_extract": 0,
-}
+from meeting_pipeline.stages.scan.process import process_one_city as _scan_impl  # noqa: E402
 
 # ============================================================================
 # SCAN DISPATCHER — delegates to stages/scan/process.py
 # ============================================================================
-
-# Import the real implementation from stages
-from meeting_pipeline.stages.scan.process import process_one_city as _scan_impl  # noqa: E402
 
 
 async def scan_city(
@@ -222,27 +212,6 @@ async def run_batch(
             print("\nNo newly-posted agendas detected.")
 
         print("=" * 60)
-
-        # Cost report — Firecrawl calls counted but credit cost varies by call type;
-        # see firecrawl.dev/app for actual credit consumption.
-        fc_basic = _COST["firecrawl_scrape_basic"]
-        fc_js = _COST["firecrawl_scrape_js"]
-        fc_llm = _COST["firecrawl_llm_extract"]
-        gemini = _COST["gemini_extract"]
-        print("\n  SCAN COST:")
-        print(f"    Firecrawl: {fc_basic:3d} basic, {fc_js:3d} JS renders, {fc_llm:3d} LLM extracts")
-        print(f"    Gemini:    {gemini:3d} extraction calls")
-
-        cost_report = {
-            "phase": "scan",
-            "firecrawl_scrape_basic": fc_basic,
-            "firecrawl_scrape_js": fc_js,
-            "firecrawl_llm_extract": fc_llm,
-            "gemini_extract": gemini,
-            "cities_scanned": results["scanned"],
-        }
-        with contextlib.suppress(Exception):
-            storage.write_json(f"{cfg.output_prefix}/cost_reports/scan.json", cost_report)
 
 
 # ============================================================================

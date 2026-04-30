@@ -49,6 +49,18 @@ from meeting_pipeline.prompts.briefing import (
 from meeting_pipeline.shared.config import AgentConfig
 
 # ============================================================================
+# LLM GENERATION CONSTANTS
+# ============================================================================
+
+TEMP_EXTRACTION = 0.1
+TEMP_WRITING = 0.3
+MAX_TOKENS_PASS1_CHUNK = 16_000
+MAX_TOKENS_PASS1_FULL = 32_000
+WORDS_PER_MINUTE = 250
+MIN_SOURCE_PASSAGE_LEN = 80
+OTHER_ITEMS_CHAR_LIMIT = 500
+
+# ============================================================================
 # FORMAT ADAPTER — normalized JSON → meeting dict used by generation pipeline
 # ============================================================================
 
@@ -182,11 +194,6 @@ def format_top_constituent_issues(constituent: dict, n: int = 5) -> str:
 # ============================================================================
 # PYDANTIC MODELS — LLM STRUCTURED OUTPUT
 # ============================================================================
-
-class SourceCitation(BaseModel):
-    field: str = Field(description="The field this citation supports (e.g. 'fiscal_amounts', 'vote_type', 'description', 'whatIsHappening', 'whyItMatters')")
-    quote: str = Field(description="Verbatim sentence or clause from the source document — exact wording, not paraphrased")
-
 
 class CategorizedAgendaItem(BaseModel):
     originalTitle: str = Field(description="Original title from the agenda")
@@ -327,9 +334,9 @@ def _run_pass1_chunk(city, body, date, items_chunk, start_index, constituent_con
     result = gemini.generate_structured_content(
         prompt=prompt,
         response_schema=AgendaCategorization,
-        temperature=0.1,
+        temperature=TEMP_EXTRACTION,
         thinking_budget=0,
-        max_tokens=16000,
+        max_tokens=MAX_TOKENS_PASS1_CHUNK,
     )
     if isinstance(result, dict):
         result = AgendaCategorization(**result)
@@ -357,9 +364,9 @@ def pass1_categorize(meeting: dict, gemini, constituent: dict | None = None, pdf
         result = gemini.generate_structured_content(
             prompt=prompt,
             response_schema=AgendaCategorization,
-            temperature=0.1,
+            temperature=TEMP_EXTRACTION,
             thinking_budget=None if use_thinking else 0,
-            max_tokens=32000,
+            max_tokens=MAX_TOKENS_PASS1_FULL,
         )
         if isinstance(result, dict):
             return AgendaCategorization(**result)
@@ -410,7 +417,7 @@ def _generate_agenda_summary(
     result = gemini.generate_structured_content(
         prompt=prompt,
         response_schema=_AgendaSummaryResult,
-        temperature=0.1,
+        temperature=TEMP_EXTRACTION,
         thinking_budget=0,
         max_tokens=200,
     )
@@ -477,7 +484,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
     result_2a = gemini.generate_structured_content(
         prompt=prompt_2a,
         response_schema=SourcePassageExtractions,
-        temperature=0.1,
+        temperature=TEMP_EXTRACTION,
         thinking_budget=0,
     )
     if isinstance(result_2a, dict):
@@ -524,7 +531,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
     result_2b = gemini.generate_structured_content(
         prompt=prompt_2b,
         response_schema=BriefingCardTexts,
-        temperature=0.3,
+        temperature=TEMP_WRITING,
         thinking_budget=0,
     )
     if isinstance(result_2b, dict):
@@ -674,7 +681,7 @@ def pass3_generate_detail(
     constituent_context = format_constituent_context(constituent, n=5) if constituent else ""
     other_items = ", ".join(
         item.title for item in all_items if item.title != card.agendaItemTitle
-    )[:500]
+    )[:OTHER_ITEMS_CHAR_LIMIT]
     available_docs_str = _format_available_docs(available_docs, meeting.get("sourceUrl"))
     prompt = build_pass3_prompt(
         city=city,
@@ -694,7 +701,7 @@ def pass3_generate_detail(
     result = gemini.generate_structured_content(
         prompt=prompt,
         response_schema=PriorityIssueDetail,
-        temperature=0.3,
+        temperature=TEMP_WRITING,
     )
 
     if isinstance(result, dict):
@@ -907,7 +914,7 @@ def assemble_briefing(
         for issue in priority_issues
     )
     word_count = len(detail_text.split())
-    read_minutes = max(3, round(word_count / 250))
+    read_minutes = max(3, round(word_count / WORDS_PER_MINUTE))
 
     return {
         "version": "1.0",
@@ -1038,7 +1045,7 @@ def generate_briefing_for_meeting(
     # honest than a detail page built on nothing.
     details = []
     for i, card in enumerate(cards.priorityIssues):
-        if not card.sourcePassage or len(card.sourcePassage) < 80:
+        if not card.sourcePassage or len(card.sourcePassage) < MIN_SOURCE_PASSAGE_LEN:
             print(f"  Pass 3.{i+1}: SKIP '{card.agendaItemTitle[:60]}' — sourcePassage missing or too short")
             details.append(None)
             continue

@@ -12,20 +12,10 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "boto3>=1.34.0",
     "firecrawl-py>=1.0.0",
+    "gp-shared",
 ]
 
 [project.optional-dependencies]
-# Heavy deps only needed for discovery (Fargate, not Lambda)
-discover = [
-    "playwright>=1.40.0",
-    "browser-use>=0.12.6",
-    "langchain-anthropic>=0.3.0",
-    "anthropic>=0.40.0",
-    "tavily-python>=0.7.8",
-    "exa-py>=2.11.0",
-    "duckduckgo-search>=8.1.1",
-    "ddgs>=9.13.1",
-]
 
 [tool.uv.sources]
 gp-shared = { workspace = true }

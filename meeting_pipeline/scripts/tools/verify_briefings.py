@@ -14,7 +14,6 @@ Checks:
 
 Usage:
     uv run python meeting_pipeline/scripts/verify_briefings.py
-    uv run python meeting_pipeline/scripts/verify_briefings.py --fix   (stub — not yet implemented)
     uv run python meeting_pipeline/scripts/verify_briefings.py --city johnstown-OH
 
 Output:
@@ -24,7 +23,6 @@ Output:
 
 import argparse
 import re
-import sys
 from collections import defaultdict
 from datetime import date, datetime
 
@@ -805,20 +803,11 @@ def print_report(report: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verify generated meeting briefings for quality issues")
     parser.add_argument(
-        "--fix",
-        action="store_true",
-        help="Delete CRITICAL briefings from S3 (not yet implemented)",
-    )
-    parser.add_argument(
         "--city",
         help="Filter to a single city slug (e.g. louisville-OH)",
         default=None,
     )
     args = parser.parse_args()
-
-    if args.fix:
-        print("--fix not yet implemented")
-        sys.exit(0)
 
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)

@@ -328,10 +328,6 @@ async def run_extract(
     # Lazy import — heavy deps
     gemini = None
     if not dry_run:
-        import sys as _sys
-        _project_root = str(Path(__file__).resolve().parent.parent.parent)
-        if _sys.path[0] != _project_root:
-            _sys.path.insert(0, _project_root)
         from shared.llm_gemini import GeminiClient, GeminiModelType
         gemini = GeminiClient(default_model=GeminiModelType.FLASH_LITE)
 

@@ -130,7 +130,6 @@ async def main():
             continue
 
         has_briefing = slug in briefed_slugs
-        len(meetings) > 0 and not posted
 
         if args.tier == 1 and not has_briefing:
             continue
@@ -168,8 +167,6 @@ async def main():
             results.append(result)
 
             verdict = result.get("verdict", "?")
-            result.get("size_kb", 0)
-            result.get("words", 0)
             marker = "PASS" if verdict == "PASS" else "FAIL"
             print(f"  [{i+1}/{len(to_verify)}] {item['slug']:<35} {item['platform']:<12} {marker:<5} {verdict}")
 

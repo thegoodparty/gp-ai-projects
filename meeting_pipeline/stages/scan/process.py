@@ -21,6 +21,8 @@ from meeting_pipeline.stages.scan.platforms.civicplus import scan_civicplus
 from meeting_pipeline.stages.scan.platforms.escribe import scan_escribe
 from meeting_pipeline.stages.scan.platforms.granicus import scan_granicus
 from meeting_pipeline.stages.scan.platforms.legistar import scan_legistar
+from meeting_pipeline.stages.scan.platforms.municode import scan_municode
+from meeting_pipeline.stages.scan.platforms.novus import scan_novus
 
 
 async def process_one_city(
@@ -115,8 +117,12 @@ async def process_one_city(
             upcoming = await scan_civicclerk(city, config, source_url, http_client)
         elif platform == "escribe":
             upcoming = await scan_escribe(city, config, source_url, http_client)
-        elif platform == "granicus":
+        elif platform in ("granicus", "swagit"):
             upcoming = await scan_granicus(city, config, source_url, http_client)
+        elif platform == "novus":
+            upcoming = await scan_novus(city, config, source_url, http_client)
+        elif platform == "municode":
+            upcoming = await scan_municode(city, config, source_url, http_client)
         elif platform in ("unknown", "generic_html") and source_url and os.environ.get("FIRECRAWL_API_KEY"):
             upcoming = await scan_generic(source_url, city, state)
 
