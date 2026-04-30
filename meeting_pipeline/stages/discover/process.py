@@ -69,7 +69,7 @@ async def process_one_city(
             timeout=20,
         )
 
-    slug = f"{city_to_slug(city)}-{state}"
+    slug = city_to_slug(city, state)
     source_key = f"{cfg.sources_prefix}/{slug}/source.json"
 
     # Load expected_body from manifest if not provided

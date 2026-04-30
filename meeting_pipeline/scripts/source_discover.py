@@ -85,7 +85,7 @@ async def run_batch(cities: list[dict], cfg: AgentConfig, storage, skip_existing
     for i, city_info in enumerate(cities):
         city = city_info["city"]
         state = city_info["state"]
-        slug = f"{city_to_slug(city)}-{state}"
+        slug = city_to_slug(city, state)
 
         if _should_skip(slug, cfg, storage, skip_existing):
             src = storage.read_json(f"{cfg.sources_prefix}/{slug}/source.json")

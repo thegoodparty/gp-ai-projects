@@ -478,3 +478,47 @@ class TestClassifyFreshness:
     def test_unknown(self):
         from meeting_pipeline.shared.date_utils import classify_freshness
         assert classify_freshness(None) == "unknown"
+
+
+# ============================================================================
+# verify_source — _check_pdf_content date extraction
+# ============================================================================
+
+class TestCheckPdfContentDates:
+    def test_returns_most_recent_date(self):
+        # Create a minimal PDF with a date in the text
+        import fitz
+
+        from meeting_pipeline.shared.verify_source import _check_pdf_content
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), (
+            "City Council Regular Meeting Agenda\nApril 15, 2026\n"
+            "I. Roll Call and Pledge of Allegiance\n"
+            "II. Motion to Approve Minutes of the Previous Council Meeting\n"
+            "III. Public Hearing on Proposed Ordinance Number 2026-04\n"
+            "IV. Resolution to Approve the Annual City Budget for Fiscal Year 2027\n"
+            "V. Consent Agenda Items for Council Review and Vote\n"
+            "VI. Adjournment of the Regular Meeting Session\n"
+        ))
+        pdf_bytes = doc.tobytes()
+        result = _check_pdf_content(pdf_bytes)
+        assert result["most_recent_date"] is not None
+        assert "2026" in result["most_recent_date"]
+        assert result["is_agenda"] is True
+
+    def test_returns_none_when_no_dates(self):
+        import fitz
+
+        from meeting_pipeline.shared.verify_source import _check_pdf_content
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "City Council Meeting Agenda\nRoll Call\nApprove Minutes")
+        pdf_bytes = doc.tobytes()
+        result = _check_pdf_content(pdf_bytes)
+        assert result["most_recent_date"] is None
+
+    def test_returns_none_for_invalid_pdf(self):
+        from meeting_pipeline.shared.verify_source import _check_pdf_content
+        result = _check_pdf_content(b"not a pdf")
+        assert result["most_recent_date"] is None

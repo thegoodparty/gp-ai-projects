@@ -40,7 +40,13 @@ AGENDA_KEYWORDS = [
 
 
 def _check_pdf_content(content: bytes) -> dict:
-    """Extract text from PDF bytes and check if it looks like an agenda."""
+    """Extract text from PDF bytes and check if it looks like an agenda.
+
+    Returns dict with pages, words, keyword_hits, is_agenda, is_scanned,
+    and most_recent_date (ISO string or None) extracted from the PDF text.
+    """
+    from meeting_pipeline.shared.date_utils import extract_dates
+
     try:
         import fitz
         doc = fitz.open(stream=content, filetype="pdf")
@@ -49,17 +55,24 @@ def _check_pdf_content(content: bytes) -> dict:
         word_count = len(text.split())
         text_lower = text.lower()
         keyword_hits = sum(1 for kw in AGENDA_KEYWORDS if kw in text_lower)
+
+        # Extract dates from PDF text to verify recency
+        dates = extract_dates(text)
+        most_recent = dates[0].isoformat() if dates else None
+
         return {
             "pages": len(doc),
             "words": word_count,
             "keyword_hits": keyword_hits,
             "is_agenda": keyword_hits >= MIN_AGENDA_KEYWORDS and word_count >= MIN_WORD_COUNT,
             "is_scanned": word_count < 20 and len(doc) > 0 and len(content) > MIN_SCANNED_PDF_SIZE,
+            "most_recent_date": most_recent,
         }
     except Exception as e:
         return {
             "pages": 0, "words": 0, "keyword_hits": 0,
             "is_agenda": False, "is_scanned": False, "error": str(e),
+            "most_recent_date": None,
         }
 
 
@@ -134,6 +147,7 @@ async def verify_agenda_url(
         pdf = _check_pdf_content(content)
         result["sample_words"] = pdf["words"]
         result["agenda_keywords"] = pdf["keyword_hits"]
+        result["most_recent_date"] = pdf.get("most_recent_date")
 
         if pdf["is_agenda"]:
             result["status"] = "verified"
@@ -147,6 +161,10 @@ async def verify_agenda_url(
         else:
             result["status"] = "verified_ocr_needed"
             result["reason"] = f"PDF with minimal text ({pdf['words']} words) — likely scanned"
+
+        # Add recency info to verification result
+        if pdf.get("most_recent_date"):
+            result["reason"] += f" — agenda date: {pdf['most_recent_date']}"
 
         return result
 
