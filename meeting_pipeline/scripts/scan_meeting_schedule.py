@@ -53,6 +53,15 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
+from meeting_pipeline.shared.constants import SUPPORTED_PLATFORMS
+
+# Cost tracking for scan phase
+_COST = {
+    "firecrawl_scrape_basic": 0,
+    "firecrawl_scrape_js": 0,
+    "firecrawl_llm_extract": 0,
+    "gemini_extract": 0,
+}
 
 # ============================================================================
 # SCAN DISPATCHER — delegates to stages/scan/process.py

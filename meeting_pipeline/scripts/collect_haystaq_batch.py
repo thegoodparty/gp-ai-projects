@@ -40,6 +40,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
 from meeting_pipeline.shared.constants import STATE_ABBREVS
 
+_ROOT = Path(__file__).resolve().parent.parent
+
 SERVE_CSV = _ROOT / "serve_users_unified.csv"
 # Fall back to old CSV if unified doesn't exist yet
 if not SERVE_CSV.exists():
