@@ -13,7 +13,6 @@ or the orchestrator calls. Handles the full discovery lifecycle:
 from __future__ import annotations
 
 import contextlib
-import os
 from datetime import UTC
 
 import httpx
@@ -33,7 +32,6 @@ async def process_one_city(
     state: str,
     expected_body: str = "",
     known_sources: dict | None = None,
-    tavily_client=None,
     http_client: httpx.AsyncClient | None = None,
     cfg: AgentConfig | None = None,
     storage=None,
@@ -49,7 +47,6 @@ async def process_one_city(
         state: 2-letter state abbreviation (e.g. "NC")
         expected_body: Expected governing body name from manifest
         known_sources: Pre-existing known source config
-        tavily_client: Shared Tavily client (created if not provided)
         http_client: Shared httpx client (created if not provided)
         cfg: AgentConfig (created from env if not provided)
         storage: StorageBackend (created from cfg if not provided)
@@ -63,13 +60,6 @@ async def process_one_city(
         cfg = AgentConfig.from_env()
     if storage is None:
         storage = get_storage(cfg)
-
-    # Create clients if not provided
-    if tavily_client is None:
-        tavily_key = os.environ.get("TAVILY_API_KEY", "")
-        if tavily_key:
-            from tavily import TavilyClient
-            tavily_client = TavilyClient(api_key=tavily_key)
 
     owns_http = http_client is None
     if owns_http:
@@ -92,7 +82,6 @@ async def process_one_city(
             city=city,
             state=state,
             known_sources=known_sources or {},
-            tavily=tavily_client,
             http=http_client,
             expected_body=expected_body,
         )

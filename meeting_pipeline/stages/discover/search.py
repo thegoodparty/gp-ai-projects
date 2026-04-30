@@ -6,20 +6,15 @@ Candidates are standardized dicts (via make_candidate) that feed into scoring.
 
 Search backends:
   - Serper.dev (real Google results — primary)
-  - DuckDuckGo (no API key, free — first fallback)
-  - Exa (neural search — second fallback)
-  - Tavily (AI search — third fallback)
   - Firecrawl (search + extract — last resort)
   - PDF search (filetype:pdf Google search — platform detection)
 """
 
-import asyncio
 import os
 from datetime import date
 from urllib.parse import urlparse
 
 import httpx
-from tavily import TavilyClient
 
 from meeting_pipeline.shared.constants import (
     PDF_PLATFORM_SIGNALS,
@@ -36,8 +31,6 @@ from meeting_pipeline.shared.url_utils import (
 # Cost tracking — shared module-level dict, updated by callers
 _COST = {
     "serper_searches": 0,
-    "exa_searches": 0,
-    "tavily_searches": 0,
 }
 
 
@@ -168,77 +161,6 @@ def serper_search(query: str, api_key: str) -> list[dict]:
         if "429" in msg or "quota" in msg.lower():
             raise RuntimeError(f"serper_rate_limited: {msg[:120]}") from e
         return []
-
-
-async def discover_from_duckduckgo(
-    city: str, state: str,
-    query: str | None = None, max_results: int = 8,
-) -> tuple[list[dict], str]:
-    """Run a DuckDuckGo web search. Returns (candidates, query_used)."""
-    if query is None:
-        query = f"{city} {state} city council agenda minutes"
-    try:
-        from ddgs import DDGS
-        results = await asyncio.wait_for(
-            asyncio.to_thread(lambda: list(DDGS().text(query, max_results=max_results))),
-            timeout=30.0,
-        )
-    except (ImportError, Exception):
-        return [], query
-
-    raw = [
-        {"url": r.get("href", ""), "title": r.get("title", ""), "content": r.get("body", "")[:500]}
-        for r in results if r.get("href")
-    ]
-    return search_results_to_candidates(raw, city, "ddg", state=state), query
-
-
-async def discover_from_exa(
-    city: str, state: str, query: str | None = None,
-) -> tuple[list[dict], str]:
-    """Run one Exa search. Returns (candidates, query_used)."""
-    api_key = os.environ.get("EXA_API_KEY")
-    if not api_key:
-        return [], ""
-    if query is None:
-        query = f"{city} {state} city council agenda minutes site:gov OR site:granicus.com OR site:legistar.com"
-    try:
-        from exa_py import Exa
-        exa = Exa(api_key=api_key)
-        _COST["exa_searches"] += 1
-        result = await asyncio.wait_for(
-            asyncio.to_thread(exa.search_and_contents, query, num_results=5, use_autoprompt=False, text=True),
-            timeout=30.0,
-        )
-        raw = [
-            {"url": r.url, "title": r.title or "", "content": (r.text or "")[:500]}
-            for r in (result.results or [])
-        ]
-    except (ImportError, Exception):
-        return [], query
-    return search_results_to_candidates(raw, city, "exa", state=state), query
-
-
-async def discover_from_tavily(
-    city: str, state: str, tavily: TavilyClient,
-    search_depth: str = "basic", query: str | None = None,
-) -> tuple[list[dict], str]:
-    """Run one Tavily search. Returns (candidates, query_used)."""
-    if query is None:
-        query = f"{city} {state} city council meeting agendas minutes"
-    try:
-        _COST["tavily_searches"] += 1
-        result = await asyncio.wait_for(
-            asyncio.to_thread(tavily.search, query=query, search_depth=search_depth, max_results=5, include_answer=False),
-            timeout=30.0,
-        )
-    except Exception:
-        return [], query
-    raw = [
-        {"url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", "")[:500]}
-        for r in result.get("results", []) if r.get("url")
-    ]
-    return search_results_to_candidates(raw, city, "tavily", state=state), query
 
 
 async def discover_from_firecrawl(city: str, state: str) -> list[dict]:

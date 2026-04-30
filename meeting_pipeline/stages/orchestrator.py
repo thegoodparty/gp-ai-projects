@@ -116,18 +116,11 @@ def filter_cities(
 
 async def run_discover(cities: list[dict], cfg: AgentConfig):
     """Run discovery for a list of cities (concurrent)."""
-    import os
-
     import httpx
 
     from meeting_pipeline.stages.discover.process import process_one_city
 
     storage = get_storage(cfg)
-    tavily = None
-    tavily_key = os.environ.get("TAVILY_API_KEY", "")
-    if tavily_key:
-        from tavily import TavilyClient
-        tavily = TavilyClient(api_key=tavily_key)
 
     sem = asyncio.Semaphore(CONCURRENCY_DISCOVER)
     ok_count = 0
@@ -144,7 +137,7 @@ async def run_discover(cities: list[dict], cfg: AgentConfig):
             try:
                 result = await process_one_city(
                     city, state, expected_body=expected_body,
-                    tavily_client=tavily, http_client=http,
+                    http_client=http,
                 )
                 platform = result.get("best_source", {}).get("platform", "?")
                 freshness = result.get("best_source", {}).get("freshness", "?")

@@ -10,7 +10,6 @@ class Secrets(BaseModel):
     GEMINI_API_KEY: str
     SERPER_API_KEY: str | None = None
     FIRECRAWL_API_KEY: str | None = None
-    TAVILY_API_KEY: str | None = None
 
 
 _cache: Secrets | None = None
@@ -39,5 +38,3 @@ def inject_secrets() -> None:
         os.environ["SERPER_API_KEY"] = secrets.SERPER_API_KEY
     if secrets.FIRECRAWL_API_KEY:
         os.environ["FIRECRAWL_API_KEY"] = secrets.FIRECRAWL_API_KEY
-    if secrets.TAVILY_API_KEY:
-        os.environ["TAVILY_API_KEY"] = secrets.TAVILY_API_KEY

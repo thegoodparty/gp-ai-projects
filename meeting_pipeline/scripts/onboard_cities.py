@@ -103,13 +103,7 @@ def main():
         from meeting_pipeline.stages.discover.process import process_one_city
 
         async def run_discovery():
-            import os
-
             import httpx
-            from tavily import TavilyClient
-
-            tavily_key = os.environ.get("TAVILY_API_KEY", "")
-            tavily = TavilyClient(api_key=tavily_key) if tavily_key else None
 
             async with httpx.AsyncClient(
                 headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
@@ -133,7 +127,7 @@ def main():
                         result = await process_one_city(
                             city_info["city"], city_info["state"],
                             expected_body=city_info.get("expected_body", ""),
-                            tavily_client=tavily, http_client=http,
+                            http_client=http,
                         )
                         platform = result.get("best_source", {}).get("platform", "?")
                         storage.write_json(source_key, result)
