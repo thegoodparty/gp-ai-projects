@@ -257,12 +257,20 @@ async def _try_fallback_candidates(
 
 
 async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dict:
-    """Download and verify a real agenda PDF from the discovered source."""
+    """Download and verify a real agenda PDF from the discovered source.
+
+    Strategy:
+    1. If source URL is already a PDF, verify it directly
+    2. Try platform API for the most recent agenda PDF (Legistar, CivicClerk, Granicus)
+    3. Use Firecrawl to scrape the page and find PDF links (renders JS, follows links)
+    4. Download the first PDF found and check: real PDF? agenda keywords? recent date?
+    """
+    import asyncio
+    import os
     from datetime import datetime
 
     from meeting_pipeline.shared.verify_source import (
         _find_past_agenda_from_platform,
-        _find_pdf_links_on_page,
         verify_agenda_url,
     )
 
@@ -272,27 +280,34 @@ async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dic
     if best.get("freshness") in ("wrong_entity", "wrong_city", "blocked", "empty"):
         return result
 
-    # Try source URL if it's a PDF
     verify_url = result.get("public_agenda_url") or best.get("url", "")
     agenda_url = None
 
     if verify_url and ".pdf" in verify_url.lower():
         agenda_url = verify_url
     else:
-        # Try platform API for past agendas
+        # Try platform API for past agendas (structured platforms only)
         platform = best.get("platform", "unknown")
         config = best.get("config", {})
         if platform not in ("unknown", "generic_html"):
             agenda_url = await _find_past_agenda_from_platform(
                 platform, config, best.get("url", ""), http_client,
             )
-        # Try scraping the page for PDF links
-        if not agenda_url:
+
+        # Firecrawl: scrape the page to find PDF links (renders JS, finds links httpx misses)
+        if not agenda_url and os.environ.get("FIRECRAWL_API_KEY"):
             source_url = best.get("url", "")
+            city = result.get("city", "")
+            state = result.get("state", "")
             if source_url:
-                pdf_links = await _find_pdf_links_on_page(source_url, http_client)
-                if pdf_links:
-                    agenda_url = pdf_links[0]
+                try:
+                    from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
+                    fc = await asyncio.to_thread(validate_agenda_page, source_url, city, state)
+                    pdf_urls = fc.get("pdf_urls", [])
+                    if pdf_urls:
+                        agenda_url = pdf_urls[0]
+                except Exception:
+                    pass
 
     if agenda_url:
         verification = await verify_agenda_url(agenda_url, client=http_client)
