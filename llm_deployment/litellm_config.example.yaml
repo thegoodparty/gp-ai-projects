@@ -1,0 +1,9 @@
+model_list:
+  - model_name: kimi-k2.5
+    litellm_params:
+      model: openai/nvidia/Kimi-K2.5-NVFP4
+      api_base: https://<pod-id>-8000.proxy.runpod.net/v1
+      api_key: your-vllm-api-key
+
+litellm_settings:
+  drop_params: true

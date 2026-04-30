@@ -1,0 +1,104 @@
+name: Build and Push Broker
+
+on:
+  push:
+    branches:
+      - develop
+      - qa
+      - prod
+    paths:
+      - 'broker/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/build-broker.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev/qa/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: gp-ai-projects
+
+jobs:
+  build-and-push:
+    name: Build and Push Broker Image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Determine environment and tag
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+            TAG="broker-${ENV}"
+          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
+            TAG="broker-prod"
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
+            TAG="broker-qa"
+            ENV="qa"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            TAG="broker-dev"
+            ENV="dev"
+          else
+            echo "ERROR: Workflow triggered from unexpected branch: ${{ github.ref }}"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "Building for environment: ${ENV} with tag: ${TAG}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./broker/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+
+      - name: Force new deployment
+        run: |
+          aws ecs update-service \
+            --cluster broker-${{ steps.env.outputs.environment }} \
+            --service broker-${{ steps.env.outputs.environment }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Image digest
+        run: echo "Image pushed with tag ${{ steps.env.outputs.tag }} and service redeployed"

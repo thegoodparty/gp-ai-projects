@@ -78,7 +78,11 @@ class Logger:
         
         self._initialized = True
         self.log_dir = Path("logs")
-        self.log_dir.mkdir(exist_ok=True)
+        try:
+            self.log_dir.mkdir(exist_ok=True)
+            self._file_logging_enabled = True
+        except OSError:
+            self._file_logging_enabled = False
         
         self.session_id = str(uuid.uuid4())[:8]
 
@@ -169,7 +173,9 @@ class Logger:
     
     def _add_file_handlers(self, logger: logging.Logger, name: str, formatter: logging.Formatter):
         """Add rotating file handlers for different log levels"""
-        
+        if not self._file_logging_enabled:
+            return
+
         general_handler = logging.handlers.RotatingFileHandler(
             filename=self.log_dir / f"{name.replace('.', '_')}.log",
             maxBytes=10 * 1024 * 1024,

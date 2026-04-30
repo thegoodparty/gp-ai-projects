@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PMF Engine — Flowchart</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', sans-serif; background: #0a0e1a; overflow: auto; }
+  h1 {
+    text-align: center; padding: 32px 0 8px;
+    font-size: 28px; font-weight: 700;
+    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { text-align: center; color: #475569; font-size: 13px; margin-bottom: 24px; }
+  svg { display: block; margin: 0 auto; }
+  .legend {
+    display: flex; gap: 20px; justify-content: center; padding: 16px 0 32px;
+  }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: #64748b;
+  }
+  .legend-dot {
+    width: 10px; height: 10px; border-radius: 3px;
+  }
+</style>
+</head>
+<body>
+<h1>PMF Engine Flowchart</h1>
+<p class="subtitle">Request &rarr; Compute &rarr; Result pipeline with data sources</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#60a5fa"></div> Frontend</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div> API / Orchestration</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> Queues</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div> Lambda</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div> Agent Runner</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div> Storage</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#e2e8f0"></div> Data Sources</div>
+</div>
+
+<svg width="1200" height="1020" viewBox="0 0 1200 1020">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#475569"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-pink" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#f472b6"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#a78bfa"/>
+    </marker>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- ═══ ROW 1: User click ═══ -->
+  <rect x="460" y="30" width="280" height="56" rx="28" fill="#0f172a" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="600" y="55" text-anchor="middle" fill="#60a5fa" font-size="12" font-weight="600" font-family="Inter">User clicks "Generate Report"</text>
+  <text x="600" y="70" text-anchor="middle" fill="#475569" font-size="10" font-family="JetBrains Mono">/dashboard/ai-insights</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="86" x2="600" y2="120" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══ ROW 2: gp-webapp ═══ -->
+  <rect x="440" y="120" width="320" height="64" rx="12" fill="#0f172a" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="470" y="148" fill="#60a5fa" font-size="13" font-weight="600" font-family="Inter">gp-webapp</text>
+  <text x="470" y="166" fill="#475569" font-size="10" font-family="Inter">POST /agent-experiments/request</text>
+  <text x="720" y="148" fill="#334155" font-size="9" font-family="JetBrains Mono">Next.js</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="184" x2="600" y2="218" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══ ROW 3: gp-api ═══ -->
+  <rect x="380" y="218" width="440" height="80" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="410" y="244" fill="#a78bfa" font-size="13" font-weight="600" font-family="Inter">gp-api</text>
+  <text x="780" y="244" fill="#334155" font-size="9" font-family="JetBrains Mono">NestJS + Prisma</text>
+  <text x="410" y="262" fill="#94a3b8" font-size="10" font-family="Inter">Validate isAiBetaVip &rarr; auto-populate params from campaign</text>
+  <text x="410" y="278" fill="#94a3b8" font-size="10" font-family="Inter">Create ExperimentRun (PENDING) &rarr; send SQS message</text>
+
+  <!-- Arrow down to dispatch queue -->
+  <line x1="600" y1="298" x2="600" y2="340" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#arrow-yellow)"/>
+
+  <!-- ═══ ROW 4: Dispatch Queue ═══ -->
+  <rect x="430" y="340" width="340" height="40" rx="8" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="600" y="365" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="500" font-family="JetBrains Mono">agent-dispatch-{env}.fifo</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="380" x2="600" y2="414" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══ ROW 5: Dispatch Lambda ═══ -->
+  <rect x="430" y="414" width="340" height="60" rx="12" fill="#0f172a" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="460" y="440" fill="#fb923c" font-size="13" font-weight="600" font-family="Inter">Dispatch Lambda</text>
+  <text x="460" y="458" fill="#475569" font-size="10" font-family="Inter">Registry lookup &rarr; ECS RunTask with overrides</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="474" x2="600" y2="518" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══ ROW 6: Agent Runner (main box) ═══ -->
+  <rect x="310" y="518" width="580" height="100" rx="14" fill="#0f172a" stroke="#34d399" stroke-width="2"/>
+  <text x="340" y="546" fill="#34d399" font-size="14" font-weight="700" font-family="Inter">Agent Runner (Fargate)</text>
+  <text x="830" y="546" fill="#1e3a2f" font-size="9" font-family="JetBrains Mono">Claude Opus via Agent SDK</text>
+  <text x="340" y="568" fill="#94a3b8" font-size="10" font-family="Inter">Loads instruction markdown + contract schema + params</text>
+  <text x="340" y="584" fill="#94a3b8" font-size="10" font-family="Inter">Claude runs 50-100 turns with tools: Bash, Write, Edit, Glob, Grep</text>
+  <text x="340" y="600" fill="#94a3b8" font-size="10" font-family="Inter">Writes artifact &rarr; contract validates JSON &rarr; uploads to S3</text>
+
+  <!-- ═══ LEFT SIDE: Data Sources ═══ -->
+  <rect x="30" y="520" width="210" height="68" rx="10" fill="#0f172a" stroke="#64748b" stroke-width="1"/>
+  <text x="135" y="548" text-anchor="middle" fill="#e2e8f0" font-size="12" font-weight="600" font-family="Inter">Data Sources</text>
+  <text x="135" y="568" text-anchor="middle" fill="#475569" font-size="9" font-family="JetBrains Mono">defined by experiment instruction</text>
+  <line x1="240" y1="554" x2="310" y2="568" stroke="#475569" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- ═══ RIGHT SIDE: Tools ═══ -->
+  <rect x="960" y="520" width="210" height="68" rx="10" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="1065" y="548" text-anchor="middle" fill="#34d399" font-size="12" font-weight="600" font-family="Inter">Tools</text>
+  <text x="1065" y="568" text-anchor="middle" fill="#475569" font-size="9" font-family="JetBrains Mono">default + additional per experiment</text>
+  <line x1="960" y1="554" x2="890" y2="568" stroke="#34d399" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+  <!-- ═══ Arrow down from runner to S3 ═══ -->
+  <line x1="600" y1="618" x2="600" y2="664" stroke="#f472b6" stroke-width="1.5" marker-end="url(#arrow-pink)"/>
+
+  <!-- ═══ ROW 7: S3 ═══ -->
+  <rect x="430" y="664" width="340" height="48" rx="12" fill="#0f172a" stroke="#f472b6" stroke-width="1.5"/>
+  <text x="460" y="688" fill="#f472b6" font-size="12" font-weight="600" font-family="Inter">S3</text>
+  <text x="497" y="688" fill="#475569" font-size="10" font-family="JetBrains Mono">gp-agent-artifacts-{env}/{experiment}/{run}/</text>
+
+  <!-- Arrow down to callback queue -->
+  <line x1="600" y1="712" x2="600" y2="746" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#arrow-yellow)"/>
+
+  <!-- ═══ ROW 8: Callback Queue ═══ -->
+  <rect x="430" y="746" width="340" height="40" rx="8" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="600" y="771" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="500" font-family="JetBrains Mono">agent-callback-{env}.fifo</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="786" x2="600" y2="810" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ═══ ROW 9: Callback Lambda ═══ -->
+  <rect x="430" y="810" width="340" height="48" rx="12" fill="#0f172a" stroke="#fb923c" stroke-width="1.5"/>
+  <text x="460" y="835" fill="#fb923c" font-size="12" font-weight="600" font-family="Inter">Callback Lambda</text>
+  <text x="615" y="835" fill="#475569" font-size="10" font-family="Inter">validate S3 artifact &rarr; forward</text>
+
+  <!-- Arrow down to results queue -->
+  <line x1="600" y1="858" x2="600" y2="886" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#arrow-yellow)"/>
+
+  <!-- ═══ ROW 10: Results Queue ═══ -->
+  <rect x="430" y="886" width="340" height="40" rx="8" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="600" y="911" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="500" font-family="JetBrains Mono">agent-results-{env}.fifo</text>
+
+  <!-- Arrow down -->
+  <line x1="600" y1="926" x2="600" y2="952" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-purple)"/>
+
+  <!-- ═══ ROW 11: gp-api consumer ═══ -->
+  <rect x="430" y="952" width="340" height="48" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="460" y="976" fill="#a78bfa" font-size="12" font-weight="600" font-family="Inter">gp-api Queue Consumer</text>
+  <text x="660" y="976" fill="#475569" font-size="10" font-family="Inter">update run &rarr; SUCCESS</text>
+
+  <!-- ═══ POLLING RETURN (left side arc) ═══ -->
+  <path d="M430,976 Q200,976 200,760 Q200,152 440,152" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="8,4" marker-end="url(#arrow)"/>
+  <text x="170" y="560" fill="#60a5fa" font-size="10" font-weight="500" font-family="Inter" transform="rotate(-90,170,560)">frontend polls every 5s</text>
+
+  <!-- ═══ S3 fetch return (right side arc): webapp → gp-api → S3 → gp-api → webapp ═══ -->
+  <path d="M770,688 Q1000,688 1000,400 Q1000,250 820,250" fill="none" stroke="#f472b6" stroke-width="1" stroke-dasharray="6,4" marker-end="url(#arrow-pink)"/>
+  <text x="1020" y="480" fill="#f472b6" font-size="10" font-weight="500" font-family="Inter" transform="rotate(-90,1020,480)">gp-api fetches from S3</text>
+  <path d="M820,270 Q960,270 960,210 Q960,152 760,152" fill="none" stroke="#a78bfa" stroke-width="1" stroke-dasharray="6,4" marker-end="url(#arrow-purple)"/>
+  <text x="980" y="200" fill="#a78bfa" font-size="10" font-weight="500" font-family="Inter" transform="rotate(-90,980,200)">returns artifact JSON</text>
+
+</svg>
+
+</body>
+</html>

@@ -1,0 +1,348 @@
+{
+  "collection_metadata": {
+    "collected_at": "2026-03-27T12:00:00Z",
+    "target_eo": {
+      "name": "Stephon Ferguson",
+      "title": "Dr.",
+      "city": "Fayetteville",
+      "state": "NC",
+      "office": "City Council District 1",
+      "district": 1,
+      "email": "StephonFerguson@Fayettevillenc.gov",
+      "term_start": "2025-12-01",
+      "term_end": "2027"
+    },
+    "data_sources": [
+      "cityoffayetteville.legistar.com",
+      "linc.osbm.nc.gov",
+      "ballotpedia.org",
+      "cityviewnc.com",
+      "voteferguson.com",
+      "branch.vote",
+      "census.gov",
+      "neilsberg.com"
+    ]
+  },
+  "meeting": {
+    "next_upcoming": {
+      "event_date": "2026-04-13",
+      "event_time": "6:30 PM",
+      "event_body_name": "City Council Regular Meeting",
+      "event_location": "Council Chamber, City Hall",
+      "event_id": null,
+      "note": "Projected based on 2nd-and-4th-Monday schedule. Agenda not yet published as of collection date."
+    },
+    "most_recent_with_agenda": {
+      "event_date": "2026-03-23",
+      "event_time": "6:30 PM",
+      "event_body_name": "City Council Regular Meeting",
+      "event_location": "Council Chamber, City Hall",
+      "event_id": 1349234,
+      "legistar_guid": "6F548143-0D37-471F-B6BA-6ECDF5ED4B89",
+      "source_url": "https://cityoffayetteville.legistar.com/MeetingDetail.aspx?ID=1349234&GUID=6F548143-0D37-471F-B6BA-6ECDF5ED4B89"
+    },
+    "schedule_pattern": "2nd and 4th Monday of each month, 6:30 PM. Work sessions on 1st Monday at 3:00 PM."
+  },
+  "agenda": {
+    "meeting_date": "2026-03-23",
+    "items": [
+      {
+        "agenda_number": "7.0A1",
+        "file_number": "26-0174",
+        "title": "Approve Meeting Minutes: March 2, 2026 Work Session and March 9, 2026 Regular Meeting",
+        "type": "consent",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "7.0A2",
+        "file_number": "26-0185",
+        "title": "Uninhabitable structures demolition recommendations at 820 Ridge Road",
+        "type": "consent",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "7.0A3",
+        "file_number": "26-0186",
+        "title": "Rescind demolition ordinance for 4714 Ashton Road",
+        "type": "consent",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "7.0A4",
+        "file_number": "26-0155",
+        "title": "Declaration of 1.53 acres on Westcliff Road as surplus property",
+        "type": "resolution",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "7.0A5",
+        "file_number": "25-4671",
+        "title": "Accept property donation on Rogers Drive",
+        "type": "resolution",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "7.0A6",
+        "file_number": "26-0018",
+        "title": "Ten-year contract with GFL for operation of Transfer Station",
+        "type": "consent",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "7.0A7",
+        "file_number": "26-0191",
+        "title": "McArthur Road Sports Field Complex construction contract ($13.6M)",
+        "type": "consent",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "7.0A8",
+        "file_number": "26-0159",
+        "title": "Budget amendment for 2025 municipal election cost increase",
+        "type": "ordinance",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "7.0A9",
+        "file_number": "26-0172",
+        "title": "Commercial airline use agreements and contracts",
+        "type": "consent",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "8.01",
+        "file_number": "26-0147",
+        "title": "P26-05 Rezoning at 5210 Arbor Rd from SF-10 to MR-5 (single-family to multi-family residential)",
+        "type": "public_hearing",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "8.02",
+        "file_number": "26-0192",
+        "title": "PWC Phase 5 Annexation Area 29 assessment resolution",
+        "type": "public_hearing",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "8.03",
+        "file_number": "26-0193",
+        "title": "PWC Phase 5 Annexation Area 30 assessment resolution",
+        "type": "public_hearing",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "8.04",
+        "file_number": "26-0194",
+        "title": "PWC Phase 5 Annexation Area 31 assessment resolution",
+        "type": "public_hearing",
+        "requires_vote": true
+      },
+      {
+        "agenda_number": "9.01",
+        "file_number": "26-0197",
+        "title": "Fayetteville-Cumberland Economic Development Corporation annual report",
+        "type": "presentation",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "9.02",
+        "file_number": "26-0167",
+        "title": "Public Arts Commission 2025 annual report",
+        "type": "presentation",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "9.03",
+        "file_number": "26-0176",
+        "title": "Historic Resources Commission 2025 annual report",
+        "type": "presentation",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "10.01",
+        "file_number": "26-0173",
+        "title": "Office of Community Safety quarterly update",
+        "type": "discussion",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "11.01",
+        "file_number": "26-0190",
+        "title": "Strategic planning retreat debrief presentation",
+        "type": "discussion",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "12.01",
+        "file_number": "26-0166",
+        "title": "Senior Technology Literacy Initiative",
+        "type": "informational",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "12.02",
+        "file_number": "26-0188",
+        "title": "Firearm safety and responsible gun storage PSA campaign",
+        "type": "informational",
+        "requires_vote": false
+      },
+      {
+        "agenda_number": "12.03",
+        "file_number": "26-0189",
+        "title": "Water and sewer assessment assistance program expansion",
+        "type": "informational",
+        "requires_vote": false
+      }
+    ]
+  },
+  "fiscal_data": {
+    "property_tax": {
+      "rates": [
+        { "year": 2024, "rate_per_100": 0.5795 },
+        { "year": 2023, "rate_per_100": 0.5395 },
+        { "year": 2022, "rate_per_100": 0.4995 }
+      ],
+      "trend": "Increasing: +$0.04 per year over 3 years (+7.4% annually). Rate rose from $0.4995 (2022) to $0.5795 (2024) per $100 valuation.",
+      "source": "NC LINC / NC Office of State Budget and Management"
+    },
+    "government_finances_2024": {
+      "total_revenues_thousands": 274314,
+      "total_expenditures_thousands": 267012,
+      "property_tax_revenues_thousands": 80770,
+      "municipal_property_tax_levy": 87938912,
+      "local_option_sales_tax_revenues": 64130538,
+      "public_safety_expenditures": 100274297,
+      "transportation_expenditures": 49017149,
+      "general_government_expenditures": 71410426,
+      "culture_recreation_expenditures": 15072686,
+      "environmental_protection_expenditures": 19543294,
+      "economic_physical_development_expenditures": 9988916,
+      "capital_outlay": 55408048,
+      "salaries_and_wages": 92581135,
+      "total_property_valuation_thousands": 15194618,
+      "real_property_valuation_thousands": 12420067,
+      "personal_property_valuation_thousands": 2590586,
+      "source": "NC LINC / NC Office of State Budget and Management"
+    },
+    "government_finances_2023": {
+      "total_revenues_thousands": 306201,
+      "public_safety_expenditures": 98632717,
+      "local_option_sales_tax_revenues": 63591544,
+      "debt_service_expenditures": 15338744,
+      "source": "NC LINC / NC Office of State Budget and Management"
+    },
+    "key_fiscal_facts": [
+      "FY2024 total revenues: ~$274.3M; total expenditures: ~$267.0M (surplus of ~$7.3M)",
+      "Public safety is largest expenditure at $100.3M (37.6% of total spending)",
+      "Property tax levy of $87.9M, with total property valuation of $15.2B",
+      "Sales tax revenue of $64.1M is second-largest revenue source",
+      "Capital outlay of $55.4M indicates ongoing infrastructure investment",
+      "Economic/physical development spending at $10.0M",
+      "Property tax rate has increased 16% over three years (2022-2024)"
+    ]
+  },
+  "population": {
+    "estimate_2024": 209496,
+    "estimate_2025_projected": 209120,
+    "trend": "Slight decline. Population peaked at 212,093 in 2019; declined modestly since. Annual change rate approximately -0.2%.",
+    "rank_in_state": "6th most populated city in North Carolina",
+    "source": "US Census Bureau Population Estimates Program via census.gov and neilsberg.com"
+  },
+  "campaign_platform": {
+    "slogan": "Growth, Safety, and Opportunity",
+    "priorities": [
+      {
+        "priority": "Economic Development",
+        "details": "Strengthen workforce training, support small businesses and entrepreneurship, revitalize neighborhoods, expand affordable housing, enhance transportation and infrastructure connectivity, prioritize local contractors, partner with Greater Fayetteville Chamber and Economic Development Department"
+      },
+      {
+        "priority": "Public Safety",
+        "details": "Support Police Chief Roberto Bryan's community engagement approach, promote Office of Community Safety initiatives addressing root causes, establish neighborhood watch programs, create organizational hub consolidating youth, safety, and anti-crime initiatives. Supported Youth Curfew Ordinance only after criminal penalty language was removed."
+      },
+      {
+        "priority": "Quality of Life",
+        "details": "Enhance parks, recreational facilities, green spaces, and district beautification through resident engagement via town halls. Promote workforce training to equip residents with skills for future employment."
+      },
+      {
+        "priority": "Accountability and Transparency",
+        "details": "Promised town hall within first 90 days. Invited constituents to 'call me out' if he fails to deliver. Stated: 'Accountable leadership looks like doing the thing that you promised to do.' Emphasizes 'less talking and more listening.'"
+      },
+      {
+        "priority": "Infrastructure and Capital Projects Oversight",
+        "details": "Rigorous contractor evaluation based on experience, financial stability, and past performance. Require financial disclosures and client references. Prioritize local contractors with community investment. Prevent contractor abandonment like the $6M project failure."
+      }
+    ],
+    "municipal_model": "Cites Raleigh's 'triple bottom line' approach: environmental stewardship, social equity, and economic strength.",
+    "positive_city_record": "Praised council for attracting a titanium plant, establishing a medical school, and passing the lowest property tax rate in 30 years.",
+    "homelessness_position": "Advocates shared city-county responsibility through Fayetteville-Cumberland County Continuum of Care partnerships and engaging Cumberland County's 500+ churches.",
+    "sources": [
+      "https://www.cityviewnc.com/stories/fayetteville-city-council-district-1-stephon-ferguson/",
+      "https://ballotpedia.org/Stephon_Ferguson_(Fayetteville_City_Council_District_1,_North_Carolina,_candidate_2025)",
+      "https://voteferguson.com/meet-stephon",
+      "https://www.branch.vote/races/2025-nc-october-primary-nc-state-city-council-member-nc-fayetteville-city-council-1-n/candidates/stephon-ferguson"
+    ]
+  },
+  "biography": {
+    "full_name": "Dr. Stephon Ferguson",
+    "age": 57,
+    "profession": "Self-employed; Speaker; Author; Veteran; Communications professional",
+    "formerly_known_as": "Steve Blackmon",
+    "military_service": "U.S. Army Sergeant, Airborne Expert Field Medic, stationed at Fort Bragg (honorable discharge)",
+    "media_career": "Nearly a decade as news reporter at WFNC radio; began at WLRD 107.7 FM",
+    "education": [
+      "Bachelor's degrees in Communications, Theater, and Film from Fayetteville State University and Georgia State University",
+      "Master of Divinity from Morehouse School of Religion at ITC",
+      "Doctor of Ministry in Theology and Philosophy from Morehouse School of Religion at ITC"
+    ],
+    "civic_training": [
+      "Leadership Fayetteville",
+      "Institute for Community Leadership",
+      "Cumberland County Citizens' Academy",
+      "Fayetteville PD Citizens Police Academy"
+    ],
+    "awards": [
+      "Three Presidential Volunteer Service Awards (Gold)",
+      "Order of the Long Leaf Pine from Governor Roy Cooper (August 2023) - highest recognition for service in NC"
+    ],
+    "religion": "Non-Denominational",
+    "known_as": "The Voice of MLK (professional reenactor of Martin Luther King Jr. speeches)",
+    "lifelong_fayetteville_resident": true,
+    "district_description": "Fayetteville's northside and the Ramsey Street corridor"
+  },
+  "committee_assignments": {
+    "confirmed": [
+      "Charter member, Fayetteville Ethics Commission (prior to council service)",
+      "Planning Commission member (prior to council service)"
+    ],
+    "current_council_committees": "Not publicly listed on city website or Legistar as of collection date. The city website (fayettevillenc.gov) returned 403 errors on council member detail pages.",
+    "note": "Ferguson's current council committee assignments could not be confirmed through available online sources. His pre-council board service included the Ethics Commission and Planning Commission."
+  },
+  "council_dynamics": {
+    "mayor": "Mitch Colvin (5th term)",
+    "mayor_pro_tem": "Derrick Thompson (District 6), appointed 7-3 on 2025-12-01",
+    "new_members_2025": ["Stephon Ferguson (District 1)", "Shaun McMillan", "Antonio Jones"],
+    "observed_divisions": "7-3 split on Mayor Pro Tem vote. Minority bloc (Greene, new members, initially Hondros) focused on transparency and accountability. Lynne Greene predicted 'a lot of six-four votes' over the term.",
+    "sources": ["https://www.cityviewnc.com/stories/mayor-pro-tem-vote-exposes-divisions-in-new-fayetteville-council/"]
+  },
+  "election_results": {
+    "primary_date": "2025-10-07",
+    "general_date": "2025-11-04",
+    "sworn_in": "2025-12-01",
+    "primary_results": {
+      "stephon_ferguson": { "votes": 462, "percent": 33.53 },
+      "james_l_thomas_iii": { "votes": 400, "percent": 29.03 }
+    },
+    "general_opponent": "James L. Thomas III",
+    "other_primary_candidates": ["Jamie Davis", "Theodore Melkoumov"],
+    "party": "Nonpartisan",
+    "status": "Won general election, seated December 2025"
+  },
+  "data_quality": {
+    "meeting_agenda": "high - Full agenda with 21 items retrieved from Legistar for March 23, 2026 meeting. April meeting date projected from schedule pattern but agenda not yet published.",
+    "fiscal_data": "high - Property tax rates (3 years) and detailed FY2024 government finances from NC LINC/OSBM. 30+ financial variables retrieved.",
+    "campaign_platform": "high - Detailed platform from 4 independent sources (CityView NC interview, Ballotpedia, campaign website, Branch.vote). 5 priorities with specific policy positions.",
+    "committee_assignments": "low - Current council committee assignments not publicly available online. Only pre-council board service confirmed (Ethics Commission, Planning Commission). City website blocked automated access.",
+    "population": "medium - 2024 Census estimate available (209,496). Population trend data available but NC LINC population endpoint returned 404.",
+    "council_dynamics": "medium - Mayor Pro Tem vote and general bloc dynamics documented via CityView NC reporting. Specific voting patterns on issues not yet available for new council."
+  }
+}
