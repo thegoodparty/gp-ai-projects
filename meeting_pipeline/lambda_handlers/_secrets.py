@@ -24,7 +24,7 @@ def _load_secrets() -> Secrets:
     import boto3
 
     environment = os.environ.get("ENVIRONMENT", "dev").upper()
-    secret_id = f"AI_SECRETS_{environment}"
+    secret_id = os.environ.get("AI_SECRET_ID", f"AI_SECRETS_{environment}")
 
     client = boto3.client("secretsmanager")
     response = client.get_secret_value(SecretId=secret_id)

@@ -741,6 +741,7 @@ async def verify_single_city(
         domain=city_info["domain"],
     )
 
+    # verify=False: this tool probes many unknown portals, some with self-signed certs
     async with http_semaphore, httpx.AsyncClient(follow_redirects=True, verify=False) as client:
 
             # ── Try Legistar first ──

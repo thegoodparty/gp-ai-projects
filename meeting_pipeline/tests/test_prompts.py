@@ -3,7 +3,8 @@
 from meeting_pipeline.prompts.briefing import (
     EDITORIAL_RULES,
     build_pass1_prompt,
-    build_pass2_prompt,
+    build_pass2a_prompt,
+    build_pass2b_prompt,
     build_pass3_prompt,
 )
 from meeting_pipeline.prompts.extraction import build_extraction_prompt
@@ -49,10 +50,18 @@ def test_pass1_prompt_includes_constituent_context():
     assert "Public Safety" in prompt
 
 
-def test_pass2_prompt_contains_editorial_rules():
-    prompt = build_pass2_prompt(
+def test_pass2a_prompt_contains_extraction_instructions():
+    prompt = build_pass2a_prompt(
+        "Durham", "City Council", "2026-04-07", "items text"
+    )
+    assert "Durham" in prompt
+    assert "EXTRACTION RULES" in prompt
+
+
+def test_pass2b_prompt_contains_editorial_rules():
+    prompt = build_pass2b_prompt(
         "Durham", "City Council", "2026-04-07", "Monday",
-        "items text", "Summary sentence.", 10
+        "passages text", "Summary sentence.", 10
     )
     assert "EDITORIAL RULES" in prompt
 
