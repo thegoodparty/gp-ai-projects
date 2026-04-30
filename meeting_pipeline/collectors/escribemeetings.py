@@ -34,7 +34,6 @@ import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
 
-
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -114,7 +113,7 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         result.bodies_count = len(bodies)
 
         # ── Step 2: Fetch meetings for each type ────────────────────
-        print(f"\nFetching meetings...")
+        print("\nFetching meetings...")
         all_meetings: list[dict] = []
         for mt in meeting_types:
             meetings = await _fetch_past_meetings(client, config, mt)
@@ -168,7 +167,7 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
             await asyncio.sleep(config.rate_limit_delay)
 
             event_items_list = []
-            for item_idx, item in enumerate(agenda_items):
+            for _item_idx, item in enumerate(agenda_items):
                 matter_id = matter_id_counter
                 matter_id_counter += 1
 

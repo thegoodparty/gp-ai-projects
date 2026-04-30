@@ -21,11 +21,9 @@ import asyncio
 import csv
 import re
 import time
-from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 
 # Default concurrency limits per stage
 CONCURRENCY_DISCOVER = 3   # Serper + Firecrawl rate limits
@@ -109,7 +107,7 @@ def filter_cities(
     """Filter city list by slug(s)."""
     if not city_slugs:
         return cities
-    slug_set = set(s.lower() for s in city_slugs)
+    slug_set = {s.lower() for s in city_slugs}
     return [c for c in cities if c["slug"].lower() in slug_set]
 
 
@@ -117,9 +115,11 @@ def filter_cities(
 
 async def run_discover(cities: list[dict], cfg: AgentConfig):
     """Run discovery for a list of cities (concurrent)."""
-    from meeting_pipeline.stages.discover.process import process_one_city
-    import httpx
     import os
+
+    import httpx
+
+    from meeting_pipeline.stages.discover.process import process_one_city
 
     storage = get_storage(cfg)
     tavily = None
@@ -166,8 +166,9 @@ async def run_discover(cities: list[dict], cfg: AgentConfig):
 
 async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
     """Run scan for cities with source.json (concurrent)."""
-    from meeting_pipeline.stages.scan.process import process_one_city
     import httpx
+
+    from meeting_pipeline.stages.scan.process import process_one_city
 
     storage = get_storage(cfg)
     sem = asyncio.Semaphore(CONCURRENCY_SCAN)
@@ -296,7 +297,7 @@ async def run_collect(cities: list[dict], cfg: AgentConfig, posted_only: bool = 
                 if isinstance(result, dict):
                     ok = result.get("ok", False)
                     pdfs = result.get("pdfs_downloaded", 0)
-                    status = f"OK ({pdfs} PDFs)" if ok else f"FAILED"
+                    status = f"OK ({pdfs} PDFs)" if ok else "FAILED"
                 else:
                     ok = not result.error
                     status = f"OK ({result.events_found} events, {result.pdfs_downloaded} PDFs)" if ok else f"FAILED: {result.error}"
@@ -323,7 +324,10 @@ async def run_extract(
 ):
     """Extract agenda items from PDFs (concurrent LLM extraction)."""
     from meeting_pipeline.stages.extract.normalize import (
-        extract_pdf_text, find_best_pdf, extract_with_gemini, normalize_meeting,
+        extract_pdf_text,
+        extract_with_gemini,
+        find_best_pdf,
+        normalize_meeting,
     )
 
     storage = get_storage(cfg)
@@ -441,7 +445,6 @@ async def run_extract(
                         return
 
                 # LLM extraction with retry
-                import time as _time
                 extraction = None
                 for attempt in range(3):
                     try:
@@ -534,7 +537,7 @@ async def run_briefing(
     )
 
     if cities:
-        slug_set = set(c["slug"] for c in cities) & verified_slugs
+        slug_set = {c["slug"] for c in cities} & verified_slugs
         norm_keys = [
             k for k in norm_keys
             if any(k.split("/")[-1].startswith(slug) for slug in slug_set)
@@ -641,7 +644,7 @@ async def run_pipeline(
         # Reload cities after discovery (new source.json files may exist)
         if csv_path:
             enriched = load_cities_from_sources(cfg, storage)
-            slug_set = set(c["slug"] for c in cities)
+            slug_set = {c["slug"] for c in cities}
             cities = [c for c in enriched if c["slug"] in slug_set] or cities
 
     if "scan" in phases:
@@ -678,7 +681,7 @@ async def run_pipeline(
 
 def _print_summary(cities: list[dict], cfg: AgentConfig, storage):
     """Print pipeline run summary."""
-    slug_set = set(c["slug"] for c in cities)
+    slug_set = {c["slug"] for c in cities}
 
     source_count = 0
     scan_count = 0

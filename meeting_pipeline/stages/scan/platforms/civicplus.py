@@ -5,13 +5,11 @@ Returns list of meeting dicts with date, title, agenda_posted, agenda_url.
 No PDFs downloaded — that is the collection stage.
 """
 
-import re
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import httpx
 
-from meeting_pipeline.shared.constants import LOOKBACK_DAYS, LOOKAHEAD_DAYS
+from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
 
 
 async def scan_civicplus(city: str, config: dict, source_url: str, client: httpx.AsyncClient) -> list[dict]:
@@ -21,7 +19,8 @@ async def scan_civicplus(city: str, config: dict, source_url: str, client: httpx
     Presence of agenda_pdf_url on a CivicPlusMeeting → agenda_posted=True.
     """
     from urllib.parse import urlparse
-    from meeting_pipeline.collectors.civicplus_scraper import find_council_category, fetch_meeting_list
+
+    from meeting_pipeline.collectors.civicplus_scraper import fetch_meeting_list, find_council_category
 
     # Extract domain the same way router.py does
     domain = config.get("domain", "") or urlparse(source_url).netloc.replace("www.", "")

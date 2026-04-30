@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:concordnc.api.civicclerk.com)",
+      "WebFetch(domain:fairfieldoh.api.civicclerk.com)",
+      "WebFetch(domain:midlandtx.api.civicclerk.com)",
+      "WebFetch(domain:duncanvilletx.api.civicclerk.com)",
+      "WebFetch(domain:killeen.legistar.com)",
+      "WebFetch(domain:webapi.legistar.com)",
+      "WebFetch(domain:www.rockymountnc.gov)",
+      "WebFetch(domain:durhamnc.legistar.com)",
+      "WebFetch(domain:meetings.boardbook.org)",
+      "WebFetch(domain:durhamnc.gov)",
+      "WebFetch(domain:concordnc.gov)",
+      "WebFetch(domain:www.duncanvilletx.gov)",
+      "WebFetch(domain:www.cityoflex.com)",
+      "WebFetch(domain:meetings.municode.com)",
+      "WebFetch(domain:tomball-tx.municodemeetings.com)",
+      "WebFetch(domain:newbernnc.gov)",
+      "Bash(done)",
+      "WebFetch(domain:api.municode.com)",
+      "WebSearch",
+      "WebFetch(domain:api.census.gov)",
+      "WebFetch(domain:portal.civicclerk.com)",
+      "WebFetch(domain:civic.band)"
+    ]
+  }
+}

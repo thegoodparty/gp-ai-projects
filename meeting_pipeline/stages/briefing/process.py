@@ -5,7 +5,6 @@ Takes a normalized meeting dict and generates a full briefing
 with provenance tracking.
 """
 
-from typing import Optional
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting
@@ -13,7 +12,7 @@ from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meet
 
 def process_one_meeting(
     normalized_meeting: dict,
-    cfg: Optional[AgentConfig] = None,
+    cfg: AgentConfig | None = None,
     storage=None,
 ) -> dict | None:
     """

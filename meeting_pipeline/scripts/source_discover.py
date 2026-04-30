@@ -20,9 +20,10 @@ from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 from meeting_pipeline.shared.constants import STATE_ABBREVS
 from meeting_pipeline.stages.discover.process import process_one_city
 

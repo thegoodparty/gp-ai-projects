@@ -21,11 +21,10 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
-
 
 # ── Thresholds (avoid magic numbers in logic) ───────────────────────────────
 MIN_AGENDA_KEYWORDS = 3
@@ -87,7 +86,7 @@ async def verify_agenda_url(
 
     result = {
         "sample_url": url[:200],
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at": datetime.now(UTC).isoformat(),
     }
 
     try:
@@ -354,7 +353,7 @@ async def find_and_verify_source(
             return {
                 "status": "unverified",
                 "reason": "No agenda URL found to verify (no posted agendas, no PDFs on source page)",
-                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "checked_at": datetime.now(UTC).isoformat(),
             }
 
         return await verify_agenda_url(agenda_url, client=client)

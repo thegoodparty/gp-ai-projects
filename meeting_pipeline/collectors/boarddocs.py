@@ -33,15 +33,13 @@ Usage:
 """
 
 import asyncio
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 
 import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # ============================================================================
 # CONFIGURATION
@@ -261,7 +259,7 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
         result.bodies_count = len(bodies)
 
         # ── Step 2: Fetch meetings for each committee ────────────────
-        print(f"\nFetching meetings...")
+        print("\nFetching meetings...")
         all_meetings: list[dict] = []
         for comm in committees:
             meetings = await _fetch_meetings(client, config, headers, comm["id"])
@@ -320,7 +318,7 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
             await asyncio.sleep(config.rate_limit_delay)
 
             event_items_list = []
-            for item_idx, item in enumerate(agenda_items):
+            for _item_idx, item in enumerate(agenda_items):
                 matter_id = matter_id_counter
                 matter_id_counter += 1
 

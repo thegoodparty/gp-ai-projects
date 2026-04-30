@@ -16,11 +16,11 @@ Usage:
 
 import argparse
 import csv
-import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
@@ -167,7 +167,7 @@ def build_manifest(record: dict) -> dict:
         "expected_city": record["city"],
         "expected_state": record["state"],
         "expected_body": record["expected_body"],
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
 
 

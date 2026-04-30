@@ -14,14 +14,14 @@ Usage:
 
 import argparse
 import csv
-import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.stages.discover.scoring import candidate_score, rank_candidates, PLATFORM_TIER as _PLATFORM_TIER
+from meeting_pipeline.stages.discover.scoring import PLATFORM_TIER as _PLATFORM_TIER
+from meeting_pipeline.stages.discover.scoring import rank_candidates
 
 SUPPORTED_PLATFORMS = {"legistar", "civicplus", "civicclerk", "boarddocs", "escribe"}
 TERRY_CSV = _ROOT / "Terry Users2.csv"
@@ -150,7 +150,7 @@ def main():
             state = source.get("state", "")
             source["all_candidates"] = rank_candidates(source.get("all_candidates", []), city, state)
             storage.write_json(key, source)
-            print(f"    ✓ Updated S3")
+            print("    ✓ Updated S3")
 
     print(f"\n{'DRY RUN — ' if args.dry_run else ''}Summary:")
     print(f"  Changed:   {len(changed)}")
@@ -158,7 +158,7 @@ def main():
     print(f"  Missing:   {len(missing)}")
 
     if changed:
-        print(f"\nCities needing re-scan:")
+        print("\nCities needing re-scan:")
         for s in changed:
             print(f"  {s}")
 

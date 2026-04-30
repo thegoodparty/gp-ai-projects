@@ -68,7 +68,7 @@ def run_discovery(city: str, state: str) -> dict:
                     continue
 
     if not source_file.exists():
-        print(f"  ✗ No source.json written — city may not be discoverable")
+        print("  ✗ No source.json written — city may not be discoverable")
         return {}
 
     source = json.loads(source_file.read_text())
@@ -93,7 +93,7 @@ def run_discovery(city: str, state: str) -> dict:
         return {"fail": f"freshness={freshness}", "platform": platform, "city_slug": city_slug, "source": source}
 
     if freshness == "unknown_spa":
-        print(f"\n  ✗ FAIL — Platform is a JS SPA — our collector cannot reach the API.")
+        print("\n  ✗ FAIL — Platform is a JS SPA — our collector cannot reach the API.")
         return {"fail": "JS SPA — API not accessible without Playwright", "platform": platform, "city_slug": city_slug, "source": source}
 
     print(f"\n  ✓ PASS — {platform} / {freshness}")
@@ -129,7 +129,7 @@ async def run_collection(platform: str, city_slug: str, city: str, state: str) -
     print(f"  PDFs downloaded: {result.pdfs_downloaded}")
 
     if result.events_found == 0:
-        print(f"\n  ✗ FAIL — Collector returned 0 events.")
+        print("\n  ✗ FAIL — Collector returned 0 events.")
         return {"fail": "no events returned"}
 
     print(f"\n  ✓ PASS — {result.events_found} events collected")
@@ -140,7 +140,7 @@ async def run_collection(platform: str, city_slug: str, city: str, state: str) -
 
 def check_pdfs(city_slug: str, platform: str) -> dict:
     print(f"\n{'─'*60}")
-    print(f"STEP 3 — PDF Quality Check")
+    print("STEP 3 — PDF Quality Check")
     print(f"{'─'*60}")
 
     # Scan all platform data dirs for PDFs (same logic as find_best_pdf)
@@ -159,7 +159,7 @@ def check_pdfs(city_slug: str, platform: str) -> dict:
 
     if not pdfs:
         print(f"  No PDFs > {MIN_PDF_BYTES // 1024}KB found.")
-        print(f"\n  ✗ FAIL — No downloadable PDFs found (viewer-only or auth required).")
+        print("\n  ✗ FAIL — No downloadable PDFs found (viewer-only or auth required).")
         return {"fail": "no downloadable PDFs"}
 
     largest = max(pdfs, key=lambda p: p.stat().st_size)
@@ -211,9 +211,9 @@ async def main_async(args: argparse.Namespace) -> None:
 def _print_verdict(passed: bool, detail: str) -> None:
     print(f"\n{'='*60}")
     if passed:
-        print(f"  ✅ PASS — This city is supported by the pipeline.")
+        print("  ✅ PASS — This city is supported by the pipeline.")
     else:
-        print(f"  ❌ FAIL — This city cannot be collected.")
+        print("  ❌ FAIL — This city cannot be collected.")
     print(f"  {detail}")
     print(f"{'='*60}\n")
 

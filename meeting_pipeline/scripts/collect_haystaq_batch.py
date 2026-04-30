@@ -33,11 +33,13 @@ import sys
 import time
 from pathlib import Path
 
-from shared.databricks_client import DatabricksClient
 from dotenv import load_dotenv
+
+from shared.databricks_client import DatabricksClient
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 from meeting_pipeline.shared.constants import STATE_ABBREVS
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -262,7 +264,7 @@ def main():
             print(f"  Skipping {skipped} cities with existing issue_scores.json")
 
     print(f"Batch Haystaq Collection: {len(cities)} cities")
-    print(f"States: {sorted(set(c['state'] for c in cities))}")
+    print(f"States: {sorted({c['state'] for c in cities})}")
     print()
 
     if args.dry_run:
@@ -333,12 +335,12 @@ def main():
         print(f"  Voters:   {total_voters:,} total across {len(ok)} cities")
 
     if no_data:
-        print(f"\n  No data found for:")
+        print("\n  No data found for:")
         for r in no_data:
             print(f"    - {r['slug']}")
 
     if errors:
-        print(f"\n  Errors:")
+        print("\n  Errors:")
         for r in errors:
             print(f"    - {r['slug']}: {r.get('error', '?')}")
 

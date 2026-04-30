@@ -16,24 +16,22 @@ Search backends:
 import asyncio
 import os
 from datetime import date
-from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 from tavily import TavilyClient
 
 from meeting_pipeline.shared.constants import (
-    STATE_NAMES,
     PDF_PLATFORM_SIGNALS,
-)
-from meeting_pipeline.shared.url_utils import (
-    detect_platform,
-    normalize_platform_url,
-    is_wrong_city,
-    is_non_agenda_url,
 )
 from meeting_pipeline.shared.date_utils import extract_dates
 from meeting_pipeline.shared.discovery_helpers import make_candidate
+from meeting_pipeline.shared.url_utils import (
+    detect_platform,
+    is_non_agenda_url,
+    is_wrong_city,
+    normalize_platform_url,
+)
 
 # Cost tracking — shared module-level dict, updated by callers
 _COST = {
@@ -174,7 +172,7 @@ def serper_search(query: str, api_key: str) -> list[dict]:
 
 async def discover_from_duckduckgo(
     city: str, state: str,
-    query: Optional[str] = None, max_results: int = 8,
+    query: str | None = None, max_results: int = 8,
 ) -> tuple[list[dict], str]:
     """Run a DuckDuckGo web search. Returns (candidates, query_used)."""
     if query is None:
@@ -196,7 +194,7 @@ async def discover_from_duckduckgo(
 
 
 async def discover_from_exa(
-    city: str, state: str, query: Optional[str] = None,
+    city: str, state: str, query: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run one Exa search. Returns (candidates, query_used)."""
     api_key = os.environ.get("EXA_API_KEY")
@@ -223,7 +221,7 @@ async def discover_from_exa(
 
 async def discover_from_tavily(
     city: str, state: str, tavily: TavilyClient,
-    search_depth: str = "basic", query: Optional[str] = None,
+    search_depth: str = "basic", query: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run one Tavily search. Returns (candidates, query_used)."""
     if query is None:
@@ -248,7 +246,7 @@ async def discover_from_firecrawl(city: str, state: str) -> list[dict]:
     if not os.environ.get("FIRECRAWL_API_KEY"):
         return []
     try:
-        from meeting_pipeline.shared.firecrawl_client import search_agenda_page, extract_meeting_links
+        from meeting_pipeline.shared.firecrawl_client import extract_meeting_links, search_agenda_page
     except ImportError:
         return []
 

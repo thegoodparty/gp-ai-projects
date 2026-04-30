@@ -8,7 +8,6 @@ doesn't exist or can't be loaded, collection proceeds unblocked.
 
 from meeting_pipeline.shared.storage import StorageBackend
 
-
 # Keywords that indicate a wrong-entity match (school district, not city council)
 WRONG_ENTITY_KEYWORDS = [
     "school district",

@@ -6,10 +6,10 @@ Runs collect → extract → briefing → QA in a single Lambda invocation.
 Message format: {"slug": "chapel-hill-NC", "date": "2026-04-29", "platform": "legistar"}
 """
 
+import asyncio
 import json
 import os
 import sys
-import asyncio
 
 import boto3
 
@@ -52,7 +52,10 @@ def _process_meeting(slug, meeting_date, platform, cfg, storage):
     # Lazy imports: these pull in heavy dependencies (Gemini, Firecrawl,
     # Playwright) that are expensive to load at module level in Lambda.
     from meeting_pipeline.stages.extract.normalize import (
-        find_best_pdf, extract_pdf_text, extract_with_gemini, normalize_meeting,
+        extract_pdf_text,
+        extract_with_gemini,
+        find_best_pdf,
+        normalize_meeting,
     )
 
     pdf_key, pdf_label = find_best_pdf(slug, meeting_date, platform, storage, cfg.sources_prefix)

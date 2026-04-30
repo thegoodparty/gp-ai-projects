@@ -44,12 +44,11 @@ Usage:
 
 import argparse
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
@@ -185,7 +184,7 @@ async def run_batch(
                         "city": slug, "note": bv.get("correction_note"), "patch": bv.get("config_patch"),
                     })
                 elif bv_status == "unresolved":
-                    bv_note = f" [BODY UNRESOLVED ⚠]"
+                    bv_note = " [BODY UNRESOLVED ⚠]"
                     results["body_unresolved"].append({"city": slug, "reason": bv.get("reason")})
 
                 past_note = f", last={past[-1]['date']}" if past else ""
@@ -231,7 +230,7 @@ async def run_batch(
         fc_js = _COST["firecrawl_scrape_js"]
         fc_llm = _COST["firecrawl_llm_extract"]
         gemini = _COST["gemini_extract"]
-        print(f"\n  SCAN COST:")
+        print("\n  SCAN COST:")
         print(f"    Firecrawl: {fc_basic:3d} basic, {fc_js:3d} JS renders, {fc_llm:3d} LLM extracts")
         print(f"    Gemini:    {gemini:3d} extraction calls")
 

@@ -5,17 +5,17 @@ Used by discovery (to validate Serper results) and scan (platform detection).
 """
 
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from meeting_pipeline.shared.constants import (
+    BROADCAST_CALLSIGN_RE,
+    NEWS_DOMAIN_SUFFIXES,
     PLATFORM_PATTERNS,
+    REJECT_URL_PATTERNS,
     STATE_NAMES,
     WRONG_CITY_PATTERNS,
-    WRONG_ENTITY_PATTERNS,
     WRONG_DOMAIN_PATTERNS,
-    REJECT_URL_PATTERNS,
-    NEWS_DOMAIN_SUFFIXES,
-    BROADCAST_CALLSIGN_RE,
+    WRONG_ENTITY_PATTERNS,
 )
 
 
@@ -74,7 +74,7 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
     # State-based validation
     if state:
         state_abbrev = state.upper()
-        expected_state_name = STATE_NAMES.get(state_abbrev, "").lower()
+        STATE_NAMES.get(state_abbrev, "").lower()
 
         # Check if a different state name appears explicitly
         for abbrev, name in STATE_NAMES.items():

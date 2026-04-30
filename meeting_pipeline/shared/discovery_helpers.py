@@ -5,7 +5,6 @@ Used across multiple discovery modules (search, probes, validation).
 """
 
 import asyncio
-from typing import Optional
 
 import httpx
 
@@ -15,8 +14,8 @@ def make_candidate(
     platform: str,
     source: str,
     http_status: int = 0,
-    display_url: Optional[str] = None,
-    config: Optional[dict] = None,
+    display_url: str | None = None,
+    config: dict | None = None,
     notes: str = "",
     body: str = "",
 ) -> dict:
@@ -61,7 +60,7 @@ async def safe_fetch(
         )
         body = resp.text[:max_bytes] if resp.text else ""
         return resp.status_code, body
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return -1, "timeout"
     except httpx.ConnectError as e:
         msg = str(e)

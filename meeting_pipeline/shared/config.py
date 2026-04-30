@@ -10,9 +10,8 @@ configure the function at deploy time.
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
-from .storage import StorageBackend, S3StorageBackend
+from .storage import S3StorageBackend, StorageBackend
 
 # NOTE: .env loading is the responsibility of the entry point script,
 # not this library module. For local dev, scripts call load_dotenv().
@@ -36,7 +35,7 @@ class AgentConfig:
     agendas_only: bool = True  # Skip Legistar matter attachments — only download agenda PDFs
 
     @classmethod
-    def from_env(cls) -> "AgentConfig":
+    def from_env(cls) -> AgentConfig:
         return cls(
             sources_prefix=os.getenv("SOURCES_PREFIX", "meeting_pipeline/sources"),
             logs_prefix=os.getenv("LOGS_PREFIX", "meeting_pipeline/logs"),

@@ -13,7 +13,6 @@ from datetime import datetime
 
 import httpx
 
-
 # ============================================================================
 # SCORING CONSTANTS
 # ============================================================================
@@ -168,7 +167,7 @@ async def validate_civicplus_body(
     """Fetch AgendaCenter categories via AJAX aria-labels and score."""
     from urllib.parse import urlparse
     try:
-        from meeting_pipeline.collectors.civicplus_scraper import discover_categories, _ensure_www
+        from meeting_pipeline.collectors.civicplus_scraper import _ensure_www, discover_categories
     except ImportError:
         return {"status": "error", "reason": "civicplus_scraper module not available"}
 

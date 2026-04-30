@@ -27,7 +27,6 @@ import re
 import sys
 from collections import defaultdict
 from datetime import date, datetime
-from typing import Optional
 
 import httpx
 
@@ -158,7 +157,7 @@ def _body_suspicious_keywords(body: str) -> list[str]:
     return [kw for kw in SUSPICIOUS_BODY_KEYWORDS if kw in body_lower]
 
 
-def _days_from_today(date_str: str) -> Optional[int]:
+def _days_from_today(date_str: str) -> int | None:
     """Return days from today to the meeting date (positive = future)."""
     try:
         meeting_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -189,7 +188,7 @@ def _date_from_key(key: str) -> str:
 # CHECKS
 # ============================================================================
 
-def check_a_body(slug: str, briefing: dict) -> Optional[dict]:
+def check_a_body(slug: str, briefing: dict) -> dict | None:
     """Check A: body name validation."""
     meeting = briefing.get("meeting", {})
     body = meeting.get("body", "")
@@ -198,7 +197,7 @@ def check_a_body(slug: str, briefing: dict) -> Optional[dict]:
             "level": "WARNING",
             "check": "A",
             "slug": slug,
-            "message": f'body is empty/missing',
+            "message": 'body is empty/missing',
             "detail": {},
         }
 
@@ -226,7 +225,7 @@ def check_a_body(slug: str, briefing: dict) -> Optional[dict]:
     return None
 
 
-def check_b_future_stub(slug: str, briefing: dict) -> Optional[dict]:
+def check_b_future_stub(slug: str, briefing: dict) -> dict | None:
     """Check B: future meeting with very few items."""
     meeting = briefing.get("meeting", {})
     date_str = meeting.get("date", "")
@@ -244,7 +243,7 @@ def check_b_future_stub(slug: str, briefing: dict) -> Optional[dict]:
     return None
 
 
-def check_c_wrong_city(slug: str, briefing: dict) -> Optional[dict]:
+def check_c_wrong_city(slug: str, briefing: dict) -> dict | None:
     """Check C: city name or state in briefing doesn't match the slug."""
     expected = _get_registry().get(slug)
     if not expected:
@@ -280,7 +279,7 @@ def check_c_wrong_city(slug: str, briefing: dict) -> Optional[dict]:
     return None
 
 
-def check_d_low_items(slug: str, briefing: dict) -> Optional[dict]:
+def check_d_low_items(slug: str, briefing: dict) -> dict | None:
     """Check D: total agenda items < 3 (extraction failure or empty stub)."""
     total = _total_items(briefing)
     if total < 3:
@@ -315,8 +314,8 @@ def check_e_duplicates(slug_date_pairs: list[tuple[str, str]]) -> list[dict]:
 
 
 def check_f_content_contamination(
-    slug: str, briefing: dict, normalized_json: Optional[dict] = None
-) -> Optional[dict]:
+    slug: str, briefing: dict, normalized_json: dict | None = None
+) -> dict | None:
     """Check F: scan agenda item titles for school/non-city content keywords."""
     # Collect all item titles from the briefing
     titles: list[str] = []
@@ -437,8 +436,8 @@ def _fetch_boarddocs_title(slug_path: str) -> tuple[bool, str]:
 def check_g_boarddocs_account(
     slug: str,
     briefing: dict,
-    normalized_json: Optional[dict],
-) -> Optional[dict]:
+    normalized_json: dict | None,
+) -> dict | None:
     """Check G: validate BoardDocs account name for city government (not school/district)."""
     # Determine platform from briefing or normalized JSON
     platform = ""
@@ -507,7 +506,7 @@ def check_g_boarddocs_account(
     return None
 
 
-def check_h_source_citations(slug: str, briefing: dict) -> Optional[dict]:
+def check_h_source_citations(slug: str, briefing: dict) -> dict | None:
     """Check H: source_citations populated in at least some priority issues."""
     # priorityIssues is at top level of briefing JSON
     issues_list = briefing.get("priorityIssues", [])
@@ -535,7 +534,7 @@ def check_h_source_citations(slug: str, briefing: dict) -> Optional[dict]:
     return None
 
 
-def check_i_haystaq_data(slug: str, briefing: dict) -> Optional[dict]:
+def check_i_haystaq_data(slug: str, briefing: dict) -> dict | None:
     """Check I: Haystaq constituent data was used (check constituentData block in briefing)."""
     constituent = briefing.get("constituentData", {})
     available = constituent.get("available", False)
@@ -556,7 +555,7 @@ def check_i_haystaq_data(slug: str, briefing: dict) -> Optional[dict]:
 # MAIN VERIFICATION LOOP
 # ============================================================================
 
-def _load_normalized_json(slug: str, date_str: str, normalized_prefix: str, storage) -> Optional[dict]:
+def _load_normalized_json(slug: str, date_str: str, normalized_prefix: str, storage) -> dict | None:
     """
     Load the normalized JSON for a given slug and date from S3.
 
@@ -586,7 +585,7 @@ def _load_normalized_json(slug: str, date_str: str, normalized_prefix: str, stor
     return None
 
 
-def verify_briefings(cfg: AgentConfig, storage, city_filter: Optional[str] = None) -> dict:
+def verify_briefings(cfg: AgentConfig, storage, city_filter: str | None = None) -> dict:
     """Download and verify all briefings, returning a structured report dict."""
     briefing_prefix = f"{cfg.output_prefix}/briefings"
     normalized_prefix = f"{cfg.output_prefix}/normalized"

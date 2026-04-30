@@ -13,11 +13,11 @@ or the orchestrator calls. Handles the full discovery lifecycle:
 from __future__ import annotations
 
 import os
-from typing import Optional
+from datetime import UTC
 
 import httpx
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 from meeting_pipeline.shared.constants import COLLECTION_METHODS
 
 # Platforms that support body validation
@@ -31,10 +31,10 @@ async def process_one_city(
     city: str,
     state: str,
     expected_body: str = "",
-    known_sources: Optional[dict] = None,
+    known_sources: dict | None = None,
     tavily_client=None,
-    http_client: Optional[httpx.AsyncClient] = None,
-    cfg: Optional[AgentConfig] = None,
+    http_client: httpx.AsyncClient | None = None,
+    cfg: AgentConfig | None = None,
     storage=None,
 ) -> dict:
     """
@@ -257,7 +257,7 @@ async def _try_fallback_candidates(
             return alt_source
 
     # No fallback worked — mark as wrong_entity
-    print(f"  [body] no fallback resolved — marking as wrong_entity")
+    print("  [body] no fallback resolved — marking as wrong_entity")
     if result.get("best_source"):
         result["best_source"]["freshness"] = "wrong_entity"
         result["best_source"]["wrong_entity_reason"] = bv.get(
@@ -270,10 +270,13 @@ async def _try_fallback_candidates(
 
 async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dict:
     """Download and verify a real agenda PDF from the discovered source."""
+    from datetime import datetime
+
     from meeting_pipeline.shared.verify_source import (
-        verify_agenda_url, _find_past_agenda_from_platform, _find_pdf_links_on_page,
+        _find_past_agenda_from_platform,
+        _find_pdf_links_on_page,
+        verify_agenda_url,
     )
-    from datetime import datetime, timezone
 
     best = result.get("best_source", {})
     if not best.get("url"):
@@ -309,7 +312,7 @@ async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dic
         verification = {
             "status": "unverified",
             "reason": "No agenda URL found to verify during discovery",
-            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "checked_at": datetime.now(UTC).isoformat(),
         }
 
     best["verification"] = verification

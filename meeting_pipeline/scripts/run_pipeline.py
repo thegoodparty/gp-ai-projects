@@ -40,10 +40,11 @@ if sys.path[0] != _PROJECT_ROOT:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig
-from meeting_pipeline.stages.orchestrator import run_pipeline, ALL_PHASES
+from meeting_pipeline.stages.orchestrator import ALL_PHASES, run_pipeline
 
 
 def main():

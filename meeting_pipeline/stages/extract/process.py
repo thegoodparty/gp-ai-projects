@@ -5,11 +5,13 @@ Downloads the agenda PDF, extracts text, runs Gemini structured extraction,
 and returns a normalized meeting JSON dict.
 """
 
-from typing import Optional
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.stages.extract.normalize import (
-    find_best_pdf, extract_pdf_text, extract_with_gemini, normalize_meeting,
+    extract_pdf_text,
+    extract_with_gemini,
+    find_best_pdf,
+    normalize_meeting,
 )
 
 
@@ -18,7 +20,7 @@ def process_one_meeting(
     meeting: dict,
     city_slug: str,
     platform: str,
-    cfg: Optional[AgentConfig] = None,
+    cfg: AgentConfig | None = None,
     storage=None,
 ) -> dict | None:
     """

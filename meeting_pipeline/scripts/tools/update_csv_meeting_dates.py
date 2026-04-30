@@ -12,8 +12,7 @@ Usage:
 
 import argparse
 import csv
-import sys
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent

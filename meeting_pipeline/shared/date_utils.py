@@ -7,14 +7,12 @@ and the generic agenda scanner (PDF filename parsing).
 
 import re
 from datetime import date, timedelta
-from typing import Optional
 
 from meeting_pipeline.shared.constants import FRESH_THRESHOLD, STALE_WARNING_THRESHOLD
 
-
 # ── Freshness Classification ──────────────────────────────────────────────────
 
-def classify_freshness(most_recent: Optional[date], today: Optional[date] = None) -> str:
+def classify_freshness(most_recent: date | None, today: date | None = None) -> str:
     """Classify how fresh a source is based on its most recent date."""
     if most_recent is None:
         return "unknown"
@@ -71,7 +69,7 @@ _MONTH_MAP = {
 _MONTHS_RE = "|".join(sorted(_MONTH_MAP.keys(), key=len, reverse=True))
 
 
-def extract_dates(text: str, today: Optional[date] = None) -> list[date]:
+def extract_dates(text: str, today: date | None = None) -> list[date]:
     """
     Extract recognizable dates from text, return sorted descending.
 

@@ -13,12 +13,11 @@ from urllib.parse import urlparse
 import httpx
 
 from meeting_pipeline.shared.constants import (
-    STATE_NAMES,
-    FETCH_BLOCKLIST,
     CITY_NAME_PREFIXES,
     CITY_NAME_SUFFIXES,
+    FETCH_BLOCKLIST,
+    STATE_NAMES,
 )
-from meeting_pipeline.shared.url_utils import detect_platform
 
 
 def validate_domain_for_city(domain: str, city: str, state: str) -> tuple[bool, str]:
@@ -111,7 +110,7 @@ def firecrawl_map_agenda(base_url: str) -> str | None:
         _non_agenda = {"facebook.com", "twitter.com", "youtube.com", "wikipedia.org"}
         links = [
             l for l in links
-            if not urlparse(l).netloc.lower().removeprefix("www.") in _non_agenda
+            if urlparse(l).netloc.lower().removeprefix("www.") not in _non_agenda
             and not l.split("?")[0].lower().endswith(".pdf")
         ]
 
@@ -181,6 +180,7 @@ def firecrawl_crawl_for_agenda(
         return None
     try:
         from firecrawl import FirecrawlApp
+
         from meeting_pipeline.shared.body_validation import REJECT_KEYWORDS
         fc = FirecrawlApp(api_key=fc_key)
 

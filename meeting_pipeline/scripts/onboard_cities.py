@@ -25,10 +25,10 @@ Usage:
 
 import argparse
 import asyncio
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
@@ -54,10 +54,11 @@ def main():
     print("STEP 1: Generate manifests")
     print("=" * 60)
 
-    from meeting_pipeline.scripts.generate_manifests import (
-        load_cities_from_csv, build_manifest, _csv_override,
-    )
     import meeting_pipeline.scripts.generate_manifests as manifests_module
+    from meeting_pipeline.scripts.generate_manifests import (
+        build_manifest,
+        load_cities_from_csv,
+    )
 
     if args.csv:
         manifests_module._csv_override = Path(args.csv)
@@ -102,8 +103,9 @@ def main():
         from meeting_pipeline.stages.discover.process import process_one_city
 
         async def run_discovery():
-            import httpx
             import os
+
+            import httpx
             from tavily import TavilyClient
 
             tavily_key = os.environ.get("TAVILY_API_KEY", "")

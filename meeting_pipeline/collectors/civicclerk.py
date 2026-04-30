@@ -23,13 +23,12 @@ Usage:
 """
 
 import asyncio
-from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # ============================================================================
 # CONFIG AND RESULT DATACLASSES
@@ -149,7 +148,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         print(f"     Found {len(all_events)} total events")
 
         # Discover categories
-        categories = sorted(set(e["categoryName"] for e in all_events))
+        categories = sorted({e["categoryName"] for e in all_events})
         print(f"     Categories: {categories}")
 
         # 2. FILTER BY COUNCIL CATEGORY + DATE
@@ -179,9 +178,9 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                 council_events = filtered_events
             else:
                 # Everything looks like a committee — collect nothing rather than pollute
-                print(f"     WARNING: No council-type category found and all categories look like committees.")
+                print("     WARNING: No council-type category found and all categories look like committees.")
                 print(f"     Categories: {categories}")
-                print(f"     Returning 0 events. Set council_categories explicitly in CivicClerkConfig.")
+                print("     Returning 0 events. Set council_categories explicitly in CivicClerkConfig.")
                 council_events = []
 
         # Filter by date: keep events after cutoff OR in the future

@@ -53,7 +53,6 @@ import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
 
-
 # ============================================================================
 # CONFIG AND RESULT
 # ============================================================================
@@ -402,8 +401,7 @@ async def _download_pdfs(
 # ============================================================================
 
 async def _main_cli():
-    import argparse, sys
-    from pathlib import Path
+    import argparse
 
     from meeting_pipeline.shared.config import AgentConfig, get_storage
 

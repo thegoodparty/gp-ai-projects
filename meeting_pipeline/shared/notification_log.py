@@ -15,11 +15,10 @@ Event schema:
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # Valid event types
 MIGRATION_DETECTED = "MIGRATION_DETECTED"
@@ -54,7 +53,7 @@ def log_event(
         "event_type": event_type,
         "city": city,
         "state": state,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     payload.update(detail)
 

@@ -1,7 +1,6 @@
 """Tests for find_best_pdf()"""
 import json
 from pathlib import Path
-import pytest
 
 from meeting_pipeline.stages.extract.normalize import find_best_pdf
 

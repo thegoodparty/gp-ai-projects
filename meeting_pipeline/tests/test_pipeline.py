@@ -11,13 +11,9 @@ dependencies are mocked.
 import asyncio
 import json
 import os
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helper: in-memory StorageBackend stub
@@ -621,7 +617,9 @@ class TestNormalizeMeeting:
 
     def test_produces_correct_schema(self):
         from meeting_pipeline.stages.extract.normalize import (
-            normalize_meeting, MeetingExtraction, AgendaItem,
+            AgendaItem,
+            MeetingExtraction,
+            normalize_meeting,
         )
 
         extraction = MeetingExtraction(
@@ -704,7 +702,8 @@ class TestNormalizeMeeting:
 
     def test_normalize_empty_extraction(self):
         from meeting_pipeline.stages.extract.normalize import (
-            normalize_meeting, MeetingExtraction,
+            MeetingExtraction,
+            normalize_meeting,
         )
 
         extraction = MeetingExtraction(
@@ -780,7 +779,7 @@ class TestScanHandler:
 
     @patch("boto3.client")
     def test_list_cities_returns_verified_slugs(self, mock_boto):
-        from meeting_pipeline.lambda_handlers.scan import handler, VERIFIED_STATUSES
+        from meeting_pipeline.lambda_handlers.scan import handler
 
         source_verified = {
             "city": "TestCity",
@@ -886,10 +885,10 @@ class TestProcessHandler:
         with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"):
             with patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg:
                 mock_cfg.return_value = MagicMock()
-                with patch("meeting_pipeline.lambda_handlers.process.get_storage") as mock_storage:
+                with patch("meeting_pipeline.lambda_handlers.process.get_storage"):
                     with patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
                         mock_proc.return_value = {"status": "ok"}
-                        result = handler(event)
+                        handler(event)
 
         mock_proc.assert_called_once()
         call_args = mock_proc.call_args

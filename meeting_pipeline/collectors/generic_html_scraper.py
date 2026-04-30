@@ -26,15 +26,14 @@ Usage:
 
 import asyncio
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # ============================================================================
 # CONFIG AND RESULT

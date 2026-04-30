@@ -16,16 +16,15 @@ Usage:
 
 import argparse
 import asyncio
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 import httpx
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
-
 
 AGENDA_KEYWORDS = [
     "agenda", "meeting", "council", "motion", "approve", "resolution",
@@ -131,7 +130,7 @@ async def main():
             continue
 
         has_briefing = slug in briefed_slugs
-        has_meetings_only = len(meetings) > 0 and not posted
+        len(meetings) > 0 and not posted
 
         if args.tier == 1 and not has_briefing:
             continue
@@ -169,8 +168,8 @@ async def main():
             results.append(result)
 
             verdict = result.get("verdict", "?")
-            size = result.get("size_kb", 0)
-            words = result.get("words", 0)
+            result.get("size_kb", 0)
+            result.get("words", 0)
             marker = "PASS" if verdict == "PASS" else "FAIL"
             print(f"  [{i+1}/{len(to_verify)}] {item['slug']:<35} {item['platform']:<12} {marker:<5} {verdict}")
 
@@ -180,7 +179,7 @@ async def main():
     failed = [r for r in results if r not in passed and r not in pdf_ok]
 
     print(f"\n{'='*60}")
-    print(f"VERIFICATION SUMMARY")
+    print("VERIFICATION SUMMARY")
     print(f"{'='*60}")
     print(f"  Verified:     {len(results)}")
     print(f"  PASS (agenda): {len(passed)}")
@@ -188,7 +187,7 @@ async def main():
     print(f"  FAILED:        {len(failed)}")
 
     if failed:
-        print(f"\n  FAILURES:")
+        print("\n  FAILURES:")
         for r in failed:
             print(f"    {r['slug']:<35} {r.get('verdict', '?')}")
 

@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
@@ -76,7 +77,7 @@ def main():
             if re.search(r"[^/]+_\d{4}-\d{2}-\d{2}\.json$", k)
         )
         if args.city:
-            city_filter = set(s.lower().replace(" ", "-") for s in args.city)
+            city_filter = {s.lower().replace(" ", "-") for s in args.city}
             before = len(target_keys)
             target_keys = [
                 k for k in target_keys
@@ -105,7 +106,7 @@ def main():
                 print(f"Skipping {skipped} with existing briefings (--force to regenerate)")
 
         if not target_keys:
-            print(f"No normalized meeting files to process")
+            print("No normalized meeting files to process")
             sys.exit(1)
 
     results = []

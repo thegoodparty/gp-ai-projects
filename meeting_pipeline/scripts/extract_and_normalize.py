@@ -24,10 +24,11 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.stages.orchestrator import run_extract, load_cities_from_sources, filter_cities
+from meeting_pipeline.shared.config import AgentConfig
+from meeting_pipeline.stages.orchestrator import filter_cities, load_cities_from_sources, run_extract
 
 
 def main():

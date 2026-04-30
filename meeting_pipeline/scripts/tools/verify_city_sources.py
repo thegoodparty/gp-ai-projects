@@ -34,14 +34,13 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
 
-import httpx
 import fitz  # PyMuPDF
+import httpx
 
 # ============================================================================
 # CONFIGURATION
@@ -156,46 +155,46 @@ class VerificationResult:
     verified: bool = False                     # True only at V4
 
     # Legistar checks
-    legistar_slug: Optional[str] = None
-    legistar_reachable: Optional[bool] = None
-    legistar_has_events: Optional[bool] = None
-    legistar_recent_event_date: Optional[str] = None
-    legistar_item_count: Optional[int] = None
-    legistar_sample_titles: Optional[list] = None
+    legistar_slug: str | None = None
+    legistar_reachable: bool | None = None
+    legistar_has_events: bool | None = None
+    legistar_recent_event_date: str | None = None
+    legistar_item_count: int | None = None
+    legistar_sample_titles: list | None = None
 
     # CivicPlus checks
-    civicplus_page_loads: Optional[bool] = None
-    civicplus_categories: Optional[dict] = None
-    civicplus_ajax_works: Optional[bool] = None
-    civicplus_working_cat_id: Optional[str] = None
-    civicplus_pdf_count: Optional[int] = None
-    civicplus_pdf_url: Optional[str] = None
+    civicplus_page_loads: bool | None = None
+    civicplus_categories: dict | None = None
+    civicplus_ajax_works: bool | None = None
+    civicplus_working_cat_id: str | None = None
+    civicplus_pdf_count: int | None = None
+    civicplus_pdf_url: str | None = None
 
     # Other platform checks
-    alt_platform: Optional[str] = None         # boarddocs, novus, primegov, civicclerk, municode, granicus
-    alt_platform_url: Optional[str] = None
-    alt_platform_reachable: Optional[bool] = None
-    alt_platform_has_data: Optional[bool] = None
-    alt_platform_sample: Optional[str] = None
+    alt_platform: str | None = None         # boarddocs, novus, primegov, civicclerk, municode, granicus
+    alt_platform_url: str | None = None
+    alt_platform_reachable: bool | None = None
+    alt_platform_has_data: bool | None = None
+    alt_platform_sample: str | None = None
 
     # PDF content checks
-    pdf_size_bytes: Optional[int] = None
-    pdf_text_length: Optional[int] = None
-    pdf_has_date: Optional[bool] = None
-    pdf_has_numbered_items: Optional[bool] = None
-    pdf_has_agenda_keywords: Optional[bool] = None
-    pdf_text_sample: Optional[str] = None
+    pdf_size_bytes: int | None = None
+    pdf_text_length: int | None = None
+    pdf_has_date: bool | None = None
+    pdf_has_numbered_items: bool | None = None
+    pdf_has_agenda_keywords: bool | None = None
+    pdf_text_sample: str | None = None
 
     # LLM extraction (V4)
-    llm_item_count: Optional[int] = None
-    llm_has_real_titles: Optional[bool] = None
-    llm_fiscal_amounts_found: Optional[int] = None
-    llm_fiscal_amounts_verified: Optional[int] = None
-    llm_date_extracted: Optional[str] = None
-    llm_cost_usd: Optional[float] = None
+    llm_item_count: int | None = None
+    llm_has_real_titles: bool | None = None
+    llm_fiscal_amounts_found: int | None = None
+    llm_fiscal_amounts_verified: int | None = None
+    llm_date_extracted: str | None = None
+    llm_cost_usd: float | None = None
 
     # Diagnostics
-    error: Optional[str] = None
+    error: str | None = None
     notes: str = ""
     duration_seconds: float = 0.0
 
@@ -634,17 +633,17 @@ def check_llm_extraction(pdf_text: str, gemini_client) -> dict:
     from pydantic import BaseModel, Field
 
     class AgendaItemExtraction(BaseModel):
-        number: Optional[str] = Field(None, description="Item number as shown in document")
+        number: str | None = Field(None, description="Item number as shown in document")
         title: str = Field(description="Item title, verbatim from document")
-        section: Optional[str] = Field(None, description="consent|action|public_hearing|discussion|procedural|other")
+        section: str | None = Field(None, description="consent|action|public_hearing|discussion|procedural|other")
         fiscal_amounts: list[str] = Field(default_factory=list, description="Dollar amounts verbatim")
         is_public_hearing: bool = Field(False)
 
     class MeetingExtraction(BaseModel):
         date: str = Field(description="Meeting date in YYYY-MM-DD format")
-        time: Optional[str] = None
+        time: str | None = None
         body: str = Field(description="Governing body name")
-        meeting_type: Optional[str] = Field(None, description="regular|special|work_session")
+        meeting_type: str | None = Field(None, description="regular|special|work_session")
         items: list[AgendaItemExtraction]
 
     result = {"success": False}
@@ -996,12 +995,12 @@ def generate_report(results: list[VerificationResult]) -> str:
     # Coverage summary
     v3_plus = [r for r in results if r.level in ("V3", "V4")]
     v3_plus_eos = sum(r.eos for r in v3_plus)
-    lines.append(f"\nCOVERAGE SUMMARY:")
+    lines.append("\nCOVERAGE SUMMARY:")
     lines.append(f"  Ready to collect (V3+): {len(v3_plus)} cities, {v3_plus_eos} EOs ({v3_plus_eos*100//total_eos}%)")
     lines.append(f"  Need work (V0-V2):      {len(results) - len(v3_plus)} cities, {total_eos - v3_plus_eos} EOs")
 
     # By source type
-    lines.append(f"\nBY SOURCE TYPE:")
+    lines.append("\nBY SOURCE TYPE:")
     by_source = {}
     for r in v3_plus:
         by_source.setdefault(r.best_source, []).append(r)
@@ -1115,6 +1114,7 @@ async def main():
 if __name__ == "__main__":
     # Suppress SSL warnings for city sites with bad certs
     import warnings
+
     import urllib3
     warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
     warnings.filterwarnings("ignore", message=".*SSL.*")

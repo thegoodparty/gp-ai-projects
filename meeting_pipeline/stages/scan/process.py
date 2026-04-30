@@ -7,29 +7,27 @@ handler would call.
 """
 
 import os
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 import httpx
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.shared.constants import SUPPORTED_PLATFORMS
 from meeting_pipeline.shared.generic_agenda_scanner import scan_generic
-
-from meeting_pipeline.stages.scan.platforms.legistar import scan_legistar
-from meeting_pipeline.stages.scan.platforms.civicplus import scan_civicplus
+from meeting_pipeline.stages.scan.body_filter import filter_by_body
 from meeting_pipeline.stages.scan.platforms.boarddocs import scan_boarddocs
 from meeting_pipeline.stages.scan.platforms.civicclerk import scan_civicclerk
-from meeting_pipeline.stages.scan.platforms.granicus import scan_granicus
+from meeting_pipeline.stages.scan.platforms.civicplus import scan_civicplus
 from meeting_pipeline.stages.scan.platforms.escribe import scan_escribe
-from meeting_pipeline.stages.scan.body_filter import filter_by_body
+from meeting_pipeline.stages.scan.platforms.granicus import scan_granicus
+from meeting_pipeline.stages.scan.platforms.legistar import scan_legistar
 
 
 async def process_one_city(
     slug: str,
     source: dict,
     source_key: str,
-    http_client: Optional[httpx.AsyncClient] = None,
+    http_client: httpx.AsyncClient | None = None,
     storage=None,
     skip_body_validation: bool = False,
 ) -> dict | None:
@@ -139,7 +137,7 @@ async def process_one_city(
             "state": state,
             "body": body,
             "platform": platform,
-            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "scanned_at": datetime.now(UTC).isoformat(),
             "body_validation": body_validation,
             "upcoming": upcoming,
         }

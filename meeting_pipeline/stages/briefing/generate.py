@@ -36,19 +36,16 @@ import json
 import re
 import time
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
 from meeting_pipeline.prompts.briefing import (
-    EDITORIAL_RULES,
     build_pass1_prompt,
     build_pass2a_prompt,
     build_pass2b_prompt,
     build_pass3_prompt,
 )
-
+from meeting_pipeline.shared.config import AgentConfig
 
 # ============================================================================
 # FORMAT ADAPTER — normalized JSON → meeting dict used by generation pipeline
@@ -118,7 +115,7 @@ def normalized_to_meeting_dict(normalized: dict) -> dict:
 # HAYSTAQ CONSTITUENT DATA
 # ============================================================================
 
-def load_constituent_data(city_slug: str, storage, sources_prefix: str) -> Optional[dict]:
+def load_constituent_data(city_slug: str, storage, sources_prefix: str) -> dict | None:
     """Load Haystaq constituent data for a city if available."""
     key = f"{sources_prefix}/{city_slug}/constituent/issue_scores.json"
     if not storage.exists(key):
@@ -193,7 +190,7 @@ class SourceCitation(BaseModel):
 class CategorizedAgendaItem(BaseModel):
     originalTitle: str = Field(description="Original title from the agenda")
     title: str = Field(description="Clean, readable title (fix ALL CAPS, remove numbering prefixes)")
-    description: Optional[str] = Field(None, description="1-2 sentence plain-language description of what this item is about. Omit entirely for procedural items (call to order, roll call, adjournment, pledge, invocation, approval of minutes) — do not generate filler content for items with nothing substantive to describe.")
+    description: str | None = Field(None, description="1-2 sentence plain-language description of what this item is about. Omit entirely for procedural items (call to order, roll call, adjournment, pledge, invocation, approval of minutes) — do not generate filler content for items with nothing substantive to describe.")
     category: str = Field(description="One of: procedural, consent, informational, vote_required, direction_setting, public_hearing")
     isPriority: bool = Field(False, description="True if this item is a genuine policy decision, significant spending, or high public interest")
     priorityScore: int = Field(0, description="0 if not priority. 1-10 if priority: 10=highest impact (major policy/budget), 1=lowest (routine vote). Only score items where isPriority=true.")
@@ -212,21 +209,21 @@ class AgendaCategorization(BaseModel):
 class SourceSection(BaseModel):
     label: str = Field(description="Short label for this section, e.g. 'Staff Memo', 'Resolution Text', 'Financial Schedule', 'Exhibit A'. If from prior meeting minutes, use a date-specific label like 'April 7 Meeting Minutes'.")
     text: str = Field(description="Verbatim text copied character-for-character from this section of the document. No changes, no summarizing.")
-    page: Optional[int] = Field(None, description="Page number from [PAGE N] markers where this section was found")
+    page: int | None = Field(None, description="Page number from [PAGE N] markers where this section was found")
     is_prior_minutes: bool = Field(False, description="True if this section comes from prior meeting minutes embedded in the packet (past-tense narrative: presented, motion passed, no action was taken, etc.) rather than from forward-looking agenda materials (staff memos, resolutions, staff reports).")
 
 
 class PriorityIssueCard(BaseModel):
     agendaItemTitle: str = Field(description="Title of the underlying agenda item")
     slug: str = Field(description="URL-safe slug (e.g. 'public-safety-camera-expansion')")
-    sourcePassage: Optional[str] = Field(None, description="Primary verbatim source text (first section). Kept for backward compatibility.")
+    sourcePassage: str | None = Field(None, description="Primary verbatim source text (first section). Kept for backward compatibility.")
     sourceSections: list[SourceSection] = Field(default_factory=list, description="All labeled source sections extracted for this item.")
-    sourcePassagePage: Optional[int] = Field(None, description="Page number (from [PAGE N] markers in the document) where the primary source section was found.")
-    sourceDocUrl: Optional[str] = Field(None, description="URL of the source document this passage came from, if multiple documents are listed in AVAILABLE SOURCE DOCUMENTS. Use the exact URL from that list.")
+    sourcePassagePage: int | None = Field(None, description="Page number (from [PAGE N] markers in the document) where the primary source section was found.")
+    sourceDocUrl: str | None = Field(None, description="URL of the source document this passage came from, if multiple documents are listed in AVAILABLE SOURCE DOCUMENTS. Use the exact URL from that list.")
     headline: str = Field(description="One punchy sentence, max 15 words. What's at stake for constituents and what this meeting means — in a single breath. No scores, percentages, or numeric rankings.")
     whatYouNeedToDo: str = Field(description="Actionable paragraph: what the council member should do about this item, what's being decided, what to watch for. Base all claims on sourcePassage, not on the item description above.")
     askThisInTheRoom: str = Field(description="A specific question the council member could ask during the meeting")
-    tryThis: Optional[str] = Field(None, description="Optional: a suggested statement or talking point the council member could use")
+    tryThis: str | None = Field(None, description="Optional: a suggested statement or talking point the council member could use")
 
 
 class BriefingCards(BaseModel):
@@ -238,8 +235,8 @@ class BriefingCards(BaseModel):
 class SourcePassageItem(BaseModel):
     agendaItemTitle: str = Field(description="Title of the agenda item — must match a candidate item exactly")
     sections: list[SourceSection] = Field(default_factory=list, description="All relevant source sections for this item, each labeled and copied verbatim")
-    sourcePassagePage: Optional[int] = Field(None, description="Page number from [PAGE N] markers where the primary section was found")
-    sourceDocUrl: Optional[str] = Field(None, description="URL of the source document from AVAILABLE SOURCE DOCUMENTS, if listed")
+    sourcePassagePage: int | None = Field(None, description="Page number from [PAGE N] markers where the primary section was found")
+    sourceDocUrl: str | None = Field(None, description="URL of the source document from AVAILABLE SOURCE DOCUMENTS, if listed")
 
 
 class SourcePassageExtractions(BaseModel):
@@ -252,7 +249,7 @@ class PriorityIssueCardText(BaseModel):
     headline: str = Field(description="One punchy sentence, max 15 words. What's at stake and what this meeting means.")
     whatYouNeedToDo: str = Field(description="3-5 sentences. First sentence states vote type. Base all claims on the sourcePassage provided.")
     askThisInTheRoom: str = Field(description="One specific question to ask in the meeting, written as a direct quote")
-    tryThis: Optional[str] = Field(None, description="Optional suggested talking point")
+    tryThis: str | None = Field(None, description="Optional suggested talking point")
 
 
 class BriefingCardTexts(BaseModel):
@@ -268,9 +265,9 @@ class PriorityIssueDetail(BaseModel):
     recommendation: str = Field(description="~40 words, 2-3 sentences. A frame for how to think about this decision — what questions to weigh, what trade-offs to understand. Not a task or directive.")
     actionItem: str = Field(description="~28 words, 1 sentence. One specific, concrete, pre-meeting task — name the exact document to read, the person to call, or the specific thing to verify. Not general framing.")
     askThis: str = Field(description="~30 words. A direct-quote question to ask in the meeting")
-    tryThis: Optional[str] = Field(None, description="~30 words. Optional suggested statement or talking point")
-    whoIsPresenting: Optional[str] = Field(None, description="50-75 words, 1-2 paragraphs. Who is presenting this item — name and title if stated in the agenda or PDF, otherwise the responsible department by type (e.g. 'Public Works' or 'City Manager's office'). Omit entirely if no presenter or responsible department can be identified from the source text. Do not predict vote outcomes or describe political dynamics.")
-    supportingContext: Optional[str] = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
+    tryThis: str | None = Field(None, description="~30 words. Optional suggested statement or talking point")
+    whoIsPresenting: str | None = Field(None, description="50-75 words, 1-2 paragraphs. Who is presenting this item — name and title if stated in the agenda or PDF, otherwise the responsible department by type (e.g. 'Public Works' or 'City Manager's office'). Omit entirely if no presenter or responsible department can be identified from the source text. Do not predict vote outcomes or describe political dynamics.")
+    supportingContext: str | None = Field(None, description="50-70 words. Background data, statistics, historical context. Use full word count.")
 
 
 # ============================================================================
@@ -338,7 +335,7 @@ def _run_pass1_chunk(city, body, date, items_chunk, start_index, constituent_con
     return result.items
 
 
-def pass1_categorize(meeting: dict, gemini, constituent: Optional[dict] = None, pdf_text: str = "") -> AgendaCategorization:
+def pass1_categorize(meeting: dict, gemini, constituent: dict | None = None, pdf_text: str = "") -> AgendaCategorization:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
     date = meeting.get("date", "")
@@ -425,7 +422,7 @@ def _generate_agenda_summary(
 # PASS 2: GENERATE CARD CONTENT FOR PRIORITY ISSUES
 # ============================================================================
 
-def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: Optional[dict] = None, pdf_text: str = "", available_docs: Optional[list[dict]] = None) -> BriefingCards:
+def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemini, constituent: dict | None = None, pdf_text: str = "", available_docs: list[dict] | None = None) -> BriefingCards:
     city = meeting.get("cityName", "")
     body = meeting.get("body", "City Council")
     date = meeting.get("date", "")
@@ -564,7 +561,7 @@ def pass2_generate_cards(meeting: dict, categorized: AgendaCategorization, gemin
 # PASS 3: GENERATE DETAIL CONTENT FOR EACH PRIORITY ISSUE
 # ============================================================================
 
-def _format_available_docs(docs: Optional[list[dict]], meeting_source_url: Optional[str]) -> str:
+def _format_available_docs(docs: list[dict] | None, meeting_source_url: str | None) -> str:
     lines = []
     if meeting_source_url:
         lines.append(f"  - Meeting page: {meeting_source_url}")
@@ -642,8 +639,8 @@ def pass3_generate_detail(
     categorized_item: CategorizedAgendaItem,
     all_items: list[CategorizedAgendaItem],
     gemini,
-    constituent: Optional[dict] = None,
-    available_docs: Optional[list[dict]] = None,
+    constituent: dict | None = None,
+    available_docs: list[dict] | None = None,
     storage=None,
     pdf_text: str = "",
 ) -> PriorityIssueDetail:
@@ -824,7 +821,7 @@ def assemble_briefing(
     categorized: AgendaCategorization,
     cards: BriefingCards,
     details: list[PriorityIssueDetail],
-    constituent: Optional[dict] = None,
+    constituent: dict | None = None,
 ) -> dict:
     date = meeting.get("date", "")
 
@@ -1015,7 +1012,7 @@ def generate_briefing_for_meeting(
     if pdf_text:
         print(f"  PDF context: {len(pdf_text.split()):,} words loaded for all passes")
     else:
-        print(f"  PDF context: not available (will use normalized fields only)")
+        print("  PDF context: not available (will use normalized fields only)")
 
     # Pass 1: Categorize
     print(f"  Pass 1: Categorizing {len(items)} agenda items...")
@@ -1026,7 +1023,7 @@ def generate_briefing_for_meeting(
     print(f"  Pass 1 done: {len(categorized.items)} items, {priority_count} priorities ({t1-t0:.1f}s)")
 
     # Pass 2: Generate cards
-    print(f"  Pass 2: Generating card content...")
+    print("  Pass 2: Generating card content...")
     t0 = time.time()
     cards = pass2_generate_cards(meeting, categorized, gemini, constituent=constituent, pdf_text=pdf_text, available_docs=meeting.get("agendaFiles"))
     t1 = time.time()
@@ -1075,7 +1072,7 @@ def generate_briefing_for_meeting(
             print(f"  ⚠ Provenance: {w}")
 
     # Assemble
-    print(f"  Assembling briefing...")
+    print("  Assembling briefing...")
     briefing = assemble_briefing(meeting, categorized, cards, details, constituent=constituent)
     if provenance_warnings:
         briefing["provenanceWarnings"] = provenance_warnings

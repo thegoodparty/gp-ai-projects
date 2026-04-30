@@ -6,12 +6,11 @@ No PDFs downloaded — that is the collection stage.
 """
 
 import re
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import httpx
 
-from meeting_pipeline.shared.constants import LOOKBACK_DAYS, LOOKAHEAD_DAYS
+from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
 
 
 async def scan_legistar(city: str, config: dict, client: httpx.AsyncClient, source_url: str = "") -> list[dict]:

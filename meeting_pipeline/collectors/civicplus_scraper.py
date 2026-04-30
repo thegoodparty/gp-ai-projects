@@ -27,14 +27,13 @@ See docs/investigation-learnings/civicplus-scraper-findings.md for full research
 
 import asyncio
 import re
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 from bs4 import BeautifulSoup
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # ============================================================================
 # CONFIG AND RESULT

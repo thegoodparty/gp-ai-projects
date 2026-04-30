@@ -15,7 +15,7 @@ import time
 import boto3
 
 from meeting_pipeline.lambda_handlers._secrets import inject_secrets
-from meeting_pipeline.shared.config import AgentConfig, get_storage, city_to_slug
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
 from meeting_pipeline.stages.discover.process import process_one_city
 
 sqs = boto3.client("sqs")

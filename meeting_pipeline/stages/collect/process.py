@@ -5,7 +5,6 @@ Routes to the correct platform collector based on source.json platform.
 Downloads agenda PDFs and platform-specific data to S3.
 """
 
-from typing import Optional
 
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 
@@ -13,7 +12,7 @@ from meeting_pipeline.shared.config import AgentConfig, get_storage
 async def process_one_city(
     city: str,
     state: str,
-    cfg: Optional[AgentConfig] = None,
+    cfg: AgentConfig | None = None,
     storage=None,
 ) -> dict:
     """

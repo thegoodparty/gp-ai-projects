@@ -5,11 +5,9 @@ Contains the core logic for converting agenda PDFs into structured meeting JSON.
 Used by stages/extract/process.py.
 """
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from pydantic import BaseModel
-
 
 # ── Pydantic schemas for LLM structured output ───────────────────────────────
 
@@ -196,7 +194,7 @@ def normalize_meeting(
 
     return {
         "schema_version": "1.0",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "official": {
             "name": official["name"],
             "city": official["city"],

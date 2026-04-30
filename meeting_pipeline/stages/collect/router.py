@@ -18,15 +18,13 @@ Platform map:
     unknown    → generic_direct (download PDFs from scan URLs)
 """
 
-from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs
+from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, find_city_slug
+from meeting_pipeline.shared.manifest import load_manifest, validate_against_manifest
 from meeting_pipeline.shared.models import CollectionResult
 from meeting_pipeline.shared.storage import StorageBackend
-from meeting_pipeline.shared.config import AgentConfig, city_to_slug, find_city_slug
-from meeting_pipeline.shared import notification_log
-from meeting_pipeline.shared.manifest import load_manifest, validate_against_manifest
-
 
 # ── Dedicated collector adapters ──────────────────────────────────────────────
 
@@ -208,7 +206,10 @@ async def _collect_granicus(
     event: dict, source: dict, storage: StorageBackend, cfg: AgentConfig
 ) -> CollectionResult:
     from meeting_pipeline.collectors.granicus_scraper import (
-        GranicusConfig, collect_granicus, CLASSIC_GRANICUS, NEW_SWAGIT
+        CLASSIC_GRANICUS,
+        NEW_SWAGIT,
+        GranicusConfig,
+        collect_granicus,
     )
 
     city = event["city"]
@@ -485,7 +486,7 @@ async def _collect_generic_direct(
                 "agenda_files": [{"name": filename, "type": "Agenda", "url": pdf_url}],
                 "source_url": source.get("best_source", {}).get("url", ""),
                 "platform": "generic_direct",
-                "collected_at": datetime.now(timezone.utc).isoformat(),
+                "collected_at": datetime.now(UTC).isoformat(),
             })
 
     if not meetings_out:
@@ -535,7 +536,7 @@ def _flag_for_rediscovery(
         best = source.get("best_source", {})
         best["collection_failed"] = True
         best["collection_error"] = error
-        best["collection_failed_at"] = datetime.now(timezone.utc).isoformat()
+        best["collection_failed_at"] = datetime.now(UTC).isoformat()
         source["best_source"] = best
         storage.write_json(source_key, source)
         print(f"  [router] Flagged {city_slug} for rediscovery: {error}")

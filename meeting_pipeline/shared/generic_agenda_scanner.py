@@ -13,12 +13,11 @@ Cost per call:
 
 import json
 import os
-import re
 import time
 from datetime import date, datetime, timedelta
 
+from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
 from meeting_pipeline.shared.date_utils import parse_date_from_filename
-from meeting_pipeline.shared.constants import LOOKBACK_DAYS, LOOKAHEAD_DAYS
 
 
 def build_meetings_from_llm(

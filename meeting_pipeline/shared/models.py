@@ -7,8 +7,7 @@ Kept as plain dataclasses (not Pydantic) so they serialize/deserialize cleanly
 as dicts without extra dependencies — compatible with Lambda event payloads.
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Any
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -33,7 +32,7 @@ class CollectionResult:
         return asdict(self)
 
     @classmethod
-    def error_result(cls, city: str, state: str, platform: str, error: str) -> "CollectionResult":
+    def error_result(cls, city: str, state: str, platform: str, error: str) -> CollectionResult:
         return cls(
             city=city,
             state=state,
@@ -68,7 +67,7 @@ class NavConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "NavConfig":
+    def from_dict(cls, d: dict) -> NavConfig:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 

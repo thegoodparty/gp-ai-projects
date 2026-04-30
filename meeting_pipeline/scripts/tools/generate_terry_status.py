@@ -25,7 +25,6 @@ Usage:
 
 import argparse
 import csv
-import sys
 from datetime import date
 from pathlib import Path
 
@@ -33,6 +32,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
@@ -267,7 +267,7 @@ def main():
             fieldnames.remove(col)
 
     anchor_idx = fieldnames.index(anchor)
-    for i, col in enumerate(PIPELINE_COLUMNS):
+    for _i, col in enumerate(PIPELINE_COLUMNS):
         if col == anchor:
             continue
         insert_at = anchor_idx + PIPELINE_COLUMNS.index(col)
@@ -354,7 +354,7 @@ def main():
         # Ensure every row has all expected fieldname keys (fill missing with "")
         # and strip any stale keys not in fieldnames to prevent DictWriter errors.
         clean_rows = []
-        fieldnames_set = set(fieldnames)
+        set(fieldnames)
         for row in rows:
             clean_row = {k: row.get(k, "") for k in fieldnames}
             clean_rows.append(clean_row)

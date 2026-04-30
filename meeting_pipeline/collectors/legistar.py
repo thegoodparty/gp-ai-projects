@@ -19,13 +19,12 @@ Usage:
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
 
 import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
-
 
 # ============================================================================
 # CONFIG AND RESULT DATACLASSES

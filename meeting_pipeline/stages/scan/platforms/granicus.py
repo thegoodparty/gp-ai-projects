@@ -8,11 +8,11 @@ No PDFs downloaded — that is the collection stage.
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
-from meeting_pipeline.shared.constants import LOOKBACK_DAYS, LOOKAHEAD_DAYS
+from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
 
 
 async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.AsyncClient) -> list[dict]:
@@ -52,7 +52,6 @@ async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.
             return []
 
         upcoming = []
-        ns = {"media": "http://search.yahoo.com/mrss/"}
         for item in root.iter("item"):
             title_el = item.find("title")
             pubdate_el = item.find("pubDate")

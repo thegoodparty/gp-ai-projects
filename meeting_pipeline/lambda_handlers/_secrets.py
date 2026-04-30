@@ -2,19 +2,18 @@
 
 import json
 import os
-from typing import Optional
 
 from pydantic import BaseModel
 
 
 class Secrets(BaseModel):
     GEMINI_API_KEY: str
-    SERPER_API_KEY: Optional[str] = None
-    FIRECRAWL_API_KEY: Optional[str] = None
-    TAVILY_API_KEY: Optional[str] = None
+    SERPER_API_KEY: str | None = None
+    FIRECRAWL_API_KEY: str | None = None
+    TAVILY_API_KEY: str | None = None
 
 
-_cache: Optional[Secrets] = None
+_cache: Secrets | None = None
 
 
 def _load_secrets() -> Secrets:

@@ -1,13 +1,12 @@
 """Tests for prompt builders in prompts/"""
-import pytest
 
-from meeting_pipeline.prompts.extraction import build_extraction_prompt
 from meeting_pipeline.prompts.briefing import (
     EDITORIAL_RULES,
     build_pass1_prompt,
     build_pass2_prompt,
     build_pass3_prompt,
 )
+from meeting_pipeline.prompts.extraction import build_extraction_prompt
 
 
 def test_extraction_prompt_contains_city():

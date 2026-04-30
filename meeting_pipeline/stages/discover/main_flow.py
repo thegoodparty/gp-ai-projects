@@ -11,45 +11,61 @@ import csv
 import json
 import os
 import re
+import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 from tavily import TavilyClient
 
-from meeting_pipeline.shared.body_validation import validate_body_for_city, VALIDATABLE_PLATFORMS
 from meeting_pipeline.shared.constants import (
-    STATE_NAMES as _STATE_NAMES, STATE_ABBREVS,
-    PLATFORM_PATTERNS, COLLECTION_METHODS,
-    FRESH_THRESHOLD, STALE_WARNING_THRESHOLD,
-    WRONG_CITY_PATTERNS, WRONG_ENTITY_PATTERNS, WRONG_DOMAIN_PATTERNS,
-    BOARDDOCS_WRONG_ENTITY_KEYWORDS, COUNCIL_BODY_KEYWORDS, GRANICUS_COUNCIL_KEYWORDS,
-    REJECT_URL_PATTERNS, FETCH_BLOCKLIST, CITY_NAME_PREFIXES, CITY_NAME_SUFFIXES,
-    PDF_PLATFORM_SIGNALS,
+    BOARDDOCS_WRONG_ENTITY_KEYWORDS,
+    COLLECTION_METHODS,
+    FRESH_THRESHOLD,
+    GRANICUS_COUNCIL_KEYWORDS,
+    STATE_ABBREVS,
+    WRONG_CITY_PATTERNS,
+    WRONG_ENTITY_PATTERNS,
+)
+from meeting_pipeline.shared.constants import (
+    STATE_NAMES as _STATE_NAMES,
+)
+from meeting_pipeline.shared.date_utils import (
+    classify_freshness,
+    extract_dates,
+)
+from meeting_pipeline.shared.date_utils import (
+    normalize_table_dates as _normalize_table_dates,
 )
 from meeting_pipeline.shared.discovery_helpers import make_candidate, safe_fetch
 from meeting_pipeline.shared.url_utils import (
-    detect_platform, normalize_platform_url, is_wrong_city, is_wrong_entity,
-    is_non_agenda_url, city_to_slug,
-)
-from meeting_pipeline.shared.date_utils import (
-    extract_dates, classify_freshness, normalize_table_dates as _normalize_table_dates,
-)
-from meeting_pipeline.stages.discover.scoring import (
-    candidate_score, rank_candidates, classify_domain_trust, agenda_authority_score,
-    FRESHNESS_SCORE, PLATFORM_TIER, SOURCE_BONUS,
-)
-from meeting_pipeline.stages.discover.search import (
-    serper_search,
-    search_results_to_candidates as _search_results_to_candidates,
-    discover_from_duckduckgo, discover_from_exa, discover_from_tavily,
-    discover_from_firecrawl, discover_from_pdf_search,
+    city_to_slug,
+    detect_platform,
+    is_non_agenda_url,
+    is_wrong_city,
+    is_wrong_entity,
 )
 from meeting_pipeline.stages.discover.crawl import (
-    validate_domain_for_city, firecrawl_map_agenda, firecrawl_crawl_for_agenda,
+    firecrawl_crawl_for_agenda,
+    firecrawl_map_agenda,
+    validate_domain_for_city,
+)
+from meeting_pipeline.stages.discover.scoring import (
+    candidate_score,
+    classify_domain_trust,
+    rank_candidates,
+)
+from meeting_pipeline.stages.discover.search import (
+    discover_from_duckduckgo,
+    discover_from_exa,
+    discover_from_firecrawl,
+    discover_from_pdf_search,
+    serper_search,
+)
+from meeting_pipeline.stages.discover.search import (
+    search_results_to_candidates as _search_results_to_candidates,
 )
 
 # ── Module-level constants ───────────────────────────────────────────────────
@@ -62,6 +78,37 @@ _DEPT_REJECT_KEYWORDS = [
     "police", "fire", "sheriff", "court", "library", "school",
     "water", "sewer", "utility", "transit", "housing", "airport",
 ]
+
+# CSV path for city list (used by get_serve_csv_cities)
+_PIPELINE_DIR = Path(__file__).resolve().parent.parent
+SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
+if not SERVE_CSV.exists():
+    SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
+if not SERVE_CSV.exists():
+    SERVE_CSV = _PIPELINE_DIR / "Terry Users2.csv"
+
+# Org-name prefixes that confirm this is the main municipal government
+_CITY_GOV_PREFIXES = (
+    "city of ", "town of ", "village of ", "borough of ",
+    "township of ", "city and county of ",
+)
+
+# Cost tracking — module-level counters (single-threaded event loop)
+_COST: dict[str, int] = {
+    "exa_searches": 0,
+    "tavily_searches": 0,
+    "firecrawl_scrape_basic": 0,
+    "firecrawl_scrape_actions": 0,
+    "firecrawl_scrapes": 0,
+    "serper_searches": 0,
+}
+
+
+def _is_council_body(name: str) -> bool:
+    """Check if an event body name is a city council (not advisory/planning/etc)."""
+    from meeting_pipeline.shared.constants import COUNCIL_BODY_KEYWORDS
+    name_lower = name.lower()
+    return any(kw in name_lower for kw in COUNCIL_BODY_KEYWORDS)
 
 
 def _load_dotgov_index() -> dict[tuple[str, str], list[dict]]:
@@ -670,7 +717,7 @@ async def discover_from_tavily(
     state: str,
     tavily: TavilyClient,
     search_depth: str = "basic",
-    query: Optional[str] = None,
+    query: str | None = None,
 ) -> tuple[list[dict], str]:
     """Run one Tavily search. Return (candidates, query_used)."""
     if query is None:
@@ -837,7 +884,7 @@ _AGENDA_PATHS = [
 
 async def discover_official_domain(
     city: str, state: str, tavily: TavilyClient
-) -> Optional[str]:
+) -> str | None:
     """
     Find the official city government domain by searching for the city homepage.
 
@@ -894,7 +941,7 @@ async def discover_official_domain(
     return None
 
 
-async def discover_official_domain_via_claude(city: str, state: str) -> Optional[str]:
+async def discover_official_domain_via_claude(city: str, state: str) -> str | None:
     """
     Fallback domain discovery using Claude's web_search tool.
 
@@ -973,7 +1020,7 @@ async def probe_city_domain_patterns(
     city: str,
     state: str,
     http: httpx.AsyncClient,
-) -> Optional[str]:
+) -> str | None:
     """
     Probe common US city government domain patterns directly.
 
@@ -1001,7 +1048,7 @@ async def probe_city_domain_patterns(
 
     state_full = _STATE_NAMES.get(state, state).lower()
 
-    async def check_domain(domain: str) -> Optional[str]:
+    async def check_domain(domain: str) -> str | None:
         for base_url in [f"https://www.{domain}", f"https://{domain}"]:
             status, body = await safe_fetch(http, base_url, timeout=6.0)
             body_lower = body.lower() if body else ""
@@ -1295,7 +1342,7 @@ async def discover_from_probes(
         # School District, not Lima city government.  Extract the <title> or first <h1>
         # from the fetched HTML and reject if it contains school/district/ISD keywords.
         if platform == "boarddocs" and body:
-            body_lower = body.lower()
+            body.lower()
             # Extract page title
             title_match = re.search(r"<title[^>]*>([^<]+)</title>", body, re.IGNORECASE)
             page_title = title_match.group(1).strip().lower() if title_match else ""
@@ -1982,7 +2029,7 @@ async def probe_boarddocs_api(url: str, http: httpx.AsyncClient) -> dict:
             }
         return {"success": False, "error": "POST returned data but no parseable dates"}
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"success": False, "error": "timeout on POST request"}
     except Exception as e:
         return {"success": False, "error": str(e)[:100]}
@@ -2101,7 +2148,7 @@ async def probe_unknown_stale(
     """
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    city_slug = city_to_slug(city)
+    city_to_slug(city)
 
     candidates_to_try = [
         f"{base}/agendas",
@@ -2317,7 +2364,7 @@ async def deep_probe_candidate(
         preferred_vid = int(preferred_vid_str) if preferred_vid_str and preferred_vid_str.isdigit() else None
         gran = await probe_granicus_views(subdomain, http, preferred_view_id=preferred_vid)
         if gran.get("view_id"):
-            gran_body = gran.pop("_body", "")
+            gran.pop("_body", "")
             result = {
                 "success": True,
                 "most_recent_date": gran.get("most_recent_date"),
@@ -2655,11 +2702,9 @@ async def run_source_discover(
             if c.get("freshness") in ("unknown_spa", "stale_warning", "stale", "unknown", "empty")
             and c.get("platform") in ("civicclerk", "boarddocs", "escribe", "civicplus", "unknown", "legistar", "granicus")
         ]
-        any_changed = False
         for target in probe_targets[:6]:  # cap to avoid runaway cost
             upgraded = await deep_probe_candidate(target, city, state, http)
             if upgraded:
-                any_changed = True
                 ranked = rank_candidates(verified, city=city, state=state)  # re-rank after upgrade
                 best = ranked[0]
                 if best.get("freshness") == "fresh" and best.get("platform") != "unknown":
@@ -2952,7 +2997,7 @@ async def run_source_discover(
     return {
         "city": city,
         "state": state,
-        "discovered_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "discovered_at": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "public_agenda_url": public_agenda_url,
         "best_source": best_source,
         "all_candidates": all_candidates_out,

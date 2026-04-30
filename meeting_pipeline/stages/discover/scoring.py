@@ -10,11 +10,10 @@ from urllib.parse import urlparse
 
 from meeting_pipeline.shared.constants import (
     FRESHNESS_SCORE,
+    GOV_PLATFORM_DOMAINS,
     PLATFORM_TIER,
     SOURCE_BONUS,
     STATE_NAMES,
-    GOV_PLATFORM_DOMAINS,
-    NEWS_DOMAIN_SUFFIXES,
 )
 
 # ── Domain trust classification ───────────────────────────────────────────────

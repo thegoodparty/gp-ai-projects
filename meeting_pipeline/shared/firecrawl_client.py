@@ -8,9 +8,9 @@ Returns firecrawl.v2.types.Document with .markdown, .metadata, .links attrs.
 Metadata is a Pydantic model — access as dict via model_dump() or getattr.
 """
 from __future__ import annotations
+
 import os
 from datetime import date
-from typing import Optional
 
 
 def _client():
@@ -52,7 +52,7 @@ def _meta_dict(metadata) -> dict:
     return {}
 
 
-def search_agenda_page(city: str, state: str) -> Optional[str]:
+def search_agenda_page(city: str, state: str) -> str | None:
     """
     Use Firecrawl search to find the city council agenda page URL.
     Returns the most likely URL or None.
@@ -151,7 +151,7 @@ def validate_agenda_page(url: str, city: str, state: str) -> dict:
         return {"valid": False, "most_recent_date": None, "pdf_urls": [], "error": str(e)}
 
 
-def scrape_pdf_text(pdf_url: str) -> Optional[str]:
+def scrape_pdf_text(pdf_url: str) -> str | None:
     """
     Use Firecrawl to extract text from a PDF URL, including OCR for scanned PDFs.
     """

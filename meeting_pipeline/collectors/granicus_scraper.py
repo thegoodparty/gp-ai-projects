@@ -39,7 +39,6 @@ import httpx
 
 from meeting_pipeline.shared.storage import StorageBackend
 
-
 # Granicus XML namespace used in RSS feeds
 GRAN_NS = "http://granicus.com/ns/1.0"
 
