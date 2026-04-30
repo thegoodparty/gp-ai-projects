@@ -22,7 +22,7 @@ from pmf_engine.runner.contract import format_contract_for_prompt
 
 logger = get_logger(__name__)
 
-ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"]
+ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
@@ -50,8 +50,8 @@ You have **{max_turns} tool-use turns** to complete this task. Each tool call (B
 **CLI**: python, aws, pdftotext (poppler-utils). You can `pip install` additional Python packages if needed.
 
 **Network egress**: The container has NO direct internet access. `curl`, `wget`, and raw `httpx` calls to external hosts will fail. All external access goes through either:
-- `WebFetch(url, prompt=...)` / `WebSearch(query)` (Claude SDK) — for HTML pages and web search. Returns extracted text. Note: some domains (e.g. `webapi.legistar.com` REST API) are blocked by Anthropic's fetch allowlist — use `pmf_runtime.http.get` for those.
-- `pmf_runtime.http.get(url)` (via broker) — for JSON REST APIs (Legistar, LINC, etc.). Broker's domain allowlist covers `.gov`, `.us`, Legistar, Granicus, PrimeGov, CivicPlus, BoardDocs, eSCRIBE, Municode.
+- `WebSearch(query)` (Claude SDK) — for discovering URLs and topical results. Returns search hits.
+- `pmf_runtime.http.get(url)` (via broker) — for HTML pages, JSON REST APIs (Legistar, LINC, etc.), and any URL retrieval. Broker's domain allowlist covers `.gov`, `.us`, Legistar, Granicus, PrimeGov, CivicPlus, BoardDocs, eSCRIBE, Municode. **This is the only sanctioned way to fetch a URL — `WebFetch` is not available.**
 - `pmf_runtime.pdf.download(url)` (via broker) — for PDFs. Same allowlist.
 - `pmf_runtime` (Databricks, priors, publish, Anthropic proxy) — structured data + artifact I/O.
 

@@ -115,11 +115,11 @@ The Lambda has a `vpc_config` attaching it to the VPC with its own SG (`pmf-disp
 
 Broker mounts the Anthropic proxy router at `/anthropic`. Dispatch Lambda sets `ANTHROPIC_BASE_URL = https://broker-{env}.ai.goodparty.org/anthropic` as a container override on the runner task. Claude Agent SDK transparently routes its `/v1/messages` calls under that base URL. Anthropic API key lives only in the broker's env (from `broker-{env}` secret).
 
-### 6. WebFetch + WebSearch allowed; no broker research/fetch route
+### 6. WebSearch allowed via Anthropic proxy; URL fetches go through broker `/http/fetch`
 
-Runner's `ALLOWED_TOOLS` includes `WebFetch` and `WebSearch` (Claude SDK built-ins). These route HTTP traffic through Anthropic's servers, not through the broker — Anthropic fetches the URL and returns extracted content to the model via chat completion.
+Runner's `ALLOWED_TOOLS` includes `WebSearch` (Claude SDK built-in). WebSearch is server-side at Anthropic — search queries piggyback on the `/messages` API call (already broker-proxied through `/anthropic/v1/messages`), and results return inline. The runner never makes a separate outbound request for search.
 
-The broker's content classifier does **not** see this fetched content. The containment guarantee still holds: even if Anthropic returns malicious content and the agent follows the injection, the runner can't exfiltrate (no egress, no IAM) and the broker's artifact validator catches malformed outputs.
+`WebFetch` is **not** in `ALLOWED_TOOLS`. Claude SDK runs WebFetch client-side in the runner container and requires direct egress to `claude.ai` for URL safety pre-checks — egress the runner SG explicitly denies. All URL retrieval now goes through `pmf_runtime.http.get(url)` and `pmf_runtime.pdf.download(url)`, which call broker `/http/fetch` and `/pdf/fetch` respectively. The broker is the sole egress path; every URL fetch is auditable.
 
 Broker no longer exposes `research_fetch` or `research_search` endpoints.
 

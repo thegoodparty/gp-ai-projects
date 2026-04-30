@@ -119,9 +119,9 @@ For each peer city, note: name, state, approximate population, and why it's comp
 
 ## STEP 4: Research peer city approaches to each issue
 
-### CRITICAL: WebFetch domain-verification failures
+### URL retrieval — use `pmf_runtime.http.get`
 
-If `WebFetch` returns an error like `Unable to verify if domain {host} is safe to fetch. This may be due to network restrictions or enterprise security policies blocking claude.ai` — **do NOT retry `WebFetch` on the same or sibling domains** (each attempt burns ~2 minutes). Fall back immediately to `pmf_runtime.http.get`, which routes through the broker's allowlist-enforced proxy and bypasses Claude SDK's domain verification:
+The runner has no direct internet egress. All URL retrieval (HTML pages, news articles, REST APIs) goes through the broker via `pmf_runtime.http.get`:
 
 ```python
 from pmf_runtime import http
@@ -130,7 +130,7 @@ r = http.get("https://peercity.gov/council-minutes")
 print(r["body"][:2000])
 ```
 
-Most `.gov` and municipal portal domains are already allowlisted. Use `pmf_runtime.http.get` whenever `WebFetch` errors, not as a second fallback after more `WebFetch` retries.
+For PDFs, use `pmf_runtime.pdf.download(url)` then `pdftotext` (see step 4c below). Use `WebSearch(...)` to discover URLs; never use `WebFetch` (it is not in the runner's tool set).
 
 For each issue from the district intel, and each peer city:
 
@@ -149,7 +149,7 @@ For each issue from the district intel, and each peer city:
 - City budget documents or reports
 - Policy implementation reports
 
-For HTML pages and short PDFs use `WebFetch(url, prompt="what did PEER_CITY do about ISSUE_TOPIC")`. For large budget books or staff reports, download through the broker:
+For HTML pages, use `pmf_runtime.http.get(url)`. For PDFs (budget books, staff reports), download through the broker:
 ```python
 from pmf_runtime import pdf
 result = pdf.download("https://peercity.gov/fy2026_budget.pdf", purpose="public safety line items")
