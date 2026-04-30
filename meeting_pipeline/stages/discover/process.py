@@ -198,7 +198,7 @@ async def _run_body_validation(
             print(f"  [body] corrected → {bv.get('correction_note', '')}")
         elif status == "unresolved":
             print(f"  [body] UNRESOLVED for {platform} — {bv.get('reason', '')}")
-            result = _try_fallback_candidates(result, slug, source_key, http_client, storage, bv)
+            result = await _try_fallback_candidates(result, slug, source_key, http_client, storage, bv)
         elif status not in ("skip", "ok"):
             print(f"  [body] {status}: {bv.get('reason', '')}")
     except Exception as e:
@@ -207,12 +207,11 @@ async def _run_body_validation(
     return result
 
 
-def _try_fallback_candidates(
+async def _try_fallback_candidates(
     result: dict, slug: str, source_key: str,
     http_client: httpx.AsyncClient, storage, bv: dict,
 ) -> dict:
     """When body validation fails, try alternate candidates from discovery."""
-    import asyncio
     from meeting_pipeline.shared.body_validation import validate_body_for_city
 
     candidates = (result.get("all_candidates") or [])[1:]
@@ -246,8 +245,8 @@ def _try_fallback_candidates(
             continue
 
         try:
-            alt_bv = asyncio.get_event_loop().run_until_complete(
-                validate_body_for_city(slug, alt_source, source_key, http_client, storage)
+            alt_bv = await validate_body_for_city(
+                slug, alt_source, source_key, http_client, storage
             )
         except Exception:
             continue
