@@ -302,9 +302,8 @@ def main():
 
             voters = data["voter_count_with_scores"]
             top3 = data["issues"][:3]
-            print(f"  ✓ {voters:,} voters, top: {top3[0]['name']} ({top3[0]['score']}), "
-                  f"{top3[1]['name']} ({top3[1]['score']}), {top3[2]['name']} ({top3[2]['score']}) "
-                  f"[{elapsed:.1f}s]")
+            top_str = ", ".join(f"{t['name']} ({t['score']})" for t in top3)
+            print(f"  ✓ {voters:,} voters, top: {top_str} [{elapsed:.1f}s]")
             results.append({"slug": slug, "status": "ok", "voters": voters, "time": elapsed})
 
         except Exception as e:
