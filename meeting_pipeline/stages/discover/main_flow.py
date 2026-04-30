@@ -410,9 +410,13 @@ async def discover_from_serper(
                 print(f"  [discover] Result #{idx+1} produced 0 meetings, trying next")
 
         if not found:
-            # None of the Serper results worked — use the first URL as best guess
-            final_url = serper_url
-            print(f"  [discover] No Serper results produced meetings — using #{1} as fallback")
+            # None of the Serper results produced parseable meetings.
+            # Prefer the Firecrawl-mapped URL (deeper page) over the raw Serper
+            # landing page — the mapped URL is more likely to be the actual agenda
+            # page (e.g. /AgendaCenter/City-Council-6), even if scan_generic
+            # couldn't extract dates from it.
+            final_url = agenda_url or serper_url
+            print(f"  [discover] No Serper results produced meetings — using {'mapped' if agenda_url else '#1'} as fallback")
     else:
         # Known platform — use Firecrawl map for sub-page but skip scan validation
         serper_path = urlparse(serper_url).path.lower() if serper_url else ""

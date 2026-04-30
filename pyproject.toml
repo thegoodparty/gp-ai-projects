@@ -46,6 +46,7 @@ dependencies = [
     "slack-sdk>=3.39.0",
     "pymupdf>=1.27.2.2",
     "beautifulsoup4>=4.14.3",
+    "firecrawl-py>=4.22.3",
 ]
 
 [project.optional-dependencies]
