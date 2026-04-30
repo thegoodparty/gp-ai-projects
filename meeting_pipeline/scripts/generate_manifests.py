@@ -23,8 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.shared.constants import STATE_ABBREVS
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage  # noqa: E402
+from meeting_pipeline.shared.constants import STATE_ABBREVS  # noqa: E402
 
 _PIPELINE_DIR = Path(__file__).resolve().parent.parent
 SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
@@ -106,18 +106,11 @@ def parse_expected_body(candidate_office: str) -> str:
             if w.lower() == "board":
                 if i > 0:
                     return f"{words[i-1].title()} Board"
-                rest = " ".join(words[i:])
-                rest = rest.split(" - ")[0].split(",")[0].strip()
-                return rest
+                return " ".join(words[i:]).split(" - ")[0].split(",")[0].strip()
         return "City Council"
 
     # Fallback
     return "City Council"
-
-
-def city_to_slug(city: str) -> str:
-    """Convert city name to lowercase hyphenated slug (no state suffix)."""
-    return city.lower().replace(" ", "-").replace(".", "").replace("'", "")
 
 
 def load_cities_from_csv(filter_city: str | None = None) -> list[dict]:
@@ -129,7 +122,7 @@ def load_cities_from_csv(filter_city: str | None = None) -> list[dict]:
     seen: dict[str, dict] = {}  # city_slug → record
 
     csv_path = _csv_override if _csv_override else SERVE_CSV
-    with open(csv_path, newline="", encoding="utf-8") as f:
+    with Path(csv_path).open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             # Support unified CSV (lowercase) and legacy formats
@@ -146,8 +139,7 @@ def load_cities_from_csv(filter_city: str | None = None) -> list[dict]:
             if filter_city and city.lower() != filter_city.lower():
                 continue
 
-            slug = city_to_slug(city)
-            city_state_key = f"{slug}-{state}"
+            city_state_key = city_to_slug(city, state)
 
             if city_state_key not in seen:
                 seen[city_state_key] = {
@@ -185,10 +177,7 @@ def main() -> None:
 
     # Set up storage
     cfg = AgentConfig.from_env()
-    if not args.dry_run:
-        storage = get_storage(cfg)
-    else:
-        storage = None
+    storage = get_storage(cfg) if not args.dry_run else None
 
     cities = load_cities_from_csv(filter_city=args.city)
     if not cities:

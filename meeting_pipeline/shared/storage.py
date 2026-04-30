@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 storage.py — StorageBackend Protocol + S3StorageBackend.
 
@@ -13,6 +11,8 @@ Keys are always forward-slash paths relative to the bucket root, e.g.:
 Keys map directly to S3 object keys within the configured bucket.
 Logs are not written to S3 — append_line() is a no-op on S3StorageBackend.
 """
+
+from __future__ import annotations
 
 import json
 from typing import Protocol, runtime_checkable

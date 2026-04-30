@@ -158,9 +158,6 @@ class TestImports:
     def test_import_stages_briefing_generate(self):
         from meeting_pipeline.stages.briefing import generate  # noqa: F401
 
-    def test_import_stages_briefing_process(self):
-        from meeting_pipeline.stages.briefing import process  # noqa: F401
-
     def test_import_stages_discover_process(self):
         from meeting_pipeline.stages.discover import process  # noqa: F401
 
@@ -803,13 +800,13 @@ class TestScanHandler:
             "meeting_pipeline/sources/bad-city-TX/source.json": source_unverified,
         })
 
-        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"):
-            with patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg:
+        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.scan.get_storage", return_value=storage):
                 cfg = MagicMock()
                 cfg.sources_prefix = "meeting_pipeline/sources"
                 mock_cfg.return_value = cfg
-                with patch("meeting_pipeline.lambda_handlers.scan.get_storage", return_value=storage):
-                    result = handler({"action": "list_cities"})
+                result = handler({"action": "list_cities"})
 
         assert "cities" in result
         slugs = [c["slug"] for c in result["cities"]]
@@ -818,12 +815,12 @@ class TestScanHandler:
 
     @patch("boto3.client")
     def test_scan_requires_slug(self, mock_boto):
-        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"):
-            with patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg:
+        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.scan.get_storage"):
                 mock_cfg.return_value = MagicMock()
-                with patch("meeting_pipeline.lambda_handlers.scan.get_storage"):
-                    from meeting_pipeline.lambda_handlers.scan import handler
-                    result = handler({})
+                from meeting_pipeline.lambda_handlers.scan import handler
+                result = handler({})
         assert "error" in result
 
     @patch("boto3.client")
@@ -882,13 +879,13 @@ class TestProcessHandler:
             ]
         }
 
-        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"):
-            with patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg:
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
                 mock_cfg.return_value = MagicMock()
-                with patch("meeting_pipeline.lambda_handlers.process.get_storage"):
-                    with patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
-                        mock_proc.return_value = {"status": "ok"}
-                        handler(event)
+                mock_proc.return_value = {"status": "ok"}
+                handler(event)
 
         mock_proc.assert_called_once()
         call_args = mock_proc.call_args
@@ -907,13 +904,13 @@ class TestProcessHandler:
             "platform": "legistar",
         }
 
-        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"):
-            with patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg:
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
                 mock_cfg.return_value = MagicMock()
-                with patch("meeting_pipeline.lambda_handlers.process.get_storage"):
-                    with patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
-                        mock_proc.return_value = {"status": "ok"}
-                        result = handler(event)
+                mock_proc.return_value = {"status": "ok"}
+                result = handler(event)
 
         mock_proc.assert_called_once()
         assert result["results"] == [{"status": "ok"}]

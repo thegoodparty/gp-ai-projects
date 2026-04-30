@@ -144,7 +144,7 @@ def validate_agenda_page(url: str, city: str, state: str) -> dict:
         ])
         valid = agenda_signals >= 2 and reject_signals == 0
 
-        pdf_urls = [l for l in links if isinstance(l, str) and ".pdf" in l.lower()]
+        pdf_urls = [link for link in links if isinstance(link, str) and ".pdf" in link.lower()]
 
         return {"valid": valid, "most_recent_date": most_recent_date, "pdf_urls": pdf_urls[:10]}
     except Exception as e:
@@ -190,7 +190,7 @@ def scrape_civicclerk_event_files(portal_url: str, event_id: str) -> list[str]:
         links = list(getattr(result, "links", None) or [])
         if isinstance(result, dict):
             links = result.get("links", []) or []
-        return [l for l in links if isinstance(l, str) and (".pdf" in l.lower() or "agenda" in l.lower())]
+        return [link for link in links if isinstance(link, str) and (".pdf" in link.lower() or "agenda" in link.lower())]
     except Exception as e:
         print(f"  [firecrawl] CivicClerk event scrape failed for event {event_id}: {e}")
         return []

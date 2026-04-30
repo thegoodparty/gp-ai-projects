@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 config.py — AgentConfig + storage backend factory.
 
@@ -7,6 +5,8 @@ All paths come from env vars or this config object — never hardcoded.
 This mirrors the Lambda handler pattern where environment variables
 configure the function at deploy time.
 """
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass

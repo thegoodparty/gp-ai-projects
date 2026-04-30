@@ -31,11 +31,11 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage  # noqa: E402
 
 TODAY = date.today().isoformat()
 TERRY_CSV = _ROOT / "Terry Users2.csv"
@@ -241,7 +241,7 @@ def main():
     storage = get_storage(cfg)
 
     # ── Load Terry CSV ────────────────────────────────────────────────────────
-    with open(TERRY_CSV, newline="", encoding="utf-8") as f:
+    with TERRY_CSV.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     fieldnames = list(rows[0].keys())
 
@@ -326,7 +326,7 @@ def main():
     ]
 
     if not args.dry_run:
-        with open(STATUS_CSV, "w", newline="", encoding="utf-8") as f:
+        with STATUS_CSV.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=status_fieldnames)
             writer.writeheader()
             writer.writerows(status_rows)
@@ -354,11 +354,10 @@ def main():
         # Ensure every row has all expected fieldname keys (fill missing with "")
         # and strip any stale keys not in fieldnames to prevent DictWriter errors.
         clean_rows = []
-        set(fieldnames)
         for row in rows:
             clean_row = {k: row.get(k, "") for k in fieldnames}
             clean_rows.append(clean_row)
-        with open(TERRY_CSV, "w", newline="", encoding="utf-8") as f:
+        with TERRY_CSV.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(clean_rows)

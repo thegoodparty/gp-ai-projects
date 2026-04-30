@@ -5,6 +5,7 @@ Used by discovery (freshness verification), scan (meeting date parsing),
 and the generic agenda scanner (PDF filename parsing).
 """
 
+import contextlib
 import re
 from datetime import date, timedelta
 
@@ -21,7 +22,7 @@ def classify_freshness(most_recent: date | None, today: date | None = None) -> s
     days = (today - most_recent).days
     if days <= FRESH_THRESHOLD:
         return "fresh"
-    elif days <= STALE_WARNING_THRESHOLD:
+    if days <= STALE_WARNING_THRESHOLD:
         return "stale_warning"
     return "stale"
 
@@ -36,8 +37,11 @@ _FILENAME_DATE_PATTERNS = [
 ]
 
 
-def parse_date_from_filename(filename: str) -> date | None:
+def parse_date_from_filename(filename: str, today: date | None = None) -> date | None:
     """Extract a meeting date from a PDF filename. Returns None if no date found."""
+    if today is None:
+        today = date.today()
+    valid_range = (date(2020, 1, 1), today + timedelta(days=500))
     for pattern, fmt in _FILENAME_DATE_PATTERNS:
         m = re.search(pattern, filename)
         if not m:
@@ -50,7 +54,7 @@ def parse_date_from_filename(filename: str) -> date | None:
                 d = date(2000 + int(g[2]), int(g[0]), int(g[1]))
             else:
                 d = date(int(g[2]), int(g[0]), int(g[1]))
-            if date(2020, 1, 1) <= d <= date(2030, 12, 31):
+            if valid_range[0] <= d <= valid_range[1]:
                 return d
         except (ValueError, TypeError):
             continue
@@ -90,35 +94,27 @@ def extract_dates(text: str, today: date | None = None) -> list[date]:
 
     # MM/DD/YYYY
     for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", text):
-        try:
+        with contextlib.suppress(ValueError):
             _add(date(int(m.group(3)), int(m.group(1)), int(m.group(2))))
-        except ValueError:
-            pass
 
     # MM/DD/YY (2-digit year)
     for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{2})\b", text):
         yy = int(m.group(3))
         full_year = 2000 + yy if yy < 50 else 1900 + yy
-        try:
+        with contextlib.suppress(ValueError):
             _add(date(full_year, int(m.group(1)), int(m.group(2))))
-        except ValueError:
-            pass
 
     # M-D-YY (dash separator, 2-digit year)
     for m in re.finditer(r"\b(\d{1,2})-(\d{1,2})-(\d{2})\b", text):
         yy = int(m.group(3))
         full_year = 2000 + yy if yy < 50 else 1900 + yy
-        try:
+        with contextlib.suppress(ValueError):
             _add(date(full_year, int(m.group(1)), int(m.group(2))))
-        except ValueError:
-            pass
 
     # YYYY-MM-DD
     for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
-        try:
+        with contextlib.suppress(ValueError):
             _add(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
-        except ValueError:
-            pass
 
     # Month DD, YYYY (long and abbreviated)
     for m in re.finditer(
@@ -127,10 +123,8 @@ def extract_dates(text: str, today: date | None = None) -> list[date]:
         key = m.group(1).lower().rstrip(".")
         month_num = _MONTH_MAP.get(key[:3])
         if month_num:
-            try:
+            with contextlib.suppress(ValueError):
                 _add(date(int(m.group(3)), month_num, int(m.group(2))))
-            except ValueError:
-                pass
 
     # Year-context "Month Day" (no adjacent year)
     # Handles tables where year is a section header and rows show "Month Day" only.
@@ -148,10 +142,8 @@ def extract_dates(text: str, today: date | None = None) -> list[date]:
         month_num = _MONTH_MAP.get(key[:3])
         if not month_num:
             continue
-        try:
+        with contextlib.suppress(ValueError):
             _add(date(inferred_year, month_num, int(m.group(2))))
-        except ValueError:
-            pass
 
     return sorted(found, reverse=True)
 

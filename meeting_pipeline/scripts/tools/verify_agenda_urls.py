@@ -22,9 +22,9 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
-import httpx
+import httpx  # noqa: E402
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage  # noqa: E402
 
 AGENDA_KEYWORDS = [
     "agenda", "meeting", "council", "motion", "approve", "resolution",

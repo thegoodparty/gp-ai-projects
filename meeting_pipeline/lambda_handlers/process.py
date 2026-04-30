@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 import boto3
 
@@ -17,7 +18,7 @@ from meeting_pipeline.lambda_handlers._secrets import inject_secrets
 from meeting_pipeline.shared.config import AgentConfig, get_storage
 
 # Ensure project root on path for shared.llm_gemini
-_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 

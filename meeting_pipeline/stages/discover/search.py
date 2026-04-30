@@ -166,7 +166,7 @@ def serper_search(query: str, api_key: str) -> list[dict]:
     except Exception as e:
         msg = str(e)
         if "429" in msg or "quota" in msg.lower():
-            raise RuntimeError(f"serper_rate_limited: {msg[:120]}")
+            raise RuntimeError(f"serper_rate_limited: {msg[:120]}") from e
         return []
 
 

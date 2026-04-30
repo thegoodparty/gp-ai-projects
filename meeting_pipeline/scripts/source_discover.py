@@ -23,9 +23,9 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
-from meeting_pipeline.shared.constants import STATE_ABBREVS
-from meeting_pipeline.stages.discover.process import process_one_city
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage  # noqa: E402
+from meeting_pipeline.shared.constants import STATE_ABBREVS  # noqa: E402
+from meeting_pipeline.stages.discover.process import process_one_city  # noqa: E402
 
 _PIPELINE_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_CSV = _PIPELINE_DIR / "Terry Users2.csv"
@@ -66,9 +66,7 @@ def _should_skip(slug: str, cfg: AgentConfig, storage, skip_existing: bool) -> b
         platform = bs.get("platform", "")
         # Re-run if empty, wrong_entity, stale, or unknown platform
         rerun = {"empty", "wrong_entity", "stale"}
-        if freshness in rerun or platform in ("unknown", "generic_html", ""):
-            return False
-        return True
+        return freshness not in rerun and platform not in ("unknown", "generic_html", "")
     except Exception:
         return False
 

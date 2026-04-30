@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """
 models.py — Shared dataclasses for the pipeline.
 
 Kept as plain dataclasses (not Pydantic) so they serialize/deserialize cleanly
 as dicts without extra dependencies — compatible with Lambda event payloads.
 """
+
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 

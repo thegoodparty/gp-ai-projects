@@ -7,7 +7,6 @@ stages/discover/process.py.
 """
 
 import asyncio
-import csv
 import json
 import os
 import re
@@ -24,7 +23,6 @@ from meeting_pipeline.shared.constants import (
     COLLECTION_METHODS,
     FRESH_THRESHOLD,
     GRANICUS_COUNCIL_KEYWORDS,
-    STATE_ABBREVS,
     WRONG_CITY_PATTERNS,
     WRONG_ENTITY_PATTERNS,
 )
@@ -40,7 +38,6 @@ from meeting_pipeline.shared.date_utils import (
 )
 from meeting_pipeline.shared.discovery_helpers import make_candidate, safe_fetch
 from meeting_pipeline.shared.url_utils import (
-    city_to_slug,
     detect_platform,
     is_non_agenda_url,
     is_wrong_city,
@@ -98,9 +95,9 @@ _COST: dict[str, int] = {
 
 def _is_council_body(name: str) -> bool:
     """Check if an event body name is a city council (not advisory/planning/etc)."""
-    from meeting_pipeline.shared.constants import COUNCIL_BODY_KEYWORDS
+    from meeting_pipeline.shared.body_validation import GOVERNING_KEYWORDS
     name_lower = name.lower()
-    return any(kw in name_lower for kw in COUNCIL_BODY_KEYWORDS)
+    return any(kw in name_lower for kw in GOVERNING_KEYWORDS)
 
 
 def _load_dotgov_index() -> dict[tuple[str, str], list[dict]]:
@@ -175,117 +172,6 @@ def lookup_gov_domain(city: str, state: str) -> str | None:
         return score
 
     return max(hits, key=_score)["domain"]
-
-
-PILOT_CITIES = [
-    # NC
-    {"city": "Apex", "state": "NC"},
-    {"city": "Asheville", "state": "NC"},
-    {"city": "Burlington", "state": "NC"},
-    {"city": "Chapel Hill", "state": "NC"},
-    {"city": "Clayton", "state": "NC"},
-    {"city": "Concord", "state": "NC"},
-    {"city": "Durham", "state": "NC"},
-    {"city": "Fayetteville", "state": "NC"},
-    {"city": "Gastonia", "state": "NC"},
-    {"city": "Gibsonville", "state": "NC"},
-    {"city": "Granite Quarry", "state": "NC"},
-    {"city": "Greensboro", "state": "NC"},
-    {"city": "Greenville", "state": "NC"},
-    {"city": "Hickory", "state": "NC"},
-    {"city": "Huntersville", "state": "NC"},
-    {"city": "Indian Trail", "state": "NC"},
-    {"city": "Jacksonville", "state": "NC"},
-    {"city": "Lexington", "state": "NC"},
-    {"city": "Locust", "state": "NC"},
-    {"city": "Marvin", "state": "NC"},
-    {"city": "Matthews", "state": "NC"},
-    {"city": "Monroe", "state": "NC"},
-    {"city": "New Bern", "state": "NC"},
-    {"city": "Pembroke", "state": "NC"},
-    {"city": "Pittsboro", "state": "NC"},
-    {"city": "Rocky Mount", "state": "NC"},
-    {"city": "Salisbury", "state": "NC"},
-    {"city": "Stallings", "state": "NC"},
-    {"city": "Statesville", "state": "NC"},
-    # OH
-    {"city": "Brecksville", "state": "OH"},
-    {"city": "Canal Fulton", "state": "OH"},
-    {"city": "Canal Winchester", "state": "OH"},
-    {"city": "Centerville", "state": "OH"},
-    {"city": "Cleveland", "state": "OH"},
-    {"city": "Cuyahoga Falls", "state": "OH"},
-    {"city": "Delaware", "state": "OH"},
-    {"city": "Dublin", "state": "OH"},
-    {"city": "Euclid", "state": "OH"},
-    {"city": "Fairborn", "state": "OH"},
-    {"city": "Fairfield", "state": "OH"},
-    {"city": "Hamilton", "state": "OH"},
-    {"city": "Hartville", "state": "OH"},
-    {"city": "Hillsboro", "state": "OH"},
-    {"city": "Johnstown", "state": "OH"},
-    {"city": "Lexington", "state": "OH"},
-    {"city": "Lima", "state": "OH"},
-    {"city": "Louisville", "state": "OH"},
-    {"city": "Loveland", "state": "OH"},
-    {"city": "Maple Heights", "state": "OH"},
-    {"city": "Marysville", "state": "OH"},
-    {"city": "Mason", "state": "OH"},
-    {"city": "Medina", "state": "OH"},
-    {"city": "Mount Sterling", "state": "OH"},
-    {"city": "North Canton", "state": "OH"},
-    {"city": "Parma", "state": "OH"},
-    {"city": "Perrysburg", "state": "OH"},
-    {"city": "Poland", "state": "OH"},
-    {"city": "Powell", "state": "OH"},
-    {"city": "Stow", "state": "OH"},
-    {"city": "Troy", "state": "OH"},
-    {"city": "Vermilion", "state": "OH"},
-    {"city": "Walbridge", "state": "OH"},
-    {"city": "Walton Hills", "state": "OH"},
-    {"city": "Warren", "state": "OH"},
-    {"city": "Westerville", "state": "OH"},
-    # TX
-    {"city": "Austin", "state": "TX"},
-    {"city": "Beaumont", "state": "TX"},
-    {"city": "Belton", "state": "TX"},
-    {"city": "Cibolo", "state": "TX"},
-    {"city": "Cleburne", "state": "TX"},
-    {"city": "Coleman", "state": "TX"},
-    {"city": "Dallas", "state": "TX"},
-    {"city": "Dickinson", "state": "TX"},
-    {"city": "Duncanville", "state": "TX"},
-    {"city": "El Paso", "state": "TX"},
-    {"city": "Farmers Branch", "state": "TX"},
-    {"city": "Grand Prairie", "state": "TX"},
-    {"city": "Killeen", "state": "TX"},
-    {"city": "Kyle", "state": "TX"},
-    {"city": "La Porte", "state": "TX"},
-    {"city": "Lago Vista", "state": "TX"},
-    {"city": "Lancaster", "state": "TX"},
-    {"city": "Longview", "state": "TX"},
-    {"city": "Lufkin", "state": "TX"},
-    {"city": "Midland", "state": "TX"},
-    {"city": "Mount Vernon", "state": "TX"},
-    {"city": "New Braunfels", "state": "TX"},
-    {"city": "Palestine", "state": "TX"},
-    {"city": "Pflugerville", "state": "TX"},
-    {"city": "Refugio", "state": "TX"},
-    {"city": "Sandy Oaks", "state": "TX"},
-    {"city": "Sherman", "state": "TX"},
-    {"city": "Temple", "state": "TX"},
-    {"city": "Texarkana", "state": "TX"},
-    {"city": "Tomball", "state": "TX"},
-    {"city": "Windcrest", "state": "TX"},
-    # NC additions
-    {"city": "Elm City", "state": "NC"},
-    # OH townships
-    {"city": "Clearcreek Township", "state": "OH"},
-    {"city": "Etna Township", "state": "OH"},
-    {"city": "Rootstown Township", "state": "OH"},
-    {"city": "Chardon Township", "state": "OH"},
-    {"city": "Beavercreek Township", "state": "OH"},
-]
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -455,8 +341,7 @@ async def discover_from_serper(
                 serper_url = url
                 rejection_log.append(f"q2:{domain}→{reason}")
                 break
-            else:
-                rejection_log.append(f"q2:{domain}→{reason}")
+            rejection_log.append(f"q2:{domain}→{reason}")
 
     if not validated_domain:
         rejection_summary = " | ".join(rejection_log) if rejection_log else "no_results_returned"
@@ -1077,8 +962,8 @@ async def playwright_crawl_city_site(
 
                 # Filter to links that look like council/meeting pages
                 nav_links = [
-                    l for l in links
-                    if NAV_KEYWORDS.search(l["text"]) or NAV_KEYWORDS.search(l["href"])
+                    link for link in links
+                    if NAV_KEYWORDS.search(link["text"]) or NAV_KEYWORDS.search(link["href"])
                 ][:MAX_NAV_LINKS]
 
                 for link in nav_links:
@@ -1613,11 +1498,10 @@ async def verify_freshness(candidate: dict, http: httpx.AsyncClient, city: str =
                 body = ac_body
 
     # Novus: body must not contain Application_Error
-    if platform == "novus":
-        if "Application_Error" in body:
-            candidate["freshness"] = "stale"
-            candidate["notes"] = "Novus 200 but Application_Error — invalid slug"
-            return candidate
+    if platform == "novus" and "Application_Error" in body:
+        candidate["freshness"] = "stale"
+        candidate["notes"] = "Novus 200 but Application_Error — invalid slug"
+        return candidate
 
     # Municode code library (not a meeting portal)
     if platform == "municode" and "library.municode.com" in url:
@@ -2020,7 +1904,7 @@ async def probe_escribe_api(url: str, http: httpx.AsyncClient) -> dict:
                             "date_source": "escribe_html",
                             "api_url": endpoint,
                         }
-                    elif has_meeting_kw:
+                    if has_meeting_kw:
                         # Page loaded with meeting content but no dates
                         return {
                             "success": True,
@@ -2084,7 +1968,6 @@ async def probe_unknown_stale(
     """
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    city_to_slug(city)
 
     candidates_to_try = [
         f"{base}/agendas",
@@ -2241,7 +2124,7 @@ async def probe_with_playwright(
                         "freshness": classify_freshness(most_recent),
                         "date_source": "playwright_render",
                     }
-                elif has_meeting_kw:
+                if has_meeting_kw:
                     return {
                         "success": True,
                         "most_recent_date": None,
@@ -2250,11 +2133,10 @@ async def probe_with_playwright(
                         "date_source": None,
                         "note": "Playwright rendered — meeting content found but no parseable dates",
                     }
-                else:
-                    return {
-                        "success": False,
-                        "error": "rendered page has no meeting/agenda content",
-                    }
+                return {
+                    "success": False,
+                    "error": "rendered page has no meeting/agenda content",
+                }
             finally:
                 await browser.close()
     except Exception as e:
@@ -2341,20 +2223,19 @@ async def deep_probe_candidate(
         elif result.get("date_source") in ("boarddocs_post_api",):
             candidate["collection_method"] = "post_api_html"
         return True
-    else:
-        # Record that we tried and failed
-        existing_notes = (candidate.get("notes") or "").strip()
-        error_msg = result.get("error", "")
-        candidate["notes"] = f"{existing_notes} api_probed:failed({error_msg})".strip()
-        # CivicClerk false-positive guard: portal.civicclerk.com returns HTTP 200
-        # with a generic 1110-byte SPA shell for ANY subdomain — including cities
-        # that don't use CivicClerk. If this candidate came from our automated probe
-        # (not the registry) and all OData API paths failed, it's almost certainly
-        # a false positive. Downgrade to empty so it doesn't block a real source.
-        if platform == "civicclerk" and candidate.get("source") == "probe":
-            candidate["freshness"] = "empty"
-            candidate["notes"] += " [civicclerk-probe-false-positive: generic shell, no events API]"
-        return False
+    # Record that we tried and failed
+    existing_notes = (candidate.get("notes") or "").strip()
+    error_msg = result.get("error", "")
+    candidate["notes"] = f"{existing_notes} api_probed:failed({error_msg})".strip()
+    # CivicClerk false-positive guard: portal.civicclerk.com returns HTTP 200
+    # with a generic 1110-byte SPA shell for ANY subdomain — including cities
+    # that don't use CivicClerk. If this candidate came from our automated probe
+    # (not the registry) and all OData API paths failed, it's almost certainly
+    # a false positive. Downgrade to empty so it doesn't block a real source.
+    if platform == "civicclerk" and candidate.get("source") == "probe":
+        candidate["freshness"] = "empty"
+        candidate["notes"] += " [civicclerk-probe-false-positive: generic shell, no events API]"
+    return False
 
 
 # ── Core skill: run_source_discover ───────────────────────────────────────────

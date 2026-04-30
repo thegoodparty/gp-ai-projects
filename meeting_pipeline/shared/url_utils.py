@@ -19,11 +19,6 @@ from meeting_pipeline.shared.constants import (
 )
 
 
-def city_to_slug(city: str) -> str:
-    """Convert city name to URL-safe slug: 'Chapel Hill' → 'chapel-hill'."""
-    return city.lower().replace(" ", "-").replace(".", "").replace("'", "")
-
-
 def detect_platform(url: str) -> str:
     """Detect the agenda platform from a URL. Returns platform name or 'unknown'."""
     url_lower = url.lower()
@@ -74,8 +69,6 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
     # State-based validation
     if state:
         state_abbrev = state.upper()
-        STATE_NAMES.get(state_abbrev, "").lower()
-
         # Check if a different state name appears explicitly
         for abbrev, name in STATE_NAMES.items():
             if abbrev == state_abbrev:
@@ -112,10 +105,9 @@ def is_wrong_city(url: str, title: str, city: str, state: str = "") -> bool:
                     cid_city = (cid[:-2] if cid_state in STATE_NAMES else cid).lower()
                     cid_stripped = cid_city.replace("cityof", "").replace("city", "").replace("townof", "").replace("villageof", "")
                     city_slug = city.lower().replace(" ", "").replace("-", "")
-                    if cid_city and city_slug and len(city_slug) >= 4:
-                        if not (city_slug in cid_city or city_slug in cid_stripped or
+                    if cid_city and city_slug and len(city_slug) >= 4 and not (city_slug in cid_city or city_slug in cid_stripped or
                                 cid_city in city_slug or cid_stripped in city_slug):
-                            return True
+                        return True
             except Exception:
                 pass
 

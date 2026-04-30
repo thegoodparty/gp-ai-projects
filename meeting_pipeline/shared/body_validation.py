@@ -38,6 +38,7 @@ GOVERNING_KEYWORDS = [
     "town board",               # NY townships (e.g. "Town Board of Horseheads")
     "select board",             # New England towns (MA, VT, NH)
     "borough council",          # PA boroughs (e.g. "Borough Council of West Mifflin")
+    "village board",            # IL villages (e.g. "Village Board of Trustees")
     "board of mayor",           # Manchester NH uses "Board of Mayor and Aldermen"
     "aldermanic",               # "Aldermanic Council", "Board of Mayor and Aldermen"
     "board of alderpersons",    # gender-neutral variant
@@ -131,7 +132,7 @@ async def validate_legistar_body(
 
     if score == 100:
         return {"status": "ok", "validated_body": best, "score": score, "candidates": body_names[:10]}
-    elif score >= 50:
+    if score >= 50:
         if best and best.lower() != expected_body.lower():
             return {
                 "status": "corrected",
@@ -142,23 +143,22 @@ async def validate_legistar_body(
                 "candidates": body_names[:10],
             }
         return {"status": "ok", "validated_body": best, "score": score}
-    elif best is None:
+    if best is None:
         return {
             "status": "unresolved",
             "reason": f"All bodies rejected as non-governing. Found: {body_names[:10]}",
             "candidates": body_names[:10],
         }
-    else:
-        result = {
-            "status": "unresolved",
-            "reason": f"Best match '{best}' (score={score}) too low for '{expected_body}'. All: {body_names[:10]}",
-            "candidates": body_names[:10],
-        }
-        # Self-heal: if the best candidate is a governing body (score >= 30),
-        # update the manifest so the next scan uses the correct expected_body.
-        if score >= 30:
-            result["config_patch"] = {"manifest_expected_body": best}
-        return result
+    result = {
+        "status": "unresolved",
+        "reason": f"Best match '{best}' (score={score}) too low for '{expected_body}'. All: {body_names[:10]}",
+        "candidates": body_names[:10],
+    }
+    # Self-heal: if the best candidate is a governing body (score >= 30),
+    # update the manifest so the next scan uses the correct expected_body.
+    if score >= 30:
+        result["config_patch"] = {"manifest_expected_body": best}
+    return result
 
 
 async def validate_civicplus_body(
@@ -183,6 +183,8 @@ async def validate_civicplus_body(
     if not categories:
         return {"status": "error", "reason": "no categories found"}
 
+    from bs4 import BeautifulSoup
+
     www_domain = _ensure_www(domain)
     verified = []
     for cat in categories:
@@ -198,7 +200,6 @@ async def validate_civicplus_body(
             )
             if resp.status_code == 404:
                 break
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             year_link = soup.find("a", attrs={"aria-label": True})
             if year_link:

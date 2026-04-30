@@ -18,7 +18,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _ROOT.parent
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
+from meeting_pipeline.shared.config import AgentConfig, get_storage  # noqa: E402
 
 CSV_PATH = _ROOT / "serve_users_unified.csv"
 

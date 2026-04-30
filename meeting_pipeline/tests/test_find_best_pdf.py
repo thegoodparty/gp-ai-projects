@@ -18,13 +18,13 @@ class _FilesystemStorageBackend:
         return p
 
     def read_json(self, key: str) -> dict:
-        with open(self._path(key)) as f:
+        with self._path(key).open() as f:
             return json.load(f)
 
     def write_json(self, key: str, data: dict) -> None:
         p = self._path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
+        with p.open("w") as f:
             json.dump(data, f, indent=2)
 
     def write_bytes(self, key: str, data: bytes) -> None:
@@ -50,7 +50,7 @@ class _FilesystemStorageBackend:
     def append_line(self, key: str, line: str) -> None:
         p = self._path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
+        with p.open("a") as f:
             f.write(line + "\n")
 
 

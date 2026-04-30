@@ -80,7 +80,7 @@ def _js_scrape(source_url: str) -> dict | None:
             )
             md = getattr(result, "markdown", "") or ""
             links = list(getattr(result, "links", None) or [])
-            pdfs = [l for l in links if ".pdf" in l.lower() or "viewfile" in l.lower()]
+            pdfs = [link for link in links if ".pdf" in link.lower() or "viewfile" in link.lower()]
             return {"markdown": md, "links": links, "pdf_urls": pdfs}
         except Exception as e:
             if attempt == 0 and "timed out" in str(e).lower():
@@ -109,7 +109,8 @@ def _gemini_extract(markdown: str, pdf_urls: list[str], city: str, state: str) -
         f"PDF links on page:\n{pdf_list}\n"
     )
 
-    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    from meeting_pipeline.shared.constants import GEMINI_MODEL
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     text = response.text.strip()
 
     # Parse JSON from response (may be wrapped in ```json ... ```)
@@ -125,14 +126,6 @@ def _gemini_extract(markdown: str, pdf_urls: list[str], city: str, state: str) -
 
 
 # ── Main scanner ──────────────────────────────────────────────────────────────
-
-# Cost tracking — callers should update these
-cost = {
-    "firecrawl_basic": 0,
-    "firecrawl_js": 0,
-    "gemini_extract": 0,
-    "firecrawl_llm_extract": 0,
-}
 
 async def scan_generic(
     source_url: str,
@@ -160,7 +153,6 @@ async def scan_generic(
 
     # ── Tier 1: Basic scrape ──────────────────────────────────────────────
     try:
-        cost["firecrawl_basic"] += 1
         fc = _basic_scrape(source_url, city, state)
     except Exception as e:
         print(f"  [generic_scan] Firecrawl failed for {source_url[:50]}: {e}")
@@ -171,7 +163,6 @@ async def scan_generic(
 
     # ── Tier 2: JS render (if basic returned minimal content) ─────────────
     if len(markdown) < 1000:
-        cost["firecrawl_js"] += 1
         js = _js_scrape(source_url)
         if js and (js["pdf_urls"] or len(js["markdown"]) > 1000):
             pdf_urls = js["pdf_urls"]
@@ -210,7 +201,6 @@ async def scan_generic(
     # ── Tier 3: Gemini LLM extraction (if filename parsing found nothing) ─
     if not meetings and len(markdown) > 500:
         try:
-            cost["gemini_extract"] += 1
             llm_results = _gemini_extract(markdown, pdf_urls, city, state)
             meetings = build_meetings_from_llm(
                 llm_results, city, lookback, lookahead, today, seen_dates
@@ -224,7 +214,6 @@ async def scan_generic(
     if not meetings and len(markdown) <= 500:
         try:
             from meeting_pipeline.shared.firecrawl_client import extract_meeting_links
-            cost["firecrawl_llm_extract"] += 1
             llm_results = extract_meeting_links(source_url, city, state)
             meetings = build_meetings_from_llm(
                 llm_results, city, lookback, lookahead, today, seen_dates,

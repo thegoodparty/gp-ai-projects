@@ -164,15 +164,6 @@ GENERIC_MEETING_TITLES = [
     "governing board",
 ]
 
-# Keywords indicating the primary governing body
-COUNCIL_BODY_KEYWORDS = [
-    "city council", "town council", "village council", "borough council",
-    "board of aldermen", "city commission", "town commission",
-    "village commission", "common council", "board of commissioners",
-    "board of trustees", "select board", "board of mayor",
-    "town board", "village board",
-]
-
 # Keywords for Granicus view title matching
 GRANICUS_COUNCIL_KEYWORDS = [
     "city council", "council meeting", "regular meeting",
@@ -299,4 +290,8 @@ GOV_PLATFORM_DOMAINS = [
     "primegov.com", "diligentoneplatform.com",
 ]
 
-# (NEWS_DOMAIN_SUFFIXES defined above in URL Reject Patterns section)
+# ── LLM / Extraction Defaults ────────────────────────────────────────────────
+
+GEMINI_MODEL = "gemini-2.5-flash"
+EXTRACT_MAX_PAGES = 60
+LARGE_AGENDA_WORD_THRESHOLD = 8000

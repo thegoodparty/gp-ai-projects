@@ -35,8 +35,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting
+from meeting_pipeline.shared.config import AgentConfig, get_storage  # noqa: E402
+from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting  # noqa: E402
 
 
 def main():

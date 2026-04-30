@@ -147,11 +147,7 @@ class FileParser(HTMLParser):
             attr_dict = dict(attrs)
             cls = attr_dict.get("class", "")
             href = attr_dict.get("href", "")
-            if "public-file" in cls or ("files/" in href and href.endswith(".pdf")):
-                self._in_link = True
-                self._current_href = href
-                self._current_text = ""
-            elif href and "$file/" in href:
+            if "public-file" in cls or ("files/" in href and href.endswith(".pdf")) or href and "$file/" in href:
                 self._in_link = True
                 self._current_href = href
                 self._current_text = ""

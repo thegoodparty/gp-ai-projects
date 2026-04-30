@@ -741,8 +741,7 @@ async def verify_single_city(
         domain=city_info["domain"],
     )
 
-    async with http_semaphore:
-        async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
+    async with http_semaphore, httpx.AsyncClient(follow_redirects=True, verify=False) as client:
 
             # ── Try Legistar first ──
             slug = city_info.get("legistar_slug")
@@ -770,7 +769,7 @@ async def verify_single_city(
                     r.duration_seconds = time.time() - start
                     return r
 
-                elif leg.get("error"):
+                if leg.get("error"):
                     r.notes = f"Legistar failed: {leg['error']}. "
 
             # ── Try CivicPlus ──
@@ -1064,11 +1063,9 @@ async def main():
     ]
 
     results: list[VerificationResult] = []
-    completed = 0
-    for coro in asyncio.as_completed(tasks):
+    for completed, coro in enumerate(asyncio.as_completed(tasks), 1):
         result = await coro
         results.append(result)
-        completed += 1
 
         # Progress indicator
         icon = {"V4": "✓", "V3": "◎", "V2": "○", "V1": "·", "V0": "✗"}[result.level]
@@ -1092,13 +1089,13 @@ async def main():
         report_data.append(d)
 
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(REPORT_PATH, "w") as f:
+    with REPORT_PATH.open("w") as f:
         json.dump(report_data, f, indent=2, default=str)
     print(f"\n[saved] {REPORT_PATH}")
 
     # Save human-readable summary
     summary = generate_report(results)
-    with open(SUMMARY_PATH, "w") as f:
+    with SUMMARY_PATH.open("w") as f:
         f.write(summary)
     print(f"[saved] {SUMMARY_PATH}")
 

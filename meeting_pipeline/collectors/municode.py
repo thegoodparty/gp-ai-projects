@@ -313,8 +313,7 @@ async def _download_pdfs(
 
             try:
                 resp = await client.get(pdf_url)
-                if resp.status_code == 200 and len(resp.content) > 5000:
-                    if resp.content[:4] == b"%PDF" or "pdf" in resp.headers.get("content-type", "").lower():
+                if resp.status_code == 200 and len(resp.content) > 5000 and (resp.content[:4] == b"%PDF" or "pdf" in resp.headers.get("content-type", "").lower()):
                         config.storage.write_bytes(key, resp.content)
                         downloaded += 1
             except Exception as e:

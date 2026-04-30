@@ -12,6 +12,7 @@ or the orchestrator calls. Handles the full discovery lifecycle:
 
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import UTC
 
@@ -114,10 +115,8 @@ async def process_one_city(
         result = await _run_verification(result, http_client)
 
         # Write final result (with validation + verification)
-        try:
+        with contextlib.suppress(Exception):
             storage.write_json(source_key, result)
-        except Exception:
-            pass
 
         return result
     finally:
@@ -322,7 +321,5 @@ async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dic
 
 def _safe_write(storage, key: str, data: dict):
     """Write to S3, swallowing errors."""
-    try:
+    with contextlib.suppress(Exception):
         storage.write_json(key, data)
-    except Exception:
-        pass

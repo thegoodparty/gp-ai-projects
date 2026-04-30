@@ -27,8 +27,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig
-from meeting_pipeline.stages.orchestrator import filter_cities, load_cities_from_sources, run_extract
+from meeting_pipeline.shared.config import AgentConfig  # noqa: E402
+from meeting_pipeline.stages.orchestrator import filter_cities, load_cities_from_sources, run_extract  # noqa: E402
 
 
 def main():

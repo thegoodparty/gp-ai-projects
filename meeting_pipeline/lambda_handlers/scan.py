@@ -54,12 +54,11 @@ def handler(event, context=None):
 
     upcoming_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
 
+    import contextlib
     previous = None
     if storage.exists(upcoming_key):
-        try:
+        with contextlib.suppress(Exception):
             previous = storage.read_json(upcoming_key)
-        except Exception:
-            pass
 
     storage.write_json(upcoming_key, result)
 

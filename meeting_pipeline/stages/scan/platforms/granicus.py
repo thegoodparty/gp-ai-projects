@@ -84,7 +84,7 @@ async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.
         return upcoming
 
     # ── Swagit fallback: scrape the main page for meeting links ─────────────
-    elif "swagit.com" in netloc:
+    if "swagit.com" in netloc:
         # Swagit doesn't expose a standard RSS — scrape the publisher index page
         # to find meeting links and dates. Strip any specific video path.
         base_url = f"https://{netloc}"

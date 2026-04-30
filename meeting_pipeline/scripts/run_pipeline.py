@@ -39,12 +39,12 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if sys.path[0] != _PROJECT_ROOT:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig
-from meeting_pipeline.stages.orchestrator import ALL_PHASES, run_pipeline
+from meeting_pipeline.shared.config import AgentConfig  # noqa: E402
+from meeting_pipeline.stages.orchestrator import ALL_PHASES, run_pipeline  # noqa: E402
 
 
 def main():

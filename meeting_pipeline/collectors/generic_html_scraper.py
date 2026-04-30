@@ -146,21 +146,16 @@ def _is_agenda_link(href: str, text: str, keyword: str) -> bool:
     lower_href = href.lower()
     combined = lower_text + " " + lower_href
 
-    # Must contain the keyword
-    if keyword and keyword.lower() not in combined:
-        # Also accept if it's just a .pdf with a date in the filename
-        if not lower_href.endswith(".pdf"):
-            return False
+    # Must contain the keyword (accept .pdf with date in filename regardless)
+    if keyword and keyword.lower() not in combined and not lower_href.endswith(".pdf"):
+        return False
 
     # Exclude minutes-only links (but allow "agenda and minutes" combo links)
     if "minute" in lower_text and keyword.lower() not in lower_text:
         return False
 
     # Exclude video/audio links
-    if any(kw in lower_text for kw in ["video", "audio", "youtube", "stream"]):
-        return False
-
-    return True
+    return not any(kw in lower_text for kw in ["video", "audio", "youtube", "stream"])
 
 
 def _get_surrounding_text(tag, max_chars: int = 500) -> str:
@@ -202,11 +197,7 @@ async def extract_direct_pdf(
     """Strategy: find <a href="...pdf"> links directly on the page."""
     meetings = []
 
-    if selector:
-        links = soup.select(selector)
-    else:
-        # Find all links that point to PDFs or known document patterns
-        links = soup.find_all("a", href=True)
+    links = soup.select(selector) if selector else soup.find_all("a", href=True)
 
     for link in links:
         href = link.get("href", "")
@@ -354,10 +345,7 @@ async def extract_two_hop(
     meetings = []
 
     # Step 1: Find subpage links on the index page
-    if selector:
-        subpage_links = soup.select(selector)
-    else:
-        subpage_links = soup.find_all("a", href=True)
+    subpage_links = soup.select(selector) if selector else soup.find_all("a", href=True)
 
     subpage_urls = []
     for link in subpage_links:

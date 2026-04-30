@@ -6,6 +6,7 @@ expect the data source to be about. Validation is best-effort: if the manifest
 doesn't exist or can't be loaded, collection proceeds unblocked.
 """
 
+from meeting_pipeline.shared.body_validation import GOVERNING_KEYWORDS
 from meeting_pipeline.shared.storage import StorageBackend
 
 # Keywords that indicate a wrong-entity match (school district, not city council)
@@ -18,20 +19,6 @@ WRONG_ENTITY_KEYWORDS = [
     "elementary",
     "high school",
     "superintendent",
-]
-
-
-# Synonyms for governing bodies — used to accept equivalent names during validation
-_GOVERNING_BODY_SYNONYMS = [
-    "city council", "town council", "village council", "common council",
-    "board of aldermen", "board of alderpersons",
-    "board of mayor",       # "Board of Mayor and Aldermen" (Manchester NH)
-    "aldermanic",
-    "city commission", "town commission", "village commission",
-    "municipal council", "board of commissioners", "board of trustees",
-    "city board", "council of the city",
-    "town board", "select board", "board of selectmen",
-    "borough council",
 ]
 
 
@@ -100,10 +87,7 @@ def validate_against_manifest(
             # Governing body synonym: if expected was "City Council" but collected name
             # is another recognized governing body (e.g. "Board of Mayor and Aldermen"),
             # accept it — don't reject valid governments for not using the default name.
-            if any(kw in expected_lower for kw in _GOVERNING_BODY_SYNONYMS):
-                if any(kw in name for kw in _GOVERNING_BODY_SYNONYMS):
-                    return True
-            return False
+            return any(kw in expected_lower for kw in GOVERNING_KEYWORDS) and any(kw in name for kw in GOVERNING_KEYWORDS)
 
         if not any(matches_expected(n) for n in names_lower):
             return False, (
@@ -113,10 +97,9 @@ def validate_against_manifest(
 
     # ── City name validation (optional, loose) ────────────────────────────────
 
-    if collected_city and expected_city:
-        if expected_city.lower() not in collected_city.lower() and collected_city.lower() not in expected_city.lower():
-            return False, (
-                f"Collected city '{collected_city}' does not match expected '{expected_city}'"
-            )
+    if collected_city and expected_city and expected_city.lower() not in collected_city.lower() and collected_city.lower() not in expected_city.lower():
+        return False, (
+            f"Collected city '{collected_city}' does not match expected '{expected_city}'"
+        )
 
     return True, None

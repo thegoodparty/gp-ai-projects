@@ -39,8 +39,8 @@ from shared.databricks_client import DatabricksClient
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
-from meeting_pipeline.shared.constants import STATE_ABBREVS
+from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage  # noqa: E402
+from meeting_pipeline.shared.constants import STATE_ABBREVS  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parent.parent
 

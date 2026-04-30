@@ -75,6 +75,7 @@ async def _fetch_json(client: httpx.AsyncClient, url: str, params: dict = None, 
                 await asyncio.sleep(wait_time)
             else:
                 raise
+    return None
 
 
 async def _fetch_all_pages(

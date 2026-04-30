@@ -36,6 +36,7 @@ import json
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -1096,7 +1097,7 @@ def generate_briefing_for_meeting(
     if dry_run:
         local_path = f"/tmp/{safe_name}"
         import json as _json
-        with open(local_path, "w") as f:
+        with Path(local_path).open("w") as f:
             _json.dump(briefing, f, indent=2)
         print(f"  DRY RUN — saved locally: {local_path}")
         return {

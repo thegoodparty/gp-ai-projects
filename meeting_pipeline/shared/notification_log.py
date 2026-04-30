@@ -18,8 +18,6 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from meeting_pipeline.shared.storage import StorageBackend
-
 # Valid event types
 MIGRATION_DETECTED = "MIGRATION_DETECTED"
 COLLECTOR_NEEDED = "COLLECTOR_NEEDED"
@@ -38,8 +36,6 @@ def log_event(
     event_type: str,
     city: str,
     state: str,
-    storage: StorageBackend | None = None,
-    logs_prefix: str = "meeting_pipeline/logs",
     **detail: Any,
 ) -> dict:
     """

@@ -43,9 +43,8 @@ def validate_domain_for_city(domain: str, city: str, state: str) -> tuple[bool, 
                 continue
             ab = abbrev.lower()
             # Pattern 1: state abbrev as suffix (camdennj → nj)
-            if first_segment.endswith(ab) and len(first_segment) > len(ab):
-                if not correct_state_full.endswith(ab) and not city_clean.endswith(ab):
-                    return False, f"domain_encodes_wrong_state:{abbrev}→rejected"
+            if first_segment.endswith(ab) and len(first_segment) > len(ab) and not correct_state_full.endswith(ab) and not city_clean.endswith(ab):
+                return False, f"domain_encodes_wrong_state:{abbrev}→rejected"
             # Pattern 2: delimited segment (clearlake-ca.municode → ca)
             if re.search(r'(?:^|[-.])' + ab + r'(?:[.-]|$)', domain_lower):
                 return False, f"domain_encodes_wrong_state:{abbrev}→rejected"
@@ -109,18 +108,18 @@ def firecrawl_map_agenda(base_url: str) -> str | None:
         # Filter out non-agenda URLs
         _non_agenda = {"facebook.com", "twitter.com", "youtube.com", "wikipedia.org"}
         links = [
-            l for l in links
-            if urlparse(l).netloc.lower().removeprefix("www.") not in _non_agenda
-            and not l.split("?")[0].lower().endswith(".pdf")
+            link for link in links
+            if urlparse(link).netloc.lower().removeprefix("www.") not in _non_agenda
+            and not link.split("?")[0].lower().endswith(".pdf")
         ]
 
         # Find agenda links
         agenda_links = [
-            l for l in links
-            if "agenda" in l.lower() and ("council" in l.lower() or "meeting" in l.lower())
+            link for link in links
+            if "agenda" in link.lower() and ("council" in link.lower() or "meeting" in link.lower())
         ]
         if not agenda_links:
-            agenda_links = [l for l in links if "agenda" in l.lower()]
+            agenda_links = [link for link in links if "agenda" in link.lower()]
         if not agenda_links:
             return None
 
@@ -197,7 +196,7 @@ def firecrawl_crawl_for_agenda(
             )
             markdown = getattr(result, "markdown", "") or ""
             links = list(getattr(result, "links", None) or [])
-            pdf_links = [l for l in links if ".pdf" in l.lower()]
+            pdf_links = [link for link in links if ".pdf" in link.lower()]
 
             # Check: page has meeting content for the right body?
             if len(pdf_links) >= 3 or len(markdown) > 5000:
@@ -240,10 +239,14 @@ def firecrawl_crawl_for_agenda(
                 score = 0
                 if body_words:
                     score += sum(5 for bw in body_words if bw in combined)
-                if "agenda" in combined: score += 3
-                if "council" in combined or "commission" in combined: score += 2
-                if "meeting" in combined: score += 1
-                if str(_date.today().year) in combined: score += 2
+                if "agenda" in combined:
+                    score += 3
+                if "council" in combined or "commission" in combined:
+                    score += 2
+                if "meeting" in combined:
+                    score += 1
+                if str(_date.today().year) in combined:
+                    score += 2
                 if any(rk in combined for rk in REJECT_KEYWORDS):
                     score -= 10
                 if score > 0:

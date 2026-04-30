@@ -44,6 +44,7 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 from pathlib import Path
 
 import httpx
@@ -51,8 +52,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from meeting_pipeline.shared.config import AgentConfig, get_storage
-from meeting_pipeline.shared.constants import SUPPORTED_PLATFORMS
+from meeting_pipeline.shared.config import AgentConfig, get_storage  # noqa: E402
+from meeting_pipeline.shared.constants import SUPPORTED_PLATFORMS  # noqa: E402
 
 # Cost tracking for scan phase
 _COST = {
@@ -67,7 +68,7 @@ _COST = {
 # ============================================================================
 
 # Import the real implementation from stages
-from meeting_pipeline.stages.scan.process import process_one_city as _scan_impl
+from meeting_pipeline.stages.scan.process import process_one_city as _scan_impl  # noqa: E402
 
 
 async def scan_city(
@@ -153,10 +154,8 @@ async def run_batch(
             prev_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
             prev = {}
             if storage.exists(prev_key):
-                try:
+                with contextlib.suppress(Exception):
                     prev = storage.read_json(prev_key)
-                except Exception:
-                    pass
 
             prev_posted = {m["date"]: m.get("agenda_posted", False)
                           for m in prev.get("upcoming", [])}
@@ -242,10 +241,8 @@ async def run_batch(
             "gemini_extract": gemini,
             "cities_scanned": results["scanned"],
         }
-        try:
+        with contextlib.suppress(Exception):
             storage.write_json(f"{cfg.output_prefix}/cost_reports/scan.json", cost_report)
-        except Exception:
-            pass
 
 
 # ============================================================================

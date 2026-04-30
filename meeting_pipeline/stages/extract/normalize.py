@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
+from meeting_pipeline.shared.constants import EXTRACT_MAX_PAGES, LARGE_AGENDA_WORD_THRESHOLD
+
 # ── Pydantic schemas for LLM structured output ───────────────────────────────
 
 class AgendaItem(BaseModel):
@@ -34,7 +36,8 @@ class MeetingExtraction(BaseModel):
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
 
-def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 60) -> str:
+
+def extract_pdf_text(pdf_bytes: bytes, max_pages: int = EXTRACT_MAX_PAGES) -> str:
     """Extract text from PDF bytes using PyMuPDF. Returns full text with [PAGE N] markers."""
     import fitz  # PyMuPDF
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -139,7 +142,7 @@ def extract_with_gemini(text: str, city: str, state: str, date: str, gemini) -> 
     """Use Gemini to extract structured agenda items from PDF text."""
     from meeting_pipeline.prompts.extraction import build_extraction_prompt
 
-    large_agenda = len(text.split()) > 8000
+    large_agenda = len(text.split()) > LARGE_AGENDA_WORD_THRESHOLD
     prompt = build_extraction_prompt(text, city, state, date, large_agenda=large_agenda)
 
     result = gemini.generate_structured_content(

@@ -117,9 +117,8 @@ async def process_one_city(
             upcoming = await scan_escribe(city, config, source_url, http_client)
         elif platform == "granicus":
             upcoming = await scan_granicus(city, config, source_url, http_client)
-        elif platform in ("unknown", "generic_html"):
-            if source_url and os.environ.get("FIRECRAWL_API_KEY"):
-                upcoming = await scan_generic(source_url, city, state)
+        elif platform in ("unknown", "generic_html") and source_url and os.environ.get("FIRECRAWL_API_KEY"):
+            upcoming = await scan_generic(source_url, city, state)
 
         # ── Fallback: try public_agenda_url if platform scanner failed ────
         if not upcoming and os.environ.get("FIRECRAWL_API_KEY"):
