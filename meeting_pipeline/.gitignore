@@ -1,12 +1,5 @@
-# All pipeline data lives in S3 (meeting-pipeline-dev bucket), not git
-sources/
-output/
-
-# Config managed in S3 (s3://meeting-pipeline-dev/meeting_pipeline/config/)
-docs/discovery/known-sources-registry.json
-
-# Generated data files
-serve_users_enriched.csv
+# Local city CSV files (not committed — each dev may have different sets)
+Terry Users*.csv
 
 # macOS
 .DS_Store

@@ -11,7 +11,6 @@ import csv
 import json
 import os
 import re
-import sys
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -79,13 +78,6 @@ _DEPT_REJECT_KEYWORDS = [
     "water", "sewer", "utility", "transit", "housing", "airport",
 ]
 
-# CSV path for city list (used by get_serve_csv_cities)
-_PIPELINE_DIR = Path(__file__).resolve().parent.parent
-SERVE_CSV = _PIPELINE_DIR / "serve_users_unified.csv"
-if not SERVE_CSV.exists():
-    SERVE_CSV = _PIPELINE_DIR / "serve_users.csv"
-if not SERVE_CSV.exists():
-    SERVE_CSV = _PIPELINE_DIR / "Terry Users2.csv"
 
 # Org-name prefixes that confirm this is the main municipal government
 _CITY_GOV_PREFIXES = (
@@ -294,62 +286,6 @@ PILOT_CITIES = [
     {"city": "Chardon Township", "state": "OH"},
     {"city": "Beavercreek Township", "state": "OH"},
 ]
-
-
-# ── City list helpers ──────────────────────────────────────────────────────────
-
-def get_serve_csv_cities() -> list[dict]:
-    """Return deduplicated cities from serve_users.csv.
-
-    Mirrors the same logic as collect_haystaq_batch.py so both scripts
-    cover the same population.  State/Region column has full state names
-    (e.g. "Ohio"), which are converted to 2-letter abbreviations.
-
-    Also extracts the "Meeting URL" column as a seed URL for discovery.
-    When present, this URL is added to known_sources as custom_agenda_url,
-    which ensures the discovery probes the city's own page even when search
-    engines return poor results for that city.
-    """
-    if not SERVE_CSV.exists():
-        print(f"ERROR: {SERVE_CSV} not found")
-        sys.exit(1)
-    seen: set[tuple[str, str]] = set()
-    cities: list[dict] = []
-    for row in csv.DictReader(SERVE_CSV.open()):
-        # Support unified CSV (lowercase columns) and legacy formats
-        city = (row.get("city") or row.get("City") or "").strip()
-        state_raw = (row.get("state") or row.get("State") or row.get("State/Region") or "").strip()
-        if not city or not state_raw:
-            continue
-        state = STATE_ABBREVS.get(
-            state_raw,
-            state_raw[:2].upper() if len(state_raw) > 2 else state_raw.upper(),
-        )
-        key = (city, state)
-        if key in seen:
-            continue
-        seen.add(key)
-        entry: dict = {"city": city, "state": state}
-        # Carry the CSV meeting URL as a discovery seed (used as custom_agenda_url)
-        meeting_url = row.get("Meeting URL", row.get("meeting_url", "")).strip()
-        if meeting_url and meeting_url.startswith("http"):
-            entry["csv_meeting_url"] = meeting_url
-        # Extract the governing body name from the Role column.
-        # Role is like "Fultondale City Council - Place 1" or "Bennington Town Select Board".
-        # Strip the seat/ward/district suffix to get the body name.
-        role = (row.get("Role") or row.get("role") or row.get("Office") or "").strip()
-        if role:
-            # Remove seat/ward/district suffixes: "City Council - Ward 1" → "City Council"
-            body = re.sub(r'\s*[-–]\s*(Ward|District|Place|Seat|At Large|Position|Post).*$', '', role, flags=re.IGNORECASE).strip()
-            # Remove city name prefix if present: "Fultondale City Council" → "City Council"
-            # But keep it if removing it leaves nothing meaningful
-            body_no_city = re.sub(r'^' + re.escape(city) + r'\s+', '', body, flags=re.IGNORECASE).strip()
-            if body_no_city and len(body_no_city) > 3:
-                body = body_no_city
-            if body:
-                entry["expected_body"] = body
-        cities.append(entry)
-    return cities
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
