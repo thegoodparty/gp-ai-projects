@@ -21,6 +21,7 @@ import asyncio
 import csv
 import re
 import time
+from datetime import date
 from pathlib import Path
 
 from meeting_pipeline.shared.config import AgentConfig, city_to_slug, get_storage
@@ -313,6 +314,7 @@ async def run_extract(
     cfg: AgentConfig,
     force: bool = False,
     dry_run: bool = False,
+    future_only: bool = False,
 ):
     """Extract agenda items from PDFs (concurrent LLM extraction)."""
     from meeting_pipeline.stages.extract.normalize import (
@@ -383,6 +385,14 @@ async def run_extract(
                 "platform": platform, "meeting": meeting, "meeting_date": meeting_date,
                 "pdf_key": pdf_key, "pdf_label": pdf_label, "out_key": out_key,
             })
+
+    if future_only:
+        today_str = date.today().isoformat()
+        before = len(work_items)
+        work_items = [w for w in work_items if w["meeting_date"] >= today_str]
+        past_skipped = before - len(work_items)
+        if past_skipped:
+            print(f"  Skipping {past_skipped} past meetings (--future-only)")
 
     if skipped:
         print(f"  Skipping {skipped} already extracted (--force to redo)")
@@ -495,6 +505,7 @@ async def run_briefing(
     cfg: AgentConfig,
     force: bool = False,
     dry_run: bool = False,
+    future_only: bool = False,
 ):
     """Generate briefings for cities with normalized meeting data (concurrent)."""
     from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting
@@ -547,6 +558,17 @@ async def run_briefing(
         if skipped:
             print(f"  Skipping {skipped} with existing briefings (--force to regenerate)")
 
+    if future_only:
+        today_str = date.today().isoformat()
+        before = len(norm_keys)
+        norm_keys = [
+            k for k in norm_keys
+            if (m := re.search(r"(\d{4}-\d{2}-\d{2})\.json$", k)) and m.group(1) >= today_str
+        ]
+        past_skipped = before - len(norm_keys)
+        if past_skipped:
+            print(f"  Skipping {past_skipped} past meetings (--future-only)")
+
     if not norm_keys:
         print("  No normalized meetings to brief")
         return
@@ -589,6 +611,7 @@ async def run_pipeline(
     force: bool = False,
     dry_run: bool = False,
     skip_existing: bool = True,
+    future_only: bool = False,
 ):
     """
     Run the full pipeline or selected phases.
@@ -651,13 +674,13 @@ async def run_pipeline(
         print(f"\n{'=' * 60}")
         print(f"EXTRACT — PDF -> normalized JSON (concurrency={CONCURRENCY_EXTRACT})")
         print(f"{'=' * 60}")
-        await run_extract(cities, cfg, force=force, dry_run=dry_run)
+        await run_extract(cities, cfg, force=force, dry_run=dry_run, future_only=future_only)
 
     if "briefing" in phases:
         print(f"\n{'=' * 60}")
         print(f"BRIEFING — normalized -> briefing (concurrency={CONCURRENCY_BRIEFING})")
         print(f"{'=' * 60}")
-        await run_briefing(cities, cfg, force=force, dry_run=dry_run)
+        await run_briefing(cities, cfg, force=force, dry_run=dry_run, future_only=future_only)
 
     elapsed = time.time() - t_start
     print(f"\n{'=' * 60}")

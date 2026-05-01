@@ -79,6 +79,7 @@ Examples:
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--dry-run", action="store_true", help="Preview without making changes")
+    parser.add_argument("--future-only", action="store_true", help="Only process meetings with dates >= today")
     args = parser.parse_args()
 
     cfg = AgentConfig.from_env()
@@ -90,6 +91,7 @@ Examples:
         csv_path=args.csv,
         force=args.force,
         dry_run=args.dry_run,
+        future_only=args.future_only,
     ))
 
 

@@ -34,6 +34,10 @@ Progressive disclosure: The first sentence of every section must be scannable st
 
 Numbers: Always write dollar amounts as numerals with a $ sign — never spell them out as words ("seventy-five thousand" is wrong; "$75,188" is correct). Use M for millions ($6.2 million). For amounts under $1 million, write the full numeral ($329,000 not $329K). Write constituent priorities as descriptive tiers (e.g. "strong constituent concern" or "a top priority for residents") — not as raw numeric scores.
 
+ATTRIBUTION RULE: When naming who requested, sponsored, or presented an item, attribute each action to the exact person named in the source. Do not combine multiple people into one sentence if they acted on different items. Do not add first names unless they appear in the source. If Councilor A sponsored item X and Councilor B sponsored item Y, state each separately — do not write "Councilors A and B sponsored the remaining items."
+
+PRECISION RULE: Use the exact title, label, or description from the source material. Do not simplify "Payroll Processing Expenditures" to "payroll" or "General Fund" to "Free Cash." If summarizing, keep the key distinguishing words.
+
 NEVER recommend how to vote. Recommendations are about how to show up, what to ask, and how to frame a position. The vote is always the official's decision.
 
 NEVER use these phrases or constructions:
