@@ -256,6 +256,29 @@ async def _try_fallback_candidates(
     return result
 
 
+def _pick_best_pdf(pdf_urls: list[str]) -> str:
+    """Pick the PDF most likely to be the actual agenda packet.
+
+    Prefers filenames containing 'agenda' or 'packet' over proclamations,
+    minutes, presentations, and other attachments.
+    """
+    _PREFER = ["agenda", "packet", "council"]
+    _AVOID = ["minute", "proclamation", "presentation", "certificate", "arbor", "resolution"]
+
+    def _score(url: str) -> int:
+        name = url.split("/")[-1].split("?")[0].lower()
+        score = 0
+        for kw in _PREFER:
+            if kw in name:
+                score += 10
+        for kw in _AVOID:
+            if kw in name:
+                score -= 5
+        return score
+
+    return max(pdf_urls, key=_score)
+
+
 async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dict:
     """Download and verify a real agenda PDF from the discovered source.
 
@@ -302,10 +325,10 @@ async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dic
             if source_url:
                 try:
                     from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
-                    fc = await asyncio.to_thread(validate_agenda_page, source_url, city, state)
-                    pdf_urls = fc.get("pdf_urls", [])
+                    fc_result = await asyncio.to_thread(validate_agenda_page, source_url, city, state)
+                    pdf_urls = fc_result.get("pdf_urls", [])
                     if pdf_urls:
-                        agenda_url = pdf_urls[0]
+                        agenda_url = _pick_best_pdf(pdf_urls)
                 except Exception:
                     pass
 

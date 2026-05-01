@@ -199,7 +199,10 @@ def firecrawl_crawl_for_agenda(
             pdf_links = [link for link in links if ".pdf" in link.lower()]
 
             # Check: page has meeting content for the right body?
-            if len(pdf_links) >= 3 or len(markdown) > 5000:
+            has_pdfs = len(pdf_links) >= 1
+            has_content = len(markdown) > 5000
+
+            if has_pdfs or has_content:
                 md_lower = markdown.lower()
                 reject_score = sum(1 for kw in REJECT_KEYWORDS if kw in md_lower)
                 wrong_body = False
@@ -209,9 +212,14 @@ def firecrawl_crawl_for_agenda(
 
                 if wrong_body:
                     print(f"  [crawl] Hop {hop+1}: Wrong body — continuing")
-                else:
+                elif has_pdfs:
+                    # Page has actual PDF links — this is the real agenda page
                     print(f"  [crawl] Hop {hop+1}: Found agenda page ({len(pdf_links)} PDFs, {len(markdown)} chars): {current_url[:70]}")
                     return current_url
+                else:
+                    # Page has content but no PDFs — likely a landing page.
+                    # Keep crawling to find the page with actual PDFs.
+                    print(f"  [crawl] Hop {hop+1}: Landing page (0 PDFs, {len(markdown)} chars) — following links for PDFs: {current_url[:70]}")
 
             if not links:
                 print(f"  [crawl] Hop {hop+1}: No links on {current_url[:60]}")
