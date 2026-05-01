@@ -266,6 +266,7 @@ async def discover_from_serper(
     fc_key = os.environ.get("FIRECRAWL_API_KEY")
     drill_note = ""
     agenda_url = None  # set if Firecrawl map found a sub-page
+    crawl_url = None   # set if Firecrawl crawl found a page with PDFs
     final_url = serper_url
 
     if fc_key and detect_platform(serper_url) in ("unknown", "generic_html", None, ""):
@@ -283,50 +284,32 @@ async def discover_from_serper(
                 continue
 
             # For results #2+, if the domain is different from #1, verify the
-            # actual page mentions both city AND state to avoid wrong-city matches
-            # (e.g. Norfolk VA vs Norfolk NE, Ocean Township vs Ocean City)
+            # actual page mentions both city AND state to avoid wrong-city matches.
+            # Note: 403 is NOT a skip — many city sites block httpx but work with
+            # Firecrawl (real browser). Only skip 404 (page doesn't exist).
             if idx > 0 and candidate_domain != first_domain:
                 import httpx as _httpx
                 try:
                     with _httpx.Client(follow_redirects=True, timeout=8,
                                        headers={"User-Agent": "Mozilla/5.0"}) as _hc:
                         _r = _hc.get(candidate_url)
-                        if _r.status_code in (403, 404, 500):
-                            print(f"  [discover] Result #{idx+1}: skip (HTTP {_r.status_code})")
+                        if _r.status_code == 404:
+                            print(f"  [discover] Result #{idx+1}: skip (HTTP 404)")
                             continue
-                        if len(_r.text) < 500:
-                            print(f"  [discover] Result #{idx+1}: skip (empty page)")
-                            continue
-                        # Verify city AND state on the actual page
-                        _page_lower = _r.text.lower()
-                        _city_lower = city.lower()
-                        _state_full = _STATE_NAMES.get(state.upper(), state).lower()
-                        import re as _re2
-                        _city_found = all(w in _page_lower for w in _city_lower.split())
-                        _state_found = (bool(_re2.search(r'\b' + _re2.escape(state.lower()) + r'\b', _page_lower))
-                                       or _state_full in _page_lower)
-                        if not (_city_found and _state_found):
-                            print(f"  [discover] Result #{idx+1}: skip (different domain, city/state not confirmed on page)")
-                            continue
+                        if _r.status_code not in (403, 500) and len(_r.text) >= 500:
+                            # Page loaded — verify city AND state
+                            _page_lower = _r.text.lower()
+                            _city_lower = city.lower()
+                            _state_full = _STATE_NAMES.get(state.upper(), state).lower()
+                            _city_found = all(w in _page_lower for w in _city_lower.split())
+                            _state_found = (bool(re.search(r'\b' + re.escape(state.lower()) + r'\b', _page_lower))
+                                           or _state_full in _page_lower)
+                            if not (_city_found and _state_found):
+                                print(f"  [discover] Result #{idx+1}: skip (different domain, city/state not confirmed on page)")
+                                continue
+                        # 403/500/unreachable on cross-domain: let Firecrawl try it
                 except Exception:
-                    print(f"  [discover] Result #{idx+1}: skip (unreachable)")
-                    continue
-            else:
-                # Same domain as #1 or first result — quick HTTP check only
-                try:
-                    import httpx as _httpx
-                    with _httpx.Client(follow_redirects=True, timeout=8,
-                                       headers={"User-Agent": "Mozilla/5.0"}) as _hc:
-                        _r = _hc.get(candidate_url)
-                        if _r.status_code in (403, 404, 500):
-                            print(f"  [discover] Result #{idx+1}: skip (HTTP {_r.status_code})")
-                            continue
-                        if len(_r.text) < 500:
-                            print(f"  [discover] Result #{idx+1}: skip (empty page)")
-                            continue
-                except Exception:
-                    print(f"  [discover] Result #{idx+1}: skip (unreachable)")
-                    continue
+                    pass  # unreachable via httpx — let Firecrawl try
 
             # Step 1: Try Firecrawl map on the domain to find a specific agenda sub-page
             candidate_path = urlparse(candidate_url).path.lower() if candidate_url else ""
@@ -383,6 +366,12 @@ async def discover_from_serper(
                         firecrawl_crawl_for_agenda,test_url, city, state, expected_body
                     )
                     if deeper:
+                        # Track the crawl result as fallback even if scan_generic
+                        # can't parse meetings — the page with PDFs is still better
+                        # than the raw Serper landing page.
+                        if not crawl_url:
+                            crawl_url = deeper
+
                         # Validate the deeper page also produces meetings
                         try:
                             deep_meetings = await scan_generic_firecrawl(deeper, city, state)
@@ -415,8 +404,9 @@ async def discover_from_serper(
             # landing page — the mapped URL is more likely to be the actual agenda
             # page (e.g. /AgendaCenter/City-Council-6), even if scan_generic
             # couldn't extract dates from it.
-            final_url = agenda_url or serper_url
-            print(f"  [discover] No Serper results produced meetings — using {'mapped' if agenda_url else '#1'} as fallback")
+            final_url = agenda_url or crawl_url or serper_url
+            fallback_source = "mapped" if agenda_url else ("crawl" if crawl_url else "#1")
+            print(f"  [discover] No Serper results produced meetings — using {fallback_source} as fallback")
     else:
         # Known platform — use Firecrawl map for sub-page but skip scan validation
         serper_path = urlparse(serper_url).path.lower() if serper_url else ""
