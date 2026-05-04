@@ -110,10 +110,6 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
 
     cutoff_date = (datetime.now() - timedelta(days=config.lookback_days)).strftime("%Y-%m-%dT00:00:00Z")
 
-    print(f"Collecting {config.city_name} CivicClerk data (tenant: {config.tenant})...")
-    print(f"  Lookback: {config.lookback_days} days (cutoff: {cutoff_date[:10]})")
-    print(f"  Saving to: {config.output_prefix}")
-    print()
 
     async with httpx.AsyncClient(timeout=config.request_timeout, follow_redirects=True) as client:
 
@@ -123,7 +119,6 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         # ignores $top). With eventDate desc ordering, events near the end-date
         # of the filter are returned. We do two queries to capture both recent
         # past meetings and upcoming meetings.
-        print("1/4  Fetching events...")
         today = datetime.now().strftime("%Y-%m-%dT00:00:00Z")
         future_cutoff = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%dT00:00:00Z")
 
@@ -145,14 +140,11 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                     seen_ids.add(evt["id"])
                     all_events.append(evt)
 
-        print(f"     Found {len(all_events)} total events")
 
         # Discover categories
         categories = sorted({e["categoryName"] for e in all_events})
-        print(f"     Categories: {categories}")
 
         # 2. FILTER BY COUNCIL CATEGORY + DATE
-        print("2/4  Filtering council events...")
         council_events = [
             e for e in all_events
             if _is_council_category(e["categoryName"], config.council_categories)
@@ -174,13 +166,10 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             ]
             if filtered_events:
                 print(f"     WARNING: No council-type category found in {categories}")
-                print(f"     Falling back to {len(filtered_events)} non-commission events (excluded commission/committee/planning/etc.)")
                 council_events = filtered_events
             else:
                 # Everything looks like a committee — collect nothing rather than pollute
                 print("     WARNING: No council-type category found and all categories look like committees.")
-                print(f"     Categories: {categories}")
-                print("     Returning 0 events. Set council_categories explicitly in CivicClerkConfig.")
                 council_events = []
 
         # Filter by date: keep events after cutoff OR in the future
@@ -189,11 +178,9 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             if e["eventDate"] >= cutoff_date
         ]
 
-        print(f"     Council events: {len(council_events)} total, {len(recent_events)} recent/upcoming")
         config.storage.write_json(f"{config.output_prefix}/events.json", recent_events)
 
         # 3. FETCH EVENT DETAILS (for publishedFiles)
-        print("3/4  Fetching event details + published files...")
         events_with_agenda = 0
         meetings = []
         pdf_count = 0
@@ -271,7 +258,6 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
 
                         config.storage.write_bytes(pdf_key, pdf_resp.content)
                         pdf_count += 1
-                        print(f"     Downloaded: {filename} ({len(pdf_resp.content) // 1024}KB)")
                     except Exception as e:
                         print(f"     WARNING: Failed to download fileId={file_id}: {e}")
 
@@ -280,7 +266,6 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                 try:
                     from meeting_pipeline.shared.firecrawl_client import scrape_civicclerk_event_files
                     portal_base = f"https://{config.tenant}.portal.civicclerk.com"
-                    print(f"     [civicclerk] API returned 0 files for event {event_id} — trying Firecrawl")
                     pdf_urls = scrape_civicclerk_event_files(portal_base, str(event_id))
                     for pdf_url in pdf_urls[:3]:
                         try:
@@ -292,14 +277,13 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                                 pdf_key = f"{config.output_prefix}/pdfs/{filename}"
                                 config.storage.write_bytes(pdf_key, resp.content)
                                 pdf_count += 1
-                                print(f"     [civicclerk] Firecrawl fallback downloaded: {filename}")
                         except Exception as e:
                             print(f"     [civicclerk] Firecrawl fallback download failed: {e}")
                 except ImportError:
                     pass  # Firecrawl not installed — skip fallback
 
             if i % 5 == 0 and i > 0:
-                print(f"     Processed {i + 1}/{len(recent_events)} events...")
+                pass
 
             await asyncio.sleep(config.rate_limit_delay)
 
@@ -307,17 +291,6 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         config.storage.write_json(f"{config.output_prefix}/meetings.json", meetings)
 
     # SUMMARY
-    print()
-    print("=" * 60)
-    print(f"Collection complete for {config.city_name}!")
-    print(f"  Total events fetched:  {len(all_events)}")
-    print(f"  Council events:        {len(council_events)}")
-    print(f"  Recent (≤{config.lookback_days}d + future): {len(recent_events)}")
-    print(f"  Events with agenda:    {events_with_agenda}")
-    print(f"  PDFs downloaded:       {pdf_count}")
-    print(f"  Categories found:      {categories}")
-    print(f"  Saved to:              {config.output_prefix}")
-    print("=" * 60)
 
     return CivicClerkResult(
         total_events=len(all_events),

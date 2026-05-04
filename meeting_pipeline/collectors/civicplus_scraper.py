@@ -212,7 +212,6 @@ async def find_council_category(client: httpx.AsyncClient, domain: str) -> tuple
 
     # Last resort: return first category
     print(f"  WARNING: No 'council' category found. Available: {[c['name'] for c in search_cats]}")
-    print(f"  Using first category: {search_cats[0]['name']} (id={search_cats[0]['id']})")
     return search_cats[0]["id"], search_cats[0]["name"]
 
 
@@ -486,7 +485,6 @@ async def download_pdf(
         if len(content) < 5000:
             text = content.decode("latin-1", errors="ignore").lower()
             if "leaving" in text or "redirect" in text:
-                print(f"    Stub/redirect PDF detected ({len(content)} bytes), skipping")
                 return False
 
         storage.write_bytes(key, content)
@@ -512,12 +510,10 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
     """
     www_domain = _ensure_www(config.domain)
 
-    print(f"Collecting {config.city_name} CivicPlus data from {www_domain}/AgendaCenter")
 
     async with httpx.AsyncClient(timeout=config.request_timeout, follow_redirects=True) as client:
 
         # Step 1: GET main page to establish session cookie
-        print("  1. Establishing session cookie...")
         session_response = await client.get(f"https://{www_domain}/AgendaCenter")
         if session_response.status_code != 200:
             print(f"    WARNING: Got status {session_response.status_code} from main page")
@@ -526,9 +522,7 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
         if config.council_category_id is not None:
             cat_id = config.council_category_id
             cat_name = "City Council"
-            print(f"  2. Using provided category ID: {cat_id}")
         else:
-            print("  2. Auto-discovering council category...")
             # If expected_body is set, try matching it against available categories first
             if config.expected_body:
                 raw_categories = await discover_categories(client, config.domain)
@@ -537,14 +531,10 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
                 if matched:
                     cat_id = matched[0]["id"]
                     cat_name = matched[0]["name"]
-                    print(f"     [body filter] Matched expected_body={config.expected_body!r} → {cat_name} (id={cat_id})")
                 else:
-                    print(f"     [body filter] No category matched {config.expected_body!r}, falling back to find_council_category()")
                     cat_id, cat_name = await find_council_category(client, config.domain)
-                    print(f"     Found: {cat_name} (id={cat_id})")
             else:
                 cat_id, cat_name = await find_council_category(client, config.domain)
-                print(f"     Found: {cat_name} (id={cat_id})")
 
         # Step 3: Discover all categories (for reference)
         categories = await discover_categories(client, config.domain)
@@ -552,7 +542,6 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
             f"{config.output_prefix}/categories.json",
             {"categories": categories, "council_category_id": cat_id},
         )
-        print(f"  3. Found {len(categories)} categories total")
 
         # Step 4: Try AJAX endpoint first, fallback to main page parsing
         all_meetings: list[CivicPlusMeeting] = []
@@ -572,16 +561,13 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
             use_fallback = True
 
         if use_fallback:
-            print("  4. AJAX endpoint not available — using main page fallback")
             # Re-discover category from h2 headers (checkbox labels may not match)
             try:
                 cat_id, cat_name = await find_council_category_from_panels(client, config.domain)
-                print(f"     Found panel: {cat_name} (id={cat_id})")
             except ValueError:
                 print(f"     WARNING: Could not find council panel, using checkbox-discovered id={cat_id}")
 
             meetings, cat_name = await fetch_meetings_from_main_page(client, config.domain, cat_id)
-            print(f"     Found {len(meetings)} meetings from main page")
             all_meetings.extend(meetings)
         else:
             # Standard AJAX flow
@@ -597,13 +583,10 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
                     print(f"  4. WARNING: No {current_year} data. Most recent year: {years[0]}")
                 else:
                     years = [current_year]
-                print(f"  4. Available years: {available_years or 'none found'}, collecting: {years}")
 
             for year in years:
-                print(f"     Fetching meetings for {year}...")
                 await asyncio.sleep(config.rate_limit_delay)
                 meetings = await fetch_meeting_list(client, config.domain, cat_id, year)
-                print(f"     Found {len(meetings)} meetings")
                 all_meetings.extend(meetings)
 
         # Filter: keep upcoming meetings + last 90 days only
@@ -612,7 +595,7 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
         before_filter = len(all_meetings)
         all_meetings = [m for m in all_meetings if m.date >= cutoff]
         if len(all_meetings) < before_filter:
-            print(f"     Filtered to {len(all_meetings)} meetings (keeping >= {cutoff}, removed {before_filter - len(all_meetings)} older)")
+            pass
 
         # Save meeting metadata
         meetings_data = [
@@ -633,7 +616,6 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
         # Step 5: Download PDFs — prefer packet over agenda-only
         pdf_count = 0
         if config.download_pdfs:
-            print(f"  5. Downloading {len(all_meetings)} agenda PDFs...")
             for m in all_meetings:
                 if not m.agenda_pdf_url and not m.packet_url:
                     continue
@@ -646,12 +628,10 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
                     packet_filename = f"agenda_{safe_date}_{agenda_id}_packet.pdf"
                     packet_key = f"{config.output_prefix}/pdfs/{packet_filename}"
                     if config.storage.exists(packet_key):
-                        print(f"    Skipping {packet_filename} (already exists)")
                         pdf_count += 1
                     else:
                         await asyncio.sleep(config.rate_limit_delay)
                         if await download_pdf(client, m.packet_url, packet_key, config.storage):
-                            print(f"    Downloaded: {packet_filename}")
                             pdf_count += 1
 
                 # Also download agenda PDF if no packet (or as fallback)
@@ -659,20 +639,13 @@ async def collect_civicplus(config: CivicPlusConfig) -> CivicPlusResult:
                     filename = f"agenda_{safe_date}_{agenda_id}.pdf"
                     pdf_key = f"{config.output_prefix}/pdfs/{filename}"
                     if config.storage.exists(pdf_key):
-                        print(f"    Skipping {filename} (already exists)")
                         pdf_count += 1
                         continue
                     await asyncio.sleep(config.rate_limit_delay)
                     if await download_pdf(client, m.agenda_pdf_url, pdf_key, config.storage):
-                        print(f"    Downloaded: {filename}")
                         pdf_count += 1
 
     # Summary
-    print()
-    print(f"Collection complete: {config.city_name}")
-    print(f"  Meetings: {len(all_meetings)}")
-    print(f"  PDFs downloaded: {pdf_count}")
-    print(f"  Saved to: {config.output_prefix}")
 
     return CivicPlusResult(
         meetings_found=len(all_meetings),

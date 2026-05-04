@@ -357,7 +357,6 @@ async def extract_two_hop(
         if full_url not in subpage_urls:
             subpage_urls.append(full_url)
 
-    print(f"  Two-hop: found {len(subpage_urls)} subpages to check")
 
     # Step 2: Visit each subpage and extract PDF links
     for i, sub_url in enumerate(subpage_urls[:30]):  # Cap at 30 subpages
@@ -401,7 +400,7 @@ async def extract_two_hop(
             continue
 
         if (i + 1) % 10 == 0:
-            print(f"    Processed {i + 1}/{len(subpage_urls)} subpages...")
+            pass
 
     return meetings
 
@@ -505,8 +504,6 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
     3. Filter by date (last N days)
     4. Download PDFs
     """
-    print(f"Collecting {config.city_name} from {config.url}")
-    print(f"  Strategy: {config.strategy}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -523,18 +520,15 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
 
         if config.strategy == "rss_feed":
             # RSS feeds don't need HTML parsing
-            print("  Fetching RSS feed...")
             meetings = await extract_rss_feed(client, config.url, config.keyword_filter)
         else:
             # Fetch the HTML page
-            print("  Fetching page...")
             response = await client.get(config.url)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
 
             # Optionally follow a second URL (e.g. Agenda Center sub-page)
             if config.follow_url:
-                print(f"  Following link: {config.follow_url}")
                 await asyncio.sleep(config.rate_limit_delay)
                 response2 = await client.get(config.follow_url)
                 response2.raise_for_status()
@@ -556,7 +550,6 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
                 print(f"  ERROR: Unknown strategy '{config.strategy}'")
                 return GenericScraperResult(output_prefix=config.output_prefix)
 
-        print(f"  Found {len(meetings)} potential agenda links")
 
         # Deduplicate by PDF URL
         seen_urls = set()
@@ -568,7 +561,7 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
         meetings = unique_meetings
 
         if len(meetings) != len(seen_urls):
-            print(f"  After dedup: {len(meetings)} unique meetings")
+            pass
 
         # Filter by date
         cutoff = (datetime.now() - timedelta(days=config.lookback_days)).strftime("%Y-%m-%d")
@@ -577,7 +570,6 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
 
         # Keep dated meetings within range + undated ones (might be recent)
         meetings = dated + undated
-        print(f"  After date filter (>= {cutoff}): {len(dated)} dated + {len(undated)} undated = {len(meetings)}")
 
         # Save meeting metadata
         meetings_data = [
@@ -594,7 +586,6 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
         # Download PDFs
         pdf_count = 0
         if config.download_pdfs and meetings:
-            print(f"  Downloading {len(meetings)} PDFs...")
             for i, m in enumerate(meetings):
                 safe_date = m.date.replace("-", "")
                 # Create a safe filename from the URL
@@ -617,15 +608,9 @@ async def collect_generic(config: GenericScraperConfig) -> GenericScraperResult:
                 await asyncio.sleep(config.rate_limit_delay)
                 if await download_pdf(client, m.pdf_url, dest_key, config.storage):
                     size = config.storage.get_size(dest_key)
-                    print(f"    Downloaded: {filename} ({size // 1024}KB)")
                     pdf_count += 1
 
     # Summary
-    print()
-    print(f"Collection complete: {config.city_name}")
-    print(f"  Meetings found: {len(meetings)}")
-    print(f"  PDFs downloaded: {pdf_count}")
-    print(f"  Output: {config.output_prefix}")
 
     return GenericScraperResult(
         meetings_found=len(meetings),

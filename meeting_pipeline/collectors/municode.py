@@ -111,7 +111,6 @@ async def collect_municode(config: MunicodeConfig) -> MunicodeResult:
 
         html = resp.text
         meetings = _parse_meetings(html, cutoff, config.portal_url)
-        print(f"  {config.city_name}: {len(meetings)} meetings found")
 
         # Save meetings.json
         config.storage.write_json(f"{config.output_prefix}/meetings.json", meetings)
@@ -350,8 +349,6 @@ async def _main_cli():
         download_pdfs=not args.no_pdfs,
     )
     result = await collect_municode(mc_cfg)
-    print(f"\nResult: {result.meetings_found} meetings, {result.pdfs_downloaded} PDFs")
-    print(f"Output: {output_prefix}/meetings.json")
 
 
 if __name__ == "__main__":

@@ -144,7 +144,6 @@ async def collect_novus(config: NovusConfig) -> NovusResult:
         if not meetings:
             board_type_val = _find_council_board_type(html)
             if board_type_val:
-                print(f"  {config.city_name}: initial page empty, trying search with board={board_type_val}")
                 for date_range in ["l6m", "n6m", "lyr"]:
                     try:
                         search_html = await _search_meetings(
@@ -152,12 +151,10 @@ async def collect_novus(config: NovusConfig) -> NovusResult:
                         )
                         meetings = _parse_meetings(search_html, cutoff, base_url)
                         if meetings:
-                            print(f"  {config.city_name}: found {len(meetings)} meetings with range={date_range}")
                             break
                     except Exception as e:
                         print(f"  WARN: search failed for range={date_range}: {e}")
 
-        print(f"  {config.city_name}: {len(meetings)} meetings found")
         # Note: some Novus portals show 0 meetings when agendas haven't been posted yet;
         # this is expected behavior, not a scraper bug. Verified for Cornelius OR,
         # Hermiston OR, and Union City GA — their Meetings.aspx pages return "No records
@@ -424,8 +421,6 @@ async def _main_cli():
         download_pdfs=not args.no_pdfs,
     )
     result = await collect_novus(novus_cfg)
-    print(f"\nResult: {result.meetings_found} meetings, {result.pdfs_downloaded} PDFs")
-    print(f"Output: {output_prefix}/meetings.json")
 
 
 if __name__ == "__main__":

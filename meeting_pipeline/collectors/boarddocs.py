@@ -222,21 +222,14 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
 
     async with httpx.AsyncClient(timeout=config.request_timeout, follow_redirects=True) as client:
         # ── Step 1: Discover committees ──────────────────────────────
-        print(f"\n{'='*60}")
-        print(f"01 — Collect Legislative Data for {config.city_name} (BoardDocs)")
-        print(f"{'='*60}")
-        print(f"\nSource: {config.base_url}")
-        print(f"Lookback: {config.lookback_days} days (since {cutoff.strftime('%Y-%m-%d')})")
 
         committees = await _fetch_committees(client, config, headers)
-        print(f"\nFound {len(committees)} committees/boards")
 
         # Committee filter: if expected_body is set, restrict to matching committees
         if config.expected_body:
             expected_lower = config.expected_body.lower()
             filtered = [c for c in committees if expected_lower in c["name"].lower()]
             if filtered:
-                print(f"  [body filter] Filtered to {len(filtered)} committees matching '{config.expected_body}'")
                 committees = filtered
             else:
                 print(f"  WARNING: No committee matched '{config.expected_body}', collecting all {len(committees)}")
@@ -255,7 +248,6 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
         result.bodies_count = len(bodies)
 
         # ── Step 2: Fetch meetings for each committee ────────────────
-        print("\nFetching meetings...")
         all_meetings: list[dict] = []
         for comm in committees:
             meetings = await _fetch_meetings(client, config, headers, comm["id"])
@@ -266,7 +258,6 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
                     all_meetings.append(m)
             await asyncio.sleep(config.rate_limit_delay)
 
-        print(f"  {len(all_meetings)} meetings within lookback period")
 
         # Save as events.json
         events = []
@@ -295,7 +286,6 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
         result.events_count = len(events)
 
         # ── Step 3: Fetch agenda items for each meeting ──────────────
-        print(f"\nFetching agenda items for {len(all_meetings)} meetings...")
         all_matters: list[dict] = []
         all_event_items: dict[int, list[dict]] = {}
         matter_id_counter = 1
@@ -375,8 +365,7 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
 
             # Progress
             if (evt_idx + 1) % 5 == 0 or evt_idx == len(all_meetings) - 1:
-                print(f"  Processed {evt_idx + 1}/{len(all_meetings)} meetings, "
-                      f"{len(all_matters)} items so far")
+                pass
 
         # Save matters.json
         config.storage.write_json(f"{config.output_prefix}/matters.json", all_matters)
@@ -389,14 +378,6 @@ async def collect_boarddocs(config: BoardDocsConfig) -> BoardDocsResult:
         result.vote_count = 0
 
     # ── Summary ──────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"Collection complete for {config.city_name} (BoardDocs)")
-    print(f"{'='*60}")
-    print(f"  Bodies/committees: {result.bodies_count}")
-    print(f"  Meetings (events): {result.events_count}")
-    print(f"  Agenda items (matters): {result.matters_count}")
-    print(f"  PDFs downloaded: {result.pdf_count}")
-    print(f"  Output: {config.output_prefix}")
 
     return result
 

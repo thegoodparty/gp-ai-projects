@@ -85,19 +85,13 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         follow_redirects=True,
         verify=False,
     ) as client:
-        print(f"\n{'='*60}")
-        print(f"01 — Collect Legislative Data for {config.city_name} (eSCRIBE)")
-        print(f"{'='*60}")
-        print(f"\nSource: {config.base_url}")
-        print(f"Lookback: {config.lookback_days} days (since {cutoff.strftime('%Y-%m-%d')})")
 
         # ── Step 1: Discover meeting types if not configured ─────────
         meeting_types = config.meeting_types
         if not meeting_types:
             meeting_types = await _discover_meeting_types(client, config)
-        print(f"\nMeeting types: {len(meeting_types)}")
         for mt in meeting_types:
-            print(f"  - {mt}")
+            pass
 
         # Save as bodies.json (one "body" per meeting type)
         bodies = []
@@ -113,7 +107,6 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         result.bodies_count = len(bodies)
 
         # ── Step 2: Fetch meetings for each type ────────────────────
-        print("\nFetching meetings...")
         all_meetings: list[dict] = []
         for mt in meeting_types:
             meetings = await _fetch_past_meetings(client, config, mt)
@@ -127,7 +120,6 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
 
         # Sort by date descending
         all_meetings.sort(key=lambda m: m.get("_parsed_date", datetime.min), reverse=True)
-        print(f"  {len(all_meetings)} meetings within lookback period")
 
         # Save as events.json
         events = []
@@ -144,7 +136,6 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         result.events_count = len(events)
 
         # ── Step 3: Download agenda PDFs and fetch agenda items ──────
-        print(f"\nFetching agendas and documents for {len(all_meetings)} meetings...")
         all_matters: list[dict] = []
         matter_id_counter = 1
 
@@ -200,8 +191,7 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
                 )
 
             if (evt_idx + 1) % 5 == 0 or evt_idx == len(all_meetings) - 1:
-                print(f"  Processed {evt_idx + 1}/{len(all_meetings)} meetings, "
-                      f"{len(all_matters)} items so far")
+                pass
 
         # Save matters.json
         config.storage.write_json(f"{config.output_prefix}/matters.json", all_matters)
@@ -211,14 +201,6 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         config.storage.write_json(f"{config.output_prefix}/persons.json", [])
 
     # ── Summary ──────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"Collection complete for {config.city_name} (eSCRIBE)")
-    print(f"{'='*60}")
-    print(f"  Bodies/meeting types: {result.bodies_count}")
-    print(f"  Meetings (events): {result.events_count}")
-    print(f"  Agenda items (matters): {result.matters_count}")
-    print(f"  PDFs downloaded: {result.pdf_count}")
-    print(f"  Output: {config.output_prefix}")
 
     return result
 

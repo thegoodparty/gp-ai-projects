@@ -130,7 +130,6 @@ async def _download_pdf(
             resp = await client.get(pdf_url)
             resp.raise_for_status()
         storage.write_bytes(dest_key, resp.content)
-        print(f"     Downloaded: {dest_key.split('/')[-1]} ({len(resp.content) // 1024}KB)")
         return True
     except Exception as e:
         # Granicus S3 bucket has cert hostname mismatch — retry without SSL verification.
@@ -151,7 +150,6 @@ async def _download_pdf(
                         resp = await insecure.get(pdf_url)
                         resp.raise_for_status()
                     storage.write_bytes(dest_key, resp.content)
-                    print(f"     Downloaded: {dest_key.split('/')[-1]} ({len(resp.content) // 1024}KB) [SSL bypassed]")
                     return True
             except Exception as e2:
                 print(f"     WARNING: Failed to download {label} (even with SSL bypass): {e2}")
@@ -209,7 +207,6 @@ async def _collect_classic_granicus(
     )
     cutoff = datetime.now() - timedelta(days=config.lookback_days)
 
-    print(f"  Fetching RSS: {rss_url}")
     resp = await client.get(rss_url)
     resp.raise_for_status()
 
@@ -221,7 +218,6 @@ async def _collect_classic_granicus(
 
     items = root.findall(".//item")
     total = len(items)
-    print(f"  Found {total} RSS items total")
 
     meetings: list[dict] = []
     pdf_count = 0
@@ -399,7 +395,6 @@ async def _collect_new_swagit(
 
     # Try city-council.json first, fall back to events.json
     for endpoint in ("city-council.json", "events.json"):
-        print(f"  Trying endpoint: {base_url}/{endpoint}")
         page = 1
         endpoint_found = False
         stop_paging = False
@@ -451,18 +446,15 @@ async def _collect_new_swagit(
             await asyncio.sleep(config.rate_limit_delay)
 
         if endpoint_found:
-            print(f"  Using endpoint: {endpoint}")
             break
 
     total_raw = len(events_raw)
-    print(f"  Found {total_raw} raw events within lookback window")
 
     # Filter to council-type body
     council_raw = [
         item for item in events_raw
         if _is_council_event(_extract_swagit_title(item), config.council_keywords)
     ]
-    print(f"  Council events: {len(council_raw)}")
 
     meetings: list[dict] = []
     pdf_count = 0
@@ -512,10 +504,6 @@ async def collect_granicus(config: GranicusConfig) -> GranicusResult:
             events.json   — council meeting metadata list
             pdfs/         — downloaded agenda PDFs
     """
-    print(f"Collecting {config.city_name} ({config.platform}, subdomain={config.subdomain})...")
-    print(f"  Lookback: {config.lookback_days} days")
-    print(f"  Output:   {config.output_prefix}")
-    print()
 
     async with httpx.AsyncClient(
         timeout=config.request_timeout,
@@ -530,15 +518,6 @@ async def collect_granicus(config: GranicusConfig) -> GranicusResult:
 
     config.storage.write_json(f"{config.output_prefix}/events.json", meetings)
 
-    print()
-    print("=" * 60)
-    print(f"Collection complete for {config.city_name}!")
-    print(f"  Platform:       {config.platform}")
-    print(f"  Total fetched:  {total_events}")
-    print(f"  Council events: {len(meetings)}")
-    print(f"  PDFs:           {pdf_count}")
-    print(f"  Saved to:       {config.output_prefix}")
-    print("=" * 60)
 
     return GranicusResult(
         platform=config.platform,

@@ -71,7 +71,6 @@ async def _fetch_json(client: httpx.AsyncClient, url: str, params: dict = None, 
         except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError):
             if attempt < retries - 1:
                 wait_time = 2 ** (attempt + 1)
-                print(f"  Retry {attempt + 1}/{retries} after {wait_time}s for {url.split('/')[-1]}...")
                 await asyncio.sleep(wait_time)
             else:
                 raise
@@ -102,7 +101,6 @@ async def _fetch_all_pages(
             break
 
         all_results.extend(page)
-        print(f"  Fetched {len(all_results)} results so far from {url.split('/')[-1]}...")
 
         if len(page) < page_size:
             break
@@ -154,18 +152,12 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
     base_url = config.base_url
     six_months_ago = (datetime.now() - timedelta(days=config.lookback_days)).strftime("%Y-%m-%d")
 
-    print(f"Collecting {config.city_name} Legistar data from {six_months_ago} to today...")
-    print(f"Saving to: {config.output_prefix}")
-    print()
 
     async with httpx.AsyncClient(timeout=config.request_timeout) as client:
 
         # 1. BODIES
-        print("1/7  Fetching legislative bodies...")
         bodies = await _fetch_json(client, f"{base_url}/bodies")
         config.storage.write_json(f"{config.output_prefix}/bodies.json", bodies)
-        print(f"     Found {len(bodies)} bodies")
-        print()
 
         # Body filter: if expected_body is set, restrict events/matters to matching bodies
         body_ids_to_keep: set[int] = set()
@@ -175,12 +167,10 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
                 b["BodyId"] for b in bodies
                 if expected_lower in b.get("BodyName", "").lower()
             }
-            print(f"  [body filter] expected_body={config.expected_body!r} matched {len(body_ids_to_keep)} of {len(bodies)} bodies")
             if not body_ids_to_keep:
                 print(f"  WARNING: [body filter] No bodies matched {config.expected_body!r} — collecting all bodies (degrading gracefully)")
 
         # 2. EVENTS
-        print("2/7  Fetching events (meetings)...")
         events = await _fetch_all_pages(
             client, f"{base_url}/events", config.page_size, config.rate_limit_delay,
             odata_filter=f"EventDate ge datetime'{six_months_ago}'",
@@ -189,28 +179,22 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
         if body_ids_to_keep:
             events = [e for e in events if e.get("EventBodyId") in body_ids_to_keep]
         config.storage.write_json(f"{config.output_prefix}/events.json", events)
-        print(f"     Found {len(events)} events")
-        print()
 
         # 3. EVENT ITEMS
-        print("3/7  Fetching agenda items for each event...")
         for i, event in enumerate(events):
             event_id = event["EventId"]
             items = await _fetch_json(client, f"{base_url}/events/{event_id}/eventitems")
             config.storage.write_json(f"{config.output_prefix}/event_items/{event_id}.json", items)
             if i % 10 == 0:
-                print(f"     Processing event {i + 1}/{len(events)}...")
+                pass
             await asyncio.sleep(config.rate_limit_delay)
-        print()
 
         # 4. MATTERS
         matters = []
         pdf_count = 0
         if config.agendas_only:
-            print("4/7  Skipping matters (agendas_only=True)")
-            print()
+            pass
         else:
-            print("4/7  Fetching recent matters (legislation)...")
             matters = await _fetch_all_pages(
                 client, f"{base_url}/matters", config.page_size, config.rate_limit_delay,
                 odata_filter=f"MatterIntroDate ge datetime'{six_months_ago}'",
@@ -219,15 +203,11 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
             if body_ids_to_keep:
                 matters = [m for m in matters if m.get("MatterBodyId") in body_ids_to_keep]
             config.storage.write_json(f"{config.output_prefix}/matters.json", matters)
-            print(f"     Found {len(matters)} matters")
-            print()
 
         # 5. MATTER DETAILS + PDFs
         if config.agendas_only:
-            print("5/7  Skipping matter histories/attachments (agendas_only=True)")
-            print()
+            pass
         else:
-            print("5/7  Fetching matter histories, attachments, and downloading PDFs...")
             skipped_count = 0
 
             for i, matter in enumerate(matters):
@@ -255,14 +235,11 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
                         await asyncio.sleep(config.rate_limit_delay)
 
                 if i % 10 == 0:
-                    print(f"     Processing matter {i + 1}/{len(matters)} ({skipped_count} skipped)...")
+                    pass
                 await asyncio.sleep(config.rate_limit_delay)
 
-            print(f"     Downloaded {pdf_count} PDF attachments")
-            print()
 
         # 6. VOTES
-        print("6/7  Fetching vote records...")
         vote_count = 0
         for event in events:
             event_id = event["EventId"]
@@ -279,27 +256,12 @@ async def collect_legistar(config: LegistarConfig) -> LegistarResult:
                         vote_count += 1
                     await asyncio.sleep(config.rate_limit_delay)
 
-        print(f"     Found {vote_count} roll-call vote records")
-        print()
 
         # 7. PERSONS
-        print("7/7  Fetching persons...")
         persons = await _fetch_json(client, f"{base_url}/persons")
         config.storage.write_json(f"{config.output_prefix}/persons.json", persons)
-        print(f"     Found {len(persons)} persons")
-        print()
 
     # SUMMARY
-    print("=" * 60)
-    print("Collection complete!")
-    print(f"  Bodies:      {len(bodies)}")
-    print(f"  Events:      {len(events)}")
-    print(f"  Matters:     {len(matters)}")
-    print(f"  PDFs:        {pdf_count}")
-    print(f"  Vote records:{vote_count}")
-    print(f"  Persons:     {len(persons)}")
-    print(f"  Saved to:    {config.output_prefix}")
-    print("=" * 60)
 
     return LegistarResult(
         bodies_count=len(bodies),
