@@ -191,9 +191,6 @@ async def run_scan(cities: list[dict], cfg: AgentConfig, force: bool = False):
             return
 
         um_key = f"{cfg.sources_prefix}/{slug}/upcoming_meetings.json"
-        if not force and storage.exists(um_key):
-            skip_count += 1
-            return
 
         async with sem, httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 (compatible; MeetingPipelineBot/1.0)"},
