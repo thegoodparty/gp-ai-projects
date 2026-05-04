@@ -1,6 +1,3 @@
-# Local city CSV files (not committed — each dev may have different sets)
-Terry Users*.csv
-
 # macOS
 .DS_Store
 
