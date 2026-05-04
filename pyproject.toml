@@ -44,9 +44,15 @@ dependencies = [
     "braintrust>=0.3.10",
     "claude-agent-sdk>=0.1.19",
     "slack-sdk>=3.39.0",
+    "pymupdf>=1.27.2.2",
+    "beautifulsoup4>=4.14.3",
+    "firecrawl-py>=4.22.3",
 ]
 
 [project.optional-dependencies]
+discovery = [
+    "exa-py>=2.11.0",
+]
 dev = [
     "mypy>=1.11.0",
     "ruff>=0.6.0",
@@ -55,7 +61,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent", "meeting_pipeline"]
 
 [build-system]
 requires = ["hatchling"]
@@ -77,6 +83,9 @@ select = [
     "B",   # flake8-bugbear
     "C4",  # flake8-comprehensions
     "UP",  # pyupgrade
+    "SIM", # simplify (unnecessary complexity)
+    "RET", # return statement checks
+    "PTH", # use pathlib instead of os.path
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
@@ -85,6 +94,13 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # unused imports in __init__.py
+# Stricter rules only enforced on meeting_pipeline — ignore elsewhere
+"shared/**" = ["SIM", "RET", "PTH"]
+"campaign_plan_lambda/**" = ["SIM", "RET", "PTH"]
+"ai_generated_campaign_plan/**" = ["SIM", "RET", "PTH"]
+"engineer_agent/**" = ["SIM", "RET", "PTH"]
+"hubspot_ddhq_match/**" = ["SIM", "RET", "PTH"]
+"serve/**" = ["SIM", "RET", "PTH"]
 
 [tool.mypy]
 python_version = "3.11"
