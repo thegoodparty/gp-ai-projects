@@ -93,3 +93,6 @@ infrastructure/shared/slack-notifier/terraform.tfvars
 
 # Claude Code local settings
 .claude/
+
+# Local-only operational scripts
+meeting_pipeline/scripts/tools/generate_terry_status.py
