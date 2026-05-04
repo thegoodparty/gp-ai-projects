@@ -30,7 +30,7 @@ cd meeting_pipeline
 uv sync
 cp .env.example .env             # then edit .env per below
 aws sso login --profile goodparty
-aws s3 ls s3://goodparty-ai-dev/meeting_pipeline/   # sanity check
+aws s3 ls s3://meeting-pipeline-dev/meeting_pipeline/   # sanity check
 ```
 
 ### .env
@@ -39,7 +39,7 @@ aws s3 ls s3://goodparty-ai-dev/meeting_pipeline/   # sanity check
 |----------|-------------|
 | `GEMINI_API_KEY` | Required — LLM extraction + briefing generation |
 | `STORAGE_BACKEND` | `s3` (default for prod) or `local` (for dev iteration) |
-| `S3_BUCKET` | `goodparty-ai-dev` for dev |
+| `S3_BUCKET` | `meeting-pipeline-dev` for dev |
 | `AWS_PROFILE` | `goodparty` |
 | `SERPER_API_KEY` | Required for discover stage |
 | `FIRECRAWL_API_KEY` | Required for discover stage |
@@ -107,7 +107,7 @@ meeting_pipeline/
 ## Storage layout
 
 ```
-s3://goodparty-ai-dev/meeting_pipeline/
+s3://meeting-pipeline-dev/meeting_pipeline/
 ├── sources/{city-slug}/
 │   ├── source.json                      # Discovery metadata
 │   ├── data/{platform}/                 # Collected meetings.json + PDFs
