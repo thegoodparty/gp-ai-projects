@@ -27,16 +27,6 @@ resource "aws_cloudwatch_log_group" "process" {
   }
 }
 
-resource "aws_cloudwatch_log_group" "qa" {
-  name              = "/aws/lambda/${local.project}-qa-${var.environment}"
-  retention_in_days = 90
-
-  tags = {
-    Environment = var.environment
-    Project     = local.project
-  }
-}
-
 resource "aws_cloudwatch_log_group" "discover_ecs" {
   name              = "/ecs/${local.project}-discover-${var.environment}"
   retention_in_days = 90
@@ -105,35 +95,6 @@ resource "aws_sqs_queue" "discover" {
   }
 }
 
-# ===== SQS: QA Queue + DLQ =====
-
-resource "aws_sqs_queue" "qa_dlq" {
-  name                      = "${local.project}-qa-dlq-${var.environment}"
-  message_retention_seconds = 1209600
-
-  tags = {
-    Environment = var.environment
-    Project     = local.project
-  }
-}
-
-resource "aws_sqs_queue" "qa" {
-  name                       = "${local.project}-qa-${var.environment}"
-  visibility_timeout_seconds = 300 # 5 min
-  message_retention_seconds  = 1209600
-  receive_wait_time_seconds  = 20
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.qa_dlq.arn
-    maxReceiveCount     = 3
-  })
-
-  tags = {
-    Environment = var.environment
-    Project     = local.project
-  }
-}
-
 # ===== IAM: Shared Lambda Role =====
 
 resource "aws_iam_role" "lambda" {
@@ -180,7 +141,13 @@ resource "aws_iam_role_policy" "lambda_permissions" {
       {
         Effect   = "Allow"
         Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
-        Resource = [aws_sqs_queue.process.arn, aws_sqs_queue.qa.arn, aws_sqs_queue.discover.arn]
+        Resource = [aws_sqs_queue.process.arn, aws_sqs_queue.discover.arn]
+      },
+      {
+        # SendMessage to the QA queue (queue itself lives in the meeting-qa module)
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = var.qa_queue_arn
       },
       {
         Effect   = "Allow"
@@ -251,7 +218,7 @@ resource "aws_lambda_function" "process" {
       SOURCES_PREFIX        = "meeting_pipeline/sources"
       OUTPUT_PREFIX         = "meeting_pipeline/output"
       FAILURE_SNS_TOPIC_ARN = aws_sns_topic.failures.arn
-      QA_QUEUE_URL          = aws_sqs_queue.qa.url
+      QA_QUEUE_URL          = var.qa_queue_url
     }
   }
 
@@ -267,46 +234,6 @@ resource "aws_lambda_function" "process" {
 resource "aws_lambda_event_source_mapping" "process_sqs" {
   event_source_arn = aws_sqs_queue.process.arn
   function_name    = aws_lambda_function.process.arn
-  batch_size       = 1
-  enabled          = true
-}
-
-# ===== Lambda: QA (separate Docker image from meeting_briefings_qa repo) =====
-
-resource "aws_lambda_function" "qa" {
-  function_name = "${local.project}-qa-${var.environment}"
-  role          = aws_iam_role.lambda.arn
-  package_type  = "Image"
-  image_uri     = "${var.ecr_repository_url}:${local.project}-qa-${var.environment}"
-  timeout       = 300
-  memory_size   = 1024
-
-  image_config {
-    command = ["qa.lambda_handler.handler"]
-  }
-
-  environment {
-    variables = {
-      ENVIRONMENT           = var.environment
-      S3_BUCKET             = var.s3_bucket_name
-      STORAGE_BACKEND       = "s3"
-      SOURCES_PREFIX        = "meeting_pipeline/sources"
-      OUTPUT_PREFIX         = "meeting_pipeline/output"
-      FAILURE_SNS_TOPIC_ARN = aws_sns_topic.failures.arn
-    }
-  }
-
-  depends_on = [aws_cloudwatch_log_group.qa]
-
-  tags = {
-    Environment = var.environment
-    Project     = local.project
-  }
-}
-
-resource "aws_lambda_event_source_mapping" "qa_sqs" {
-  event_source_arn = aws_sqs_queue.qa.arn
-  function_name    = aws_lambda_function.qa.arn
   batch_size       = 1
   enabled          = true
 }
@@ -671,30 +598,6 @@ resource "aws_cloudwatch_metric_alarm" "process_dlq" {
 
   dimensions = {
     QueueName = aws_sqs_queue.process_dlq.name
-  }
-
-  alarm_actions = [aws_sns_topic.failures.arn]
-
-  tags = {
-    Environment = var.environment
-    Project     = local.project
-  }
-}
-
-resource "aws_cloudwatch_metric_alarm" "qa_dlq" {
-  alarm_name          = "${local.project}-qa-dlq-${var.environment}"
-  alarm_description   = "QA failed after 3 retries"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  namespace           = "AWS/SQS"
-  period              = 300
-  statistic           = "Maximum"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    QueueName = aws_sqs_queue.qa_dlq.name
   }
 
   alarm_actions = [aws_sns_topic.failures.arn]

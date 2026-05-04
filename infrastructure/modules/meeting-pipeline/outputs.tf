@@ -22,14 +22,6 @@ output "process_queue_arn" {
   value = aws_sqs_queue.process.arn
 }
 
-output "qa_lambda_name" {
-  value = aws_lambda_function.qa.function_name
-}
-
-output "qa_queue_url" {
-  value = aws_sqs_queue.qa.url
-}
-
 output "discover_queue_url" {
   value = aws_sqs_queue.discover.url
 }

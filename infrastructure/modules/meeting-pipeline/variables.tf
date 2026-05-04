@@ -40,3 +40,15 @@ variable "shared_slack_notifier_lambda_arn" {
   type        = string
   default     = ""
 }
+
+variable "qa_queue_url" {
+  description = "URL of the meeting-qa SQS queue (sourced from terraform_remote_state of the meeting-qa module). The process Lambda sends to this queue after briefing generation. Empty string disables QA dispatch (graceful no-op)."
+  type        = string
+  default     = ""
+}
+
+variable "qa_queue_arn" {
+  description = "ARN of the meeting-qa SQS queue (sourced from terraform_remote_state of the meeting-qa module). Used to grant the process Lambda's role sqs:SendMessage on it."
+  type        = string
+  default     = ""
+}

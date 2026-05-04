@@ -54,6 +54,17 @@ data "terraform_remote_state" "shared_slack_notifier" {
   }
 }
 
+# meeting-qa lives in its own module/state — read its queue URL/ARN here so the
+# process Lambda can send to it. Apply meeting-qa BEFORE meeting-pipeline.
+data "terraform_remote_state" "meeting_qa" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "meeting-qa/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 # ── Module ─────────────────────────────────────────────────────────────────
 
 module "meeting_pipeline" {
@@ -67,16 +78,25 @@ module "meeting_pipeline" {
   private_subnet_ids = var.private_subnet_ids
 
   shared_slack_notifier_lambda_arn = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
+
+  qa_queue_url = data.terraform_remote_state.meeting_qa.outputs.queue_url
+  qa_queue_arn = data.terraform_remote_state.meeting_qa.outputs.queue_arn
 }
 
 # ── Outputs ────────────────────────────────────────────────────────────────
 
 output "lambda_function_names" {
-  value = module.meeting_pipeline.lambda_function_names
+  value = {
+    scan    = module.meeting_pipeline.scan_lambda_name
+    process = module.meeting_pipeline.process_lambda_name
+  }
 }
 
 output "queue_urls" {
-  value = module.meeting_pipeline.queue_urls
+  value = {
+    process  = module.meeting_pipeline.process_queue_url
+    discover = module.meeting_pipeline.discover_queue_url
+  }
 }
 
 output "step_function_arn" {
