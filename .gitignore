@@ -90,3 +90,6 @@ infrastructure/shared/slack-notifier/terraform.tfvars
 
 #pickle files
 *.pickle
+
+# Claude Code local settings
+.claude/
