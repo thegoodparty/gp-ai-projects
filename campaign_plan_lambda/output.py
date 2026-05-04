@@ -38,13 +38,17 @@ class SqsMessage(TypedDict):
     data: CompletionData | ErrorData
 
 
-class TaskDict(TypedDict):
+class _TaskDictRequired(TypedDict):
     title: str
     description: str
     cta: str
     flowType: str
     week: int
     date: str
+
+
+class TaskDict(_TaskDictRequired, total=False):
+    url: str
 
 
 class CampaignPlanResult(TypedDict):

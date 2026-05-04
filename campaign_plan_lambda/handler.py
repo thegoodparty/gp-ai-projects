@@ -151,8 +151,9 @@ async def _generate(campaign_id: int, msg: SqsMessageBody) -> CampaignPlanResult
 
     from campaign_plan_lambda.output import TaskDict
 
-    task_dicts: list[TaskDict] = [
-        {
+    task_dicts: list[TaskDict] = []
+    for task in event_tasks:
+        d: TaskDict = {
             "title": task.title,
             "description": task.description,
             "cta": task.cta,
@@ -160,8 +161,9 @@ async def _generate(campaign_id: int, msg: SqsMessageBody) -> CampaignPlanResult
             "week": task.week,
             "date": task.date,
         }
-        for task in event_tasks
-    ]
+        if task.url:
+            d["url"] = task.url
+        task_dicts.append(d)
 
     result: CampaignPlanResult = {
         "campaignId": campaign_id,
