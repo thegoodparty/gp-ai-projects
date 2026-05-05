@@ -74,13 +74,18 @@ async def scan_boarddocs(city: str, config: dict, source_url: str, client: httpx
                 date_str = datetime.strptime(num_date[:8], "%Y%m%d").strftime("%Y-%m-%d")
             except ValueError:
                 continue
-            agenda_url = m.get("EventAgendaFile") or None
+            # _fetch_meetings returns raw BoardDocs JSON with lowercase fields
+            # (numberdate, name, unique). The collector treats `unique` as the
+            # agenda viewer key and constructs the same URL — see
+            # collectors/boarddocs.py:265-269.
+            unique = m.get("unique", "")
+            agenda_url = f"{base_url}/goto?open&id={unique}" if unique else None
             upcoming.append({
                 "date": date_str,
-                "title": m.get("EventComment", committee["name"]),
+                "title": m.get("name", committee["name"]),
                 "agenda_posted": bool(agenda_url),
                 "agenda_url": agenda_url,
-                "event_id": str(m.get("EventId", m.get("unique", ""))),
+                "event_id": str(unique),
                 "status": "past" if num_date < today_str else "upcoming",
             })
 

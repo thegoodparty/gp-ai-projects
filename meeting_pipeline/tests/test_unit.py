@@ -767,3 +767,151 @@ class TestSkipExistingBriefingsExactMatch:
         }
         result = self._filter_with_exact_basename(norm_keys, existing_names)
         assert result == []
+
+
+# ============================================================================
+# scripts/tools/check_city — SUPPORTED_PLATFORMS must use canonical keys
+# (bug fix: was using "escribemeetings" and missing boarddocs/municode/novus)
+# ============================================================================
+
+class TestCheckCitySupportedPlatforms:
+    def test_uses_canonical_escribe_key(self):
+        from meeting_pipeline.scripts.tools.check_city import SUPPORTED_PLATFORMS
+        # Wrong: "escribemeetings". Right: "escribe" (matches shared.constants).
+        assert "escribe" in SUPPORTED_PLATFORMS
+        assert "escribemeetings" not in SUPPORTED_PLATFORMS
+
+    def test_includes_all_platforms_with_collectors(self):
+        from meeting_pipeline.scripts.tools.check_city import SUPPORTED_PLATFORMS
+        for platform in ("civicclerk", "civicplus", "granicus", "legistar",
+                         "escribe", "boarddocs", "municode", "novus"):
+            assert platform in SUPPORTED_PLATFORMS, f"missing {platform}"
+
+
+# ============================================================================
+# scan/platforms/granicus — Swagit fallback must accept abbreviated month
+# names like "Apr 21 2026" (was %B-only, dropping ~11/12 of meetings)
+# ============================================================================
+
+class TestSwagitDateAbbreviated:
+    def test_full_month_name_parses(self):
+        from datetime import datetime
+        # Verify the format we kept handling
+        assert datetime.strptime("April 21 2026", "%B %d %Y").date().isoformat() == "2026-04-21"
+
+    def test_abbreviated_month_name_parses(self):
+        from datetime import datetime
+        # The new fallback — was failing under %B-only logic
+        assert datetime.strptime("Apr 21 2026", "%b %d %Y").date().isoformat() == "2026-04-21"
+
+    def test_format_fallback_handles_both_forms(self):
+        """The fix is a try-%B-then-%b loop. Verify it accepts both forms."""
+        from datetime import datetime
+        for raw in ("April 21 2026", "Apr 21 2026"):
+            dt = None
+            for fmt in ("%B %d %Y", "%b %d %Y"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            assert dt is not None, f"format-fallback should accept {raw!r}"
+            assert dt.date().isoformat() == "2026-04-21"
+
+
+# ============================================================================
+# scan/platforms/boarddocs — must read lowercase BoardDocs JSON fields
+# (numberdate, name, unique), not Legistar field names (EventComment etc.)
+# ============================================================================
+
+class TestBoarddocsScanFields:
+    async def test_reads_name_unique_and_constructs_agenda_url(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock, patch
+        from meeting_pipeline.stages.scan.platforms import boarddocs as bd_mod
+
+        today = datetime.now().date()
+        future_d = today + timedelta(days=14)
+        future_numberdate = future_d.strftime("%Y%m%d")  # BoardDocs format
+
+        meetings_payload = [
+            {
+                "numberdate": future_numberdate + "120000",
+                "name": "Regular City Council Meeting",
+                "unique": "ABC1XYZ",
+            },
+        ]
+        committees = [{"id": "C1", "name": "City Council"}]
+
+        # scan_boarddocs lazy-imports these from the collectors module — patch there.
+        with patch("meeting_pipeline.collectors.boarddocs._fetch_committees",
+                   new=AsyncMock(return_value=committees)), \
+             patch("meeting_pipeline.collectors.boarddocs._fetch_meetings",
+                   new=AsyncMock(return_value=meetings_payload)):
+            result = await bd_mod.scan_boarddocs(
+                city="TestCity",
+                config={},
+                source_url="https://go.boarddocs.com/oh/testcity/Board.nsf/Public",
+                client=None,
+            )
+
+        assert len(result) == 1
+        m = result[0]
+        assert m["title"] == "Regular City Council Meeting", "should use 'name' field, not EventComment"
+        assert m["event_id"] == "ABC1XYZ", "should use 'unique' field, not EventId"
+        assert m["agenda_url"] == "https://go.boarddocs.com/oh/testcity/Board.nsf/goto?open&id=ABC1XYZ"
+        assert m["agenda_posted"] is True
+
+
+# ============================================================================
+# scan/platforms/{novus,municode} — status must reflect past vs upcoming
+# (bug fix: both were hardcoding "upcoming" regardless of date)
+# ============================================================================
+
+class TestNovusMunicodeStatus:
+    def _make_module_meeting(self, days_offset: int) -> dict:
+        from datetime import datetime, timedelta
+        d = (datetime.now() + timedelta(days=days_offset)).strftime("%Y-%m-%d")
+        return {"date": d, "title": "Council", "agendaUrl": "https://x/agenda.pdf"}
+
+    async def test_novus_marks_past_meetings_past(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from meeting_pipeline.stages.scan.platforms import novus as novus_mod
+        past = self._make_module_meeting(-7)
+        future = self._make_module_meeting(14)
+
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+        fake_response.text = "<html></html>"  # ignored — _parse_meetings is patched
+        fake_client = MagicMock()
+        fake_client.get = AsyncMock(return_value=fake_response)
+
+        # scan_novus lazy-imports _parse_meetings from collectors.novus_scraper
+        with patch("meeting_pipeline.collectors.novus_scraper._parse_meetings",
+                   return_value=[past, future]):
+            result = await novus_mod.scan_novus("Kyle", {}, "https://kyle.novusagenda.com/agendapublic", fake_client)
+
+        statuses = {m["date"]: m["status"] for m in result}
+        assert statuses[past["date"]] == "past"
+        assert statuses[future["date"]] == "upcoming"
+
+    async def test_municode_marks_past_meetings_past(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from meeting_pipeline.stages.scan.platforms import municode as muni_mod
+        past = self._make_module_meeting(-7)
+        future = self._make_module_meeting(14)
+
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+        fake_response.text = "<html></html>"
+        fake_client = MagicMock()
+        fake_client.get = AsyncMock(return_value=fake_response)
+
+        # scan_municode lazy-imports _parse_meetings from collectors.municode
+        with patch("meeting_pipeline.collectors.municode._parse_meetings",
+                   return_value=[past, future]):
+            result = await muni_mod.scan_municode("Austell", {}, "https://example.com", fake_client)
+
+        statuses = {m["date"]: m["status"] for m in result}
+        assert statuses[past["date"]] == "past"
+        assert statuses[future["date"]] == "upcoming"

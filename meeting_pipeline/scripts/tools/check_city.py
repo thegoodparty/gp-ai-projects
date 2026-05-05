@@ -29,7 +29,11 @@ _PROJECT_ROOT = _ROOT.parent
 
 SOURCES_DIR = _ROOT / "sources"
 
-SUPPORTED_PLATFORMS = {"civicclerk", "civicplus", "granicus", "legistar", "escribemeetings"}
+SUPPORTED_PLATFORMS = {
+    "civicclerk", "civicplus", "granicus", "legistar",
+    "escribe",  # NOT "escribemeetings" — must match shared.constants and source_discover
+    "boarddocs", "municode", "novus",
+}
 
 MIN_PDF_BYTES = 50_000  # 50KB — anything smaller is a stub or viewer redirect
 

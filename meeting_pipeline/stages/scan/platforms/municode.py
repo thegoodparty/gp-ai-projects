@@ -38,6 +38,7 @@ async def scan_municode(city: str, config: dict, source_url: str, client: httpx.
         return []
 
     meetings = _parse_meetings(resp.text, cutoff, url)
+    today = datetime.now().date()
 
     return [
         {
@@ -45,7 +46,7 @@ async def scan_municode(city: str, config: dict, source_url: str, client: httpx.
             "title": m.get("title", f"{city} City Council"),
             "agenda_posted": bool(m.get("agendaUrl")),
             "agenda_url": m.get("agendaUrl", ""),
-            "status": "upcoming",
+            "status": "past" if datetime.strptime(m["date"], "%Y-%m-%d").date() < today else "upcoming",
         }
         for m in meetings
     ]

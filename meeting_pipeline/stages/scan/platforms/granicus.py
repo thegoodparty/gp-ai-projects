@@ -106,12 +106,18 @@ async def scan_granicus(city: str, config: dict, source_url: str, client: httpx.
         pdf_pattern = re.compile(r'href=["\']([^"\']*\.pdf)["\']', re.IGNORECASE)
         # Group dates with nearby PDF links (rough approach for Swagit HTML)
         for m in date_pattern.finditer(html):
-            raw_date = m.group(1)
-            try:
-                dt = datetime.strptime(raw_date.replace(",", "").strip(), "%B %d %Y")
-                date_str = dt.strftime("%Y-%m-%d")
-            except ValueError:
+            raw_date = m.group(1).replace(",", "").replace(".", "").strip()
+            # Try full month names first ("April"), then 3-letter abbreviations ("Apr")
+            dt = None
+            for fmt in ("%B %d %Y", "%b %d %Y"):
+                try:
+                    dt = datetime.strptime(raw_date, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
                 continue
+            date_str = dt.strftime("%Y-%m-%d")
             if date_str < start_str or date_str > cutoff_str:
                 continue
             # Look for a PDF link in the surrounding 500 chars
