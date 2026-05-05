@@ -35,6 +35,23 @@ data "terraform_remote_state" "shared_ecr" {
   }
 }
 
+# Optional — set use_slack_notifier = false (or omit shared/slack-notifier
+# state entirely) in environments without the shared notifier deployed.
+variable "use_slack_notifier" {
+  type    = bool
+  default = true
+}
+
+data "terraform_remote_state" "shared_slack_notifier" {
+  count   = var.use_slack_notifier ? 1 : 0
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "shared/slack-notifier/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 # ── Module ─────────────────────────────────────────────────────────────────
 
 module "meeting_qa" {
@@ -43,6 +60,8 @@ module "meeting_qa" {
   environment        = "dev"
   s3_bucket_name     = "meeting-pipeline-dev"
   ecr_repository_url = data.terraform_remote_state.shared_ecr.outputs.repository_url
+
+  shared_slack_notifier_lambda_arn = try(data.terraform_remote_state.shared_slack_notifier[0].outputs.lambda_function_arn, "")
 }
 
 # ── Outputs ────────────────────────────────────────────────────────────────
@@ -57,4 +76,8 @@ output "queue_url" {
 
 output "queue_arn" {
   value = module.meeting_qa.queue_arn
+}
+
+output "sns_topic_arn" {
+  value = module.meeting_qa.sns_topic_arn
 }

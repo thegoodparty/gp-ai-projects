@@ -22,3 +22,8 @@ output "dlq_arn" {
   description = "Dead-letter queue ARN."
   value       = aws_sqs_queue.qa_dlq.arn
 }
+
+output "sns_topic_arn" {
+  description = "ARN of the SNS topic that DLQ alarms publish to. Subscribed by the shared Slack notifier (if wired) and any failure_notification_email."
+  value       = aws_sns_topic.failures.arn
+}

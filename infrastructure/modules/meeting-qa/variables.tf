@@ -42,3 +42,15 @@ variable "log_retention_days" {
   type        = number
   default     = 90
 }
+
+variable "failure_notification_email" {
+  description = "Email address to receive QA DLQ alarm notifications (optional)."
+  type        = string
+  default     = ""
+}
+
+variable "shared_slack_notifier_lambda_arn" {
+  description = "ARN of the shared Slack notifier Lambda. Leave empty to disable Slack notifications."
+  type        = string
+  default     = ""
+}

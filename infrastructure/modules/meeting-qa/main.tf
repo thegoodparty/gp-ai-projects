@@ -147,3 +147,54 @@ resource "aws_lambda_event_source_mapping" "qa_sqs" {
   batch_size       = 1
   enabled          = true
 }
+
+# ===== SNS: Failure Notifications =====
+
+resource "aws_sns_topic" "failures" {
+  name = "${local.project}-failures-${var.environment}"
+
+  tags = {
+    Environment = var.environment
+    Project     = local.project
+  }
+}
+
+resource "aws_sns_topic_subscription" "failures_email" {
+  count     = var.failure_notification_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.failures.arn
+  protocol  = "email"
+  endpoint  = var.failure_notification_email
+}
+
+resource "aws_sns_topic_subscription" "shared_slack_notifier" {
+  count     = var.shared_slack_notifier_lambda_arn != "" ? 1 : 0
+  topic_arn = aws_sns_topic.failures.arn
+  protocol  = "lambda"
+  endpoint  = var.shared_slack_notifier_lambda_arn
+}
+
+# ===== CloudWatch Alarms: DLQ Depth =====
+
+resource "aws_cloudwatch_metric_alarm" "qa_dlq" {
+  alarm_name          = "${local.project}-dlq-${var.environment}"
+  alarm_description   = "QA Lambda failed to process a briefing after 3 retries"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.qa_dlq.name
+  }
+
+  alarm_actions = [aws_sns_topic.failures.arn]
+
+  tags = {
+    Environment = var.environment
+    Project     = local.project
+  }
+}
