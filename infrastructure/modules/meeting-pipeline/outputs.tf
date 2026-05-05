@@ -1,3 +1,11 @@
+output "s3_bucket_name" {
+  value = aws_s3_bucket.pipeline.id
+}
+
+output "s3_bucket_arn" {
+  value = aws_s3_bucket.pipeline.arn
+}
+
 output "scan_lambda_arn" {
   value = aws_lambda_function.scan.arn
 }

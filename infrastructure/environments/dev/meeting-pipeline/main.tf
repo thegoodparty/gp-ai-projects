@@ -74,7 +74,6 @@ module "meeting_pipeline" {
   source = "../../../modules/meeting-pipeline"
 
   environment        = "dev"
-  s3_bucket_name     = "meeting-pipeline-dev"
   ecr_repository_url = data.terraform_remote_state.shared_ecr.outputs.repository_url
   docker_image_tag   = "meeting-pipeline-dev"
   vpc_id             = var.vpc_id
@@ -86,6 +85,10 @@ module "meeting_pipeline" {
 }
 
 # ── Outputs ────────────────────────────────────────────────────────────────
+
+output "s3_bucket_name" {
+  value = module.meeting_pipeline.s3_bucket_name
+}
 
 output "lambda_function_names" {
   value = {

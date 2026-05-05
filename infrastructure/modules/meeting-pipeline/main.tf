@@ -2,7 +2,48 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  project = "meeting-pipeline"
+  project        = "meeting-pipeline"
+  s3_bucket_name = coalesce(var.s3_bucket_name, "${local.project}-${var.environment}")
+}
+
+# ===== S3: Pipeline Bucket =====
+
+# Stores sources, scan output, raw HTML/PDFs, extracted content, and briefings
+# under the meeting_pipeline/ key prefix. Bucket name defaults to
+# "${local.project}-${var.environment}" so dev gets meeting-pipeline-dev,
+# prod gets meeting-pipeline-prod, etc. The Lambda + ECS env vars below
+# read aws_s3_bucket.pipeline.id so the rest of the module stays in sync.
+#
+# If the bucket already exists in the account when this module is first
+# applied, run a one-time:
+#   terraform import module.meeting_pipeline.aws_s3_bucket.pipeline ${local.s3_bucket_name}
+# Without that, AWS returns BucketAlreadyOwnedByYou and the apply fails.
+resource "aws_s3_bucket" "pipeline" {
+  bucket = local.s3_bucket_name
+
+  tags = {
+    Environment = var.environment
+    Project     = local.project
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "pipeline" {
+  bucket = aws_s3_bucket.pipeline.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "pipeline" {
+  bucket = aws_s3_bucket.pipeline.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
 # ===== CloudWatch Log Groups =====
@@ -134,12 +175,12 @@ resource "aws_iam_role_policy" "lambda_permissions" {
         {
           Effect = "Allow"
           Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"]
-          Resource = "arn:aws:s3:::${var.s3_bucket_name}/meeting_pipeline/*"
+          Resource = "${aws_s3_bucket.pipeline.arn}/meeting_pipeline/*"
         },
         {
           Effect    = "Allow"
           Action    = ["s3:ListBucket"]
-          Resource  = "arn:aws:s3:::${var.s3_bucket_name}"
+          Resource  = aws_s3_bucket.pipeline.arn
           Condition = { StringLike = { "s3:prefix" = "meeting_pipeline/*" } }
         },
         {
@@ -188,7 +229,7 @@ resource "aws_lambda_function" "scan" {
   environment {
     variables = {
       ENVIRONMENT       = var.environment
-      S3_BUCKET         = var.s3_bucket_name
+      S3_BUCKET         = aws_s3_bucket.pipeline.id
       STORAGE_BACKEND   = "s3"
       SOURCES_PREFIX    = "meeting_pipeline/sources"
       OUTPUT_PREFIX     = "meeting_pipeline/output"
@@ -225,7 +266,7 @@ resource "aws_lambda_function" "process" {
   environment {
     variables = {
       ENVIRONMENT           = var.environment
-      S3_BUCKET             = var.s3_bucket_name
+      S3_BUCKET             = aws_s3_bucket.pipeline.id
       STORAGE_BACKEND       = "s3"
       SOURCES_PREFIX        = "meeting_pipeline/sources"
       OUTPUT_PREFIX         = "meeting_pipeline/output"
@@ -499,12 +540,12 @@ resource "aws_iam_role_policy" "ecs_task_permissions" {
       {
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"]
-        Resource = "arn:aws:s3:::${var.s3_bucket_name}/meeting_pipeline/*"
+        Resource = "${aws_s3_bucket.pipeline.arn}/meeting_pipeline/*"
       },
       {
         Effect    = "Allow"
         Action    = ["s3:ListBucket"]
-        Resource  = "arn:aws:s3:::${var.s3_bucket_name}"
+        Resource  = aws_s3_bucket.pipeline.arn
         Condition = { StringLike = { "s3:prefix" = "meeting_pipeline/*" } }
       },
       {
@@ -551,7 +592,7 @@ resource "aws_ecs_task_definition" "discover" {
 
     environment = [
       { name = "ENVIRONMENT", value = var.environment },
-      { name = "S3_BUCKET", value = var.s3_bucket_name },
+      { name = "S3_BUCKET", value = aws_s3_bucket.pipeline.id },
       { name = "STORAGE_BACKEND", value = "s3" },
       { name = "SOURCES_PREFIX", value = "meeting_pipeline/sources" },
       { name = "DISCOVER_QUEUE_URL", value = aws_sqs_queue.discover.url },
