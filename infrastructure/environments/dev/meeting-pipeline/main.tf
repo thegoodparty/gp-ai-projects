@@ -36,11 +36,11 @@ variable "public_subnet_ids" {
 
 # ── Remote state references ────────────────────────────────────────────────
 
-data "terraform_remote_state" "shared_infra" {
+data "terraform_remote_state" "shared_ecr" {
   backend = "s3"
   config = {
     bucket = "goodparty-terraform-state-us-west-2"
-    key    = "shared-infra/dev/terraform.tfstate"
+    key    = "shared/ecr/terraform.tfstate"
     region = "us-west-2"
   }
 }
@@ -75,7 +75,7 @@ module "meeting_pipeline" {
 
   environment        = "dev"
   s3_bucket_name     = "meeting-pipeline-dev"
-  ecr_repository_url = data.terraform_remote_state.shared_infra.outputs.ecr_repository_url
+  ecr_repository_url = data.terraform_remote_state.shared_ecr.outputs.repository_url
   docker_image_tag   = "meeting-pipeline-dev"
   vpc_id             = var.vpc_id
   public_subnet_ids  = var.public_subnet_ids

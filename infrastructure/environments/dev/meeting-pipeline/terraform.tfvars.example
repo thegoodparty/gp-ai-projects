@@ -1,0 +1,20 @@
+# Dev Environment Configuration
+# Copy this file to terraform.tfvars and update with actual values.
+# terraform.tfvars is gitignored.
+
+# VPC Configuration (us-west-2)
+# Use the prod/master VPC shared across all environments.
+vpc_id = "vpc-XXXXXXXXXXXXXXXXX"
+
+# Public subnets for the discover Fargate task (minimum 2 for multi-AZ).
+# The task is outbound-only — its security group has no ingress and
+# discover.py runs no server — so running in public subnets with
+# auto-assigned public IPs is safe and avoids NAT gateway cost.
+public_subnet_ids = [
+  "subnet-XXXXXXXXXXXXXXXXX", # us-west-2a public
+  "subnet-XXXXXXXXXXXXXXXXX"  # us-west-2b public
+]
+
+# Set to false in environments without the shared/slack-notifier state
+# deployed. Defaults to true.
+# use_slack_notifier = true
