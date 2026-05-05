@@ -31,6 +31,12 @@ variable "lambda_memory_mb" {
   default     = 1024
 }
 
+variable "lambda_reserved_concurrency" {
+  description = "Cap on concurrent QA Lambda invocations. Prevents SQS-driven fan-out from blowing Anthropic / Gemini per-minute quotas."
+  type        = number
+  default     = 5
+}
+
 variable "log_retention_days" {
   description = "CloudWatch log retention for the QA Lambda."
   type        = number

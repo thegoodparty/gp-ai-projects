@@ -24,11 +24,13 @@ provider "aws" {
 
 # ── Remote state references ────────────────────────────────────────────────
 
-data "terraform_remote_state" "shared_infra" {
+# shared/ecr is the actual ECR repo state. shared-infra/dev is the ALB stack
+# and does not export an ECR URL.
+data "terraform_remote_state" "shared_ecr" {
   backend = "s3"
   config = {
     bucket = "goodparty-terraform-state-us-west-2"
-    key    = "shared-infra/dev/terraform.tfstate"
+    key    = "shared/ecr/terraform.tfstate"
     region = "us-west-2"
   }
 }
@@ -39,8 +41,8 @@ module "meeting_qa" {
   source = "../../../modules/meeting-qa"
 
   environment        = "dev"
-  s3_bucket_name     = "goodparty-ai-dev"
-  ecr_repository_url = data.terraform_remote_state.shared_infra.outputs.ecr_repository_url
+  s3_bucket_name     = "meeting-pipeline-dev"
+  ecr_repository_url = data.terraform_remote_state.shared_ecr.outputs.repository_url
 }
 
 # ── Outputs ────────────────────────────────────────────────────────────────

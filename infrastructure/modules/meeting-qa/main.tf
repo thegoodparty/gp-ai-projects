@@ -31,8 +31,10 @@ resource "aws_sqs_queue" "qa_dlq" {
 }
 
 resource "aws_sqs_queue" "qa" {
-  name                       = "${local.project}-${var.environment}"
-  visibility_timeout_seconds = var.lambda_timeout_seconds
+  name = "${local.project}-${var.environment}"
+  # AWS recommends visibility timeout >= 6× the Lambda timeout so in-flight
+  # invocations near the timeout don't get duplicated by SQS redelivery.
+  visibility_timeout_seconds = var.lambda_timeout_seconds * 6
   message_retention_seconds  = 1209600
   receive_wait_time_seconds  = 20
 
@@ -111,8 +113,13 @@ resource "aws_lambda_function" "qa" {
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
   image_uri     = "${var.ecr_repository_url}:${local.image_tag}"
+  architectures = ["arm64"] # CI builds linux/arm64; Lambda default is x86_64
   timeout       = var.lambda_timeout_seconds
   memory_size   = var.lambda_memory_mb
+  # Cap concurrency so SQS-driven fan-out can't blow Anthropic / Gemini per-
+  # minute quotas. Tune up if quotas allow; tune down if rate-limit DLQ noise
+  # increases.
+  reserved_concurrent_executions = var.lambda_reserved_concurrency
 
   image_config {
     command = ["meeting_qa.lambda_handler.handler"]
