@@ -173,19 +173,8 @@ class TestImports:
     def test_import_stages_discover_main_flow(self):
         from meeting_pipeline.stages.discover import main_flow  # noqa: F401
 
-    # -- lambda_handlers/ --
-
-    @patch("boto3.client")
-    def test_import_lambda_scan(self, mock_boto):
-        from meeting_pipeline.lambda_handlers import scan  # noqa: F401
-
-    @patch("boto3.client")
-    def test_import_lambda_process(self, mock_boto):
-        from meeting_pipeline.lambda_handlers import process  # noqa: F401
-
-    @patch("boto3.client")
-    def test_import_lambda_discover(self, mock_boto):
-        from meeting_pipeline.lambda_handlers import discover  # noqa: F401
+    # -- lambda_handlers/ live on the meeting-pipeline-infra branch — see
+    # meeting_pipeline/tests/test_lambda_handlers.py there.
 
     # -- collectors/ --
 
@@ -768,152 +757,9 @@ class TestFindBestPdf:
 
 
 # =========================================================================
-# 6. LAMBDA HANDLER TESTS
+# 6. LAMBDA HANDLER TESTS — moved to test_lambda_handlers.py on the
+#    meeting-pipeline-infra branch (handlers themselves live there).
 # =========================================================================
-
-class TestScanHandler:
-    """Scan Lambda handler: list_cities mode and scan-one-city mode."""
-
-    @patch("boto3.client")
-    def test_list_cities_returns_verified_slugs(self, mock_boto):
-        from meeting_pipeline.lambda_handlers.scan import handler
-
-        source_verified = {
-            "city": "TestCity",
-            "state": "OH",
-            "best_source": {
-                "platform": "civicplus",
-                "verification": {"status": "verified"},
-            },
-        }
-        source_unverified = {
-            "city": "BadCity",
-            "state": "TX",
-            "best_source": {
-                "platform": "unknown",
-                "verification": {"status": "unverified"},
-            },
-        }
-
-        storage = FakeStorage({
-            "meeting_pipeline/sources/test-city-OH/source.json": source_verified,
-            "meeting_pipeline/sources/bad-city-TX/source.json": source_unverified,
-        })
-
-        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
-             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
-             patch("meeting_pipeline.lambda_handlers.scan.get_storage", return_value=storage):
-                cfg = MagicMock()
-                cfg.sources_prefix = "meeting_pipeline/sources"
-                mock_cfg.return_value = cfg
-                result = handler({"action": "list_cities"})
-
-        assert "cities" in result
-        slugs = [c["slug"] for c in result["cities"]]
-        assert "test-city-OH" in slugs
-        assert "bad-city-TX" not in slugs
-
-    @patch("boto3.client")
-    def test_scan_requires_slug(self, mock_boto):
-        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
-             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
-             patch("meeting_pipeline.lambda_handlers.scan.get_storage"):
-                mock_cfg.return_value = MagicMock()
-                from meeting_pipeline.lambda_handlers.scan import handler
-                result = handler({})
-        assert "error" in result
-
-    @patch("boto3.client")
-    def test_scan_sends_new_posted_to_queue(self, mock_boto):
-        """When scan finds a newly posted agenda, it sends to SQS."""
-        from meeting_pipeline.lambda_handlers.scan import _detect_new_posted
-
-        previous = {
-            "upcoming": [
-                {"date": "2026-04-10", "agenda_posted": True},
-            ]
-        }
-        current = {
-            "upcoming": [
-                {"date": "2026-04-10", "agenda_posted": True},
-                {"date": "2026-04-17", "agenda_posted": True},
-            ]
-        }
-        new = _detect_new_posted(previous, current)
-        assert len(new) == 1
-        assert new[0]["date"] == "2026-04-17"
-
-    @patch("boto3.client")
-    def test_detect_new_posted_first_scan(self, mock_boto):
-        """First scan (no previous): all posted meetings are new."""
-        from meeting_pipeline.lambda_handlers.scan import _detect_new_posted
-
-        current = {
-            "upcoming": [
-                {"date": "2026-04-10", "agenda_posted": True},
-                {"date": "2026-04-17", "agenda_posted": False},
-            ]
-        }
-        new = _detect_new_posted(None, current)
-        assert len(new) == 1
-        assert new[0]["date"] == "2026-04-10"
-
-
-class TestProcessHandler:
-    """Process Lambda handler: SQS record parsing."""
-
-    @patch("boto3.client")
-    def test_sqs_record_parsing(self, mock_boto):
-        """Handler correctly parses SQS Records wrapping."""
-        from meeting_pipeline.lambda_handlers.process import handler
-
-        event = {
-            "Records": [
-                {
-                    "body": json.dumps({
-                        "slug": "test-city-OH",
-                        "date": "2026-04-15",
-                        "platform": "civicplus",
-                    }),
-                }
-            ]
-        }
-
-        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
-             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
-             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
-             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
-                mock_cfg.return_value = MagicMock()
-                mock_proc.return_value = {"status": "ok"}
-                handler(event)
-
-        mock_proc.assert_called_once()
-        call_args = mock_proc.call_args
-        assert call_args[0][0] == "test-city-OH"
-        assert call_args[0][1] == "2026-04-15"
-        assert call_args[0][2] == "civicplus"
-
-    @patch("boto3.client")
-    def test_process_handler_inline_event(self, mock_boto):
-        """Handler also supports inline event (not wrapped in Records)."""
-        from meeting_pipeline.lambda_handlers.process import handler
-
-        event = {
-            "slug": "test-city-OH",
-            "date": "2026-04-15",
-            "platform": "legistar",
-        }
-
-        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
-             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
-             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
-             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
-                mock_cfg.return_value = MagicMock()
-                mock_proc.return_value = {"status": "ok"}
-                result = handler(event)
-
-        mock_proc.assert_called_once()
-        assert result["results"] == [{"status": "ok"}]
 
 
 # =========================================================================
