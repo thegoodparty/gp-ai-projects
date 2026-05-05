@@ -202,9 +202,6 @@ class TestImports:
     def test_import_collectors_novus_scraper(self):
         from meeting_pipeline.collectors import novus_scraper  # noqa: F401
 
-    def test_import_collectors_generic_html_scraper(self):
-        from meeting_pipeline.collectors import generic_html_scraper  # noqa: F401
-
     # -- prompts/ --
 
     def test_import_prompts_extraction(self):

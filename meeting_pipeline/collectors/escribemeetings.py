@@ -107,16 +107,25 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
         result.bodies_count = len(bodies)
 
         # ── Step 2: Fetch meetings for each type ────────────────────
+        # Hit BOTH endpoints. Scan finds upcoming agendas via UpcomingMeetings;
+        # if collect only queries PastMeetings the scanned future meetings have
+        # no PDFs to download. Past is also fetched for cutoff-window history.
         all_meetings: list[dict] = []
+        seen_ids: set[str] = set()
         for mt in meeting_types:
-            meetings = await _fetch_past_meetings(client, config, mt)
-            for m in meetings:
-                # Parse date from the meeting object
-                meeting_date = _parse_escribemeetings_date(m)
-                if meeting_date and meeting_date >= cutoff:
-                    m["_parsed_date"] = meeting_date
-                    all_meetings.append(m)
-            await asyncio.sleep(config.rate_limit_delay)
+            for endpoint in ("UpcomingMeetings", "PastMeetings"):
+                meetings = await _fetch_meetings(client, config, mt, endpoint)
+                for m in meetings:
+                    mid = str(m.get("Id", ""))
+                    if mid and mid in seen_ids:
+                        continue
+                    meeting_date = _parse_escribemeetings_date(m)
+                    if meeting_date and meeting_date >= cutoff:
+                        m["_parsed_date"] = meeting_date
+                        all_meetings.append(m)
+                        if mid:
+                            seen_ids.add(mid)
+                await asyncio.sleep(config.rate_limit_delay)
 
         # Sort by date descending
         all_meetings.sort(key=lambda m: m.get("_parsed_date", datetime.min), reverse=True)
@@ -281,19 +290,20 @@ async def _discover_meeting_types(
         return []
 
 
-async def _fetch_past_meetings(
+async def _fetch_meetings(
     client: httpx.AsyncClient,
     config: EscribeConfig,
     meeting_type: str,
+    endpoint: str,
 ) -> list[dict]:
-    """Fetch past meetings for a meeting type via the PastMeetings API."""
+    """Fetch meetings via UpcomingMeetings or PastMeetings (same response shape)."""
     all_meetings: list[dict] = []
     page = 1
 
     while True:
         try:
             resp = await client.post(
-                f"{config.base_url}/MeetingsCalendarView.aspx/PastMeetings"
+                f"{config.base_url}/MeetingsCalendarView.aspx/{endpoint}"
                 f"?MeetingviewId={config.meeting_view_id}",
                 json={"type": meeting_type, "pageNumber": page},
                 headers={
@@ -313,7 +323,7 @@ async def _fetch_past_meetings(
             page += 1
             await asyncio.sleep(config.rate_limit_delay)
         except Exception as e:
-            print(f"  Warning: PastMeetings page {page} failed for {meeting_type[:40]}: {e}")
+            print(f"  Warning: {endpoint} page {page} failed for {meeting_type[:40]}: {e}")
             break
 
     return all_meetings

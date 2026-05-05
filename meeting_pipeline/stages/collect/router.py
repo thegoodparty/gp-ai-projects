@@ -162,6 +162,11 @@ async def _collect_civicclerk(
     if not tenant:
         return CollectionResult.error_result(city, state, "civicclerk", "Could not determine CivicClerk tenant")
 
+    # Portal-generation tenants expose {tenant}.portal.civicclerk.com and use
+    # camelCase OData fields. Legacy tenants don't have a portal subdomain and
+    # need PascalCase fields. Both share {tenant}.api.civicclerk.com/v1.
+    is_portal = "portal.civicclerk.com" in url
+
     output_prefix = f"{cfg.sources_prefix}/{city_slug}/data/civicclerk"
 
     council_categories = best.get("config", {}).get("council_categories")
@@ -170,6 +175,7 @@ async def _collect_civicclerk(
         city_name=city,
         output_prefix=output_prefix,
         storage=storage,
+        is_portal=is_portal,
         lookback_days=cfg.lookback_days,
         download_pdfs=cfg.download_pdfs,
         **({"council_categories": council_categories} if council_categories else {}),

@@ -130,7 +130,6 @@ s3://meeting-pipeline-dev/meeting_pipeline/
 | `boarddocs.py` | BoardDocs | AJAX scraper |
 | `novus_scraper.py` | NovusAgenda | |
 | `municode.py` | Municode | |
-| `generic_html_scraper.py` | Custom city HTML | Multi-strategy fallback for non-platform sites |
 
 ## Operational tools
 

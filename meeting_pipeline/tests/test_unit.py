@@ -525,54 +525,6 @@ class TestCheckPdfContentDates:
 
 
 # ============================================================================
-# generic_html_scraper — extract_date (bug fix: ISO dates were being eaten by
-# the looser MM-DD-YY/YYYY pattern, producing nonsense like '2023-26-03')
-# ============================================================================
-
-class TestExtractDateGenericHtml:
-    def test_iso_date_in_url(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        # Regression: this used to match the MM-DD-YY pattern and produce '2023-26-03'
-        assert extract_date("agendas/2026-03-23-council.pdf") == "2026-03-23"
-
-    def test_iso_date_alone(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("2026-03-23") == "2026-03-23"
-
-    def test_mdy_dashes_still_works(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("03-23-2026-council.pdf") == "2026-03-23"
-
-    def test_mdy_slashes(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("Meeting on 03/23/2026") == "2026-03-23"
-
-    def test_two_digit_year(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        # 03-23-26 → 2026-03-23
-        assert extract_date("agenda_03-23-26.pdf") == "2026-03-23"
-
-    def test_month_name_long(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("Council Meeting March 17, 2026") == "2026-03-17"
-
-    def test_month_name_short(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("Council Mar 17, 2026") == "2026-03-17"
-
-    def test_invalid_month_rejected(self):
-        # Construct a string that would have produced an invalid 'month=26'
-        # under the old logic — the validation must now reject it.
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        # No valid date here at all (months out of range)
-        assert extract_date("99-99-9999") is None
-
-    def test_no_date_returns_none(self):
-        from meeting_pipeline.collectors.generic_html_scraper import extract_date
-        assert extract_date("Council Meeting Notes") is None
-
-
-# ============================================================================
 # briefing.generate — _normalize_amount + check_fiscal_amounts (bug fix:
 # substring match let LLM digit-padding hallucinations slip through)
 # ============================================================================
@@ -967,20 +919,58 @@ class TestEscribePdfFilename:
 # 15-event cap doesn't silently drop the nearest upcoming meetings.
 # ============================================================================
 
+class TestCivicClerkSchemaTolerance:
+    """Both portal (camelCase) and legacy (PascalCase) tenants must read OK."""
+
+    def test_evt_date_portal(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_date
+        assert _evt_date({"eventDate": "2026-04-15T00:00:00Z"}) == "2026-04-15T00:00:00Z"
+
+    def test_evt_date_legacy(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_date
+        assert _evt_date({"MeetingStartDate": "2026-04-15T18:30:00"}) == "2026-04-15T18:30:00"
+
+    def test_evt_id_portal(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_id
+        assert _evt_id({"id": 42}) == "42"
+
+    def test_evt_id_legacy(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_id
+        assert _evt_id({"EventId": 99}) == "99"
+
+    def test_evt_category_portal(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_category
+        assert _evt_category({"categoryName": "City Council"}) == "City Council"
+
+    def test_evt_category_legacy_missing(self):
+        from meeting_pipeline.collectors.civicclerk import _evt_category
+        # Legacy tenants may not expose category metadata at all; helper must
+        # return "" so downstream filters fall through to exclude-pattern logic.
+        assert _evt_category({"EventName": "Council Meeting"}) == ""
+
+    def test_router_detects_portal(self):
+        """Router must set is_portal=True iff source URL contains portal.civicclerk.com."""
+        from pathlib import Path
+        src = Path(__file__).parent.parent / "stages" / "collect" / "router.py"
+        text = src.read_text()
+        assert '"portal.civicclerk.com" in url' in text
+        assert "is_portal=is_portal" in text
+
+
 class TestCivicClerkFutureOrdering:
     def test_future_query_uses_asc_ordering(self):
-        """Verify the source still names eventDate asc for the future window.
-        A pure config-level test — running the full collector would need a
-        live API. Reading the source guards against future regressions."""
+        """Past window must use desc, future window must use asc — otherwise
+        the API's 15-event cap silently drops the nearest upcoming meetings.
+        Reading the source guards against future regressions; running the
+        full collector would need a live API."""
         from pathlib import Path
         src = Path(__file__).parent.parent / "collectors" / "civicclerk.py"
         text = src.read_text()
-        # The fix is two distinct orderings tied to (cutoff_date, today) and
-        # (today, future_cutoff). Verify the asc literal is present and is
-        # used together with the future_cutoff window.
-        assert '"eventDate asc"' in text, "future query should use 'eventDate asc'"
-        # Past should still be desc
-        assert '"eventDate desc"' in text, "past query should keep 'eventDate desc'"
+        # The orderby is built dynamically from a date_field that varies by
+        # tenant generation (eventDate vs MeetingStartDate), so check the
+        # direction is paired with the right date window in the loop tuple.
+        assert '(cutoff_date, today, "desc")' in text, "past window should use desc"
+        assert '(today, future_cutoff, "asc")' in text, "future window should use asc"
 
 
 # ============================================================================

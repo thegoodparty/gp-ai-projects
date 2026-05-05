@@ -41,6 +41,14 @@ class CivicClerkConfig:
     city_name: str
     output_prefix: str
     storage: StorageBackend
+    # CivicClerk has two API generations sharing the same {tenant}.api.civicclerk.com
+    # backend but different OData field names:
+    #   portal (newer, source URL contains portal.civicclerk.com): camelCase
+    #     fields — startDateTime, id, eventName, categoryName
+    #   legacy (older, source URL is bare {tenant}.civicclerk.com or unspecified):
+    #     PascalCase fields — MeetingStartDate, EventId/Id, EventName/Name
+    # The router infers this from the source URL and passes it in.
+    is_portal: bool = True
     lookback_days: int = 90
     # Priority patterns for the primary governing body, checked in order.
     # These are exact substring matches (case-insensitive) against categoryName.
@@ -86,6 +94,63 @@ def _is_council_category(category_name: str, council_patterns: list[str]) -> boo
     return any(pat in lower for pat in council_patterns)
 
 
+# Schema-tolerant accessors. Portal tenants use camelCase; legacy tenants use
+# PascalCase. We try the most common variants in each generation and let the
+# rest of the function work with normalized values.
+
+def _evt_date(evt: dict) -> str:
+    return (
+        evt.get("eventDate")
+        or evt.get("startDateTime")
+        or evt.get("MeetingStartDate")
+        or evt.get("EventDate")
+        or ""
+    )
+
+
+def _evt_id(evt: dict) -> str:
+    return str(
+        evt.get("id")
+        or evt.get("EventId")
+        or evt.get("Id")
+        or ""
+    )
+
+
+def _evt_name(evt: dict) -> str:
+    return (
+        evt.get("eventName")
+        or evt.get("EventName")
+        or evt.get("Name")
+        or ""
+    )
+
+
+def _evt_category(evt: dict) -> str:
+    return (
+        evt.get("categoryName")
+        or evt.get("CategoryName")
+        or evt.get("Category")
+        or ""
+    )
+
+
+def _evt_has_agenda(evt: dict) -> bool:
+    return bool(
+        evt.get("hasAgenda")
+        or evt.get("HasAgenda")
+        or evt.get("AgendaFile")
+    )
+
+
+def _evt_published_files(evt: dict) -> list:
+    return (
+        evt.get("publishedFiles")
+        or evt.get("PublishedFiles")
+        or []
+    )
+
+
 # ============================================================================
 # MAIN COLLECTION FUNCTION
 # ============================================================================
@@ -114,7 +179,8 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
     async with httpx.AsyncClient(timeout=config.request_timeout, follow_redirects=True) as client:
 
         # 1. FETCH ALL EVENTS
-        # NOTE: CivicClerk OData is case-sensitive — use lowercase 'eventDate'.
+        # CivicClerk OData is case-sensitive. Portal tenants accept lowercase
+        # 'eventDate'; legacy tenants need PascalCase 'MeetingStartDate'.
         # The API returns at most ~15 events per request (internal limit that
         # ignores $top). Order matters: with `desc`, results are pinned to the
         # END of the date window. Two queries with different orderings:
@@ -124,35 +190,40 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         today = datetime.now().strftime("%Y-%m-%dT00:00:00Z")
         future_cutoff = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%dT00:00:00Z")
 
+        date_field = "eventDate" if config.is_portal else "MeetingStartDate"
+
         seen_ids: set = set()
         all_events: list = []
 
-        for (start, end, orderby) in [
-            (cutoff_date, today, "eventDate desc"),
-            (today, future_cutoff, "eventDate asc"),
+        for (start, end, direction) in [
+            (cutoff_date, today, "desc"),
+            (today, future_cutoff, "asc"),
         ]:
             resp = await client.get(
                 f"{base_url}/Events/",
                 params={
-                    "$orderby": orderby,
+                    "$orderby": f"{date_field} {direction}",
                     "$top": "500",
-                    "$filter": f"eventDate ge {start} and eventDate le {end}",
+                    "$filter": f"{date_field} ge {start} and {date_field} le {end}",
                 },
             )
             resp.raise_for_status()
             for evt in resp.json().get("value", []):
-                if evt["id"] not in seen_ids:
-                    seen_ids.add(evt["id"])
+                evt_id = _evt_id(evt)
+                if evt_id and evt_id not in seen_ids:
+                    seen_ids.add(evt_id)
                     all_events.append(evt)
 
 
-        # Discover categories
-        categories = sorted({e["categoryName"] for e in all_events})
+        # Discover categories. Legacy tenants without category metadata
+        # produce empty strings here; the council-filter falls through to the
+        # exclude-pattern fallback below.
+        categories = sorted({_evt_category(e) for e in all_events if _evt_category(e)})
 
         # 2. FILTER BY COUNCIL CATEGORY + DATE
         council_events = [
             e for e in all_events
-            if _is_council_category(e["categoryName"], config.council_categories)
+            if _is_council_category(_evt_category(e), config.council_categories)
         ]
 
         if not council_events:
@@ -167,7 +238,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             ]
             filtered_events = [
                 e for e in all_events
-                if not any(pat in e["categoryName"].lower() for pat in _EXCLUDE_PATTERNS)
+                if not any(pat in _evt_category(e).lower() for pat in _EXCLUDE_PATTERNS)
             ]
             if filtered_events:
                 print(f"     WARNING: No council-type category found in {categories}")
@@ -180,7 +251,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         # Filter by date: keep events after cutoff OR in the future
         recent_events = [
             e for e in council_events
-            if e["eventDate"] >= cutoff_date
+            if _evt_date(e) >= cutoff_date
         ]
 
         config.storage.write_json(f"{config.output_prefix}/events.json", recent_events)
@@ -191,7 +262,9 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         pdf_count = 0
 
         for i, event in enumerate(recent_events):
-            event_id = event["id"]
+            event_id = _evt_id(event)
+            if not event_id:
+                continue
 
             try:
                 detail_resp = await client.get(f"{base_url}/Events/{event_id}")
@@ -205,7 +278,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             config.storage.write_json(f"{config.output_prefix}/events_detail/{event_id}.json", detail)
 
             # Extract meeting info
-            published_files = detail.get("publishedFiles", [])
+            published_files = _evt_published_files(detail)
             agenda_files = [f for f in published_files if f.get("type") in ("Agenda", "Agenda Packet")]
             minutes_files = [f for f in published_files if f.get("type") == "Minutes"]
 
@@ -213,12 +286,13 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
             if has_agenda:
                 events_with_agenda += 1
 
+            event_date = _evt_date(event)
             meeting = {
-                "date": event["eventDate"][:10],
-                "title": event["eventName"],
-                "categoryName": event["categoryName"],
+                "date": event_date[:10],
+                "title": _evt_name(event),
+                "categoryName": _evt_category(event),
                 "eventId": event_id,
-                "hasAgenda": event.get("hasAgenda", False),
+                "hasAgenda": _evt_has_agenda(event),
                 "agendaFiles": [
                     {
                         "fileId": f["fileId"],
@@ -246,7 +320,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                 for af in agenda_files:
                     file_id = af["fileId"]
                     file_type = af["type"].lower().replace(" ", "_")
-                    filename = f"{event['eventDate'][:10]}_{file_type}_{file_id}.pdf"
+                    filename = f"{event_date[:10]}_{file_type}_{file_id}.pdf"
                     pdf_key = f"{config.output_prefix}/pdfs/{filename}"
 
                     if config.storage.exists(pdf_key):
@@ -266,8 +340,10 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                     except Exception as e:
                         print(f"     WARNING: Failed to download fileId={file_id}: {e}")
 
-            # Firecrawl fallback: scrape portal event page when API returns no files
-            elif config.download_pdfs and not agenda_files and event.get("hasAgenda"):
+            # Firecrawl fallback: scrape portal event page when API returns no files.
+            # Only meaningful for portal tenants — legacy tenants don't have a
+            # portal.civicclerk.com site to scrape.
+            elif config.download_pdfs and not agenda_files and _evt_has_agenda(event) and config.is_portal:
                 try:
                     from meeting_pipeline.shared.firecrawl_client import scrape_civicclerk_event_files
                     portal_base = f"https://{config.tenant}.portal.civicclerk.com"
@@ -277,7 +353,7 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
                             resp = await client.get(pdf_url, timeout=30, follow_redirects=True)
                             resp.raise_for_status()
                             if len(resp.content) > 5000:
-                                date_str = event["eventDate"][:10]
+                                date_str = event_date[:10]
                                 filename = pdf_url.split("/")[-1].split("?")[0] or f"{date_str}_{event_id}.pdf"
                                 pdf_key = f"{config.output_prefix}/pdfs/{filename}"
                                 config.storage.write_bytes(pdf_key, resp.content)
