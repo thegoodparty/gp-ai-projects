@@ -560,7 +560,6 @@ resource "aws_ecs_task_definition" "discover" {
     secrets = [
       { name = "SERPER_API_KEY", valueFrom = "${data.aws_secretsmanager_secret.ai_secrets.arn}:SERPER_API_KEY::" },
       { name = "FIRECRAWL_API_KEY", valueFrom = "${data.aws_secretsmanager_secret.ai_secrets.arn}:FIRECRAWL_API_KEY::" },
-      { name = "TAVILY_API_KEY", valueFrom = "${data.aws_secretsmanager_secret.ai_secrets.arn}:TAVILY_API_KEY::" },
       { name = "GEMINI_API_KEY", valueFrom = "${data.aws_secretsmanager_secret.ai_secrets.arn}:GEMINI_API_KEY::" },
     ]
 
