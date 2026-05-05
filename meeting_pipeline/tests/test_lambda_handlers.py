@@ -228,3 +228,87 @@ class TestProcessHandler:
 
         mock_proc.assert_called_once()
         assert result["results"] == [{"status": "ok"}]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Scan handler — must enqueue SQS BEFORE persisting upcoming_meetings.json,
+# otherwise an SQS failure mid-loop loses the un-enqueued items: on retry,
+# the persisted state is already the new one, so _detect_new_posted returns []
+# and the missed messages are silently dropped.
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestScanPersistAfterSend:
+    @patch("boto3.client")
+    def test_sqs_failure_leaves_previous_state_intact(self, mock_boto):
+        """Regression: when sqs.send_message raises mid-loop, the old
+        upcoming_meetings.json is preserved so the Step Function retry
+        re-detects the un-enqueued meetings."""
+        from meeting_pipeline.lambda_handlers import scan as scan_mod
+
+        previous = {"upcoming": [], "platform": "civicplus"}
+        new_result = {
+            "upcoming": [
+                {"date": "2099-01-15", "agenda_posted": True},  # far future
+                {"date": "2099-01-22", "agenda_posted": True},
+                {"date": "2099-01-29", "agenda_posted": True},
+            ],
+            "platform": "civicplus",
+        }
+
+        storage = FakeStorage({
+            "meeting_pipeline/sources/test-OH/source.json": {
+                "city": "Test", "state": "OH",
+                "best_source": {"verification": {"status": "verified"}},
+            },
+            "meeting_pipeline/sources/test-OH/upcoming_meetings.json": previous,
+        })
+
+        # Make SQS raise after the first send to simulate a transient failure
+        sqs_calls = {"count": 0}
+        def boom_after_first(*args, **kwargs):
+            sqs_calls["count"] += 1
+            if sqs_calls["count"] >= 2:
+                raise RuntimeError("simulated SQS failure")
+
+        with patch.object(scan_mod, "sqs") as mock_sqs, \
+             patch.object(scan_mod, "PROCESS_QUEUE_URL", "https://sqs/process"), \
+             patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.scan.get_storage", return_value=storage), \
+             patch("meeting_pipeline.lambda_handlers.scan._scan", new=AsyncMock(return_value=new_result)):
+            mock_cfg.return_value = MagicMock(sources_prefix="meeting_pipeline/sources")
+            mock_sqs.send_message.side_effect = boom_after_first
+            try:
+                scan_mod.handler({"slug": "test-OH"})
+            except RuntimeError:
+                pass  # expected
+
+        # Persisted state must still be the OLD one so retry can re-detect
+        persisted = storage.read_json("meeting_pipeline/sources/test-OH/upcoming_meetings.json")
+        assert persisted == previous, (
+            "regression: upcoming_meetings.json was overwritten before SQS "
+            "completed — retry will see the new state and lose un-enqueued items"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Discover Lambda module must not require playwright/chromium (Dockerfile
+# was claiming to need them via a non-existent --extra discover, but no code
+# actually imports playwright).
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestDiscoverNoPlaywright:
+    @patch("boto3.client")
+    def test_discover_module_does_not_import_playwright(self, mock_boto):
+        import sys
+        # Force a fresh import path by clearing relevant cache entries
+        for mod_name in list(sys.modules):
+            if mod_name.startswith("meeting_pipeline.lambda_handlers.discover"):
+                del sys.modules[mod_name]
+        from meeting_pipeline.lambda_handlers import discover  # noqa: F401
+        assert "playwright" not in sys.modules
+        assert "playwright.async_api" not in sys.modules
+
+
+# Need AsyncMock import at module level for ScanPersistAfterSend
+from unittest.mock import AsyncMock  # noqa: E402

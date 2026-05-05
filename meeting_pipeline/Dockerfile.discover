@@ -1,5 +1,6 @@
-# Discover stage — Fargate task with Playwright + Chromium
-# This is separate from Dockerfile.lambda because it needs heavy browser deps.
+# Discover stage — Fargate task that consumes the discover SQS queue.
+# Discovery uses Serper + Firecrawl over httpx; no browser automation is
+# required (an earlier Playwright/Chromium plan was scrapped).
 
 # Stage 1: Builder
 FROM python:3.12-slim AS builder
@@ -20,17 +21,10 @@ COPY meeting_pipeline/pyproject.toml ./meeting_pipeline/
 COPY shared/ ./shared/
 COPY meeting_pipeline/ ./meeting_pipeline/
 
-# Install ALL deps including discover extras (playwright, browser-use, etc.)
-RUN uv sync --frozen --no-dev --package meeting-pipeline --extra discover
+RUN uv sync --frozen --no-dev --package meeting-pipeline
 
-# Stage 2: Runtime with Chromium
+# Stage 2: Runtime
 FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
-    libgbm1 libpango-1.0-0 libasound2 libxshmfence1 \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -42,8 +36,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"
 ENV PYTHONUNBUFFERED=1
 
-# Install Playwright Chromium browser
-RUN playwright install chromium
-
-# Discover processes cities from SQS queue
 ENTRYPOINT ["python", "-m", "meeting_pipeline.lambda_handlers.discover"]

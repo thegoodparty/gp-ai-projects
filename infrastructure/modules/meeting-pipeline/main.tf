@@ -50,8 +50,11 @@ resource "aws_sqs_queue" "process_dlq" {
 }
 
 resource "aws_sqs_queue" "process" {
-  name                       = "${local.project}-process-${var.environment}"
-  visibility_timeout_seconds = 900 # 15 min (Lambda timeout)
+  name = "${local.project}-process-${var.environment}"
+  # AWS recommends visibility timeout >= 6× the Lambda timeout (90 min) so
+  # in-flight invocations near the 15-min limit don't get duplicated by
+  # SQS redelivery. Lambda timeout is 900s.
+  visibility_timeout_seconds = 5400
   message_retention_seconds  = 1209600
   receive_wait_time_seconds  = 20
 
@@ -126,40 +129,44 @@ resource "aws_iam_role_policy" "lambda_permissions" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"]
-        Resource = "arn:aws:s3:::${var.s3_bucket_name}/meeting_pipeline/*"
-      },
-      {
-        Effect    = "Allow"
-        Action    = ["s3:ListBucket"]
-        Resource  = "arn:aws:s3:::${var.s3_bucket_name}"
-        Condition = { StringLike = { "s3:prefix" = "meeting_pipeline/*" } }
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
-        Resource = [aws_sqs_queue.process.arn, aws_sqs_queue.discover.arn]
-      },
-      {
-        # SendMessage to the QA queue (queue itself lives in the meeting-qa module)
+    Statement = concat(
+      [
+        {
+          Effect = "Allow"
+          Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"]
+          Resource = "arn:aws:s3:::${var.s3_bucket_name}/meeting_pipeline/*"
+        },
+        {
+          Effect    = "Allow"
+          Action    = ["s3:ListBucket"]
+          Resource  = "arn:aws:s3:::${var.s3_bucket_name}"
+          Condition = { StringLike = { "s3:prefix" = "meeting_pipeline/*" } }
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+          Resource = [aws_sqs_queue.process.arn, aws_sqs_queue.discover.arn]
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}-??????"
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["sns:Publish"]
+          Resource = aws_sns_topic.failures.arn
+        },
+      ],
+      # SendMessage to the QA queue — only emitted when qa_queue_arn is set
+      # (queue itself lives in the meeting-qa module). With an empty default,
+      # AWS would reject the policy with MalformedPolicyDocument.
+      var.qa_queue_arn != "" ? [{
         Effect   = "Allow"
         Action   = ["sqs:SendMessage"]
         Resource = var.qa_queue_arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}-??????"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["sns:Publish"]
-        Resource = aws_sns_topic.failures.arn
-      },
-    ]
+      }] : []
+    )
   })
 }
 
@@ -499,6 +506,14 @@ resource "aws_iam_role_policy" "ecs_task_permissions" {
         Effect   = "Allow"
         Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
         Resource = aws_sqs_queue.discover.arn
+      },
+      {
+        # discover.py calls inject_secrets() at runtime, which uses boto3 to
+        # read AI_SECRETS_<env> via the task role. Without this grant the task
+        # crashes on startup.
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}-??????"
       },
     ]
   })

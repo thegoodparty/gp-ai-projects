@@ -60,9 +60,11 @@ def handler(event, context=None):
         with contextlib.suppress(Exception):
             previous = storage.read_json(upcoming_key)
 
-    storage.write_json(upcoming_key, result)
-
-    # Send each newly posted future meeting to process queue
+    # Compute new-posted, then enqueue SQS, THEN persist. If a send_message
+    # raises mid-loop and the Step Function retries, we want `previous` on
+    # retry to still be the old state so _detect_new_posted re-finds the
+    # un-enqueued meetings. Persisting before the loop completes would lose
+    # them silently.
     today = date.today().isoformat()
     platform = result.get("platform", "")
     new_posted = _detect_new_posted(previous, result)
@@ -80,6 +82,8 @@ def handler(event, context=None):
                     }),
                 )
                 sent += 1
+
+    storage.write_json(upcoming_key, result)
 
     return {
         "status": "ok",
