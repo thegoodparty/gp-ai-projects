@@ -90,10 +90,11 @@ def poll_loop():
             try:
                 result = asyncio.run(discover_one(city, state, cfg, storage))
                 print(f"[{result['platform']}/{result['freshness']}] ({time.time()-t:.0f}s)")
+                # Only delete on success — on exception, leave the message visible
+                # so SQS redelivers (counting toward maxReceiveCount → DLQ on persistent failure).
+                sqs.delete_message(QueueUrl=DISCOVER_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
             except Exception as e:
-                print(f"ERROR: {e} ({time.time()-t:.0f}s)")
-
-            sqs.delete_message(QueueUrl=DISCOVER_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
+                print(f"ERROR: {e} ({time.time()-t:.0f}s) — leaving message for retry")
 
     print("Queue empty — exiting")
 

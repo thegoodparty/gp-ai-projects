@@ -64,9 +64,11 @@ jobs:
           fi
 
           TAG="meeting-pipeline-${ENV}"
+          DISCOVER_TAG="meeting-pipeline-discover-${ENV}"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "discover_tag=${DISCOVER_TAG}" >> $GITHUB_OUTPUT
           echo "environment=${ENV}" >> $GITHUB_OUTPUT
-          echo "Building for environment: ${ENV} with tag: ${TAG}"
+          echo "Building for environment: ${ENV} with tags: ${TAG}, ${DISCOVER_TAG}"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -78,7 +80,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
+      - name: Build and push Lambda Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -87,6 +89,19 @@ jobs:
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Build and push discover (Fargate) Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./meeting_pipeline/Dockerfile.discover
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.env.outputs.discover_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false

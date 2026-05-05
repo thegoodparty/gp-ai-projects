@@ -18,6 +18,14 @@ from meeting_pipeline.shared.config import AgentConfig, get_storage
 sqs = boto3.client("sqs")
 QA_QUEUE_URL = os.environ.get("QA_QUEUE_URL", "")
 
+# Statuses that represent transient failures worth retrying via SQS redrive
+# (network blips, API errors, temporary auth issues). Re-raising in handler
+# tells SQS the invocation failed → message becomes visible again → retried
+# until maxReceiveCount is hit, then routed to the DLQ for alerting.
+# Other statuses (no_pdf, no_items, text_too_short) are permanent outcomes
+# — retrying won't change them, so we let SQS delete the message.
+TRANSIENT_FAILURE_STATUSES = {"collect_failed", "extract_failed", "briefing_failed"}
+
 
 def handler(event, context=None):
     inject_secrets()
@@ -26,6 +34,7 @@ def handler(event, context=None):
 
     records = event.get("Records", [event])
     results = []
+    transient_errors = []
 
     for record in records:
         body = json.loads(record["body"]) if isinstance(record.get("body"), str) else record
@@ -35,6 +44,15 @@ def handler(event, context=None):
 
         result = _process_meeting(slug, meeting_date, platform, cfg, storage)
         results.append(result)
+        if result.get("status") in TRANSIENT_FAILURE_STATUSES:
+            transient_errors.append(
+                f"{slug}/{meeting_date}: {result.get('status')} — {result.get('error', '?')[:120]}"
+            )
+
+    if transient_errors:
+        # Raising tells the SQS event-source mapping the invocation failed,
+        # so the message is redelivered (up to maxReceiveCount, then DLQ).
+        raise RuntimeError("Transient processing failures: " + "; ".join(transient_errors))
 
     return {"results": results}
 
