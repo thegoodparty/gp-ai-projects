@@ -148,9 +148,12 @@ async def collect_escribemeetings(config: EscribeConfig) -> EscribeResult:
             if not meeting_id:
                 continue
 
-            # Download agenda/minutes PDFs from MeetingLinks.
+            # Download agenda/minutes PDFs from MeetingLinks. Pass the meeting
+            # date so the filename can include it — find_best_pdf in extract
+            # filters PDFs by date-in-filename.
             result.pdf_count += await _download_meeting_pdfs(
                 client, config, meeting.get("MeetingLinks", []), event_id,
+                meeting_date=meeting_date.strftime("%Y-%m-%d"),
             )
 
             # Fetch HTML agenda to get individual items
@@ -214,8 +217,13 @@ async def _download_meeting_pdfs(
     config: EscribeConfig,
     meeting_links: list[dict],
     event_id: int,
+    meeting_date: str = "",
 ) -> int:
-    """Download PDF documents from a meeting's links. Returns count of PDFs saved."""
+    """Download PDF documents from a meeting's links. Returns count of PDFs saved.
+
+    Filename includes the meeting date (YYYY-MM-DD) so find_best_pdf can match
+    these PDFs to the meeting during extraction.
+    """
     pdf_count = 0
     for link in meeting_links:
         url = link.get("Url", "")
@@ -227,7 +235,8 @@ async def _download_meeting_pdfs(
             continue
 
         doc_url = f"{config.base_url}/{url}" if not url.startswith("http") else url
-        pdf_key = f"{config.output_prefix}/attachments/meeting_{event_id}_doc_{doc_id.group(1)}.pdf"
+        date_prefix = f"{meeting_date}_" if meeting_date else ""
+        pdf_key = f"{config.output_prefix}/attachments/{date_prefix}meeting_{event_id}_doc_{doc_id.group(1)}.pdf"
 
         if not config.storage.exists(pdf_key):
             try:

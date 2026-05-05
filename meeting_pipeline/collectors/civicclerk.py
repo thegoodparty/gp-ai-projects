@@ -116,20 +116,25 @@ async def collect_civicclerk(config: CivicClerkConfig) -> CivicClerkResult:
         # 1. FETCH ALL EVENTS
         # NOTE: CivicClerk OData is case-sensitive — use lowercase 'eventDate'.
         # The API returns at most ~15 events per request (internal limit that
-        # ignores $top). With eventDate desc ordering, events near the end-date
-        # of the filter are returned. We do two queries to capture both recent
-        # past meetings and upcoming meetings.
+        # ignores $top). Order matters: with `desc`, results are pinned to the
+        # END of the date window. Two queries with different orderings:
+        #   past window  → `desc` → most-recent past events first
+        #   future window → `asc`  → nearest upcoming events first (otherwise
+        #     the cap can drop the closest meetings — bug 18)
         today = datetime.now().strftime("%Y-%m-%dT00:00:00Z")
         future_cutoff = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%dT00:00:00Z")
 
         seen_ids: set = set()
         all_events: list = []
 
-        for (start, end) in [(cutoff_date, today), (today, future_cutoff)]:
+        for (start, end, orderby) in [
+            (cutoff_date, today, "eventDate desc"),
+            (today, future_cutoff, "eventDate asc"),
+        ]:
             resp = await client.get(
                 f"{base_url}/Events/",
                 params={
-                    "$orderby": "eventDate desc",
+                    "$orderby": orderby,
                     "$top": "500",
                     "$filter": f"eventDate ge {start} and eventDate le {end}",
                 },

@@ -396,22 +396,22 @@ async def _download_item_attachments(
 ) -> int:
     """Download PDF attachments for a single agenda item. Returns count of PDFs saved.
 
-    PDFs are stored under pdfs/ with the meeting date in the filename so that
-    find_best_pdf() in extract_and_normalize.py can locate them by date.
-    Format: pdfs/{date}_{matter_id}_{att_id}.pdf  (date = YYYY-MM-DD)
+    BoardDocs has no meeting-level agenda PDF — only per-item attachments
+    (the agenda is rendered as HTML at the BD-GetAgenda viewer URL). These
+    attachments are NOT agendas, so we deliberately:
+      - store them under attachments/, not pdfs/, and
+      - omit the meeting date from the filename
+    so find_best_pdf() does NOT pick an arbitrary attachment as "the agenda".
+    Until proper meeting-level agenda PDF generation lands, BoardDocs cities
+    will return no_pdf during extract — honest, vs. previously normalizing
+    a single random attachment as if it were the full agenda.
+    Format: attachments/{matter_id}_{att_id}.pdf
     """
     files = await _fetch_files(client, config, {
         **_HEADERS, "Referer": f"{config.base_url}/Public",
     }, item_unique, committee_id=committee_id)
     if not files:
         return 0
-
-    # Build a date prefix for the filename so find_best_pdf() can match by date.
-    # meeting_date is in YYYYMMDD format from numberdate; convert to YYYY-MM-DD for readability.
-    if len(meeting_date) == 8:
-        date_prefix = f"{meeting_date[:4]}-{meeting_date[4:6]}-{meeting_date[6:8]}"
-    else:
-        date_prefix = meeting_date or "nodate"
 
     pdf_count = 0
     att_records = []
@@ -421,10 +421,8 @@ async def _download_item_attachments(
         download_url = _resolve_boarddocs_url(config.base_url, href)
 
         filename = f["name"] or f"attachment_{att_id}"
-        # Include date in filename so find_best_pdf() can match this PDF to a meeting date
-        local_name = f"{date_prefix}_{matter_id}_{att_id}.pdf"
-        # Store under pdfs/ so find_best_pdf()'s broad scan picks it up
-        att_key = f"{config.output_prefix}/pdfs/{local_name}"
+        local_name = f"{matter_id}_{att_id}.pdf"
+        att_key = f"{config.output_prefix}/attachments/{local_name}"
 
         if not config.storage.exists(att_key):
             pdf_count += await _try_download_pdf(

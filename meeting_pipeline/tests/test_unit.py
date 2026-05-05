@@ -915,3 +915,116 @@ class TestNovusMunicodeStatus:
         statuses = {m["date"]: m["status"] for m in result}
         assert statuses[past["date"]] == "past"
         assert statuses[future["date"]] == "upcoming"
+
+
+# ============================================================================
+# eSCRIBE PDFs must include the meeting date in the filename so find_best_pdf
+# can match them. Was previously meeting_{event_id}_doc_{doc_id}.pdf — invisible.
+# ============================================================================
+
+class TestEscribePdfFilename:
+    async def test_filename_includes_meeting_date(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from meeting_pipeline.collectors.escribemeetings import (
+            EscribeConfig, _download_meeting_pdfs,
+        )
+
+        # Capture write_bytes calls to inspect the storage key
+        captured_keys: list[str] = []
+        storage = MagicMock()
+        storage.exists.return_value = False
+        storage.write_bytes = lambda key, _data: captured_keys.append(key)
+
+        # Fake httpx response — valid PDF magic
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.content = b"%PDF-1.4 fake content"
+        fake_client = AsyncMock()
+        fake_client.get = AsyncMock(return_value=fake_response)
+
+        config = EscribeConfig(
+            base_url="https://example.com",
+            city_name="Test",
+            output_prefix="meeting_pipeline/sources/test-OH/data/escribe",
+            storage=storage,
+            rate_limit_delay=0,
+        )
+        meeting_links = [{"Url": "Document.aspx?DocumentId=42", "Format": ".pdf"}]
+
+        await _download_meeting_pdfs(
+            fake_client, config, meeting_links, event_id=7, meeting_date="2026-05-04"
+        )
+
+        assert len(captured_keys) == 1
+        key = captured_keys[0]
+        assert "2026-05-04" in key, f"meeting date must appear in filename: {key}"
+        # confirms find_best_pdf's `date in filename` check would match
+        assert "/attachments/" in key
+
+
+# ============================================================================
+# CivicClerk: future event query must use ascending order so the API's
+# 15-event cap doesn't silently drop the nearest upcoming meetings.
+# ============================================================================
+
+class TestCivicClerkFutureOrdering:
+    def test_future_query_uses_asc_ordering(self):
+        """Verify the source still names eventDate asc for the future window.
+        A pure config-level test — running the full collector would need a
+        live API. Reading the source guards against future regressions."""
+        from pathlib import Path
+        src = Path(__file__).parent.parent / "collectors" / "civicclerk.py"
+        text = src.read_text()
+        # The fix is two distinct orderings tied to (cutoff_date, today) and
+        # (today, future_cutoff). Verify the asc literal is present and is
+        # used together with the future_cutoff window.
+        assert '"eventDate asc"' in text, "future query should use 'eventDate asc'"
+        # Past should still be desc
+        assert '"eventDate desc"' in text, "past query should keep 'eventDate desc'"
+
+
+# ============================================================================
+# BoardDocs attachments must NOT be discoverable by find_best_pdf as agendas
+# (they're per-item attachments, not a meeting-level agenda PDF).
+# ============================================================================
+
+class TestBoarddocsAttachmentPath:
+    async def test_attachments_path_excludes_pdfs_and_date(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from meeting_pipeline.collectors.boarddocs import (
+            BoardDocsConfig, _download_item_attachments,
+        )
+
+        captured_keys: list[str] = []
+        storage = MagicMock()
+        storage.exists.return_value = False
+        storage.write_bytes = lambda key, _data: captured_keys.append(key)
+
+        config = BoardDocsConfig(
+            base_url="https://go.boarddocs.com/oh/test/Board.nsf",
+            city_name="Test",
+            output_prefix="meeting_pipeline/sources/test-OH/data/boarddocs",
+            storage=storage,
+        )
+
+        files = [{"href": "/path.pdf", "name": "doc.pdf"}]
+        # Fake _fetch_files to return our list and _try_download_pdf to "succeed"
+        async def fake_download(_client, _base, _url, key, _storage):
+            captured_keys.append(key)
+            return 1
+
+        with patch("meeting_pipeline.collectors.boarddocs._fetch_files",
+                   new=AsyncMock(return_value=files)), \
+             patch("meeting_pipeline.collectors.boarddocs._try_download_pdf",
+                   new=fake_download):
+            await _download_item_attachments(
+                client=AsyncMock(), config=config, item_unique="ABC", matter_id="42",
+                committee_id="C1", meeting_date="20260504",
+            )
+
+        assert len(captured_keys) >= 1
+        for key in captured_keys:
+            assert "/pdfs/" not in key, f"BoardDocs attachments must not go under /pdfs/ — got {key!r}"
+            assert "/attachments/" in key, f"BoardDocs attachments should be under /attachments/ — got {key!r}"
+            assert "2026-05-04" not in key, f"date must not be in filename — got {key!r}"
+            assert "20260504" not in key, f"date must not be in filename — got {key!r}"
