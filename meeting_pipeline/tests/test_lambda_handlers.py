@@ -409,5 +409,39 @@ class TestProcessSkippedBriefing:
                 handler(event)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# process.py must surface CollectionResult.error_result(...) as collect_failed
+# rather than letting it fall through to no_pdf (permanent skip → SQS deletes).
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestProcessCollectErrorVisibility:
+    @patch("boto3.client")
+    def test_collector_error_result_routes_to_collect_failed(self, mock_boto):
+        """When process_one_city returns CollectionResult with error set (no
+        exception), _process_meeting must report collect_failed so SQS retries
+        instead of silently dropping the message via no_pdf."""
+        from meeting_pipeline.lambda_handlers.process import _process_meeting
+        from meeting_pipeline.shared.models import CollectionResult
+
+        cfg = MagicMock(sources_prefix="meeting_pipeline/sources")
+        storage = FakeStorage({
+            "meeting_pipeline/sources/test-OH/source.json": {"city": "Test", "state": "OH"},
+        })
+
+        async def fake_collect(*args, **kwargs):
+            return CollectionResult.error_result("Test", "OH", "civicclerk", "tenant lookup failed")
+
+        # Mock find_best_pdf to return no PDF before AND after collect, so the
+        # control flow reaches the collect path and the post-collect retry.
+        with patch("meeting_pipeline.stages.extract.normalize.find_best_pdf",
+                   return_value=(None, None)), \
+             patch("meeting_pipeline.stages.collect.process.process_one_city",
+                   new=fake_collect):
+            result = _process_meeting("test-OH", "2026-04-15", "civicclerk", cfg, storage)
+
+        assert result["status"] == "collect_failed"
+        assert "tenant lookup failed" in result.get("error", "")
+
+
 # Need AsyncMock import at module level for ScanPersistAfterSend
 from unittest.mock import AsyncMock  # noqa: E402

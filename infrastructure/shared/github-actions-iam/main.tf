@@ -140,7 +140,7 @@ resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
   })
 }
 
-# Policy for ECS deploy access (force-new-deployment from build-broker workflow)
+# Policy for ECS deploy access (force-new-deployment from build workflows)
 resource "aws_iam_role_policy" "github_actions_ecs_deploy" {
   name = "ecs-deploy-policy"
   role = aws_iam_role.github_actions_ecr_push.id
@@ -157,7 +157,10 @@ resource "aws_iam_role_policy" "github_actions_ecs_deploy" {
         Resource = [
           "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-dev/broker-dev",
           "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-qa/broker-qa",
-          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-prod/broker-prod"
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-prod/broker-prod",
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/meeting-pipeline-discover-dev/meeting-pipeline-discover-dev",
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/meeting-pipeline-discover-qa/meeting-pipeline-discover-qa",
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/meeting-pipeline-discover-prod/meeting-pipeline-discover-prod"
         ]
       }
     ]

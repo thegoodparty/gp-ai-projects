@@ -79,7 +79,14 @@ def _process_meeting(slug, meeting_date, platform, cfg, storage):
             city = source.get("city", slug)
             state = source.get("state", "")
             from meeting_pipeline.stages.collect.process import process_one_city
-            asyncio.run(process_one_city(city, state, cfg=cfg, storage=storage))
+            collect_result = asyncio.run(process_one_city(city, state, cfg=cfg, storage=storage))
+            # Collectors return CollectionResult.error_result(...) on failure
+            # without raising — surface that as collect_failed so SQS retries
+            # (and DLQs on persistent failure) instead of dropping the message
+            # via the no_pdf path below.
+            collect_error = getattr(collect_result, "error", None)
+            if collect_error:
+                return {"status": "collect_failed", "slug": slug, "date": meeting_date, "error": collect_error}
             # Retry finding PDF
             pdf_key, pdf_label = find_best_pdf(slug, meeting_date, platform, storage, cfg.sources_prefix)
         except Exception as e:
