@@ -367,7 +367,7 @@ def _parse_escribemeetings_date(meeting: dict) -> datetime | None:
     for field_name in ("DateLong", "DateMedium", "DateShort"):
         date_str = meeting.get(field_name, "")
         if date_str:
-            for fmt in ("%B %d, %Y", "%b %d, %Y", "%b %d, %Y"):
+            for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%Y-%m-%d"):
                 try:
                     return datetime.strptime(date_str.strip(), fmt)
                 except ValueError:

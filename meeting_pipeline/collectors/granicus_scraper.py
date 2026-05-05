@@ -291,12 +291,14 @@ def _parse_swagit_date(date_str: str) -> datetime | None:
     """Parse Swagit date strings: ISO, '{Mon DD, YYYY}', or '{YYYY-MM-DD}'."""
     if not date_str:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(date_str[:len(fmt)], fmt)
-        except ValueError:
-            pass
-    m = re.match(r"(\w+)\s+(\d{1,2}),?\s+(\d{4})", date_str)
+    s = date_str.strip()
+    try:
+        # Handles "2026-05-05", "2026-05-05T14:30:00", "...+00:00", and "...Z"
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except ValueError:
+        pass
+    m = re.match(r"(\w+)\s+(\d{1,2}),?\s+(\d{4})", s)
     if m:
         month = _parse_month(m.group(1))
         if month:
