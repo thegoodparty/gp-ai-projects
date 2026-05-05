@@ -54,16 +54,11 @@ data "terraform_remote_state" "shared_slack_notifier" {
   }
 }
 
-# meeting-qa lives in its own module/state — read its queue URL/ARN here so the
-# process Lambda can send to it. Apply meeting-qa BEFORE meeting-pipeline.
-data "terraform_remote_state" "meeting_qa" {
-  backend = "s3"
-  config = {
-    bucket = "goodparty-terraform-state-us-west-2"
-    key    = "meeting-qa/dev/terraform.tfstate"
-    region = "us-west-2"
-  }
-}
+# NOTE: meeting-qa wiring deferred until the meeting-qa module ships.
+# Once meeting-qa/dev/terraform.tfstate exists, add a data
+# "terraform_remote_state" "meeting_qa" block here and pass its outputs as
+# qa_queue_url / qa_queue_arn below. The module already defaults both to ""
+# with documented graceful no-op behavior, so leaving them unset is safe.
 
 # ── Module ─────────────────────────────────────────────────────────────────
 
@@ -71,7 +66,7 @@ module "meeting_pipeline" {
   source = "../../../modules/meeting-pipeline"
 
   environment        = "dev"
-  s3_bucket_name     = "goodparty-ai-dev"
+  s3_bucket_name     = "meeting-pipeline-dev"
   ecr_repository_url = data.terraform_remote_state.shared_infra.outputs.ecr_repository_url
   docker_image_tag   = "meeting-pipeline-dev"
   vpc_id             = var.vpc_id
@@ -79,8 +74,7 @@ module "meeting_pipeline" {
 
   shared_slack_notifier_lambda_arn = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
 
-  qa_queue_url = data.terraform_remote_state.meeting_qa.outputs.queue_url
-  qa_queue_arn = data.terraform_remote_state.meeting_qa.outputs.queue_arn
+  # qa_queue_url / qa_queue_arn intentionally omitted — see note above.
 }
 
 # ── Outputs ────────────────────────────────────────────────────────────────
