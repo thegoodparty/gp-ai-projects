@@ -591,9 +591,12 @@ resource "aws_ecs_service" "discover" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.private_subnet_ids
+    subnets          = var.public_subnet_ids
     security_groups  = [aws_security_group.discover.id]
-    assign_public_ip = false # private subnets — VPC NAT must provide internet egress
+    # Public subnet + auto-assigned IP avoids NAT cost. Safe because the
+    # security group has no ingress rules and discover.py runs no server —
+    # the task can only initiate outbound connections.
+    assign_public_ip = true
   }
 
   # desired_count = 1 with default 100% min healthy would block redeploys.

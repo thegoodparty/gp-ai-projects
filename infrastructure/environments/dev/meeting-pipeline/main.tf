@@ -29,8 +29,8 @@ variable "vpc_id" {
   type        = string
 }
 
-variable "private_subnet_ids" {
-  description = "Private subnet IDs for Fargate discover task"
+variable "public_subnet_ids" {
+  description = "Public subnet IDs for the discover Fargate task (outbound-only, no NAT)"
   type        = list(string)
 }
 
@@ -78,7 +78,7 @@ module "meeting_pipeline" {
   ecr_repository_url = data.terraform_remote_state.shared_infra.outputs.ecr_repository_url
   docker_image_tag   = "meeting-pipeline-dev"
   vpc_id             = var.vpc_id
-  private_subnet_ids = var.private_subnet_ids
+  public_subnet_ids  = var.public_subnet_ids
 
   shared_slack_notifier_lambda_arn = try(data.terraform_remote_state.shared_slack_notifier[0].outputs.lambda_function_arn, "")
 

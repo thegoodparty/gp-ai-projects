@@ -24,8 +24,8 @@ variable "vpc_id" {
   type        = string
 }
 
-variable "private_subnet_ids" {
-  description = "Private subnet IDs for Fargate tasks"
+variable "public_subnet_ids" {
+  description = "Public subnet IDs for the discover Fargate task. The task is outbound-only (no ingress in its security group) and runs in public subnets with auto-assigned public IPs to avoid the cost of a NAT gateway."
   type        = list(string)
 }
 
