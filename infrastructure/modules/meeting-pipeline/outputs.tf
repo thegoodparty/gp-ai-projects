@@ -41,3 +41,7 @@ output "ecs_cluster_name" {
 output "ecs_task_definition_arn" {
   value = aws_ecs_task_definition.discover.arn
 }
+
+output "ecs_service_name" {
+  value = aws_ecs_service.discover.name
+}

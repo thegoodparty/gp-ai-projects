@@ -1,7 +1,8 @@
-"""Discover handler — Fargate task that processes cities from the discover SQS queue.
+"""Discover handler — long-running Fargate service that consumes the discover SQS queue.
 
-Polls discover-queue for city slugs, runs source discovery, writes source.json.
-Runs as a long-lived Fargate task (not Lambda) because discovery needs Playwright.
+Runs as an ECS service with desired_count=1: long-polls forever, processes cities
+as messages arrive, never exits on its own. Producers (e.g. an external API) just
+SendMessage to the queue and this service picks them up.
 
 Usage (local): python -m meeting_pipeline.lambda_handlers.discover
 Usage (Fargate): ENTRYPOINT in Dockerfile.discover
@@ -42,7 +43,7 @@ async def discover_one(city: str, state: str, cfg, storage):
 
 
 def poll_loop():
-    """Long-poll SQS queue and process cities until queue is empty."""
+    """Long-poll SQS queue forever. ECS keeps the service at desired_count=1."""
     inject_secrets()
     cfg = AgentConfig.from_env()
     storage = get_storage(cfg)
@@ -52,9 +53,8 @@ def poll_loop():
         return
 
     print(f"Polling {DISCOVER_QUEUE_URL}...")
-    idle_count = 0
 
-    while idle_count < 3:
+    while True:
         resp = sqs.receive_message(
             QueueUrl=DISCOVER_QUEUE_URL,
             MaxNumberOfMessages=1,
@@ -63,11 +63,10 @@ def poll_loop():
         messages = resp.get("Messages", [])
 
         if not messages:
-            idle_count += 1
-            print(f"No messages (idle {idle_count}/3)")
+            # Idle long-poll cycle — keep waiting. ECS service health is
+            # observed via container running, not via queue activity.
             continue
 
-        idle_count = 0
         for msg in messages:
             body = json.loads(msg["Body"])
             city = body.get("city", "")
@@ -95,8 +94,6 @@ def poll_loop():
                 sqs.delete_message(QueueUrl=DISCOVER_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
             except Exception as e:
                 print(f"ERROR: {e} ({time.time()-t:.0f}s) — leaving message for retry")
-
-    print("Queue empty — exiting")
 
 
 if __name__ == "__main__":

@@ -177,6 +177,7 @@ resource "aws_lambda_function" "scan" {
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
   image_uri     = "${var.ecr_repository_url}:${var.docker_image_tag}"
+  architectures = ["arm64"] # CI builds linux/arm64; Lambda default is x86_64
   timeout       = 300
   memory_size   = 512
 
@@ -210,8 +211,12 @@ resource "aws_lambda_function" "process" {
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
   image_uri     = "${var.ecr_repository_url}:${var.docker_image_tag}"
+  architectures = ["arm64"] # CI builds linux/arm64; Lambda default is x86_64
   timeout       = 900
   memory_size   = 1024
+  # Cap concurrency so SQS-driven fan-out can't blow Gemini per-minute quotas.
+  # Tune up if Gemini quota allows; tune down if rate-limit DLQ noise increases.
+  reserved_concurrent_executions = 5
 
   image_config {
     command = ["meeting_pipeline.lambda_handlers.process.handler"]
@@ -527,10 +532,13 @@ resource "aws_ecs_task_definition" "discover" {
   family                   = "${local.project}-discover-${var.environment}"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "4096"
-  memory                   = "16384"
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.ecs_task.arn
+  # Sized for httpx-based discovery (Serper + Firecrawl + Gemini API calls).
+  # An earlier plan included Playwright/Chromium which needed 4 vCPU / 16 GB —
+  # that plan was scrapped. 0.5 vCPU / 1 GB is plenty for an idle long-poller.
+  cpu                = "512"
+  memory             = "1024"
+  execution_role_arn = aws_iam_role.ecs_execution.arn
+  task_role_arn      = aws_iam_role.ecs_task.arn
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -565,6 +573,33 @@ resource "aws_ecs_task_definition" "discover" {
       }
     }
   }])
+
+  tags = {
+    Environment = var.environment
+    Project     = local.project
+  }
+}
+
+# Always-on Fargate service: keeps one task running to long-poll the discover
+# queue. External producers (e.g. an API) just SendMessage to the queue; this
+# service picks them up. Force a new deployment via CI when the image changes.
+resource "aws_ecs_service" "discover" {
+  name            = "${local.project}-discover-${var.environment}"
+  cluster         = aws_ecs_cluster.discover.id
+  task_definition = aws_ecs_task_definition.discover.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [aws_security_group.discover.id]
+    assign_public_ip = false # private subnets — VPC NAT must provide internet egress
+  }
+
+  # desired_count = 1 with default 100% min healthy would block redeploys.
+  # 0% min / 200% max lets ECS stop the old task and start a new one.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 200
 
   tags = {
     Environment = var.environment

@@ -45,7 +45,15 @@ data "terraform_remote_state" "shared_infra" {
   }
 }
 
+# Optional — set use_slack_notifier = false (or omit shared/slack-notifier
+# state entirely) in environments without the shared notifier deployed.
+variable "use_slack_notifier" {
+  type    = bool
+  default = true
+}
+
 data "terraform_remote_state" "shared_slack_notifier" {
+  count   = var.use_slack_notifier ? 1 : 0
   backend = "s3"
   config = {
     bucket = "goodparty-terraform-state-us-west-2"
@@ -72,7 +80,7 @@ module "meeting_pipeline" {
   vpc_id             = var.vpc_id
   private_subnet_ids = var.private_subnet_ids
 
-  shared_slack_notifier_lambda_arn = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
+  shared_slack_notifier_lambda_arn = try(data.terraform_remote_state.shared_slack_notifier[0].outputs.lambda_function_arn, "")
 
   # qa_queue_url / qa_queue_arn intentionally omitted — see note above.
 }

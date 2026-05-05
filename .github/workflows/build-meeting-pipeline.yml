@@ -133,3 +133,24 @@ jobs:
           done
 
           echo "All Lambda functions updated successfully."
+
+      - name: Force discover ECS service redeploy
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          CLUSTER="meeting-pipeline-discover-${ENV}"
+          SERVICE="meeting-pipeline-discover-${ENV}"
+
+          echo "Forcing new deployment of ${SERVICE} in ${CLUSTER}..."
+          aws ecs update-service \
+            --cluster "${CLUSTER}" \
+            --service "${SERVICE}" \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }} \
+            > /dev/null
+
+          echo "Waiting for ${SERVICE} to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}" \
+            --region ${{ env.AWS_REGION }}
+          echo "${SERVICE} is ready."
