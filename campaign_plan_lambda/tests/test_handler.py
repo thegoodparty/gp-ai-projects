@@ -36,6 +36,17 @@ def _make_sqs_event(body: dict, receive_count: int = 1) -> dict:
 
 VALID_MESSAGE = {
     "campaignId": 123,
+    "electionDate": "2026-11-04",
+    "city": "Boston",
+    "state": "MA",
+    "officeName": "Mayor",
+    "officeLevel": "CITY",
+    "primaryElectionDate": "2026-06-02",
+}
+
+# Legacy payload shape that gp-api sends today — kept supported during transition.
+LEGACY_MESSAGE = {
+    "campaignId": 123,
     "election_date": "2026-11-04",
     "city": "Boston",
     "state": "MA",
@@ -46,33 +57,107 @@ class TestInputValidation:
     def test_valid_message_parses(self):
         body = SqsMessageBody(**VALID_MESSAGE)
         assert body.campaignId == 123
+        assert body.electionDate == "2026-11-04"
+        assert body.state == "MA"
+        assert body.city == "Boston"
+        assert body.officeName == "Mayor"
+        assert body.officeLevel == "CITY"
+        assert body.primaryElectionDate == "2026-06-02"
+
+    def test_legacy_election_date_alias_still_works(self):
+        body = SqsMessageBody(**LEGACY_MESSAGE)
+        assert body.campaignId == 123
+        assert body.electionDate == "2026-11-04"
         assert body.city == "Boston"
         assert body.state == "MA"
-        assert body.election_date == "2026-11-04"
+
+    def test_only_required_fields_accepted(self):
+        body = SqsMessageBody(campaignId=123, electionDate="2026-11-04")
+        assert body.campaignId == 123
+        assert body.electionDate == "2026-11-04"
+        assert body.state is None
+        assert body.city is None
+        assert body.officeName is None
+        assert body.officeLevel is None
+        assert body.primaryElectionDate is None
+
+    def test_unknown_fields_ignored(self):
+        # Forward compatibility: gp-api can add fields without breaking the Lambda.
+        body = SqsMessageBody(
+            campaignId=123,
+            electionDate="2026-11-04",
+            someFutureField="whatever",
+            anotherNewThing={"nested": True},
+        )
+        assert body.campaignId == 123
 
     def test_missing_campaign_id_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"election_date": "2026-11-04", "city": "Boston", "state": "MA"})
-
-    def test_missing_city_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"campaignId": 123, "election_date": "2026-11-04", "state": "MA"})
-
-    def test_missing_state_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"campaignId": 123, "election_date": "2026-11-04", "city": "Boston"})
+        with pytest.raises(ValidationError):
+            SqsMessageBody(**{"electionDate": "2026-11-04"})
 
     def test_missing_election_date_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"campaignId": 123, "city": "Boston", "state": "MA"})
+        with pytest.raises(ValidationError):
+            SqsMessageBody(**{"campaignId": 123})
 
     def test_invalid_campaign_id_type_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"campaignId": "not-a-number", "election_date": "2026-11-04", "city": "Boston", "state": "MA"})
+        with pytest.raises(ValidationError):
+            SqsMessageBody(**{"campaignId": "not-a-number", "electionDate": "2026-11-04"})
 
     def test_invalid_election_date_rejected(self):
-        with pytest.raises(Exception):
-            SqsMessageBody(**{"campaignId": 123, "election_date": "not-a-date", "city": "Boston", "state": "MA"})
+        with pytest.raises(ValidationError):
+            SqsMessageBody(**{"campaignId": 123, "electionDate": "not-a-date"})
+
+    def test_invalid_primary_election_date_rejected(self):
+        with pytest.raises(ValidationError):
+            SqsMessageBody(
+                campaignId=123, electionDate="2026-11-04", primaryElectionDate="not-a-date"
+            )
+
+    def test_empty_primary_election_date_allowed(self):
+        # gp-api may send an empty string when the field is genuinely absent.
+        body = SqsMessageBody(campaignId=123, electionDate="2026-11-04", primaryElectionDate="")
+        assert body.primaryElectionDate is None
+
+    def test_empty_strings_on_optional_fields_normalize_to_none(self):
+        # gp-api may send "" for any optional field it doesn't have a value for;
+        # normalizing to None here means the downstream fallback fires uniformly.
+        body = SqsMessageBody(
+            campaignId=123,
+            electionDate="2026-11-04",
+            state="",
+            city="",
+            officeName="",
+            officeLevel="",
+            primaryElectionDate="",
+        )
+        assert body.state is None
+        assert body.city is None
+        assert body.officeName is None
+        assert body.officeLevel is None
+        assert body.primaryElectionDate is None
+
+    def test_whitespace_only_optional_fields_normalize_to_none(self):
+        # Same as empty strings — a whitespace-only value on a date field would
+        # otherwise trip the ISO-format check and DLQ the message.
+        body = SqsMessageBody(
+            campaignId=123,
+            electionDate="2026-11-04",
+            state="   ",
+            city="\t\n ",
+            officeName="  ",
+            officeLevel=" ",
+            primaryElectionDate="   ",
+        )
+        assert body.state is None
+        assert body.city is None
+        assert body.officeName is None
+        assert body.officeLevel is None
+        assert body.primaryElectionDate is None
+
+    def test_empty_election_date_still_rejected(self):
+        # electionDate is required — "" is a real validation error, not a fallback trigger.
+        with pytest.raises(ValidationError):
+            SqsMessageBody(campaignId=123, electionDate="")
 
     def test_invalid_json_raises(self):
         event = {

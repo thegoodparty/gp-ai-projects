@@ -90,3 +90,14 @@ infrastructure/shared/slack-notifier/terraform.tfvars
 
 #pickle files
 *.pickle
+
+# Lambda build artifacts
+.lambda_build/
+*/.lambda_build/
+
+# Local dev scratch + buggy env-var paths
+$WORKSPACE/
+spot-testing/
+
+# Terraform lock files live in env wrappers, not in reusable modules
+infrastructure/modules/**/.terraform.lock.hcl

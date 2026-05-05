@@ -11,7 +11,7 @@ import os
 import time
 from datetime import date, datetime, timezone
 
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from typing import TypedDict, Optional
 
@@ -45,14 +45,45 @@ MAX_RECEIVE_COUNT = 3
 
 
 class SqsMessageBody(BaseModel):
-    campaignId: int
-    election_date: str
-    city: str
-    state: str
+    # populate_by_name lets the `electionDate` field accept either alias below.
+    # extra="ignore" means gp-api can add new fields without breaking the Lambda.
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    @field_validator("election_date")
+    campaignId: int
+    electionDate: str = Field(
+        validation_alias=AliasChoices("electionDate", "election_date"),
+    )
+    state: Optional[str] = None
+    city: Optional[str] = None
+    officeName: Optional[str] = None
+    officeLevel: Optional[str] = None
+    primaryElectionDate: Optional[str] = None
+
+    # Blank optional strings from gp-api collapse to None so the "not available"
+    # fallback fires uniformly downstream. Whitespace-only strings count as
+    # blank. electionDate is excluded — it's required, so blank input is a real
+    # validation error.
+    @field_validator(
+        "state", "city", "officeName", "officeLevel", "primaryElectionDate",
+        mode="before",
+    )
+    @classmethod
+    def _blank_string_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("electionDate")
     @classmethod
     def validate_election_date(cls, v: str) -> str:
+        date.fromisoformat(v)
+        return v
+
+    @field_validator("primaryElectionDate")
+    @classmethod
+    def validate_primary_election_date(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
         date.fromisoformat(v)
         return v
 
@@ -141,9 +172,12 @@ async def _generate(campaign_id: int, msg: SqsMessageBody) -> CampaignPlanResult
     from campaign_plan_lambda.output import write_result_to_s3, send_completion_message
 
     event_tasks = await generate_event_tasks(
-        election_date=date.fromisoformat(msg.election_date),
-        city=msg.city,
+        election_date=date.fromisoformat(msg.electionDate),
         state=msg.state,
+        city=msg.city,
+        office_name=msg.officeName,
+        office_level=msg.officeLevel,
+        primary_election_date=msg.primaryElectionDate,
     )
     logger.info(f"Generated {len(event_tasks)} event tasks")
 

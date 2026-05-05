@@ -39,6 +39,41 @@ source .venv/bin/activate
 python -m pytest campaign_plan_lambda/tests/ -v
 ```
 
+### Run with gp-api locally
+
+The local server lets gp-api trigger event generation on your machine instead of going through SQS + Lambda. Real Gemini API calls are made, results are written to dev S3, and completion messages are sent to your personal SQS queue.
+
+**1. Set up `.env` in gp-ai-projects root:**
+
+```
+GEMINI_API_KEY=...
+AWS_PROFILE=your-admin-profile
+AWS_DEFAULT_REGION=us-west-2
+S3_RESULTS_BUCKET=campaign-plan-results-dev
+OUTPUT_SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/333022194791/YourName_Queue.fifo
+```
+
+Each engineer should have their own dedicated SQS queue (e.g. `YourName_Queue.fifo`). This is the same queue your local gp-api reads from (`SQS_QUEUE` in gp-api's `.env`).
+
+**2. Start the local server:**
+
+```bash
+cd /gp-ai-projects
+source .venv/bin/activate
+python campaign_plan_lambda/local_server.py
+```
+
+**3. Set up gp-api `.env`:**
+
+```
+CAMPAIGN_PLAN_LOCAL_URL=http://localhost:8089/generate
+CAMPAIGN_PLAN_RESULTS_BUCKET=campaign-plan-results-dev
+```
+
+**4. Start gp-api:** `npm run start:dev`
+
+When a user with no tasks opens the dashboard, gp-api POSTs to `localhost:8089`, the local server runs Gemini, writes to S3, and sends a completion message to your queue. gp-api picks it up and saves the event tasks.
+
 ## Deploying to Lambda
 
 ### Build the zip

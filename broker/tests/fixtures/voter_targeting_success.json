@@ -1,0 +1,405 @@
+{
+  "organization_slug": "4",
+  "district": {
+    "state": "NC",
+    "type": "CITY",
+    "name": "Hendersonville City Council"
+  },
+  "generated_at": "2026-04-20T15:41:52.730808Z",
+  "summary": {
+    "total_voters_in_district": 6282,
+    "win_number": 3142,
+    "projected_turnout": 6282
+  },
+  "segments": [
+    {
+      "tier": 1,
+      "name": "Base Voters",
+      "description": "Tier 1 voters by independent appeal score",
+      "count": 869,
+      "demographics": {
+        "party_breakdown": {
+          "Non-Partisan": 369,
+          "Libertarian": 141,
+          "Unaffiliated": 155,
+          "Democratic": 100,
+          "Republican": 104
+        },
+        "age_distribution": {
+          "35-54": 249,
+          "18-34": 222,
+          "55+": 398
+        },
+        "gender_split": {
+          "M": 289,
+          "U": 283,
+          "F": 297
+        }
+      },
+      "outreach_priority": "critical",
+      "recommended_channels": [
+        "door_knock",
+        "phone",
+        "text"
+      ],
+      "voters": [
+        {
+          "voter_id": "NC10001574",
+          "first_name": "William",
+          "last_name": "Rodriguez",
+          "address": "9645 Cedar Ln",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 51,
+          "gender": "M",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10000798",
+          "first_name": "Linda",
+          "last_name": "Rodriguez",
+          "address": "7716 Oak Ave",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 43,
+          "gender": "U",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005516",
+          "first_name": "Elizabeth",
+          "last_name": "Jones",
+          "address": "9457 Oak Ave",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 23,
+          "gender": "F",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10004387",
+          "first_name": "Jennifer",
+          "last_name": "Williams",
+          "address": "5755 Church St",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 30,
+          "gender": "F",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005472",
+          "first_name": "Michael",
+          "last_name": "Brown",
+          "address": "2156 Main St",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 30,
+          "gender": "M",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        }
+      ]
+    },
+    {
+      "tier": 2,
+      "name": "Persuadable Voters",
+      "description": "Tier 2 voters by independent appeal score",
+      "count": 2420,
+      "demographics": {
+        "party_breakdown": {
+          "Democratic": 428,
+          "Libertarian": 489,
+          "Republican": 439,
+          "Non-Partisan": 582,
+          "Unaffiliated": 482
+        },
+        "age_distribution": {
+          "35-54": 731,
+          "55+": 1086,
+          "18-34": 603
+        },
+        "gender_split": {
+          "F": 817,
+          "U": 800,
+          "M": 803
+        }
+      },
+      "outreach_priority": "high",
+      "recommended_channels": [
+        "text",
+        "mail",
+        "door_knock"
+      ],
+      "voters": [
+        {
+          "voter_id": "NC10001973",
+          "first_name": "Robert",
+          "last_name": "Martinez",
+          "address": "8488 Park Ave",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 44,
+          "gender": "F",
+          "party": "Democratic",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10001204",
+          "first_name": "James",
+          "last_name": "Smith",
+          "address": "4805 Church St",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 82,
+          "gender": "U",
+          "party": "Libertarian",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005617",
+          "first_name": "Robert",
+          "last_name": "Martinez",
+          "address": "1619 Church St",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 26,
+          "gender": "M",
+          "party": "Democratic",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005134",
+          "first_name": "Michael",
+          "last_name": "Jones",
+          "address": "8995 Oak Ave",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 50,
+          "gender": "F",
+          "party": "Libertarian",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10004493",
+          "first_name": "William",
+          "last_name": "Miller",
+          "address": "8095 Oak Ave",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 76,
+          "gender": "M",
+          "party": "Republican",
+          "voter_status": "A"
+        }
+      ]
+    },
+    {
+      "tier": 3,
+      "name": "Stretch Voters",
+      "description": "Tier 3 voters by independent appeal score",
+      "count": 2290,
+      "demographics": {
+        "party_breakdown": {
+          "Unaffiliated": 497,
+          "Republican": 511,
+          "Non-Partisan": 290,
+          "Democratic": 498,
+          "Libertarian": 494
+        },
+        "age_distribution": {
+          "55+": 1076,
+          "35-54": 697,
+          "18-34": 517
+        },
+        "gender_split": {
+          "F": 783,
+          "U": 706,
+          "M": 801
+        }
+      },
+      "outreach_priority": "medium",
+      "recommended_channels": [
+        "digital_ads",
+        "social_media",
+        "mail"
+      ],
+      "voters": [
+        {
+          "voter_id": "NC10004783",
+          "first_name": "William",
+          "last_name": "Garcia",
+          "address": "6734 Main St",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 75,
+          "gender": "F",
+          "party": "Unaffiliated",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10002392",
+          "first_name": "John",
+          "last_name": "Johnson",
+          "address": "538 Washington Ave",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 71,
+          "gender": "U",
+          "party": "Republican",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10000302",
+          "first_name": "James",
+          "last_name": "Davis",
+          "address": "8097 Oak Ave",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 76,
+          "gender": "M",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10003085",
+          "first_name": "Patricia",
+          "last_name": "Rodriguez",
+          "address": "8397 Elm St",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 70,
+          "gender": "F",
+          "party": "Democratic",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005730",
+          "first_name": "John",
+          "last_name": "Miller",
+          "address": "6153 Pine Rd",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 42,
+          "gender": "U",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        }
+      ]
+    },
+    {
+      "tier": 4,
+      "name": "Awareness Only",
+      "description": "Tier 4 voters by independent appeal score",
+      "count": 703,
+      "demographics": {
+        "party_breakdown": {
+          "Non-Partisan": 25,
+          "Republican": 174,
+          "Democratic": 202,
+          "Unaffiliated": 138,
+          "Libertarian": 164
+        },
+        "age_distribution": {
+          "55+": 338,
+          "35-54": 197,
+          "18-34": 168
+        },
+        "gender_split": {
+          "U": 249,
+          "F": 219,
+          "M": 235
+        }
+      },
+      "outreach_priority": "low",
+      "recommended_channels": [
+        "digital_ads",
+        "social_media"
+      ],
+      "voters": [
+        {
+          "voter_id": "NC10005376",
+          "first_name": "James",
+          "last_name": "Garcia",
+          "address": "8471 Elm St",
+          "city": "Hendersonville",
+          "zip": "28739",
+          "age": 59,
+          "gender": "U",
+          "party": "Non-Partisan",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10000827",
+          "first_name": "Elizabeth",
+          "last_name": "Johnson",
+          "address": "9503 Park Ave",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 75,
+          "gender": "F",
+          "party": "Republican",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10002224",
+          "first_name": "Michael",
+          "last_name": "Brown",
+          "address": "5104 Elm St",
+          "city": "Hendersonville",
+          "zip": "28792",
+          "age": 35,
+          "gender": "U",
+          "party": "Democratic",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10005467",
+          "first_name": "Mary",
+          "last_name": "Brown",
+          "address": "7327 Pine Rd",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 37,
+          "gender": "M",
+          "party": "Democratic",
+          "voter_status": "A"
+        },
+        {
+          "voter_id": "NC10004595",
+          "first_name": "Jennifer",
+          "last_name": "Johnson",
+          "address": "4499 Highland Dr",
+          "city": "Hendersonville",
+          "zip": "28791",
+          "age": 77,
+          "gender": "F",
+          "party": "Democratic",
+          "voter_status": "A"
+        }
+      ]
+    }
+  ],
+  "geographic_clusters": [
+    {
+      "area": "Hendersonville 28792",
+      "voter_count": 2125,
+      "density_rank": 1
+    },
+    {
+      "area": "Hendersonville 28739",
+      "voter_count": 2107,
+      "density_rank": 2
+    },
+    {
+      "area": "Hendersonville 28791",
+      "voter_count": 2050,
+      "density_rank": 3
+    }
+  ],
+  "methodology": "Contact-goal-driven targeting with synthetic data (Databricks backend unavailable). Composite Independent Appeal Score: hs_partisanship_moderate_third_party_support (25%), hs_ideology_overall_party_indep (25%), hs_likely_mid_term_voter (20%), inverse strong partisan (15%), party bonus (+8 Non-Partisan, -2 major party). Tiers by score threshold: Base (55+), Persuadable (40-55), Stretch (25-40), Awareness (<25). Geographic clusters by zip code, sorted by voter density."
+}
