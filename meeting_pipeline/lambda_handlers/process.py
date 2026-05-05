@@ -141,7 +141,18 @@ def _process_meeting(slug, meeting_date, platform, cfg, storage):
     try:
         from meeting_pipeline.stages.briefing.generate import generate_briefing_for_meeting
         brief_result = generate_briefing_for_meeting(normalized_key, storage, cfg)
-        if brief_result.get("status") != "ok":
+        status = brief_result.get("status")
+        if status == "skipped":
+            # Permanent skip (too few items, manual exclusion, etc.). Treat as
+            # successful no-op so SQS deletes the message — retrying would
+            # re-run the paid extract+briefing chain only to skip again.
+            return {
+                "status": "skipped",
+                "slug": slug,
+                "date": meeting_date,
+                "reason": brief_result.get("reason", "unknown"),
+            }
+        if status != "ok":
             return {"status": "briefing_failed", "slug": slug, "date": meeting_date, "error": brief_result.get("error", "unknown")}
         briefing_key = brief_result.get("output", "")
     except Exception as e:

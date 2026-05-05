@@ -310,5 +310,104 @@ class TestDiscoverNoPlaywright:
         assert "playwright.async_api" not in sys.modules
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Discover poll_loop robustness — the always-on Fargate task must not crash
+# on transient SQS errors or malformed messages.
+# ────────────────────────────────────────────────────────────────────────────
+
+import pytest  # noqa: E402
+
+
+class TestDiscoverPollLoopRobustness:
+    @patch("boto3.client")
+    def test_receive_message_error_does_not_crash(self, mock_boto):
+        """A receive_message failure must be caught — otherwise the container
+        exits and ECS restarts it on every transient SQS/STS hiccup."""
+        from meeting_pipeline.lambda_handlers import discover as d
+
+        sentinel = SystemExit("stop")
+        with patch.object(d, "DISCOVER_QUEUE_URL", "https://sqs.test/q"), \
+             patch.object(d, "inject_secrets"), \
+             patch.object(d, "AgentConfig"), \
+             patch.object(d, "get_storage"), \
+             patch.object(d.sqs, "receive_message", side_effect=[
+                 Exception("boto3 retry exhausted"),
+                 sentinel,
+             ]) as mock_recv, \
+             patch.object(d.time, "sleep") as mock_sleep:
+            with pytest.raises(SystemExit):
+                d.poll_loop()
+
+        assert mock_recv.call_count == 2
+        mock_sleep.assert_called_once_with(5)
+
+    @patch("boto3.client")
+    def test_malformed_json_message_is_deleted(self, mock_boto):
+        """A poison-pill message (invalid JSON) must be deleted, otherwise it
+        crashes the loop on every redelivery until DLQ."""
+        from meeting_pipeline.lambda_handlers import discover as d
+
+        sentinel = SystemExit("stop")
+        with patch.object(d, "DISCOVER_QUEUE_URL", "https://sqs.test/q"), \
+             patch.object(d, "inject_secrets"), \
+             patch.object(d, "AgentConfig"), \
+             patch.object(d, "get_storage"), \
+             patch.object(d.sqs, "receive_message", side_effect=[
+                 {"Messages": [{"Body": "not json{", "ReceiptHandle": "rh1"}]},
+                 sentinel,
+             ]), \
+             patch.object(d.sqs, "delete_message") as mock_delete:
+            with pytest.raises(SystemExit):
+                d.poll_loop()
+
+        mock_delete.assert_called_once_with(
+            QueueUrl="https://sqs.test/q", ReceiptHandle="rh1"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# process.py briefing-skipped handling — generate_briefing_for_meeting can
+# return status="skipped" for permanent outcomes (too_few_items,
+# too_few_substantive_items, pipeline_excluded). Those must NOT route to
+# briefing_failed (which is in TRANSIENT_FAILURE_STATUSES → re-raised → SQS
+# redelivers → false DLQ pages on every sparse-agenda meeting).
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestProcessSkippedBriefing:
+    @patch("boto3.client")
+    def test_skipped_briefing_does_not_trigger_retry(self, mock_boto):
+        """Handler must not raise when _process_meeting returns skipped."""
+        from meeting_pipeline.lambda_handlers.process import handler
+
+        event = {"slug": "test-OH", "date": "2026-04-15", "platform": "civicplus"}
+
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
+            mock_cfg.return_value = MagicMock()
+            mock_proc.return_value = {"status": "skipped", "reason": "too_few_items"}
+            # Must not raise — skipped is a permanent no-op, not a transient error.
+            result = handler(event)
+
+        assert result["results"][0]["status"] == "skipped"
+
+    @patch("boto3.client")
+    def test_briefing_failed_does_trigger_retry(self, mock_boto):
+        """Sanity check: briefing_failed (real transient errors) still raises."""
+        from meeting_pipeline.lambda_handlers.process import handler
+
+        event = {"slug": "test-OH", "date": "2026-04-15", "platform": "civicplus"}
+
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
+            mock_cfg.return_value = MagicMock()
+            mock_proc.return_value = {"status": "briefing_failed", "error": "API timeout"}
+            with pytest.raises(RuntimeError, match="Transient processing failures"):
+                handler(event)
+
+
 # Need AsyncMock import at module level for ScanPersistAfterSend
 from unittest.mock import AsyncMock  # noqa: E402

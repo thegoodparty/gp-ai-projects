@@ -55,11 +55,20 @@ def poll_loop():
     print(f"Polling {DISCOVER_QUEUE_URL}...")
 
     while True:
-        resp = sqs.receive_message(
-            QueueUrl=DISCOVER_QUEUE_URL,
-            MaxNumberOfMessages=1,
-            WaitTimeSeconds=20,
-        )
+        try:
+            resp = sqs.receive_message(
+                QueueUrl=DISCOVER_QUEUE_URL,
+                MaxNumberOfMessages=1,
+                WaitTimeSeconds=20,
+            )
+        except Exception as e:
+            # Don't crash the container on transient SQS/STS/network failures —
+            # boto3 already retries internally; if we got here those retries
+            # were exhausted. Sleep briefly and reconnect on the next iteration.
+            print(f"receive_message error: {e} — backing off 5s")
+            time.sleep(5)
+            continue
+
         messages = resp.get("Messages", [])
 
         if not messages:
@@ -68,7 +77,15 @@ def poll_loop():
             continue
 
         for msg in messages:
-            body = json.loads(msg["Body"])
+            try:
+                body = json.loads(msg["Body"])
+            except json.JSONDecodeError as e:
+                # Poison-pill message — would crash the loop on every redelivery
+                # until DLQ. Delete it so the queue keeps moving and log once.
+                print(f"Skipping malformed message: {e} — body: {msg.get('Body', '')[:200]}")
+                sqs.delete_message(QueueUrl=DISCOVER_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
+                continue
+
             city = body.get("city", "")
             state = body.get("state", "")
             slug = body.get("slug", "")
