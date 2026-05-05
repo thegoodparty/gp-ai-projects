@@ -37,6 +37,17 @@ from qa.inputs.meeting_briefing_spec import MeetingBriefingSpec
 
 s3 = boto3.client("s3")
 
+QA_OUTPUT_PREFIX = "meeting_pipeline/output/qa"
+
+
+def _bucket() -> str:
+    """Read S3_BUCKET at call time so env changes (e.g. between tests, or
+    after Secrets Manager injection) are picked up. Raises if unset."""
+    b = os.environ.get("S3_BUCKET", "")
+    if not b:
+        raise RuntimeError("S3_BUCKET environment variable is not set")
+    return b
+
 
 # ── Secrets injection ──────────────────────────────────────────────────────
 
@@ -72,15 +83,12 @@ def _inject_secrets() -> None:
 
     _SECRETS_INJECTED = True
 
-S3_BUCKET = os.environ.get("S3_BUCKET", "")
-QA_OUTPUT_PREFIX = "meeting_pipeline/output/qa"
-
 
 # ── S3 helpers ─────────────────────────────────────────────────────────────
 
 def _read_json_s3(key: str) -> dict | None:
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        obj = s3.get_object(Bucket=_bucket(), Key=key)
         return json.loads(obj["Body"].read())
     except s3.exceptions.NoSuchKey:
         return None
@@ -91,7 +99,7 @@ def _read_json_s3(key: str) -> dict | None:
 
 def _read_bytes_s3(key: str) -> bytes | None:
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        obj = s3.get_object(Bucket=_bucket(), Key=key)
         return obj["Body"].read()
     except s3.exceptions.NoSuchKey:
         return None
@@ -102,13 +110,14 @@ def _read_bytes_s3(key: str) -> bytes | None:
 
 def _upload_dir(local_dir: Path, s3_prefix: str) -> list[str]:
     """Upload every file in local_dir (recursive) to s3://<bucket>/<s3_prefix>/<relative path>."""
+    bucket = _bucket()
     uploaded = []
     for path in local_dir.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(local_dir)
         key = f"{s3_prefix}/{rel.as_posix()}"
-        s3.upload_file(str(path), S3_BUCKET, key)
+        s3.upload_file(str(path), bucket, key)
         uploaded.append(key)
     return uploaded
 
@@ -123,19 +132,35 @@ class _S3Storage:
 
     def exists(self, key: str) -> bool:
         try:
-            s3.head_object(Bucket=S3_BUCKET, Key=key)
+            s3.head_object(Bucket=_bucket(), Key=key)
             return True
         except Exception:
             return False
 
 
+# ── Agenda-file lookup (matches normalized JSON shape from meeting_pipeline) ──
+
+def _agenda_files(normalized: dict) -> list:
+    """Find the agenda_files list in a normalized briefing JSON.
+
+    Canonical location is normalized["sources"]["agenda_files"] (snake_case).
+    Falls back to a top-level "agenda_files" for older shapes.
+    """
+    return (
+        (normalized.get("sources") or {}).get("agenda_files")
+        or normalized.get("agenda_files")
+        or []
+    )
+
+
 # ── One-briefing runner ────────────────────────────────────────────────────
 
 def run_qa_for_briefing(briefing_key: str) -> dict:
-    """Run QA on a single briefing identified by its S3 key. Returns a result dict."""
-    if not S3_BUCKET:
-        return {"status": "error", "error": "S3_BUCKET not set", "briefing_key": briefing_key}
+    """Run QA on a single briefing identified by its S3 key.
 
+    Returns a result dict on permanent outcomes (briefing missing, bad shape).
+    Raises on transient failures (S3 read errors, LLM call errors) so the
+    Lambda handler can propagate to SQS and trigger redrive/DLQ."""
     # Derive related keys
     # briefing_key: "meeting_pipeline/output/briefings/<stem>.json"
     stem = Path(briefing_key).stem.removesuffix("_briefing")
@@ -157,16 +182,16 @@ def run_qa_for_briefing(briefing_key: str) -> dict:
         hq_key = f"meeting_pipeline/sources/{city_slug}/constituent/issue_scores.json"
         haystaq = _read_json_s3(hq_key)
 
-    # Optional PDF (resolved via agendaFiles in normalized)
+    # Optional PDF — read agenda_files from canonical normalized JSON shape
     pdf_bytes: bytes | None = None
-    af = (normalized.get("agenda") or {}).get("agendaFiles") or normalized.get("agendaFiles") or []
+    af = _agenda_files(normalized)
     if af:
         try:
             pdf_bytes = load_pdf_bytes_from_files(af, _S3Storage())
         except Exception as e:
             print(f"  [pdf] load failed: {e}")
 
-    # Build inputs and run
+    # Build inputs and run (run_qa raises on LLM/transient failures)
     cfg = QARunConfig.from_env()
     spec = MeetingBriefingSpec()
     project_input = spec.to_project_input(briefing)
@@ -191,31 +216,48 @@ def handler(event, context=None):
 
     Accepts either a raw SQS event (Records[]) or a direct invoke with
     {"briefing_key": "..."} for testing.
+
+    Permanent failures (bad message body, missing briefing) are returned in
+    the result list. Transient failures (S3 read, LLM call errors) are
+    re-raised at the end so SQS redrives the message — defeating the swallow
+    pattern that would otherwise bury errors in CloudWatch and prevent DLQ
+    routing after maxReceiveCount.
     """
     _inject_secrets()
 
-    # Direct-invoke shape
+    # Direct-invoke shape (for testing) — propagate exceptions
     if "briefing_key" in event:
         return run_qa_for_briefing(event["briefing_key"])
 
     # SQS event shape
     results = []
+    transient_errors = []
     for record in event.get("Records", []):
         try:
             body = json.loads(record["body"])
         except (json.JSONDecodeError, KeyError):
+            # Bad message shape — don't retry, ack and move on.
             results.append({"status": "error", "error": "bad message body"})
             continue
 
         briefing_key = body.get("briefing_key", "")
         if not briefing_key:
+            # Missing required field — don't retry.
             results.append({"status": "error", "error": "missing briefing_key"})
             continue
 
         try:
             results.append(run_qa_for_briefing(briefing_key))
         except Exception as e:
-            print(f"  [qa] failed for {briefing_key}: {e}")
-            results.append({"status": "error", "error": str(e), "briefing_key": briefing_key})
+            # Transient failure (S3 read, LLM call, etc.) — collect to re-raise.
+            err = f"{briefing_key}: {type(e).__name__}: {str(e)[:200]}"
+            print(f"  [qa] transient failure for {briefing_key}: {e}")
+            transient_errors.append(err)
+            results.append({"status": "error", "error": str(e), "briefing_key": briefing_key, "transient": True})
+
+    if transient_errors:
+        # Tell SQS the invocation failed → message becomes visible again
+        # → redelivered up to maxReceiveCount → routed to DLQ on persistent failure.
+        raise RuntimeError("Transient QA failures: " + "; ".join(transient_errors))
 
     return {"results": results}
