@@ -4,7 +4,7 @@ variable "environment" {
 }
 
 variable "s3_bucket_name" {
-  description = "Override for the pipeline S3 bucket name. Leave empty to use the default \"meeting-pipeline-${var.environment}\". The module creates the bucket; pre-existing buckets must be imported once before first apply."
+  description = "Override for the pipeline S3 bucket name. Leave empty to use the default 'meeting-pipeline-<environment>'. The module creates the bucket; pre-existing buckets must be imported once before first apply."
   type        = string
   default     = ""
 }
