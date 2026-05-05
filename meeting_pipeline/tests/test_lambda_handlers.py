@@ -1,0 +1,230 @@
+"""
+Lambda handler tests for meeting_pipeline.lambda_handlers.{scan,process,discover}.
+
+These live on the meeting-pipeline-infra branch with the handlers themselves.
+"""
+import json
+from unittest.mock import MagicMock, patch
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# In-memory storage shim — duplicated from test_pipeline.py to keep this file
+# self-contained (the handler tests live on a different branch from the rest
+# of test_pipeline.py during the staged review of meeting-pipeline + infra).
+# ────────────────────────────────────────────────────────────────────────────
+
+class FakeStorage:
+    """Minimal in-memory StorageBackend for testing (no S3 needed)."""
+
+    def __init__(self, data: dict | None = None):
+        self._store: dict[str, bytes] = {}
+        if data:
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    self._store[k] = json.dumps(v).encode()
+                else:
+                    self._store[k] = v
+
+    def read_json(self, key: str) -> dict:
+        raw = self._store.get(key)
+        if raw is None:
+            raise FileNotFoundError(key)
+        return json.loads(raw)
+
+    def write_json(self, key: str, data: dict) -> None:
+        self._store[key] = json.dumps(data).encode()
+
+    def write_bytes(self, key: str, data: bytes) -> None:
+        self._store[key] = data
+
+    def read_bytes(self, key: str) -> bytes:
+        raw = self._store.get(key)
+        if raw is None:
+            raise FileNotFoundError(key)
+        return raw
+
+    def exists(self, key: str) -> bool:
+        return key in self._store
+
+    def list_keys(self, prefix: str) -> list[str]:
+        return [k for k in self._store if k.startswith(prefix)]
+
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def get_size(self, key: str) -> int:
+        raw = self._store.get(key)
+        return len(raw) if raw else 0
+
+    def append_line(self, key: str, line: str) -> None:
+        pass
+
+    def get_presigned_url(self, key: str, expiry_seconds: int = 300) -> str:
+        return f"https://fake-presigned/{key}"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Import smoke tests — every handler module loads without errors.
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestImports:
+    @patch("boto3.client")
+    def test_import_lambda_scan(self, mock_boto):
+        from meeting_pipeline.lambda_handlers import scan  # noqa: F401
+
+    @patch("boto3.client")
+    def test_import_lambda_process(self, mock_boto):
+        from meeting_pipeline.lambda_handlers import process  # noqa: F401
+
+    @patch("boto3.client")
+    def test_import_lambda_discover(self, mock_boto):
+        from meeting_pipeline.lambda_handlers import discover  # noqa: F401
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Scan handler — list_cities mode + single-city scan + new-posted detection.
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestScanHandler:
+    @patch("boto3.client")
+    def test_list_cities_returns_verified_slugs(self, mock_boto):
+        from meeting_pipeline.lambda_handlers.scan import handler
+
+        source_verified = {
+            "city": "TestCity",
+            "state": "OH",
+            "best_source": {
+                "platform": "civicplus",
+                "verification": {"status": "verified"},
+            },
+        }
+        source_unverified = {
+            "city": "BadCity",
+            "state": "TX",
+            "best_source": {
+                "platform": "unknown",
+                "verification": {"status": "unverified"},
+            },
+        }
+
+        storage = FakeStorage({
+            "meeting_pipeline/sources/test-city-OH/source.json": source_verified,
+            "meeting_pipeline/sources/bad-city-TX/source.json": source_unverified,
+        })
+
+        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.scan.get_storage", return_value=storage):
+            cfg = MagicMock()
+            cfg.sources_prefix = "meeting_pipeline/sources"
+            mock_cfg.return_value = cfg
+            result = handler({"action": "list_cities"})
+
+        assert "cities" in result
+        slugs = [c["slug"] for c in result["cities"]]
+        assert "test-city-OH" in slugs
+        assert "bad-city-TX" not in slugs
+
+    @patch("boto3.client")
+    def test_scan_requires_slug(self, mock_boto):
+        with patch("meeting_pipeline.lambda_handlers.scan.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.scan.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.scan.get_storage"):
+            mock_cfg.return_value = MagicMock()
+            from meeting_pipeline.lambda_handlers.scan import handler
+            result = handler({})
+        assert "error" in result
+
+    @patch("boto3.client")
+    def test_scan_sends_new_posted_to_queue(self, mock_boto):
+        """When scan finds a newly posted agenda, it sends to SQS."""
+        from meeting_pipeline.lambda_handlers.scan import _detect_new_posted
+
+        previous = {
+            "upcoming": [
+                {"date": "2026-04-10", "agenda_posted": True},
+            ]
+        }
+        current = {
+            "upcoming": [
+                {"date": "2026-04-10", "agenda_posted": True},
+                {"date": "2026-04-17", "agenda_posted": True},
+            ]
+        }
+        new = _detect_new_posted(previous, current)
+        assert len(new) == 1
+        assert new[0]["date"] == "2026-04-17"
+
+    @patch("boto3.client")
+    def test_detect_new_posted_first_scan(self, mock_boto):
+        """First scan (no previous): all posted meetings are new."""
+        from meeting_pipeline.lambda_handlers.scan import _detect_new_posted
+
+        current = {
+            "upcoming": [
+                {"date": "2026-04-10", "agenda_posted": True},
+                {"date": "2026-04-17", "agenda_posted": False},
+            ]
+        }
+        new = _detect_new_posted(None, current)
+        assert len(new) == 1
+        assert new[0]["date"] == "2026-04-10"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Process handler — SQS record parsing + inline event support.
+# ────────────────────────────────────────────────────────────────────────────
+
+class TestProcessHandler:
+    @patch("boto3.client")
+    def test_sqs_record_parsing(self, mock_boto):
+        """Handler correctly parses SQS Records wrapping."""
+        from meeting_pipeline.lambda_handlers.process import handler
+
+        event = {
+            "Records": [
+                {
+                    "body": json.dumps({
+                        "slug": "test-city-OH",
+                        "date": "2026-04-15",
+                        "platform": "civicplus",
+                    }),
+                }
+            ]
+        }
+
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
+            mock_cfg.return_value = MagicMock()
+            mock_proc.return_value = {"status": "ok"}
+            handler(event)
+
+        mock_proc.assert_called_once()
+        call_args = mock_proc.call_args
+        assert call_args[0][0] == "test-city-OH"
+        assert call_args[0][1] == "2026-04-15"
+        assert call_args[0][2] == "civicplus"
+
+    @patch("boto3.client")
+    def test_process_handler_inline_event(self, mock_boto):
+        """Handler also supports inline event (not wrapped in Records)."""
+        from meeting_pipeline.lambda_handlers.process import handler
+
+        event = {
+            "slug": "test-city-OH",
+            "date": "2026-04-15",
+            "platform": "legistar",
+        }
+
+        with patch("meeting_pipeline.lambda_handlers.process.inject_secrets"), \
+             patch("meeting_pipeline.lambda_handlers.process.AgentConfig.from_env") as mock_cfg, \
+             patch("meeting_pipeline.lambda_handlers.process.get_storage"), \
+             patch("meeting_pipeline.lambda_handlers.process._process_meeting") as mock_proc:
+            mock_cfg.return_value = MagicMock()
+            mock_proc.return_value = {"status": "ok"}
+            result = handler(event)
+
+        mock_proc.assert_called_once()
+        assert result["results"] == [{"status": "ok"}]
