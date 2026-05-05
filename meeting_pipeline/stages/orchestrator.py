@@ -545,11 +545,15 @@ async def run_briefing(
         ]
 
     if not force:
+        # Compare exact basenames — substring match would skip a smaller-slug
+        # city when a hyphen-suffix sibling already has a briefing
+        # (e.g. canton-OH would be falsely matched by north-canton-OH).
         existing = set(storage.list_keys(briefing_prefix))
+        existing_names = {bk.split("/")[-1] for bk in existing}
         before = len(norm_keys)
         norm_keys = [
             k for k in norm_keys
-            if not any(k.split("/")[-1].replace(".json", "") in bk for bk in existing)
+            if f"{k.split('/')[-1].removesuffix('.json')}_briefing.json" not in existing_names
         ]
         skipped = before - len(norm_keys)
         if skipped:

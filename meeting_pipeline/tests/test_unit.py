@@ -705,3 +705,65 @@ class TestEscribeLookbackBounds:
         assert far_future in dates, "future within LOOKAHEAD_DAYS should be admitted"
         assert too_far_past not in dates
         assert too_far_future not in dates
+
+
+# ============================================================================
+# orchestrator — skip-existing-briefings filter must compare exact basenames
+# (bug fix: substring `in` check was dropping smaller-slug siblings, e.g.
+# canton-OH skipped because north-canton-OH had a briefing for the same date)
+# ============================================================================
+
+class TestSkipExistingBriefingsExactMatch:
+    """Reproduces the substring-skip bug by simulating the filter logic
+    inline. The fix: compare exact basenames, not substring containment."""
+
+    def _filter_with_substring(self, norm_keys, existing_names):
+        # OLD broken logic: `basename without .json` is a substring of `briefing_basename`
+        return [
+            k for k in norm_keys
+            if not any(k.split("/")[-1].replace(".json", "") in bk for bk in existing_names)
+        ]
+
+    def _filter_with_exact_basename(self, norm_keys, existing_names):
+        # NEW logic: build the expected briefing basename and check membership
+        return [
+            k for k in norm_keys
+            if f"{k.split('/')[-1].removesuffix('.json')}_briefing.json" not in existing_names
+        ]
+
+    def test_substring_filter_drops_canton_when_north_canton_exists(self):
+        """Demonstrates the bug — old code would falsely skip canton-OH."""
+        norm_keys = [
+            "meeting_pipeline/output/normalized/canton-OH_2026-04-15.json",
+        ]
+        existing_names = {
+            "north-canton-OH_2026-04-15_briefing.json",
+        }
+        result = self._filter_with_substring(norm_keys, existing_names)
+        # Old bug: canton-OH dropped because its basename is a substring of
+        # north-canton-OH_2026-04-15_briefing.json
+        assert result == [], "old substring logic incorrectly drops canton-OH"
+
+    def test_exact_filter_keeps_canton_when_only_north_canton_exists(self):
+        """The fixed filter retains canton-OH because its actual briefing
+        file (canton-OH_2026-04-15_briefing.json) doesn't exist."""
+        norm_keys = [
+            "meeting_pipeline/output/normalized/canton-OH_2026-04-15.json",
+        ]
+        existing_names = {
+            "north-canton-OH_2026-04-15_briefing.json",
+        }
+        result = self._filter_with_exact_basename(norm_keys, existing_names)
+        assert result == norm_keys, "canton-OH should not be skipped"
+
+    def test_exact_filter_skips_when_briefing_actually_exists(self):
+        """Sanity: when the actual briefing file IS present, the entry is skipped."""
+        norm_keys = [
+            "meeting_pipeline/output/normalized/canton-OH_2026-04-15.json",
+        ]
+        existing_names = {
+            "canton-OH_2026-04-15_briefing.json",
+            "north-canton-OH_2026-04-15_briefing.json",
+        }
+        result = self._filter_with_exact_basename(norm_keys, existing_names)
+        assert result == []

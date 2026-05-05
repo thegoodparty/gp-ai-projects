@@ -94,12 +94,16 @@ def main():
             print(f"Date filter >= {args.from_date}: {len(target_keys)} of {before} files")
 
         if not args.force:
+            # Compare exact basenames — substring match would skip a smaller-slug
+            # city when a hyphen-suffix sibling already has a briefing
+            # (e.g. canton-OH would be falsely matched by north-canton-OH).
             briefing_prefix = f"{cfg.output_prefix}/briefings"
             existing = set(storage.list_keys(briefing_prefix))
+            existing_names = {bk.split("/")[-1] for bk in existing}
             before = len(target_keys)
             target_keys = [
                 k for k in target_keys
-                if not any(k.split("/")[-1][:-5] in bk for bk in existing)
+                if f"{k.split('/')[-1].removesuffix('.json')}_briefing.json" not in existing_names
             ]
             skipped = before - len(target_keys)
             if skipped:
