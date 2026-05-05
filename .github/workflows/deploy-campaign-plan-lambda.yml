@@ -1,0 +1,94 @@
+name: Deploy Campaign Plan Lambda
+
+on:
+  push:
+    branches:
+      - develop
+      - qa
+      - prod
+    paths:
+      - 'campaign_plan_lambda/**'
+      - '.github/workflows/deploy-campaign-plan-lambda.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev/qa/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    name: Deploy Lambda
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
+            ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
+            ENV="qa"
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            ENV="dev"
+          else
+            echo "ERROR: Unexpected branch: ${{ github.ref }}"
+            exit 1
+          fi
+
+          FUNCTION_NAME="campaign-plan-${ENV}"
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "function_name=${FUNCTION_NAME}" >> $GITHUB_OUTPUT
+          echo "Deploying to: ${FUNCTION_NAME}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Lambda zip
+        run: |
+          cd campaign_plan_lambda
+          chmod +x build.sh
+          bash build.sh
+
+      - name: Deploy Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ steps.env.outputs.function_name }} \
+            --zip-file fileb://campaign_plan_lambda/lambda.zip \
+            --region ${{ env.AWS_REGION }}
+
+          echo "Deployed ${{ steps.env.outputs.function_name }}"
+
+      - name: Wait for update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ steps.env.outputs.function_name }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Lambda function updated successfully"

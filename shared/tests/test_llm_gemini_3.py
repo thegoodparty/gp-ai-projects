@@ -6,6 +6,7 @@ from shared.llm_gemini_3 import (
     Gemini3Client,
     GeminiModelType,
     ThinkingLevel,
+    SearchResult,
     GEMINI_3_PRICING,
 )
 
@@ -183,13 +184,32 @@ class TestUsageTracking:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client._update_usage("gemini-3-flash-preview", mock_response)
 
         assert client.api_call_count == 1
         assert client.total_prompt_tokens == 100
         assert client.total_completion_tokens == 50
+        assert client.total_thinking_tokens == 0
         assert client.total_cost > 0
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_thinking_tokens_included_in_cost(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 100
+        mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 1000
+
+        client._update_usage("gemini-3-flash-preview", mock_response)
+
+        assert client.total_thinking_tokens == 1000
+        assert client.total_completion_tokens == 50
+        expected_cost = (100 / 1_000_000) * 0.50 + (1050 / 1_000_000) * 3.00
+        assert abs(client.total_cost - expected_cost) < 0.0001
 
     @patch('shared.llm_gemini_3.genai.Client')
     def test_update_usage_handles_missing_metadata(self, _mock_genai):
@@ -209,6 +229,7 @@ class TestUsageTracking:
         client.api_call_count = 10
         client.total_prompt_tokens = 5000
         client.total_completion_tokens = 2000
+        client.total_thinking_tokens = 500
         client.total_cost = 0.05
 
         stats = client.get_usage_stats()
@@ -216,6 +237,7 @@ class TestUsageTracking:
         assert stats["api_calls"] == 10
         assert stats["prompt_tokens"] == 5000
         assert stats["completion_tokens"] == 2000
+        assert stats["thinking_tokens"] == 500
         assert stats["total_cost"] == 0.05
 
 
@@ -234,6 +256,7 @@ class TestGenerateStructuredContent:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -255,6 +278,7 @@ class TestGenerateStructuredContent:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -276,6 +300,7 @@ class TestGenerateStructuredContent:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -299,6 +324,7 @@ class TestGenerateContent:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -316,6 +342,7 @@ class TestGenerateContent:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -336,6 +363,7 @@ class TestRetryLogic:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(
             side_effect=[Exception("Error 1"), Exception("Error 2"), mock_response]
@@ -356,6 +384,7 @@ class TestRetryLogic:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(
             side_effect=[Exception("Error"), Exception("Error"), mock_response]
@@ -423,6 +452,7 @@ class TestBraintrustIntegration:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -497,6 +527,7 @@ class TestInvalidJsonResponse:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -516,6 +547,7 @@ class TestInvalidJsonResponse:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -536,12 +568,14 @@ class TestCumulativeUsage:
         mock_response1.usage_metadata = Mock()
         mock_response1.usage_metadata.prompt_token_count = 100
         mock_response1.usage_metadata.candidates_token_count = 50
+        mock_response1.usage_metadata.thoughts_token_count = 0
 
         mock_response2 = Mock()
         mock_response2.text = "Response 2"
         mock_response2.usage_metadata = Mock()
         mock_response2.usage_metadata.prompt_token_count = 200
         mock_response2.usage_metadata.candidates_token_count = 100
+        mock_response2.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(
             side_effect=[mock_response1, mock_response2]
@@ -590,6 +624,7 @@ class TestZeroTokens:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 0
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client._update_usage("gemini-3-flash-preview", mock_response)
 
@@ -604,6 +639,7 @@ class TestZeroTokens:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 0
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client._update_usage("gemini-3-flash-preview", mock_response)
 
@@ -652,6 +688,7 @@ class TestBaseDelay:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 50
         mock_response.usage_metadata.candidates_token_count = 20
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(
             side_effect=[Exception("Error"), mock_response]
@@ -671,6 +708,7 @@ class TestNoneTokenCounts:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = None
         mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client._update_usage("gemini-3-flash-preview", mock_response)
 
@@ -685,6 +723,7 @@ class TestNoneTokenCounts:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = None
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client._update_usage("gemini-3-flash-preview", mock_response)
 
@@ -717,6 +756,7 @@ class TestCallTimeout:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 10
         mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
@@ -745,6 +785,7 @@ class TestCallTimeout:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 10
         mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(
             side_effect=[
@@ -774,8 +815,161 @@ class TestCallTimeout:
         mock_response.usage_metadata = Mock()
         mock_response.usage_metadata.prompt_token_count = 10
         mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.thoughts_token_count = 0
 
         client.client.models.generate_content = Mock(return_value=mock_response)
 
         result = client.generate_content(prompt="Test")
         assert result == "Success"
+
+
+class TestGenerateWithSearch:
+    def _make_mock_response(self, text="Search result text", with_grounding=True):
+        mock_response = Mock()
+        mock_response.text = text
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 50
+        mock_response.usage_metadata.candidates_token_count = 100
+        mock_response.usage_metadata.thoughts_token_count = 0
+
+        if with_grounding:
+            mock_chunk = Mock()
+            mock_chunk.web = Mock()
+            mock_chunk.web.title = "Example Source"
+            mock_chunk.web.uri = "https://example.com"
+
+            mock_metadata = Mock()
+            mock_metadata.web_search_queries = ["test query"]
+            mock_metadata.grounding_chunks = [mock_chunk]
+
+            mock_candidate = Mock()
+            mock_candidate.finish_reason = "STOP"
+            mock_candidate.grounding_metadata = mock_metadata
+            mock_response.candidates = [mock_candidate]
+        else:
+            mock_response.candidates = []
+
+        return mock_response
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_returns_text_and_sources(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+        client.client.models.generate_content = Mock(
+            return_value=self._make_mock_response()
+        )
+
+        result = client.generate_with_search(prompt="Find events in Boston")
+
+        assert isinstance(result, SearchResult)
+        assert result.text == "Search result text"
+        assert result.search_queries == ["test query"]
+        assert len(result.sources) == 1
+        assert result.sources[0].title == "Example Source"
+        assert result.sources[0].uri == "https://example.com"
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_returns_empty_lists_without_grounding(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+        client.client.models.generate_content = Mock(
+            return_value=self._make_mock_response(with_grounding=False)
+        )
+
+        result = client.generate_with_search(prompt="Find events")
+
+        assert result.text == "Search result text"
+        assert result.search_queries == []
+        assert result.sources == []
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_raises_on_empty_response(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.text = None
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 50
+        mock_response.usage_metadata.candidates_token_count = 0
+        mock_response.usage_metadata.thoughts_token_count = 0
+        mock_response.candidates = []
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        with pytest.raises(ValueError, match="Empty response from API"):
+            client.generate_with_search(prompt="Find events")
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_configures_google_search_tool(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+        client.client.models.generate_content = Mock(
+            return_value=self._make_mock_response()
+        )
+
+        client.generate_with_search(prompt="Find events")
+
+        call_args = client.client.models.generate_content.call_args
+        config = call_args.kwargs['config']
+        assert config.tools is not None
+        assert len(config.tools) == 1
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    @patch('shared.llm_gemini_3.time.sleep')
+    def test_retries_on_failure(self, mock_sleep, _mock_genai):
+        client = Gemini3Client(api_key="test-key", max_retries=3)
+        client.client.models.generate_content = Mock(
+            side_effect=[
+                Exception("API error"),
+                Exception("API error again"),
+                self._make_mock_response()
+            ]
+        )
+
+        result = client.generate_with_search(prompt="Find events")
+
+        assert result.text == "Search result text"
+        assert mock_sleep.call_count == 2
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_handles_none_web_search_queries(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+
+        mock_response = self._make_mock_response()
+        mock_response.candidates[0].grounding_metadata.web_search_queries = None
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        result = client.generate_with_search(prompt="Find events")
+
+        assert result.search_queries == []
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_handles_chunk_without_web(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key")
+
+        mock_response = self._make_mock_response()
+        bad_chunk = Mock(spec=[])
+        mock_response.candidates[0].grounding_metadata.grounding_chunks = [bad_chunk]
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        result = client.generate_with_search(prompt="Find events")
+
+        assert result.sources == []
+
+    @patch('shared.llm_gemini_3.genai.Client')
+    def test_blocked_response_does_not_retry(self, _mock_genai):
+        client = Gemini3Client(api_key="test-key", max_retries=3)
+
+        mock_response = Mock()
+        mock_response.text = None
+        mock_response.usage_metadata = Mock()
+        mock_response.usage_metadata.prompt_token_count = 50
+        mock_response.usage_metadata.candidates_token_count = 0
+        mock_response.usage_metadata.thoughts_token_count = 0
+
+        mock_candidate = Mock()
+        mock_candidate.finish_reason = "SAFETY"
+        mock_response.candidates = [mock_candidate]
+
+        client.client.models.generate_content = Mock(return_value=mock_response)
+
+        with pytest.raises(Exception, match="Response blocked: SAFETY"):
+            client.generate_with_search(prompt="blocked prompt")
+
+        assert client.client.models.generate_content.call_count == 1

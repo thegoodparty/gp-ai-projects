@@ -105,6 +105,60 @@ resource "aws_iam_role_policy" "github_actions_ecr_push" {
         Resource = [
           "arn:aws:ecr:us-west-2:${data.aws_caller_identity.current.account_id}:repository/gp-ai-projects"
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:UpdateFunctionCode"
+        ]
+        Resource = [
+          "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:clickup-bot-*"
+        ]
+      }
+    ]
+  })
+}
+
+# Policy for Lambda deploy access (used by Lambda deploy workflows)
+resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
+  name = "lambda-deploy-policy"
+  role = aws_iam_role.github_actions_ecr_push.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:UpdateFunctionCode",
+          "lambda:GetFunction",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
+      }
+    ]
+  })
+}
+
+# Policy for ECS deploy access (force-new-deployment from build-broker workflow)
+resource "aws_iam_role_policy" "github_actions_ecs_deploy" {
+  name = "ecs-deploy-policy"
+  role = aws_iam_role.github_actions_ecr_push.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecs:UpdateService",
+          "ecs:DescribeServices"
+        ]
+        Resource = [
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-dev/broker-dev",
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-qa/broker-qa",
+          "arn:aws:ecs:us-west-2:${data.aws_caller_identity.current.account_id}:service/broker-prod/broker-prod"
+        ]
       }
     ]
   })

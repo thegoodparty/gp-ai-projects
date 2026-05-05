@@ -20,9 +20,9 @@ from shared.braintrust import is_enabled as braintrust_enabled, get_client as ge
 load_dotenv()
 
 GEMINI_PRICING = {
-    'gemini-2.5-flash': {'input': 0.075, 'output': 0.30},
-    'gemini-2.5-pro': {'input': 2.50, 'output': 7.50},
-    'gemini-2.5-flash-lite': {'input': 0.0375, 'output': 0.15},
+    'gemini-2.5-flash': {'input': 0.30, 'output': 2.50},
+    'gemini-2.5-pro': {'input': 1.25, 'output': 10.00},
+    'gemini-2.5-flash-lite': {'input': 0.10, 'output': 0.40},
     'gemini-embedding-001': {'input': 0.15, 'output': 0.0},
 }
 
