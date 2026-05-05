@@ -522,3 +522,186 @@ class TestCheckPdfContentDates:
         from meeting_pipeline.shared.verify_source import _check_pdf_content
         result = _check_pdf_content(b"not a pdf")
         assert result["most_recent_date"] is None
+
+
+# ============================================================================
+# generic_html_scraper — extract_date (bug fix: ISO dates were being eaten by
+# the looser MM-DD-YY/YYYY pattern, producing nonsense like '2023-26-03')
+# ============================================================================
+
+class TestExtractDateGenericHtml:
+    def test_iso_date_in_url(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        # Regression: this used to match the MM-DD-YY pattern and produce '2023-26-03'
+        assert extract_date("agendas/2026-03-23-council.pdf") == "2026-03-23"
+
+    def test_iso_date_alone(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("2026-03-23") == "2026-03-23"
+
+    def test_mdy_dashes_still_works(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("03-23-2026-council.pdf") == "2026-03-23"
+
+    def test_mdy_slashes(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("Meeting on 03/23/2026") == "2026-03-23"
+
+    def test_two_digit_year(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        # 03-23-26 → 2026-03-23
+        assert extract_date("agenda_03-23-26.pdf") == "2026-03-23"
+
+    def test_month_name_long(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("Council Meeting March 17, 2026") == "2026-03-17"
+
+    def test_month_name_short(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("Council Mar 17, 2026") == "2026-03-17"
+
+    def test_invalid_month_rejected(self):
+        # Construct a string that would have produced an invalid 'month=26'
+        # under the old logic — the validation must now reject it.
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        # No valid date here at all (months out of range)
+        assert extract_date("99-99-9999") is None
+
+    def test_no_date_returns_none(self):
+        from meeting_pipeline.collectors.generic_html_scraper import extract_date
+        assert extract_date("Council Meeting Notes") is None
+
+
+# ============================================================================
+# briefing.generate — _normalize_amount + check_fiscal_amounts (bug fix:
+# substring match let LLM digit-padding hallucinations slip through)
+# ============================================================================
+
+class TestNormalizeAmount:
+    def test_strips_dollar_and_commas(self):
+        from meeting_pipeline.stages.briefing.generate import _normalize_amount
+        assert _normalize_amount("$1,000") == "1000"
+
+    def test_strips_trailing_zero_decimal(self):
+        from meeting_pipeline.stages.briefing.generate import _normalize_amount
+        assert _normalize_amount("$1,000.00") == "1000"
+        assert _normalize_amount("$1000.0") == "1000"
+
+    def test_preserves_non_zero_decimal(self):
+        from meeting_pipeline.stages.briefing.generate import _normalize_amount
+        assert _normalize_amount("$1,000.50") == "1000.50"
+
+    def test_lowercases_million_suffix(self):
+        from meeting_pipeline.stages.briefing.generate import _normalize_amount
+        assert _normalize_amount("$1.5 Million") == "1.5million"
+
+
+class TestCheckFiscalAmountsExactness:
+    """Regression: the old guardrail used `norm in s or s in norm`, so any
+    digit-prefix substring (e.g. source $1,000 vs briefing $1,000,000) was
+    treated as a match and hallucinated digit-padding slipped through."""
+
+    def _briefing_with_amount(self, amount_str):
+        return {
+            "priorityIssues": [
+                {"detail": {"whatIsHappening": f"Approve {amount_str} for X."}}
+            ]
+        }
+
+    def _cards_with_source(self, source_text):
+        from meeting_pipeline.stages.briefing.generate import (
+            BriefingCards, PriorityIssueCard, SourceSection,
+        )
+        # SourceSection (text + label) supplies sourceSections
+        cards = BriefingCards(
+            executiveHeadline="x",
+            executiveSubheadline="y",
+            priorityIssues=[
+                PriorityIssueCard(
+                    agendaItemTitle="t",
+                    slug="t",
+                    sourcePassage=source_text,
+                    sourceSections=[SourceSection(label="Memo", text=source_text)],
+                    headline="h",
+                    whatYouNeedToDo="w",
+                    askThisInTheRoom="a",
+                )
+            ],
+        )
+        return cards
+
+    def test_digit_padding_now_flagged(self):
+        # Source has $1,000 — briefing has $1,000,000. Substring match used to
+        # pass this. With exact equality, it's flagged.
+        from meeting_pipeline.stages.briefing.generate import check_fiscal_amounts
+        cards = self._cards_with_source("Total cost: $1,000.")
+        briefing = self._briefing_with_amount("$1,000,000")
+        warnings = check_fiscal_amounts(briefing, cards)
+        assert any("$1,000,000" in w for w in warnings), \
+            f"expected digit-padding hallucination to be flagged, got {warnings!r}"
+
+    def test_exact_match_passes(self):
+        from meeting_pipeline.stages.briefing.generate import check_fiscal_amounts
+        cards = self._cards_with_source("Total cost: $1,000.")
+        briefing = self._briefing_with_amount("$1,000")
+        assert check_fiscal_amounts(briefing, cards) == []
+
+    def test_canonical_decimal_equality(self):
+        # $1,000.00 in source ↔ $1,000 in briefing — should match after canonicalization
+        from meeting_pipeline.stages.briefing.generate import check_fiscal_amounts
+        cards = self._cards_with_source("Total cost: $1,000.00.")
+        briefing = self._briefing_with_amount("$1,000")
+        assert check_fiscal_amounts(briefing, cards) == []
+
+
+# ============================================================================
+# escribe scanner — date filter must use LOOKBACK_DAYS as lower bound
+# (bug fix: filter was today_str <= date <= cutoff_str, which dropped all
+# past meetings and made the PastMeetings fallback dead code)
+# ============================================================================
+
+class TestEscribeLookbackBounds:
+    async def test_admits_past_within_lookback_window(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
+        from meeting_pipeline.stages.scan.platforms import escribe as escribe_mod
+
+        today = datetime.now()
+        recent_past = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+        far_future = (today + timedelta(days=30)).strftime("%Y-%m-%d")
+        too_far_past = (today - timedelta(days=LOOKBACK_DAYS + 30)).strftime("%Y-%m-%d")
+        too_far_future = (today + timedelta(days=LOOKAHEAD_DAYS + 30)).strftime("%Y-%m-%d")
+
+        meetings_payload = [
+            {"DateShort": recent_past, "Id": 1},
+            {"DateShort": far_future, "Id": 2},
+            {"DateShort": too_far_past, "Id": 3},
+            {"DateShort": too_far_future, "Id": 4},
+        ]
+
+        # Mock httpx.AsyncClient: get() and post() both return a response
+        # whose .json() yields the payload above.
+        fake_response = MagicMock()
+        fake_response.raise_for_status = MagicMock()
+        fake_response.json.return_value = {"d": {"Meetings": meetings_payload}}
+
+        fake_client = AsyncMock()
+        fake_client.__aenter__.return_value = fake_client
+        fake_client.__aexit__.return_value = False
+        fake_client.get = AsyncMock(return_value=fake_response)
+        fake_client.post = AsyncMock(return_value=fake_response)
+
+        config = {"meeting_view_id": "1", "meeting_types": ["Council"]}
+
+        with patch.object(escribe_mod.httpx, "AsyncClient", return_value=fake_client):
+            result = await escribe_mod.scan_escribe(
+                "test-city", config, "https://example.com", client=None
+            )
+
+        dates = [r["date"] for r in result]
+        assert recent_past in dates, "regression: past meetings within LOOKBACK_DAYS should be admitted"
+        assert far_future in dates, "future within LOOKAHEAD_DAYS should be admitted"
+        assert too_far_past not in dates
+        assert too_far_future not in dates

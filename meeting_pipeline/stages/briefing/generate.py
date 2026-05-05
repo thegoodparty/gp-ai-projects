@@ -782,8 +782,13 @@ _DOLLAR_PATTERN = re.compile(
 
 
 def _normalize_amount(s: str) -> str:
-    """Strip formatting for loose comparison."""
-    return re.sub(r'[\s,$]', '', s).lower()
+    """Canonicalize a dollar string for exact comparison.
+
+    Strips $, commas, whitespace; lowercases (preserves any 'million'/'k'
+    suffix); collapses trailing zero-only decimal places ('.00' / '.0...0')
+    so '1000' == '1000.00'."""
+    cleaned = re.sub(r'[\s,$]', '', s).lower()
+    return re.sub(r'\.0+$', '', cleaned)
 
 
 def check_fiscal_amounts(briefing: dict, cards: "BriefingCards") -> list[str]:
@@ -809,7 +814,9 @@ def check_fiscal_amounts(briefing: dict, cards: "BriefingCards") -> list[str]:
     warnings = []
     for amount in generated_amounts:
         norm = _normalize_amount(amount)
-        if norm and not any(norm in s or s in norm for s in source_amounts):
+        # Require exact match — substring matching let LLM digit-padding
+        # hallucinations slip through (source $1,000 → briefing $1,000,000).
+        if norm and norm not in source_amounts:
             warnings.append(f"Unverified amount in briefing: '{amount}' not found in normalized agenda source")
 
     return warnings

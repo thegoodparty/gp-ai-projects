@@ -27,7 +27,7 @@ Usage:
 import asyncio
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -79,14 +79,17 @@ class GenericScraperResult:
 # DATE PARSING
 # ============================================================================
 
-# Common date patterns found across Tier 3 city pages
+# Common date patterns found across Tier 3 city pages.
+# Order matters: try the most specific (4-digit-year-leading ISO) first so a
+# string like "2026-03-23" doesn't get caught by the looser MM-DD-YY/YYYY
+# pattern and reordered into "2023-26-03".
 DATE_PATTERNS = [
+    # YYYY-MM-DD (ISO) — must come first so MM-DD-YY doesn't eat it
+    (re.compile(r'(\d{4})-(\d{2})-(\d{2})'), lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}"),
     # MM/DD/YYYY or M/D/YYYY
     (re.compile(r'(\d{1,2})/(\d{1,2})/(\d{4})'), lambda m: f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"),
     # MM-DD-YYYY or MM-DD-YY
     (re.compile(r'(\d{1,2})-(\d{1,2})-(\d{2,4})'), lambda m: _fix_year(m.group(3)) + f"-{int(m.group(1)):02d}-{int(m.group(2)):02d}"),
-    # YYYY-MM-DD
-    (re.compile(r'(\d{4})-(\d{2})-(\d{2})'), lambda m: f"{m.group(1)}-{m.group(2)}-{m.group(3)}"),
     # Month DD, YYYY (e.g. "March 17, 2026")
     (re.compile(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s*(\d{4})', re.IGNORECASE),
      lambda m: f"{m.group(3)}-{_month_num(m.group(1)):02d}-{int(m.group(2)):02d}"),
@@ -117,12 +120,20 @@ def _fix_year(yr: str) -> str:
 
 
 def extract_date(text: str) -> str | None:
-    """Extract the first date found in text using common patterns."""
+    """Extract the first VALID date found in text using common patterns.
+
+    Each pattern's formatter produces a YYYY-MM-DD string; we then verify it
+    parses as a real calendar date so that nonsense outputs (e.g. month=26
+    from misordered patterns matching ISO inputs) get rejected and the next
+    pattern is tried.
+    """
     for pattern, formatter in DATE_PATTERNS:
         match = pattern.search(text)
         if match:
             try:
-                return formatter(match)
+                date_str = formatter(match)
+                date.fromisoformat(date_str)  # validates calendar correctness
+                return date_str
             except (ValueError, IndexError):
                 continue
     return None

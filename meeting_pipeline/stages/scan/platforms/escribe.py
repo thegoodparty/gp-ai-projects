@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS
+from meeting_pipeline.shared.constants import LOOKAHEAD_DAYS, LOOKBACK_DAYS
 
 
 async def scan_escribe(city: str, config: dict, source_url: str, client: httpx.AsyncClient) -> list[dict]:
@@ -53,6 +53,7 @@ async def scan_escribe(city: str, config: dict, source_url: str, client: httpx.A
             return []
 
         today_str = datetime.now().strftime("%Y-%m-%d")
+        start_str = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
         cutoff_str = (datetime.now() + timedelta(days=LOOKAHEAD_DAYS)).strftime("%Y-%m-%d")
         upcoming: list[dict] = []
 
@@ -78,7 +79,7 @@ async def scan_escribe(city: str, config: dict, source_url: str, client: httpx.A
                             date = dateparser.parse(date_str).strftime("%Y-%m-%d") if date_str else None
                         except Exception:
                             date = None
-                        if not date or not (today_str <= date <= cutoff_str):
+                        if not date or not (start_str <= date <= cutoff_str):
                             continue
                         agenda_posted = bool(m.get("Agenda")) or bool(m.get("HasAgenda"))
                         agenda_url = m.get("AgendaUrl") or m.get("Agenda") or None
