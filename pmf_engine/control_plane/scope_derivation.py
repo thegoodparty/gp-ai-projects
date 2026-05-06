@@ -18,32 +18,21 @@ def _validate_scope_string(field: str, value: str) -> None:
             )
 
 
-EXPERIMENT_SCOPE_CONFIG = {
-    "voter_targeting": {
-        "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
-        "max_rows": 50000,
-    },
-    "walking_plan": {
-        "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
-        "max_rows": 50000,
-    },
-    "district_intel": {
-        "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
-        "max_rows": 50000,
-    },
-    "peer_city_benchmarking": {
-        "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
-        "max_rows": 50000,
-    },
-    "meeting_briefing": {
-        "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
-        "max_rows": 50000,
-    },
-}
+def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None = None) -> dict:
+    """Build the broker scope ticket fields.
 
+    `manifest_scope` is the `scope` block from the experiment manifest in S3.
+    When present, its `allowed_tables` and `max_rows` are passed through verbatim.
 
-def derive_scope(experiment_id: str, params: dict) -> dict:
-    config = EXPERIMENT_SCOPE_CONFIG.get(experiment_id, {})
+    Permissive defaults are intentional: when `manifest_scope` is None or empty
+    (e.g. web-research-only experiments with no Databricks access), we default
+    to `allowed_tables=[]` (no table access) and `max_rows=50000`. The empty
+    `allowed_tables` is a hard deny at the broker layer — there is no implicit
+    table grant. Callers needing Databricks data MUST supply a manifest scope
+    block; absence here is treated as "no Databricks data needed" rather than
+    a publish-pipeline bug.
+    """
+    config = manifest_scope or {}
 
     state = params.get("state", "")
     if state and not _STATE_PATTERN.match(state):

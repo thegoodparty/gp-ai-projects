@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from broker.auth import BrokerTokenAuth, get_broker_token
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket
 from broker.sql_rewriter import ScopeViolation, rewrite_query, validate_parameters
 
@@ -90,16 +89,11 @@ def get_databricks_client() -> DatabricksClient:  # pragma: no cover
     raise NotImplementedError("Must be overridden via dependency_overrides")
 
 
-def get_data_query_tracker() -> DataQueryTracker:  # pragma: no cover
-    raise NotImplementedError("Must be overridden via dependency_overrides")
-
-
 @router.post("/query", response_model=QueryResponse)
 async def databricks_query(
     req: QueryRequest,
     ticket: ScopeTicket = Depends(get_scope_ticket),
     db_client: DatabricksClient = Depends(get_databricks_client),
-    tracker: DataQueryTracker = Depends(get_data_query_tracker),
 ):
     scope = ticket.scope
 
@@ -134,8 +128,6 @@ async def databricks_query(
         raise HTTPException(status_code=502, detail="Databricks query execution failed")
 
     row_cap_hit = len(rows) >= ROW_CAP
-
-    tracker.increment(ticket.pk)
 
     return QueryResponse(
         columns=columns,

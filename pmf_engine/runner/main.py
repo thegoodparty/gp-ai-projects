@@ -11,7 +11,7 @@ import time
 
 from shared.braintrust import BraintrustClient
 from shared.logger import get_logger
-from .config import RunnerConfig
+from .config import RunnerConfig, BrokerUrlSchemeError, validate_broker_url_scheme
 from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
 from .pmf_runtime import publish
@@ -93,6 +93,101 @@ def _is_callback_already_sent() -> bool:
 def _reset_callback_marker() -> None:
     global _terminal_callback_sent
     _terminal_callback_sent = False
+
+
+def _send_failed_to_sqs_directly(
+    *,
+    run_id: str,
+    experiment_id: str,
+    reason_code: str,
+    detail: str,
+) -> bool:
+    """Last-resort failed callback when the broker is unreachable.
+
+    Posts the same envelope shape the broker would post to RESULTS_QUEUE_URL.
+    Returns True if SQS accepted the message.
+
+    The runner in v2 deliberately has no AWS task-role permissions — all I/O
+    goes through the broker. If/when ops decides to plug a narrow SQS:SendMessage
+    permission into the runner task role and wire RESULTS_QUEUE_URL onto the
+    task definition, this helper will deliver a terminal status and prevent
+    PENDING-forever hangs when the broker can't be reached during init. Until
+    then, the helper still runs but no-ops cleanly (returns False), keeping
+    the entrypoint's exit path identical regardless of wiring state.
+    """
+    queue_url = os.environ.get("RESULTS_QUEUE_URL", "").strip()
+    if not queue_url:
+        return False
+    try:
+        import boto3
+        sqs = boto3.client("sqs")
+        body = {
+            "run_id": run_id,
+            "experiment_id": experiment_id,
+            "status": "failed",
+            "reason_code": reason_code,
+            "detail": detail,
+        }
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps(body),
+            MessageGroupId=run_id or "unknown",
+            MessageDeduplicationId=f"failed-{run_id}-{reason_code}",
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "last_resort_sqs_send_failed run_id=%s experiment_id=%s",
+            run_id, experiment_id,
+        )
+        return False
+
+
+def _exit_on_pre_task_shutdown(
+    *,
+    run_id: str,
+    experiment_id: str,
+    main_start_time: float,
+    broker_initialized: bool,
+) -> None:
+    """If a SIGTERM/SIGINT arrived during pre-task setup, exit cleanly with a
+    failed-status callback BEFORE wasting an ECS task slot launching the
+    agent. Returns silently if no shutdown was requested.
+    """
+    if not _shutdown_requested:
+        return
+    duration = time.monotonic() - main_start_time
+    detail = "Task terminated by signal during init"
+    logger.info(
+        "pre_task_shutdown_requested run_id=%s experiment_id=%s",
+        run_id, experiment_id,
+    )
+    if broker_initialized:
+        try:
+            publish.report_status(
+                "failed",
+                reason_code="Signal",
+                detail=detail,
+                duration_seconds=duration,
+            )
+        except Exception:
+            logger.exception(
+                "pre_task_shutdown_callback_failed run_id=%s", run_id,
+            )
+            _send_failed_to_sqs_directly(
+                run_id=run_id,
+                experiment_id=experiment_id,
+                reason_code="Signal",
+                detail=detail,
+            )
+    else:
+        _send_failed_to_sqs_directly(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            reason_code="Signal",
+            detail=detail,
+        )
+    sys.exit(1)
 
 
 _SECRET_PATTERNS = [
@@ -413,17 +508,112 @@ async def main():
         signal.signal(signal.SIGTERM, _handle_signal)
         signal.signal(signal.SIGINT, _handle_signal)
 
+    # Raw env reads first so we can init the broker before from_env() — the
+    # broker must be reachable to surface config/manifest failures back to
+    # gp-api as a proper "failed" callback rather than an opaque PENDING hang.
+    raw_broker_url = os.environ.get("BROKER_URL", "").strip()
+    raw_broker_token = os.environ.get("BROKER_TOKEN", "").strip()
+    raw_run_id = os.environ.get("RUN_ID", "").strip()
+    raw_experiment_id = os.environ.get("EXPERIMENT_ID", "").strip()
+    raw_environment = os.environ.get("ENVIRONMENT", "dev")
+
+    # Scheme guard runs BEFORE init_config — a misconfigured plaintext URL
+    # (e.g. http://broker.example.test in prod) must never get baked into
+    # the broker client. Without this, the failed-callback fires over an
+    # unencrypted channel.
+    try:
+        validate_broker_url_scheme(raw_broker_url, raw_environment)
+    except BrokerUrlSchemeError as e:
+        logger.exception(
+            "broker_url_scheme_invalid errorType=BrokerUrlSchemeError "
+            f"run_id={raw_run_id} experiment_id={raw_experiment_id} error={e}"
+        )
+        _send_failed_to_sqs_directly(
+            run_id=raw_run_id,
+            experiment_id=raw_experiment_id,
+            reason_code="BrokerUrlSchemeError",
+            detail=str(e),
+        )
+        sys.exit(1)
+
+    broker_initialized = False
+    if raw_broker_url and raw_broker_token:
+        try:
+            init_config(raw_broker_url, raw_broker_token)
+            broker_initialized = True
+        except Exception as e:
+            logger.exception(
+                "broker_init_failed errorType=BrokerInitError "
+                f"run_id={raw_run_id} experiment_id={raw_experiment_id} error={e}"
+            )
+
+    _exit_on_pre_task_shutdown(
+        run_id=raw_run_id,
+        experiment_id=raw_experiment_id,
+        main_start_time=main_start_time,
+        broker_initialized=broker_initialized,
+    )
+
     try:
         config = RunnerConfig.from_env()
     except Exception as e:
-        logger.exception(f"Failed to load RunnerConfig from env: {e}")
+        error_type = type(e).__name__
+        logger.exception(
+            "runner_config_load_failed "
+            f"errorType={error_type} run_id={raw_run_id} "
+            f"experiment_id={raw_experiment_id} error={e}"
+        )
+        callback_sent = False
+        if broker_initialized:
+            try:
+                publish.report_status(
+                    "failed",
+                    reason_code=error_type,
+                    detail=f"Runner config load failed: {e}",
+                    duration_seconds=time.monotonic() - main_start_time,
+                )
+                callback_sent = True
+            except Exception as report_err:
+                logger.exception(
+                    "failed_callback_send_failed errorType=ReportStatusError "
+                    f"run_id={raw_run_id} error={report_err}"
+                )
+        # C2 fallback: if the broker channel never came up (or the callback
+        # itself failed), post the failed envelope DIRECTLY to RESULTS_QUEUE_URL
+        # so the run row in gp-api flips PENDING → FAILED instead of hanging
+        # forever. The helper no-ops cleanly when RESULTS_QUEUE_URL isn't
+        # plumbed (current default), so this is safe to always attempt.
+        if not callback_sent:
+            _send_failed_to_sqs_directly(
+                run_id=raw_run_id,
+                experiment_id=raw_experiment_id,
+                reason_code=error_type,
+                detail=f"Runner config load failed: {e}",
+            )
         sys.exit(1)
 
-    try:
-        init_config(config.broker_url, config.broker_token)
-    except Exception as e:
-        logger.exception(f"Failed to initialize broker config: {e}")
-        sys.exit(1)
+    if not broker_initialized:
+        try:
+            init_config(config.broker_url, config.broker_token)
+        except Exception as e:
+            logger.exception(
+                "broker_init_failed errorType=BrokerInitError "
+                f"run_id={config.run_id} experiment_id={config.experiment_id} error={e}"
+            )
+            _send_failed_to_sqs_directly(
+                run_id=config.run_id,
+                experiment_id=config.experiment_id,
+                reason_code="BrokerInitError",
+                detail=f"Broker init failed: {e}",
+            )
+            sys.exit(1)
+
+    _exit_on_pre_task_shutdown(
+        run_id=config.run_id,
+        experiment_id=config.experiment_id,
+        main_start_time=main_start_time,
+        broker_initialized=True,
+    )
 
     timeout = config.timeout_seconds
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")

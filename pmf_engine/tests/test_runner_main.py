@@ -76,7 +76,7 @@ class TestUploadLogsObservability:
                 _upload_logs(
                     str(workspace),
                     run_id="run-upload-obs-001",
-                    experiment_id="district_intel",
+                    experiment_id="smoke_test",
                 )
         finally:
             _main_mod.logger.removeHandler(handler)
@@ -91,7 +91,7 @@ class TestUploadLogsObservability:
         )
         msg = warns[0].getMessage()
         assert "run-upload-obs-001" in msg, f"expected run_id in log, got: {msg}"
-        assert "district_intel" in msg, f"expected experiment_id in log, got: {msg}"
+        assert "smoke_test" in msg, f"expected experiment_id in log, got: {msg}"
         assert "RuntimeError" in msg, f"expected exc_type in log, got: {msg}"
         assert warns[0].exc_info is not None, "expected exc_info=True so stacktrace is preserved"
 
@@ -124,7 +124,11 @@ async def test_run_experiment_publishes_artifact_via_broker(mock_publish, _mock_
 
     await run_experiment(config, harness=mock_harness)
 
-    mock_publish.publish.assert_called_once_with({"greeting": "hello"})
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    assert call_args.kwargs.get("cost_usd") == pytest.approx(0.05)
+    assert "duration_seconds" in call_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -765,7 +769,7 @@ class TestCallbackLifecycleFix:
         with patch.dict(os.environ, {
             "RUN_ID": "run-boot",
             "ORGANIZATION_SLUG": "org-boot",
-            "EXPERIMENT_ID": "voter_targeting",
+            "EXPERIMENT_ID": "smoke_test",
             "BROKER_URL": "https://broker.test",
             "BROKER_TOKEN": "tok-test",
             "ENVIRONMENT": "dev",
@@ -1015,29 +1019,69 @@ class TestFailureCallbacksCarryDurationAndCost:
 
 class TestObservabilityHardening:
     @pytest.mark.asyncio
-    async def test_main_surfaces_registry_error_in_status(self):
-        class BrokenRegistry:
-            def get(self, *args, **kwargs):
-                raise RuntimeError("Experiment module 'foo' failed to load: FileNotFoundError")
-
+    async def test_main_surfaces_broker_fetch_error_in_status(self):
+        """A broker fetch failure (transport error, malformed envelope, etc.)
+        must surface as SystemExit(1) so ECS marks the task FAILED instead of
+        silently passing the runner empty state."""
+        from pmf_engine.runner.manifest_loader import ManifestLoadError
         with patch.dict(os.environ, {
-            "EXPERIMENT_ID": "voter_targeting",
-            "RUN_ID": "run-reg",
-            "ORGANIZATION_SLUG": "org-reg",
+            "EXPERIMENT_ID": "smoke_test",
+            "RUN_ID": "run-broker-err",
+            "ORGANIZATION_SLUG": "org-x",
             "BROKER_URL": "https://broker.test",
             "BROKER_TOKEN": "tok-test",
             "PARAMS_JSON": "{}",
         }, clear=False):
-            for k in ("INSTRUCTION",):
-                os.environ.pop(k, None)
+            os.environ.pop("INSTRUCTION", None)
             with patch(
-                "pmf_engine.control_plane.registry.EXPERIMENT_REGISTRY",
-                BrokenRegistry(),
+                "pmf_engine.runner.manifest_loader.load_from_broker",
+                side_effect=ManifestLoadError("broker 503"),
             ):
                 with pytest.raises(SystemExit) as exc_info:
                     await main()
 
         assert exc_info.value.code == 1
+
+    @pytest.mark.asyncio
+    async def test_main_reports_failed_callback_when_broker_fetch_fails(self):
+        """When the broker is reachable enough to mint a token but the
+        manifest fetch fails (e.g., 503, malformed envelope), the runner MUST
+        send a `report_status('failed', ...)` callback so gp-api flips the
+        ExperimentRun row from PENDING → FAILED. Without this, runs hang
+        PENDING forever and operators have to grep CloudWatch to find them.
+        """
+        from pmf_engine.runner.manifest_loader import ManifestLoadError
+        with patch.dict(os.environ, {
+            "EXPERIMENT_ID": "smoke_test",
+            "RUN_ID": "run-callback-on-fail",
+            "ORGANIZATION_SLUG": "org-x",
+            "BROKER_URL": "https://broker.test",
+            "BROKER_TOKEN": "tok-test",
+            "PARAMS_JSON": "{}",
+        }, clear=False):
+            os.environ.pop("INSTRUCTION", None)
+            with patch("pmf_engine.runner.main.publish") as mock_publish, \
+                 patch("pmf_engine.runner.main.init_config"), \
+                 patch(
+                     "pmf_engine.runner.manifest_loader.load_from_broker",
+                     side_effect=ManifestLoadError("broker 503"),
+                 ):
+                with pytest.raises(SystemExit):
+                    await main()
+
+        mock_publish.report_status.assert_called_once()
+        call = mock_publish.report_status.call_args
+        assert call.args[0] == "failed", (
+            f"first arg must be 'failed' status, got {call.args[0]!r}"
+        )
+        assert call.kwargs.get("reason_code") == "ManifestLoadError", (
+            f"reason_code must surface the exception type for ops triage, "
+            f"got {call.kwargs.get('reason_code')!r}"
+        )
+        detail = call.kwargs.get("detail", "")
+        assert "broker 503" in detail, (
+            f"detail must include the underlying error message, got {detail!r}"
+        )
 
 
 class TestRunExperimentNoS3OrSQS:
@@ -1103,4 +1147,253 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
             f"config.env.yaml must NOT be collected (contains .env), got keys: {keys}"
         )
 
+
+class TestBrokerInitLastResortSqsFallback:
+    """C2: When BOTH init_config AND the subsequent RunnerConfig.from_env
+    broker fetch fail, the runner has no broker channel to send a failed
+    callback through. Without a fallback, the run hangs PENDING forever in
+    gp-api — exactly the hang this PR was supposed to fix.
+
+    Fix: post the failed-status envelope DIRECTLY to RESULTS_QUEUE_URL via
+    SQS as a last resort. Even if the runner doesn't currently have IAM/env
+    wired, the helper must exist, be exercised, and gracefully no-op when
+    RESULTS_QUEUE_URL is unset.
+    """
+
+    @pytest.mark.asyncio
+    async def test_double_failure_attempts_direct_sqs_send_then_exits(
+        self, monkeypatch
+    ):
+        """init_config raises, then from_env's broker fetch raises. The
+        last-resort SQS sender MUST be invoked, then sys.exit(1).
+        """
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-double-fail")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("RESULTS_QUEUE_URL", "https://sqs.us-west-2.amazonaws.com/123/results.fifo")
+
+        with patch(
+            "pmf_engine.runner.main.init_config",
+            side_effect=RuntimeError("broker unreachable"),
+        ):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=RuntimeError("broker manifest fetch failed"),
+            ):
+                with patch(
+                    "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                    return_value=True,
+                ) as mock_sqs_send:
+                    with pytest.raises(SystemExit) as exc_info:
+                        await main()
+
+        assert exc_info.value.code == 1
+        mock_sqs_send.assert_called_once()
+        call_kwargs = mock_sqs_send.call_args.kwargs or {}
+        call_args = mock_sqs_send.call_args.args
+        # Helper signature: (run_id, experiment_id, reason_code, detail)
+        all_args = list(call_args) + list(call_kwargs.values())
+        joined = " ".join(str(a) for a in all_args)
+        assert "run-double-fail" in joined, (
+            f"run_id must be in last-resort SQS send args, got: {all_args!r}"
+        )
+        assert "smoke_test" in joined, (
+            f"experiment_id must be in last-resort SQS send args, got: {all_args!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_double_failure_still_exits_when_direct_sqs_send_fails(
+        self, monkeypatch
+    ):
+        """If even the SQS direct send fails (e.g., no IAM, no RESULTS_QUEUE_URL,
+        SQS down) we MUST still sys.exit(1). The hang-prevention is best-effort —
+        a failed sentinel is still better than a CrashLoop on the SQS retry.
+        """
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-no-sqs")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+
+        with patch(
+            "pmf_engine.runner.main.init_config",
+            side_effect=RuntimeError("broker unreachable"),
+        ):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=RuntimeError("broker manifest fetch failed"),
+            ):
+                with patch(
+                    "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                    return_value=False,
+                ) as mock_sqs_send:
+                    with pytest.raises(SystemExit) as exc_info:
+                        await main()
+
+        assert exc_info.value.code == 1
+        mock_sqs_send.assert_called_once()
+
+    def test_helper_returns_false_when_results_queue_url_unset(self, monkeypatch):
+        """Without RESULTS_QUEUE_URL set, the helper must no-op (return False)
+        rather than raising — the entrypoint must still reach sys.exit(1).
+        """
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+        monkeypatch.delenv("RESULTS_QUEUE_URL", raising=False)
+        ok = _send_failed_to_sqs_directly(
+            run_id="run-001",
+            experiment_id="smoke_test",
+            reason_code="BrokerInitError",
+            detail="broker 503",
+        )
+        assert ok is False
+
+    def test_helper_posts_envelope_to_sqs_when_url_set(self, monkeypatch):
+        """When RESULTS_QUEUE_URL is set and SQS accepts the message, the
+        helper returns True and the envelope contains the canonical fields
+        gp-api's results consumer expects.
+        """
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+
+        monkeypatch.setenv(
+            "RESULTS_QUEUE_URL",
+            "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
+        )
+        sent = {}
+
+        class _FakeSqs:
+            def send_message(self, **kwargs):
+                sent.update(kwargs)
+                return {"MessageId": "fake-msg-id"}
+
+        with patch(
+            "boto3.client",
+            return_value=_FakeSqs(),
+        ):
+            ok = _send_failed_to_sqs_directly(
+                run_id="run-001",
+                experiment_id="smoke_test",
+                reason_code="BrokerInitError",
+                detail="broker 503",
+            )
+
+        assert ok is True
+        assert sent["QueueUrl"] == "https://sqs.us-west-2.amazonaws.com/123/results.fifo"
+        body = json.loads(sent["MessageBody"])
+        assert body["run_id"] == "run-001"
+        assert body["experiment_id"] == "smoke_test"
+        assert body["status"] == "failed"
+        assert body["reason_code"] == "BrokerInitError"
+        assert body["detail"] == "broker 503"
+        assert sent["MessageGroupId"] == "run-001"
+        assert "run-001" in sent["MessageDeduplicationId"]
+        assert "BrokerInitError" in sent["MessageDeduplicationId"]
+
+    def test_helper_returns_false_on_sqs_exception(self, monkeypatch):
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+
+        monkeypatch.setenv(
+            "RESULTS_QUEUE_URL",
+            "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
+        )
+
+        class _BrokenSqs:
+            def send_message(self, **kwargs):
+                raise RuntimeError("sqs down")
+
+        with patch("boto3.client", return_value=_BrokenSqs()):
+            ok = _send_failed_to_sqs_directly(
+                run_id="run-001",
+                experiment_id="smoke_test",
+                reason_code="BrokerInitError",
+                detail="x",
+            )
+        assert ok is False
+
+
+class TestBrokerUrlSchemeGuardBeforeInit:
+    """H4: validate_broker_url_scheme MUST run before init_config so a
+    plaintext BROKER_URL in prod never gets wired into the broker client.
+    The previous code passed http://... straight to init_config, then only
+    raised in from_env() AFTER the failed-callback path was already pointed
+    at an unencrypted channel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_plaintext_broker_url_in_prod_does_not_call_init_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("BROKER_URL", "http://broker.example.test:8080")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-001")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("ENVIRONMENT", "prod")
+
+        with patch("pmf_engine.runner.main.init_config") as mock_init:
+            with patch(
+                "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                return_value=True,
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    await main()
+
+        assert exc_info.value.code == 1
+        mock_init.assert_not_called()
+
+
+class TestSigtermDuringInitExitsCleanly:
+    """L3: SIGTERM/SIGINT during pre-task init currently sets
+    `_shutdown_requested = True` but no code checks it before
+    `asyncio.wait_for(...)`. The task then runs to completion or timeout
+    despite the signal. This wastes ECS task time and confuses operators
+    grepping for SIGTERM-triggered exits.
+
+    Fix: check _shutdown_requested after init_config and after from_env.
+    On True, send a Signal failed-callback and sys.exit(1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_requested_after_init_exits_cleanly(self, monkeypatch, tmp_path):
+        config = _make_config(instruction="Do stuff")
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-sig")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path))
+
+        # init_config succeeds, but signal arrives during it — simulated by
+        # toggling the module flag inside the patched init_config.
+        def init_then_signal(*args, **kwargs):
+            import pmf_engine.runner.main as _m
+            _m._shutdown_requested = True
+
+        # Use AsyncMock so the patched run_experiment is a valid coroutine
+        # — without this, the test "passes" incidentally because MagicMock
+        # is not awaitable and the broad exception handler catches it.
+        async_run = AsyncMock()
+
+        with patch("pmf_engine.runner.main.init_config", side_effect=init_then_signal):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                return_value=config,
+            ):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", side_effect=async_run):
+                        with pytest.raises(SystemExit) as exc_info:
+                            await main()
+
+        assert exc_info.value.code == 1
+        async_run.assert_not_called(), (
+            "run_experiment must NOT be reached after a pre-task signal — "
+            "the runner should exit before launching the agent task"
+        )
+        # We should have sent a failed callback with reason_code Signal.
+        signal_calls = [
+            c for c in mock_publish.report_status.call_args_list
+            if c[0][0] == "failed"
+            and "Signal" in (c.kwargs.get("reason_code", "") or "")
+        ]
+        assert signal_calls, (
+            f"expected failed-status with reason_code='Signal' on pre-task "
+            f"shutdown; got calls: {mock_publish.report_status.call_args_list!r}"
+        )
 

@@ -7,7 +7,6 @@ from pydantic import BaseModel
 
 from broker.auth import get_broker_token
 from broker.callback_sender import CallbackSender
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 
 logger = logging.getLogger(__name__)
@@ -15,10 +14,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 # Agent may report any of these via /run-status. `success` is NOT in this set
-# — success must only flow through /artifact/publish so the data-required
-# guard (DataQueryTracker) can't be bypassed. `timeout` is accepted here but
-# translated to `failed` before the callback is sent, because gp-api's zod
-# consumer only accepts `success | failed | contract_violation`.
+# — success must only flow through /artifact/publish, which is the only path
+# that uploads to S3 and emits the success callback. `timeout` is accepted
+# here but translated to `failed` before the callback is sent, because
+# gp-api's zod consumer only accepts `success | failed | contract_violation`.
 AgentReportableStatus = Literal[
     "failed", "contract_violation", "timeout"
 ]
@@ -59,9 +58,6 @@ def get_broker_token_raw() -> str:  # pragma: no cover
 def get_artifact_bucket() -> str:  # pragma: no cover
     raise NotImplementedError
 
-def get_data_query_tracker() -> DataQueryTracker:  # pragma: no cover
-    raise NotImplementedError
-
 
 @router.post("/run-status", response_model=RunStatusResponse)
 def run_status(
@@ -72,7 +68,6 @@ def run_status(
     store: ScopeTicketStore = Depends(get_ticket_store),
     broker_token: str = Depends(get_broker_token_raw),
     bucket: str = Depends(get_artifact_bucket),
-    tracker: DataQueryTracker = Depends(get_data_query_tracker),
 ):
     if req.status == "contract_violation" and req.rejected_artifact:
         quarantine_key = f"rejected/{ticket.run_id}.json"
@@ -137,14 +132,6 @@ def run_status(
             logger.error(
                 "ticket/run-lock delete failed after terminal run_status run_id=%s broker_token_prefix=%s",
                 ticket.run_id, broker_token[:8],
-                exc_info=True,
-            )
-        try:
-            tracker.clear(ticket.pk)
-        except Exception:
-            logger.error(
-                "tracker clear failed after terminal run_status run_id=%s",
-                ticket.run_id,
                 exc_info=True,
             )
 

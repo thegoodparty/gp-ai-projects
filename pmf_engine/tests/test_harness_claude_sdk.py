@@ -201,18 +201,18 @@ class TestCollectOutputArtifact:
 
     def test_prefers_experiment_named_file_when_multiple_present(self):
         """Agent sometimes writes a helper file alongside the real artifact
-        (e.g., meeting_briefing wrote EXPERIMENT_SUMMARY.md next to
-        meeting_briefing.json). If the experiment_id matches one of the files,
-        that one is the artifact; the others are ignored with a log warning."""
+        (e.g., a SUMMARY.md next to <id>.json). If the experiment_id matches
+        one of the files, that one is the artifact; the others are ignored
+        with a log warning."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = os.path.join(tmpdir, "output")
             os.makedirs(output_dir)
-            with open(os.path.join(output_dir, "meeting_briefing.json"), "w") as f:
+            with open(os.path.join(output_dir, "smoke_test.json"), "w") as f:
                 f.write('{"ok": true}')
             with open(os.path.join(output_dir, "EXPERIMENT_SUMMARY.md"), "w") as f:
                 f.write("# Summary")
 
-            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="smoke_test")
             assert content_type == "application/json"
             assert json.loads(data) == {"ok": True}
 
@@ -228,7 +228,7 @@ class TestCollectOutputArtifact:
                 f.write("a,b\n")
 
             with pytest.raises(RuntimeError, match="Expected exactly one artifact"):
-                collect_output_artifact(tmpdir, experiment_id="voter_targeting")
+                collect_output_artifact(tmpdir, experiment_id="smoke_test")
 
     def test_single_file_returned_regardless_of_experiment_id(self):
         """Preserves existing single-file contract: if there's only one file,
@@ -239,7 +239,7 @@ class TestCollectOutputArtifact:
             with open(os.path.join(output_dir, "whatever.json"), "w") as f:
                 f.write('{"ok": true}')
 
-            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="smoke_test")
             assert content_type == "application/json"
 
     def test_raises_when_output_dir_empty(self):

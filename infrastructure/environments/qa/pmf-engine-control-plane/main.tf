@@ -57,6 +57,17 @@ data "terraform_remote_state" "broker" {
   }
 }
 
+data "terraform_remote_state" "agent_experiment_metadata" {
+  count = var.bootstrap ? 0 : 1
+
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "agent-experiment-metadata/qa/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 # Direct lookup so control-plane can pass the secret ARN to its dispatch Lambda
 # without depending on broker remote_state existing (the secret is created by
 # broker/main.tf as a top-level resource, before any cross-stack wiring).
@@ -83,6 +94,9 @@ module "pmf_engine_control_plane" {
 
   broker_url                = var.bootstrap ? "https://broker-bootstrap.placeholder" : try(data.terraform_remote_state.broker[0].outputs.broker_url, "https://broker-bootstrap.placeholder")
   service_tokens_secret_arn = data.aws_secretsmanager_secret.service_tokens.arn
+
+  experiment_metadata_bucket_name     = var.bootstrap ? "" : try(data.terraform_remote_state.agent_experiment_metadata[0].outputs.bucket_name, "")
+  experiment_metadata_read_policy_arn = var.bootstrap ? "" : try(data.terraform_remote_state.agent_experiment_metadata[0].outputs.read_policy_arn, "")
 
   vpc_id                   = "vpc-0763fa52c32ebcf6a"
   broker_security_group_id = var.bootstrap ? "" : try(data.terraform_remote_state.broker[0].outputs.security_group_id, "")

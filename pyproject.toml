@@ -45,6 +45,7 @@ dependencies = [
     "claude-agent-sdk>=0.1.19",
     "slack-sdk>=3.39.0",
     "sqlglot>=30.4.3",
+    "jsonschema>=4.26.0",
 ]
 
 [project.optional-dependencies]

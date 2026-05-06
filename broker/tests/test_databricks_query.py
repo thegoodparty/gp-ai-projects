@@ -8,11 +8,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport
 
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket
 from broker.endpoints.databricks_query import (
     DatabricksClient,
-    get_data_query_tracker,
     get_databricks_client,
     get_scope_ticket,
     router,
@@ -53,7 +51,6 @@ def _create_app(
     db_columns: list[str] | None = None,
     db_rows: list[list] | None = None,
     db_error: Exception | None = None,
-    tracker: DataQueryTracker | None = None,
 ) -> tuple[FastAPI, MagicMock]:
     app = FastAPI()
     app.include_router(router)
@@ -69,9 +66,6 @@ def _create_app(
         rows = db_rows or [["Independent", 35], ["Democrat", 42]]
         mock_db.execute.return_value = (columns, rows)
     app.dependency_overrides[get_databricks_client] = lambda: mock_db
-
-    _tracker = tracker if tracker is not None else DataQueryTracker()
-    app.dependency_overrides[get_data_query_tracker] = lambda: _tracker
 
     return app, mock_db
 
@@ -165,57 +159,6 @@ class TestDatabricksQueryExecutionError:
 
         assert resp.status_code == 502
         assert "Databricks query execution failed" in resp.json()["detail"]
-
-
-class TestDatabricksQueryTracksSuccess:
-    """Successful queries must be counted against the ticket so that the
-    publish endpoint can reject data-required experiments with zero queries.
-    """
-
-    def test_successful_query_increments_ticket_counter(self):
-        tracker = DataQueryTracker()
-        app, _ = _create_app(tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/databricks/query",
-            json={
-                "sql": "SELECT party, age FROM goodparty_data_catalog.gold.voter_file LIMIT 10",
-                "parameters": {},
-            },
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert resp.status_code == 200
-        assert tracker.get(BROKER_TOKEN) == 1
-
-        client.post(
-            "/databricks/query",
-            json={
-                "sql": "SELECT party, age FROM goodparty_data_catalog.gold.voter_file LIMIT 20",
-                "parameters": {},
-            },
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert tracker.get(BROKER_TOKEN) == 2
-
-    def test_failed_query_does_not_increment_counter(self):
-        tracker = DataQueryTracker()
-        app, _ = _create_app(
-            db_error=Exception("Connection refused"),
-            tracker=tracker,
-        )
-        client = TestClient(app)
-
-        resp = client.post(
-            "/databricks/query",
-            json={
-                "sql": "SELECT party FROM goodparty_data_catalog.gold.voter_file LIMIT 1",
-                "parameters": {},
-            },
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert resp.status_code == 502
-        assert tracker.get(BROKER_TOKEN) == 0
 
 
 class TestDatabricksQueryDisallowedVerb:
@@ -518,7 +461,6 @@ class TestEventLoopNotBlockedByDatabricks:
         mock_db = MagicMock(spec=DatabricksClient)
         mock_db.execute.side_effect = _slow_execute
         app.dependency_overrides[get_databricks_client] = lambda: mock_db
-        app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
 
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

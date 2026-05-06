@@ -47,6 +47,15 @@ data "aws_sqs_queue" "results" {
   name = "develop-Queue.fifo"
 }
 
+data "terraform_remote_state" "agent_experiment_metadata" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "agent-experiment-metadata/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 resource "aws_secretsmanager_secret" "service_tokens" {
   name        = "broker-service-tokens-dev"
   description = "Plaintext SERVICE_TOKEN used by the dispatch Lambda to call broker /internal/mint-run-token. Hash lives in broker-dev."
@@ -81,6 +90,9 @@ module "broker" {
 
   artifact_bucket_arn  = data.aws_s3_bucket.artifacts.arn
   artifact_bucket_name = data.aws_s3_bucket.artifacts.bucket
+
+  experiment_metadata_bucket_name     = data.terraform_remote_state.agent_experiment_metadata.outputs.bucket_name
+  experiment_metadata_read_policy_arn = data.terraform_remote_state.agent_experiment_metadata.outputs.read_policy_arn
 
   results_queue_arn = data.aws_sqs_queue.results.arn
   results_queue_url = data.aws_sqs_queue.results.url

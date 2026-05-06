@@ -85,6 +85,18 @@ variable "broker_security_group_id" {
   default     = ""
 }
 
+variable "experiment_metadata_bucket_name" {
+  description = "Name of the S3 metadata bucket holding PMF experiment manifests + index.json. Injected as EXPERIMENT_METADATA_BUCKET env var. Empty string makes the dispatch Lambda fall back to the bundled DISPATCH_REGISTRY (Phase 1 bring-up before the bucket is provisioned)."
+  type        = string
+  default     = ""
+}
+
+variable "experiment_metadata_read_policy_arn" {
+  description = "ARN of the managed IAM policy granting read access to the experiment metadata bucket. Empty string skips the attachment."
+  type        = string
+  default     = ""
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_vpc" "selected" {
@@ -257,6 +269,12 @@ resource "aws_iam_role_policy_attachment" "dispatch_lambda_vpc_access" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
+resource "aws_iam_role_policy_attachment" "dispatch_lambda_experiment_metadata_read" {
+  count      = var.experiment_metadata_read_policy_arn != "" ? 1 : 0
+  role       = aws_iam_role.dispatch_lambda_role.name
+  policy_arn = var.experiment_metadata_read_policy_arn
+}
+
 resource "aws_security_group" "dispatch_lambda" {
   name        = "pmf-dispatch-lambda-sg-${var.environment}"
   description = "Dispatch Lambda ENI: egress to broker + AWS APIs via NAT"
@@ -365,7 +383,7 @@ resource "aws_lambda_function" "dispatch" {
   filename         = data.archive_file.dispatch_lambda.output_path
   source_code_hash = data.archive_file.dispatch_lambda.output_base64sha256
   handler          = "dispatch_handler.handler"
-  runtime          = "python3.12"
+  runtime          = "python3.13"
   role             = aws_iam_role.dispatch_lambda_role.arn
   timeout          = 120
   memory_size      = 128
@@ -379,10 +397,11 @@ resource "aws_lambda_function" "dispatch" {
       ECS_SECURITY_GROUP_ID = var.ecs_security_group_id
       ARTIFACT_BUCKET       = aws_s3_bucket.artifacts.id
       CONTAINER_NAME        = "pmf-engine"
-      AI_SECRETS_NAME       = "AI_SECRETS_${upper(var.environment)}"
-      BROKER_URL            = var.broker_url
-      RESULTS_QUEUE_URL     = aws_sqs_queue.results.url
-      SERVICE_TOKEN         = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
+      AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
+      BROKER_URL                 = var.broker_url
+      RESULTS_QUEUE_URL          = aws_sqs_queue.results.url
+      SERVICE_TOKEN              = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
+      EXPERIMENT_METADATA_BUCKET = var.experiment_metadata_bucket_name
     }
   }
 

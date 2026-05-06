@@ -9,7 +9,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from broker.callback_sender import CallbackSender
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.artifact_publish import (
     router,
@@ -19,7 +18,6 @@ from broker.endpoints.artifact_publish import (
     get_ticket_store,
     get_broker_token_raw,
     get_artifact_bucket,
-    get_data_query_tracker,
 )
 
 BROKER_TOKEN = "broker-token-test-abc123"
@@ -62,7 +60,6 @@ def _create_app(
     ticket: ScopeTicket | None = None,
     s3_error: Exception | None = None,
     bucket: str = "gp-agent-artifacts-dev",
-    tracker: DataQueryTracker | None = None,
 ) -> tuple[FastAPI, MagicMock, MagicMock, MagicMock]:
     app = FastAPI()
     app.include_router(router)
@@ -83,9 +80,6 @@ def _create_app(
 
     app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
     app.dependency_overrides[get_artifact_bucket] = lambda: bucket
-
-    _tracker = tracker if tracker is not None else DataQueryTracker()
-    app.dependency_overrides[get_data_query_tracker] = lambda: _tracker
 
     return app, mock_s3, mock_sender, mock_store
 
@@ -363,9 +357,7 @@ class TestArtifactPublishVoterTargeting:
             organization_slug="4",
             run_id="331e5b56-e316-45a3-bdb3-08f81c7fad00",
         )
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket, tracker=tracker)
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
         client = TestClient(app)
 
         artifact = self._load_fixture()
@@ -410,85 +402,6 @@ class TestArtifactPublishVoterTargeting:
         mock_store.delete_ticket_and_run_lock.assert_called_once_with(
             BROKER_TOKEN, "331e5b56-e316-45a3-bdb3-08f81c7fad00"
         )
-
-
-class TestArtifactPublishDataRequiredGuard:
-    """Experiments that depend on voter data (voter_targeting, walking_plan) MUST
-    have at least one successful Databricks query before publish is allowed.
-
-    Backstory: on 2026-04-20 a voter_targeting run hit Databricks 502s (stale
-    session), the agent fabricated synthetic voter data that passed schema
-    validation, and the broker happily published it as SUCCESS. The schema
-    can't distinguish real vs synthetic data — the only trustworthy signal is
-    whether the broker itself mediated a real query.
-    """
-
-    def test_voter_targeting_with_zero_queries_is_rejected(self):
-        ticket = _make_ticket(experiment_id="voter_targeting", organization_slug="4")
-        tracker = DataQueryTracker()
-        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/artifact/publish",
-            json={"artifact": _valid_artifact()},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 400
-        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
-        mock_s3.put_object.assert_not_called()
-        mock_sender.send_result.assert_not_called()
-        mock_store.delete_ticket_and_run_lock.assert_not_called()
-
-    def test_voter_targeting_with_one_query_is_accepted(self):
-        ticket = _make_ticket(experiment_id="voter_targeting", organization_slug="4")
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/artifact/publish",
-            json={"artifact": _valid_artifact()},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert mock_s3.put_object.call_count == 2
-        mock_sender.send_result.assert_called_once()
-
-    def test_walking_plan_with_zero_queries_is_rejected(self):
-        ticket = _make_ticket(experiment_id="walking_plan", organization_slug="4")
-        tracker = DataQueryTracker()
-        app, mock_s3, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/artifact/publish",
-            json={"artifact": _valid_artifact()},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 400
-        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
-
-    def test_district_intel_with_zero_queries_is_accepted(self):
-        """district_intel is web-research only — no Databricks required."""
-        ticket = _make_ticket(experiment_id="district_intel", organization_slug="42")
-        tracker = DataQueryTracker()
-        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/artifact/publish",
-            json={"artifact": _valid_artifact()},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert mock_s3.put_object.call_count == 2
-        mock_sender.send_result.assert_called_once()
 
 
 class TestArtifactPublishFenceBreakout:
@@ -643,35 +556,6 @@ class TestArtifactPublishS3Error:
         )
 
         assert resp.status_code == 500
-
-
-class TestArtifactPublishTrackerCleanup:
-    """DataQueryTracker._counts is process-local and indexed by ticket.pk.
-    If we never clear the entry after a successful publish, the dict grows
-    unbounded over many runs. Worse, if a pk is ever re-minted (test replay,
-    broker restart edge case) the stale count would let a data-required
-    experiment pass the guard with zero queries on the new run.
-    """
-
-    def test_tracker_cleared_after_successful_publish(self):
-        ticket = _make_ticket(experiment_id="voter_targeting", organization_slug="4")
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-        tracker.increment(ticket.pk)
-        assert tracker.get(ticket.pk) == 2
-
-        app, _, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/artifact/publish",
-            json={"artifact": _valid_artifact()},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert tracker.get(ticket.pk) == 0
-        assert ticket.pk not in tracker._counts
 
 
 class TestArtifactPublishLatestJsonFailureIsBestEffort:

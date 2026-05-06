@@ -49,6 +49,15 @@ data "terraform_remote_state" "broker" {
   }
 }
 
+data "terraform_remote_state" "agent_experiment_metadata" {
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "agent-experiment-metadata/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 module "pmf_engine_control_plane" {
   source = "../../../modules/pmf-engine-control-plane"
 
@@ -68,6 +77,9 @@ module "pmf_engine_control_plane" {
 
   broker_url                = data.terraform_remote_state.broker.outputs.broker_url
   service_tokens_secret_arn = data.terraform_remote_state.broker.outputs.service_tokens_secret_arn
+
+  experiment_metadata_bucket_name     = data.terraform_remote_state.agent_experiment_metadata.outputs.bucket_name
+  experiment_metadata_read_policy_arn = data.terraform_remote_state.agent_experiment_metadata.outputs.read_policy_arn
 
   vpc_id                   = "vpc-0763fa52c32ebcf6a"
   broker_security_group_id = try(data.terraform_remote_state.broker.outputs.security_group_id, "")

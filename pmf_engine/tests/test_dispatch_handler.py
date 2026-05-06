@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -12,6 +13,41 @@ from pmf_engine.control_plane.dispatch_handler import (
 )
 
 
+def _routing_from_manifest(manifest: dict) -> dict:
+    """Build the routing dict the dispatch handler expects from a manifest.
+
+    The handler reads: model, timeout_seconds, input_schema, scope (optional),
+    plus any pinned manifest_version_id / instruction_version_id from the
+    loader. This mirrors what `ManifestRoutingLoader.routing_for` returns.
+    """
+    return {
+        "model": manifest["model"],
+        "timeout_seconds": manifest["timeout_seconds"],
+        "input_schema": manifest["input_schema"],
+        "scope": manifest.get("scope", {}),
+    }
+
+
+def _build_synthetic_loader() -> MagicMock:
+    """Fake ManifestRoutingLoader serving only the synthetic manifest.
+
+    The engine doesn't know about specific experiments — one synthetic
+    manifest is enough to exercise dispatch routing. Tests that need a
+    different routing should construct their own MagicMock inline.
+    """
+    from pmf_engine.tests.conftest import synthetic_manifest
+
+    manifest = synthetic_manifest()
+    routings = {manifest["id"]: _routing_from_manifest(manifest)}
+    loader = MagicMock()
+    loader.routing_for.side_effect = lambda eid: routings.get(eid)
+    loader.known_experiments.return_value = list(routings.keys())
+    return loader
+
+
+SMOKE_EXPERIMENT_ID = "smoke_test"
+
+
 @pytest.fixture(autouse=True)
 def _default_dispatch_env(monkeypatch):
     import pmf_engine.control_plane.dispatch_handler as dh
@@ -22,6 +58,12 @@ def _default_dispatch_env(monkeypatch):
     monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo", raising=False)
     monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com", raising=False)
     monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token-xyz", raising=False)
+    monkeypatch.setenv("EXPERIMENT_METADATA_BUCKET", "agent-experiment-metadata-test")
+    fake_loader = _build_synthetic_loader()
+    monkeypatch.setattr(dh, "_manifest_loader", fake_loader, raising=False)
+    monkeypatch.setattr(dh, "get_manifest_loader", lambda: fake_loader)
+    dh.reset_validator_cache_for_tests()
+    dh.reset_broker_client_for_tests()
 
 
 def _make_sqs_event(body: dict) -> dict:
@@ -48,31 +90,26 @@ def _mock_broker_success(broker_token="tok-abc123"):
     return mock
 
 
-VALID_L2_PARAMS = {
-    "state": "WI",
-    "city": "Fall River",
-    "l2DistrictType": "City",
-    "l2DistrictName": "FALL RIVER CITY",
-}
+VALID_PARAMS = {"state": "WI"}
 
 
 class TestParseDispatchMessage:
     def test_parses_valid_message(self):
         body = {
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": {"topic": "education"},
         }
         result = parse_dispatch_message(json.dumps(body))
-        assert result["experiment_type"] == "voter_targeting"
+        assert result["experiment_type"] == "smoke_test"
         assert result["organization_slug"] == "org-123"
         assert result["run_id"] == "run-001"
         assert result["params"] == {"topic": "education"}
 
     def test_defaults_params_to_empty_dict(self):
         body = {
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
         }
@@ -85,18 +122,97 @@ class TestParseDispatchMessage:
             parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_missing_organization_slug(self):
-        body = {"experiment_type": "voter_targeting", "run_id": "run-001"}
+        body = {"experiment_type": "smoke_test", "run_id": "run-001"}
         with pytest.raises(ValueError, match="organization_slug"):
             parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_missing_run_id(self):
-        body = {"experiment_type": "voter_targeting", "organization_slug": "org-123"}
+        body = {"experiment_type": "smoke_test", "organization_slug": "org-123"}
         with pytest.raises(ValueError, match="run_id"):
             parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_invalid_json(self):
         with pytest.raises(ValueError, match="Invalid"):
             parse_dispatch_message("not-json")
+
+    @pytest.mark.parametrize(
+        "bad_experiment_type",
+        [
+            "Smoke_Test",  # uppercase
+            "1smoke",  # leading digit
+            "smoke-test",  # hyphen
+            "smoke test",  # space
+            "smoke;drop",  # punctuation
+            "a" * 65,  # too long
+            "",  # empty (caught by missing-required check, but verify)
+        ],
+    )
+    def test_rejects_malformed_experiment_type(self, bad_experiment_type):
+        body = {
+            "experiment_type": bad_experiment_type,
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+        }
+        with pytest.raises(ValueError):
+            parse_dispatch_message(json.dumps(body))
+
+    @pytest.mark.parametrize(
+        "bad_run_id",
+        [
+            "run id",  # space
+            "run/001",  # slash
+            "run;drop",  # punctuation
+            "r" * 65,  # too long
+        ],
+    )
+    def test_rejects_malformed_run_id(self, bad_run_id):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": bad_run_id,
+        }
+        with pytest.raises(ValueError, match="run_id"):
+            parse_dispatch_message(json.dumps(body))
+
+    @pytest.mark.parametrize(
+        "bad_org_slug",
+        [
+            "org slug",  # space
+            "org/slug",  # slash
+            "org;drop",  # punctuation
+            "o" * 65,  # too long
+        ],
+    )
+    def test_rejects_malformed_organization_slug(self, bad_org_slug):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": bad_org_slug,
+            "run_id": "run-001",
+        }
+        with pytest.raises(ValueError, match="organization_slug"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_accepts_valid_identifiers(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "Org-123_abc",
+            "run_id": "run-ABC-001",
+        }
+        parsed = parse_dispatch_message(json.dumps(body))
+        assert parsed["organization_slug"] == "Org-123_abc"
+        assert parsed["run_id"] == "run-ABC-001"
+
+    def test_rejects_too_many_prior_artifact_versions(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "prior_artifact_versions": {
+                f"k{i}": f"e/r/artifact.json" for i in range(11)
+            },
+        }
+        with pytest.raises(ValueError, match="too large"):
+            parse_dispatch_message(json.dumps(body))
 
 
 class TestBuildContainerOverrides:
@@ -111,7 +227,7 @@ class TestBuildContainerOverrides:
             "memory": "2048",
         }
         message = {
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": {"district": "CA-12"},
@@ -126,11 +242,11 @@ class TestBuildContainerOverrides:
         )
 
         env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
-        assert env_map["EXPERIMENT_ID"] == "voter_targeting"
+        assert env_map["EXPERIMENT_ID"] == "smoke_test"
         assert env_map["ORGANIZATION_SLUG"] == "org-123"
         assert env_map["RUN_ID"] == "run-abc"
-        assert env_map["HARNESS"] == "claude_sdk"
         assert env_map["AGENT_MODEL"] == "sonnet"
+        assert "HARNESS" not in env_map  # dropped — runner hardcodes claude_sdk
         assert env_map["BROKER_TOKEN"] == "tok-abc123"
         assert env_map["BROKER_URL"] == "https://broker.example.com"
         assert env_map["ANTHROPIC_BASE_URL"] == "https://broker.example.com/anthropic"
@@ -145,7 +261,7 @@ class TestBuildContainerOverrides:
             "contract": {"type": "json", "s3_key_template": "t"},
         }
         message = {
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
             "params": {},
@@ -175,10 +291,10 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -189,13 +305,13 @@ class TestHandler:
         overrides = call_kwargs["overrides"]
         env_list = overrides["containerOverrides"][0]["environment"]
         env_map = {e["name"]: e["value"] for e in env_list}
-        assert env_map["EXPERIMENT_ID"] == "voter_targeting"
+        assert env_map["EXPERIMENT_ID"] == "smoke_test"
         assert env_map["RUN_ID"] == "run-001"
         assert env_map["ORGANIZATION_SLUG"] == "org-123"
-        assert env_map["HARNESS"] == "claude_sdk"
         assert env_map["AGENT_MODEL"] == "sonnet"
+        assert "HARNESS" not in env_map  # dropped — runner hardcodes claude_sdk
         assert env_map["BROKER_TOKEN"] == "tok-run001"
-        assert json.loads(env_map["PARAMS_JSON"]) == dict(VALID_L2_PARAMS)
+        assert json.loads(env_map["PARAMS_JSON"]) == dict(VALID_PARAMS)
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -282,7 +398,7 @@ class TestHandler:
         )
 
         assert any(
-            "voter_targeting" in r.getMessage() and "walking_plan" in r.getMessage()
+            "smoke_test" in r.getMessage()
             for r in error_records
         ), "Expected error log to include known experiment IDs for operator triage"
 
@@ -298,10 +414,10 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -343,10 +459,10 @@ class TestHandler:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -374,7 +490,7 @@ class TestHandler:
         dh.logger.addHandler(collector)
         try:
             message = {
-                "experiment_type": "voter_targeting",
+                "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
             }
@@ -400,10 +516,10 @@ class TestHandler:
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -423,10 +539,10 @@ class TestHandler:
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -446,10 +562,10 @@ class TestBrokerFlow:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -472,10 +588,10 @@ class TestBrokerFlow:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -494,10 +610,10 @@ class TestBrokerFlow:
         mock_broker.mint_run_token.side_effect = BrokerError(401, "Invalid service token")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -515,10 +631,10 @@ class TestBrokerFlow:
         mock_broker.mint_run_token.side_effect = BrokerError(400, "Some detail", "")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -534,7 +650,7 @@ class TestNonDictParamsGuard:
         self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
     ):
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": "not a dict",
@@ -546,7 +662,7 @@ class TestNonDictParamsGuard:
         mock_send_error_callback.assert_called_once()
         assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "invalid-params-type-run-xyz"
         assert "JSON object" in mock_send_error_callback.call_args[0][1]
-        mock_emit_metric.assert_any_call("InvalidParamsType", "voter_targeting")
+        mock_emit_metric.assert_any_call("InvalidParamsType", "smoke_test")
         assert result["batchItemFailures"] == []
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -556,7 +672,7 @@ class TestNonDictParamsGuard:
         self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
     ):
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": [1, 2, 3],
@@ -581,7 +697,7 @@ class TestNonDictParamsGuard:
         mock_ecs = mock_get_ecs.return_value
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": None,
@@ -592,7 +708,7 @@ class TestNonDictParamsGuard:
         mock_broker_cls.return_value.mint_run_token.assert_not_called()
         mock_ecs.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "missing-params-run-001"
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "input-schema-run-001"
 
 
 class TestErrorCallbackStableDedup:
@@ -609,10 +725,10 @@ class TestErrorCallbackStableDedup:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -629,10 +745,10 @@ class TestErrorCallbackStableDedup:
         mock_get_ecs.return_value.run_task.side_effect = Exception("Network timeout")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -651,10 +767,10 @@ class TestErrorCallbackStableDedup:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -678,7 +794,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": {},
@@ -707,7 +823,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
             "params": {},
@@ -718,6 +834,31 @@ class TestMissingCriticalEnvVars:
         mock_send_error_callback.assert_called_once()
         error_msg = mock_send_error_callback.call_args[0][1]
         assert "ECS_CLUSTER_ARN" in error_msg
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_missing_experiment_metadata_bucket_uses_per_message_error_path(
+        self, mock_get_ecs, mock_send_error_callback, monkeypatch
+    ):
+        """Missing EXPERIMENT_METADATA_BUCKET must trigger the per-message
+        send_error_callback path — NOT crash the whole batch with an uncaught
+        RuntimeError from get_manifest_loader().
+        """
+        monkeypatch.delenv("EXPERIMENT_METADATA_BUCKET", raising=False)
+
+        event = _make_sqs_event({
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-xyz",
+            "params": {},
+        })
+
+        result = handler(event, None)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        error_msg = mock_send_error_callback.call_args[0][1]
+        assert "EXPERIMENT_METADATA_BUCKET" in error_msg
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
 
 class TestParamsSizeLimit:
@@ -730,7 +871,7 @@ class TestParamsSizeLimit:
         oversized = {f"key_{i}": "x" * 900 for i in range(12)}
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-big",
             "params": oversized,
@@ -744,7 +885,7 @@ class TestParamsSizeLimit:
         assert "size limit" in error_msg or "too large" in error_msg
         assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "params-too-large-run-big"
         assert any(
-            call.args == ("ParamsTooLarge", "voter_targeting")
+            call.args == ("ParamsTooLarge", "smoke_test")
             for call in mock_emit_metric.call_args_list
         )
 
@@ -757,10 +898,14 @@ class TestParamsSizeLimit:
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
             "failures": [],
         }
-        small = {**VALID_L2_PARAMS, "note": "x" * 100}
+        # Inflate one of the schema-allowed string fields so the params
+        # body is non-trivially sized but still valid against the schema.
+        # The synthetic input_schema has additionalProperties: false, so we
+        # use the optional `note` field rather than inventing a new key.
+        small = {**VALID_PARAMS, "note": "x" * 100}
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
             "params": small,
@@ -782,16 +927,16 @@ class TestRequiredParamsValidation:
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_missing_state_rejected_before_mint(
+    def test_missing_required_field_rejected_before_mint(
         self, mock_get_ecs, mock_broker_cls, mock_emit_metric, mock_send_error_callback
     ):
         mock_broker_cls.return_value = _mock_broker_success()
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-missing-state",
-            "params": {"city": "Yakima", "l2DistrictType": "City", "l2DistrictName": "YAKIMA CITY"},
+            "params": {},
         })
 
         handler(event, None)
@@ -801,49 +946,26 @@ class TestRequiredParamsValidation:
         mock_send_error_callback.assert_called_once()
 
         detail = mock_send_error_callback.call_args[0][1]
-        assert "missing" in detail.lower()
+        assert "input_schema" in detail.lower() or "required" in detail.lower()
         assert "state" in detail.lower()
 
         dedup = mock_send_error_callback.call_args.kwargs["dedup_id"]
-        assert dedup == "missing-params-run-missing-state"
-
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
-    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
-    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
-    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_missing_l2_district_rejected_for_l2_experiment(
-        self, mock_get_ecs, mock_broker_cls, mock_emit_metric, mock_send_error_callback
-    ):
-        mock_broker_cls.return_value = _mock_broker_success()
-
-        event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
-            "organization_slug": "org-no-district",
-            "run_id": "run-no-l2",
-            "params": {"state": "NC", "city": "Fayetteville"},
-        })
-
-        handler(event, None)
-
-        mock_broker_cls.return_value.mint_run_token.assert_not_called()
-        mock_get_ecs.return_value.run_task.assert_not_called()
-        mock_send_error_callback.assert_called_once()
-        detail = mock_send_error_callback.call_args[0][1]
-        assert "l2districttype" in detail.lower() or "l2district" in detail.lower()
+        assert "input-schema-run-missing-state" in dedup or "missing-params-run-missing-state" in dedup
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_empty_string_counts_as_missing(
+    def test_invalid_param_pattern_rejected(
         self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
     ):
+        """The synthetic input_schema enforces `state` matches `^[A-Z]{2}$`."""
         mock_broker_cls.return_value = _mock_broker_success()
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-empty",
             "run_id": "run-empty-strings",
-            "params": {"state": "", "city": "Fayetteville", "l2DistrictType": "", "l2DistrictName": ""},
+            "params": {"state": ""},
         })
 
         handler(event, None)
@@ -863,15 +985,10 @@ class TestRequiredParamsValidation:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-ok",
             "run_id": "run-ok",
-            "params": {
-                "state": "WI",
-                "city": "Sturgeon Bay",
-                "l2DistrictType": "City_Council_Commissioner_District",
-                "l2DistrictName": "STURGEON BAY CITY ALDERMANIC 6",
-            },
+            "params": {"state": "WI"},
         })
 
         handler(event, None)
@@ -891,10 +1008,10 @@ class TestTransientBrokerErrors:
         mock_broker.mint_run_token.side_effect = httpx.ConnectError("DNS failed")
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-transient",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -917,10 +1034,10 @@ class TestTransientBrokerErrors:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-terminal",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -947,10 +1064,10 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = True
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-prog-err",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -971,7 +1088,7 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = False
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-missing-params",
             "params": {},
@@ -994,7 +1111,7 @@ class TestDispatchHandlerErrorPathResilience:
         mock_send_error_callback.return_value = True
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-missing-params-ok",
             "params": {},
@@ -1070,12 +1187,12 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_path_traversal_in_value(self):
         body = {
-            "experiment_type": "peer_city_benchmarking",
+            "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-1",
             "params": {},
             "prior_artifact_versions": {
-                "district_intel": "../../etc/passwd",
+                "smoke_dep": "../../etc/passwd",
             },
         }
         with pytest.raises(ValueError, match="prior_artifact_versions"):
@@ -1083,12 +1200,12 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_cross_org_artifact_key(self):
         body = {
-            "experiment_type": "peer_city_benchmarking",
+            "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-2",
             "params": {},
             "prior_artifact_versions": {
-                "district_intel": "district_intel/other-org-run-id/artifact.json/../secrets.txt",
+                "smoke_dep": "smoke_dep/other-org-run-id/artifact.json/../secrets.txt",
             },
         }
         with pytest.raises(ValueError, match="prior_artifact_versions"):
@@ -1096,12 +1213,12 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_wrong_file_suffix(self):
         body = {
-            "experiment_type": "peer_city_benchmarking",
+            "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-3",
             "params": {},
             "prior_artifact_versions": {
-                "district_intel": "district_intel/abc-123/latest.json",
+                "smoke_dep": "smoke_dep/abc-123/latest.json",
             },
         }
         with pytest.raises(ValueError, match="prior_artifact_versions"):
@@ -1109,12 +1226,12 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_empty_segment(self):
         body = {
-            "experiment_type": "peer_city_benchmarking",
+            "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-4",
             "params": {},
             "prior_artifact_versions": {
-                "district_intel": "/abc-123/artifact.json",
+                "smoke_dep": "/abc-123/artifact.json",
             },
         }
         with pytest.raises(ValueError, match="prior_artifact_versions"):
@@ -1122,12 +1239,12 @@ class TestPriorArtifactVersionsValidation:
 
     def test_accepts_valid_prior_artifact_key(self):
         body = {
-            "experiment_type": "peer_city_benchmarking",
+            "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-5",
             "params": {},
             "prior_artifact_versions": {
-                "district_intel": "district_intel/d188bc17-87bd-4fe0-9b45-d34d3b301d98/artifact.json",
+                "smoke_dep": "smoke_dep/d188bc17-87bd-4fe0-9b45-d34d3b301d98/artifact.json",
             },
         }
         result = parse_dispatch_message(json.dumps(body))
@@ -1135,7 +1252,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_accepts_absent_prior_artifact_versions(self):
         body = {
-            "experiment_type": "district_intel",
+            "experiment_type": "smoke_dep",
             "organization_slug": "acme",
             "run_id": "run-6",
             "params": {},
@@ -1145,7 +1262,7 @@ class TestPriorArtifactVersionsValidation:
 
     def test_rejects_non_dict_prior_artifact_versions(self):
         body = {
-            "experiment_type": "district_intel",
+            "experiment_type": "smoke_dep",
             "organization_slug": "acme",
             "run_id": "run-7",
             "params": {},
@@ -1186,10 +1303,10 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-iam-leak",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -1226,10 +1343,10 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-iam-exc-leak",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -1275,10 +1392,10 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         dh.logger.setLevel(logging.DEBUG)
         try:
             event = _make_sqs_event({
-                "experiment_type": "voter_targeting",
+                "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-log-detail",
-                "params": dict(VALID_L2_PARAMS),
+                "params": dict(VALID_PARAMS),
             })
             handler(event, None)
         finally:
@@ -1314,10 +1431,10 @@ class TestRunTaskFailureCleansUpMintedTicket:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ecs-cap",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -1339,10 +1456,10 @@ class TestRunTaskFailureCleansUpMintedTicket:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ecs-boom",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
@@ -1365,10 +1482,10 @@ class TestRunTaskFailureCleansUpMintedTicket:
         )
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-double-fail",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         result = handler(event, None)
@@ -1392,12 +1509,164 @@ class TestRunTaskFailureCleansUpMintedTicket:
         }
 
         event = _make_sqs_event({
-            "experiment_type": "voter_targeting",
+            "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ok",
-            "params": dict(VALID_L2_PARAMS),
+            "params": dict(VALID_PARAMS),
         })
 
         handler(event, None)
 
         mock_broker.delete_run_token.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_routing — manifest loader is the single source of truth.
+#
+# The bundled DISPATCH_REGISTRY fallback is GONE. Two distinct failure modes
+# need distinct operator signals AND distinct handler responses:
+#   - TRANSIENT (S3 outage, IAM throttle, transient 5xx) → re-raise so the
+#     SQS-batch loop adds the record to batch_item_failures (silent retry).
+#   - MALFORMED (corrupt JSON, missing required fields) → re-raise so the
+#     handler sends an error callback to gp-api AND adds to batch_item_failures.
+#
+# Both emit a `manifest_loader_fallback` CloudWatch metric (legacy name kept
+# for dashboard continuity — it's now a "manifest loader failure" signal, not
+# an actual fallback). The `error_type` and `Environment` dimensions let
+# dashboards filter (e.g., page on malformed-only since transient is expected
+# during AWS weather and SQS will retry the dispatch).
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRoutingFailures:
+    """Lock the contract for _resolve_routing's two-tier failure handling."""
+
+    def _setup_loader(self, monkeypatch, fake_loader):
+        """Wire a fake ManifestRoutingLoader into the dispatch_handler module."""
+        import pmf_engine.control_plane.dispatch_handler as dh
+        monkeypatch.setattr(dh, "_manifest_loader", fake_loader, raising=False)
+        # Bypass get_manifest_loader's bucket-env check by patching it directly
+        monkeypatch.setattr(dh, "get_manifest_loader", lambda: fake_loader)
+        return dh
+
+    def test_loader_success_returns_routing_no_fallback_metric(self, monkeypatch):
+        from pmf_engine.control_plane.dispatch_handler import _resolve_routing
+        fake_loader = MagicMock()
+        fake_loader.routing_for.return_value = {
+            "model": "sonnet",
+            "timeout_seconds": 900,
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "scope": {},
+        }
+        fake_loader.known_experiments.return_value = ["smoke_test"]
+        self._setup_loader(monkeypatch, fake_loader)
+
+        with patch("pmf_engine.control_plane.dispatch_handler._emit_metric") as mock_metric:
+            routing, known = _resolve_routing("smoke_test")
+
+        assert routing is not None
+        assert routing["model"] == "sonnet"
+        # known is only populated on the unknown-experiment branch (routing is None).
+        assert known == []
+        assert not any(
+            call.args[0] == "manifest_loader_fallback"
+            for call in mock_metric.call_args_list
+        ), "happy path must not emit fallback metric"
+
+    def test_loader_transient_error_raises_and_emits_metric(self, monkeypatch):
+        """S3 outage / IAM throttle → re-raise ManifestLoaderTransientError so
+        the handler's batch loop converts it to an SQS retry signal. Emit
+        the metric with error_type=transient + Environment dimension so SREs
+        can correlate to AWS weather."""
+        from pmf_engine.control_plane.dispatch_handler import _resolve_routing
+        from pmf_engine.control_plane.manifest_loader import ManifestLoaderTransientError
+
+        fake_loader = MagicMock()
+        fake_loader.routing_for.side_effect = ManifestLoaderTransientError(
+            "S3 GetObject failed: ServiceUnavailable"
+        )
+        self._setup_loader(monkeypatch, fake_loader)
+
+        with patch.dict(os.environ, {"ENVIRONMENT": "qa"}, clear=False), \
+             patch("pmf_engine.control_plane.dispatch_handler._emit_metric") as mock_metric:
+            with pytest.raises(ManifestLoaderTransientError):
+                _resolve_routing("smoke_test")
+
+        fallback_calls = [
+            call for call in mock_metric.call_args_list
+            if call.args[0] == "manifest_loader_fallback"
+        ]
+        assert len(fallback_calls) == 1, "must emit exactly one failure metric"
+        dimensions = fallback_calls[0].args[1]
+        dim_dict = {d["Name"]: d["Value"] for d in dimensions}
+        assert dim_dict.get("error_type") == "transient", (
+            f"error_type dimension must be 'transient', got {dim_dict!r}"
+        )
+        assert dim_dict.get("experiment_id") == "smoke_test"
+        assert dim_dict.get("Environment") == "qa"
+
+    def test_loader_malformed_error_raises_and_emits_metric(self, monkeypatch):
+        """Corrupt/invalid manifest in S3 → publish-pipeline bug. Re-raise
+        ManifestLoaderMalformedError so the handler sends an error callback to
+        gp-api. Emit metric with error_type=malformed + Environment dimension
+        so this lights up a different alarm than transient AWS noise."""
+        from pmf_engine.control_plane.dispatch_handler import _resolve_routing
+        from pmf_engine.control_plane.manifest_loader import ManifestLoaderMalformedError
+
+        fake_loader = MagicMock()
+        fake_loader.routing_for.side_effect = ManifestLoaderMalformedError(
+            "manifest for 'smoke_test' is not valid JSON"
+        )
+        self._setup_loader(monkeypatch, fake_loader)
+
+        with patch.dict(os.environ, {"ENVIRONMENT": "prod"}, clear=False), \
+             patch("pmf_engine.control_plane.dispatch_handler._emit_metric") as mock_metric:
+            with pytest.raises(ManifestLoaderMalformedError):
+                _resolve_routing("smoke_test")
+
+        fallback_calls = [
+            call for call in mock_metric.call_args_list
+            if call.args[0] == "manifest_loader_fallback"
+        ]
+        assert len(fallback_calls) == 1
+        dim_dict = {d["Name"]: d["Value"] for d in fallback_calls[0].args[1]}
+        assert dim_dict.get("error_type") == "malformed"
+        assert dim_dict.get("experiment_id") == "smoke_test"
+        assert dim_dict.get("Environment") == "prod"
+
+    def test_no_bucket_configured_raises(self, monkeypatch):
+        """EXPERIMENT_METADATA_BUCKET is required — there is no longer a
+        bundled-registry fallback. Misconfigured Lambda env must fail loud.
+
+        The autouse fixture stubs `get_manifest_loader`; undo it for this
+        test so we exercise the real function."""
+        # Reverse the autouse fixture's monkeypatches so we can call the
+        # real get_manifest_loader.
+        monkeypatch.undo()
+
+        import pmf_engine.control_plane.dispatch_handler as dh
+        dh.reset_manifest_loader_for_tests()
+        monkeypatch.delenv("EXPERIMENT_METADATA_BUCKET", raising=False)
+
+        with pytest.raises(RuntimeError, match="EXPERIMENT_METADATA_BUCKET"):
+            dh.get_manifest_loader()
+
+    def test_unknown_experiment_returns_none_no_fallback_metric(self, monkeypatch):
+        """Loader returns None for unknown experiments — that's the well-defined
+        'unknown experiment' case, NOT a loader failure. No fallback metric."""
+        from pmf_engine.control_plane.dispatch_handler import _resolve_routing
+
+        fake_loader = MagicMock()
+        fake_loader.routing_for.return_value = None
+        fake_loader.known_experiments.return_value = ["smoke_test"]
+        self._setup_loader(monkeypatch, fake_loader)
+
+        with patch("pmf_engine.control_plane.dispatch_handler._emit_metric") as mock_metric:
+            routing, known = _resolve_routing("nonexistent_experiment")
+
+        assert routing is None
+        assert known == ["smoke_test"]
+        assert not any(
+            call.args[0] == "manifest_loader_fallback"
+            for call in mock_metric.call_args_list
+        )

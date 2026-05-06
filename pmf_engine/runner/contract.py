@@ -53,12 +53,77 @@ def collect_contract_errors(
         return ["Artifact must be a JSON object"]
 
     errors: list[str] = []
-    _collect_object_errors(data, schema, "", errors)
+    if _is_jsonschema_draft7(schema):
+        errors.extend(_collect_jsonschema_errors(data, schema))
+    else:
+        _collect_object_errors(data, schema, "", errors)
 
     if constraints:
         errors.extend(_check_constraints(data, constraints))
 
     return errors
+
+
+def _is_jsonschema_draft7(schema: dict) -> bool:
+    """Detect JSON Schema Draft-07 vs the legacy GP-shape ('field': 'string').
+
+    JSON Schema Draft-07 root for an object artifact looks like:
+        {"type": "object", "properties": {...}, "required": [...]}
+    GP-shape root looks like:
+        {"field1": "string", "field2": {...}}
+    The presence of `"type"` AND `"properties"` at the root is the cleanest
+    discriminator — neither is a legal GP-shape field declaration.
+    """
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and isinstance(schema.get("properties"), dict)
+    )
+
+
+def _jsonschema_to_example(schema) -> dict | list | str:
+    """Convert a JSON Schema fragment to its GP-shape example form (for prompt).
+    Inverse of port_legacy_experiments.gp_shape_to_jsonschema. Used only by
+    format_contract_for_prompt — runtime validation goes through jsonschema."""
+    if not isinstance(schema, dict):
+        return schema
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        if not properties:
+            return {}
+        return {k: _jsonschema_to_example(v) for k, v in properties.items()}
+    if schema_type == "array":
+        items = schema.get("items", {})
+        return [_jsonschema_to_example(items)]
+    if schema_type in ("string", "number", "boolean"):
+        return schema_type
+    return "string"
+
+
+def _collect_jsonschema_errors(data: dict, schema: dict) -> list[str]:
+    """Validate against JSON Schema Draft-07 and format errors as 'path: message'
+    strings — same shape as the GP-shape walker so callers (in-container
+    validate_output.py + broker contract enforcement) don't care which format
+    the manifest uses."""
+    from jsonschema import Draft7Validator
+
+    out: list[str] = []
+    for err in sorted(Draft7Validator(schema).iter_errors(data), key=lambda e: list(e.absolute_path)):
+        # Render the path the same way the GP-shape walker does:
+        #   district.state, segments[1].name, score.dimensions[3].id
+        path_parts: list[str] = []
+        for part in err.absolute_path:
+            if isinstance(part, int):
+                if path_parts:
+                    path_parts[-1] = f"{path_parts[-1]}[{part}]"
+                else:
+                    path_parts.append(f"[{part}]")
+            else:
+                path_parts.append(str(part))
+        path_str = ".".join(path_parts) if path_parts else "<root>"
+        out.append(f"{path_str}: {err.message}")
+    return out
 
 
 def _collect_object_errors(data: dict, schema: dict, path: str, errors: list[str]) -> None:
@@ -297,7 +362,14 @@ def format_contract_for_prompt(schema: dict | None, constraints: dict | None = N
 
     lines = ["## OUTPUT CONTRACT", "", "Your output JSON MUST match this exact shape. Missing or wrong-typed fields = FAILURE.", ""]
     lines.append("```json")
-    lines.append(_schema_to_example(schema, indent=0))
+    if _is_jsonschema_draft7(schema):
+        # JSON Schema Draft-07 — convert to a GP-shape example for the prompt
+        # (the agent reads better with simple {"field": "string"} examples than
+        # with the full nested {"type": "string"} JSON Schema).
+        example = _jsonschema_to_example(schema)
+        lines.append(_schema_to_example(example, indent=0))
+    else:
+        lines.append(_schema_to_example(schema, indent=0))
     lines.append("```")
     lines.append("")
     lines.append("Field types: `string`, `number`, `boolean`. Arrays marked with `[...]` must have at least one item.")

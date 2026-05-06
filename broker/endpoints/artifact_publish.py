@@ -8,11 +8,8 @@ from pydantic import BaseModel
 
 from broker.auth import get_broker_token
 from broker.callback_sender import CallbackSender
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.pii_scanner import scan_artifact
-
-DATA_REQUIRED_EXPERIMENTS = {"voter_targeting", "walking_plan"}
 
 _PII_ENABLED_VALUES = {"1", "true", "yes"}
 
@@ -28,9 +25,8 @@ _DANGEROUS_HTML_RE = re.compile(
 # <untrusted_web_content>...</untrusted_web_content> so the reading agent
 # treats it as data, not instructions. An upstream agent embedding either
 # tag in its artifact can break out of the fence and inject "system" text
-# into a downstream experiment (e.g., peer_city_benchmarking reading
-# district_intel). _DANGEROUS_HTML_RE doesn't cover this, so reject
-# explicitly.
+# into any downstream experiment that depends on this artifact.
+# _DANGEROUS_HTML_RE doesn't cover this, so reject explicitly.
 _FENCE_BREAKOUT_RE = re.compile(r"</?untrusted_web_content\b", re.IGNORECASE)
 
 
@@ -62,9 +58,6 @@ def get_broker_token_raw() -> str:  # pragma: no cover
     raise NotImplementedError
 
 def get_artifact_bucket() -> str:  # pragma: no cover
-    raise NotImplementedError
-
-def get_data_query_tracker() -> DataQueryTracker:  # pragma: no cover
     raise NotImplementedError
 
 
@@ -108,19 +101,7 @@ def artifact_publish(
     store: ScopeTicketStore = Depends(get_ticket_store),
     broker_token: str = Depends(get_broker_token_raw),
     bucket: str = Depends(get_artifact_bucket),
-    tracker: DataQueryTracker = Depends(get_data_query_tracker),
 ):
-    if ticket.experiment_id in DATA_REQUIRED_EXPERIMENTS and tracker.get(ticket.pk) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"NoDataQueriesSucceeded: experiment '{ticket.experiment_id}' requires "
-                "real voter data but no Databricks query succeeded during this run. "
-                "Refusing to publish — this prevents synthetic/fabricated artifacts "
-                "from being accepted when data sources are unreachable."
-            ),
-        )
-
     if os.environ.get("ENABLE_PII_SCANNER", "").strip().lower() in _PII_ENABLED_VALUES:
         pii_matches = scan_artifact(req.artifact)
         if pii_matches:
@@ -146,7 +127,7 @@ def artifact_publish(
         # IfNoneMatch=* makes the archive write-once at the S3 layer — a
         # second publish for the same run_id (e.g., from a leaked broker_token
         # bypassing post-publish ticket-delete) will 412 instead of silently
-        # overwriting the immutable record peer_city_benchmarking depends on.
+        # overwriting the immutable record that downstream experiments depend on.
         try:
             s3_client.put_object(
                 Bucket=bucket,
@@ -203,7 +184,7 @@ def artifact_publish(
     # Callback carries the run-scoped immutable key. If we pointed gp-api at
     # latest.json, a subsequent regeneration of this (or dependent) experiment
     # would silently change what a SUCCESS run "produced", breaking the STALE
-    # invariant for peer_city_benchmarking and any other dependent experiment.
+    # invariant for any downstream experiment that depends on this artifact.
     callback_sender.send_result(
         run_id=ticket.run_id,
         organization_slug=ticket.organization_slug,
@@ -221,14 +202,6 @@ def artifact_publish(
         logger.error(
             "ticket/run-lock delete failed after publish run_id=%s broker_token_prefix=%s",
             ticket.run_id, broker_token[:8],
-            exc_info=True,
-        )
-    try:
-        tracker.clear(ticket.pk)
-    except Exception:
-        logger.error(
-            "tracker clear failed after publish run_id=%s",
-            ticket.run_id,
             exc_info=True,
         )
 
