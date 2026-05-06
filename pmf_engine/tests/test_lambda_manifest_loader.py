@@ -113,10 +113,14 @@ class FakeS3:
         self.calls.append(("head_object", Bucket, Key))
         entry = self.objects.get((Bucket, Key))
         if entry is None:
+            # boto3 head_object returns code "404" (HTTP status) on missing
+            # keys, NOT "NoSuchKey" (which only appears in get_object's parsed
+            # XML body). Faking this correctly is load-bearing — get it wrong
+            # and tests pass against impossible-in-prod codes.
             raise ClientError(
                 {
-                    "Error": {"Code": "NoSuchKey", "Message": "Not found"},
-                    "ResponseMetadata": {"RequestId": "fake-req-id"},
+                    "Error": {"Code": "404", "Message": "Not Found"},
+                    "ResponseMetadata": {"RequestId": "fake-req-id", "HTTPStatusCode": 404},
                 },
                 "HeadObject",
             )
@@ -385,12 +389,13 @@ class TestInstructionVersionIdPinning:
         ]
 
     def test_returns_none_when_instruction_genuinely_absent(self):
-        """NoSuchKey on instruction.md is the ONE legitimate case to swallow:
+        """A missing instruction.md is the ONE legitimate case to swallow:
         instruction file was never published. Returning None lets dispatch
         proceed (and the runner will fail at fetch time with a clear 404 from
-        the broker)."""
+        the broker). boto3 head_object returns code '404' (not 'NoSuchKey')
+        for missing keys; the loader must accept both spellings."""
         s3 = self._s3_with_manifest()
-        s3.set_error(BUCKET, "smoke_test/instruction.md", code="NoSuchKey", op="HeadObject")
+        s3.set_error(BUCKET, "smoke_test/instruction.md", code="404", op="HeadObject")
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
 
         routing = loader.routing_for("smoke_test")

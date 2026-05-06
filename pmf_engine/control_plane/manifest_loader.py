@@ -105,7 +105,9 @@ class ManifestRoutingLoader:
         entry = self._find_index_entry(experiment_id)
         if entry is None:
             return None
-        manifest, manifest_version_id = self._fetch_manifest(experiment_id, entry["manifest_key"])
+        manifest, manifest_version_id = self._fetch_manifest(
+            experiment_id, entry.get("manifest_key", f"{experiment_id}/manifest.json"),
+        )
         instruction_version_id = self._fetch_instruction_version_id(
             experiment_id, entry.get("instruction_key", f"{experiment_id}/instruction.md"),
         )
@@ -187,11 +189,15 @@ class ManifestRoutingLoader:
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             request_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
-            if code == "NoSuchKey":
+            # boto3 head_object returns "404" (HTTP status, no XML body) for
+            # missing keys; get_object returns "NoSuchKey" (parsed from the
+            # XML error body). Match all three so we route absence the same
+            # way regardless of which API the caller used.
+            if code in ("NoSuchKey", "NoSuchVersion", "404"):
                 logger.warning(
                     "instruction object absent — proceeding without version pin: "
-                    "experiment_id=%s key=%s bucket=%s request_id=%s",
-                    experiment_id, instruction_key, self._bucket, request_id,
+                    "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
+                    experiment_id, instruction_key, self._bucket, code, request_id,
                 )
                 return None
             logger.error(

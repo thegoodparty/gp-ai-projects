@@ -649,18 +649,18 @@ def handler(event: dict, context) -> dict:
     return {"batchItemFailures": batch_item_failures}
 
 
-def _classify_ecs_failure_reasons(reasons: list[str]) -> str:
-    joined_upper = " ".join(str(r).upper() for r in reasons)
-    if "CAPACITY" in joined_upper or "RESOURCE:" in joined_upper:
-        return "capacity exhausted (see server logs for detail)"
-    if "ACCESSDENIED" in joined_upper or "NOT AUTHORIZED" in joined_upper or "IAM" in joined_upper:
-        return "permission error (see server logs for detail)"
-    if "THROTTL" in joined_upper:
-        return "throttled by AWS (see server logs for detail)"
-    return "capacity or permission error (see server logs for detail)"
+_ECS_FAILURE_KIND_TO_USER_MESSAGE = {
+    "Capacity": "capacity exhausted (see server logs for detail)",
+    "IAM": "permission error (see server logs for detail)",
+    "Throttled": "throttled by AWS (see server logs for detail)",
+    "Other": "capacity or permission error (see server logs for detail)",
+}
 
 
 def _classify_ecs_failure_kind(reasons: list[str]) -> str:
+    """Classify ECS RunTask failure reasons into a stable kind tag used for
+    BOTH the user-facing message (via the table above) AND the CloudWatch
+    metric dimension. Single source of truth so the two never drift."""
     joined_upper = " ".join(str(r).upper() for r in reasons)
     if "CAPACITY" in joined_upper or "RESOURCE:" in joined_upper:
         return "Capacity"
@@ -669,6 +669,10 @@ def _classify_ecs_failure_kind(reasons: list[str]) -> str:
     if "THROTTL" in joined_upper:
         return "Throttled"
     return "Other"
+
+
+def _classify_ecs_failure_reasons(reasons: list[str]) -> str:
+    return _ECS_FAILURE_KIND_TO_USER_MESSAGE[_classify_ecs_failure_kind(reasons)]
 
 
 def _cleanup_minted_token(broker, broker_token: str, run_id: str) -> None:
