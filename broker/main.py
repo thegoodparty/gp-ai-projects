@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from broker.auth import AuthError, BrokerTokenAuth
 from broker.callback_sender import CallbackSender
+from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.anthropic_proxy import (
     get_anthropic_api_key,
@@ -19,6 +20,7 @@ from broker.endpoints.artifact_publish import (
     get_artifact_bucket as publish_get_artifact_bucket,
     get_broker_token_raw as publish_get_broker_token_raw,
     get_callback_sender as publish_get_callback_sender,
+    get_data_query_tracker as publish_get_data_query_tracker,
     get_s3_client as publish_get_s3_client,
     get_scope_ticket as publish_get_scope_ticket,
     get_ticket_store as publish_get_ticket_store,
@@ -31,6 +33,7 @@ from broker.endpoints.artifact_read import (
     router as read_router,
 )
 from broker.endpoints.databricks_query import (
+    get_data_query_tracker as dbx_get_data_query_tracker,
     get_databricks_client as dbx_get_databricks_client,
     get_scope_ticket as dbx_get_scope_ticket,
     router as databricks_router,
@@ -59,6 +62,7 @@ from broker.endpoints.run_status import (
     get_artifact_bucket as status_get_artifact_bucket,
     get_broker_token_raw as status_get_broker_token_raw,
     get_callback_sender as status_get_callback_sender,
+    get_data_query_tracker as status_get_data_query_tracker,
     get_s3_client as status_get_s3_client,
     get_scope_ticket as status_get_scope_ticket,
     get_ticket_store as status_get_ticket_store,
@@ -120,6 +124,11 @@ async def lifespan(app: FastAPI):
     # `async def` and use httpx.AsyncClient's await/async-with APIs.
     http_client = httpx.AsyncClient(timeout=30)
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
+    # Per-ticket counter feeding the artifact_publish anti-fabrication gate.
+    # Process-local; broker restart mid-run rejects publish (strictly safer
+    # than accepting a synthetic artifact from an agent whose data calls
+    # all failed).
+    data_query_tracker = DataQueryTracker()
     artifact_bucket = os.environ.get("ARTIFACT_BUCKET", "gp-agent-artifacts-dev")
     env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
     experiment_metadata_bucket = os.environ.get(
@@ -153,6 +162,7 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[publish_get_ticket_store] = lambda: store
     app.dependency_overrides[publish_get_broker_token_raw] = _resolve_broker_token_raw
     app.dependency_overrides[publish_get_artifact_bucket] = lambda: artifact_bucket
+    app.dependency_overrides[publish_get_data_query_tracker] = lambda: data_query_tracker
 
     app.dependency_overrides[read_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[read_get_s3_client] = lambda: s3_client
@@ -164,6 +174,7 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[status_get_ticket_store] = lambda: store
     app.dependency_overrides[status_get_broker_token_raw] = _resolve_broker_token_raw
     app.dependency_overrides[status_get_artifact_bucket] = lambda: artifact_bucket
+    app.dependency_overrides[status_get_data_query_tracker] = lambda: data_query_tracker
 
     app.dependency_overrides[dbx_get_scope_ticket] = _resolve_ticket_from_request
     from broker.endpoints.databricks_query import DatabricksClient
@@ -173,6 +184,7 @@ async def lifespan(app: FastAPI):
         access_token=secrets.databricks_api_key,
     ) if secrets.databricks_server_hostname else None
     app.dependency_overrides[dbx_get_databricks_client] = lambda: dbx_client
+    app.dependency_overrides[dbx_get_data_query_tracker] = lambda: data_query_tracker
 
     app.dependency_overrides[upload_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[upload_get_s3_client] = lambda: s3_client

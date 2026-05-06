@@ -67,6 +67,10 @@ def _create_app(
         mock_db.execute.return_value = (columns, rows)
     app.dependency_overrides[get_databricks_client] = lambda: mock_db
 
+    from broker.data_query_tracker import DataQueryTracker
+    from broker.endpoints.databricks_query import get_data_query_tracker
+    app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
+
     return app, mock_db
 
 
@@ -461,6 +465,9 @@ class TestEventLoopNotBlockedByDatabricks:
         mock_db = MagicMock(spec=DatabricksClient)
         mock_db.execute.side_effect = _slow_execute
         app.dependency_overrides[get_databricks_client] = lambda: mock_db
+        from broker.data_query_tracker import DataQueryTracker
+        from broker.endpoints.databricks_query import get_data_query_tracker
+        app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
 
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

@@ -62,6 +62,10 @@ def _create_app(
     app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
     app.dependency_overrides[get_artifact_bucket] = lambda: "gp-agent-artifacts-dev"
 
+    from broker.data_query_tracker import DataQueryTracker
+    from broker.endpoints.run_status import get_data_query_tracker
+    app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
+
     return app, mock_s3, mock_sender, mock_store
 
 
@@ -338,6 +342,9 @@ class TestRunStatusClearsRunLock:
             app.dependency_overrides[get_ticket_store] = lambda: real_store
             app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
             app.dependency_overrides[get_artifact_bucket] = lambda: "bucket"
+            from broker.data_query_tracker import DataQueryTracker
+            from broker.endpoints.run_status import get_data_query_tracker
+            app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
 
             client = TestClient(app)
             resp = client.post(

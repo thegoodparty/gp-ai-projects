@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from broker.auth import get_broker_token
 from broker.callback_sender import CallbackSender
+from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.pii_scanner import scan_artifact
 
@@ -61,6 +62,10 @@ def get_artifact_bucket() -> str:  # pragma: no cover
     raise NotImplementedError
 
 
+def get_data_query_tracker() -> DataQueryTracker:  # pragma: no cover
+    raise NotImplementedError
+
+
 def _collect_strings(obj, path: str = "") -> list[tuple[str, str]]:
     results = []
     if isinstance(obj, str):
@@ -101,7 +106,31 @@ def artifact_publish(
     store: ScopeTicketStore = Depends(get_ticket_store),
     broker_token: str = Depends(get_broker_token_raw),
     bucket: str = Depends(get_artifact_bucket),
+    tracker: DataQueryTracker = Depends(get_data_query_tracker),
 ):
+    # Anti-fabrication gate: if the manifest declared scope.allowed_tables
+    # (i.e. this experiment uses Databricks) but no Databricks query
+    # succeeded during this run, refuse to publish. The agent fabricated
+    # its output — Databricks was unreachable, scope rejected every query,
+    # or the agent never tried. Schema-valid synthetic data passes the
+    # output_schema check; the only trustworthy signal that real data
+    # backed the artifact is whether the broker mediated a real query.
+    #
+    # Keyed off ticket.scope (manifest-derived), NOT a hardcoded experiment
+    # list — broker stays consumer-domain-agnostic. Any new experiment that
+    # adds allowed_tables automatically gets the safety check; web-only
+    # experiments skip it.
+    if ticket.scope.get("allowed_tables") and tracker.get(ticket.pk) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"NoDataQueriesSucceeded: experiment '{ticket.experiment_id}' "
+                f"declares scope.allowed_tables but no Databricks query succeeded "
+                f"during this run. Refusing to publish — this prevents synthetic "
+                f"artifacts from being accepted when data sources are unreachable."
+            ),
+        )
+
     if os.environ.get("ENABLE_PII_SCANNER", "").strip().lower() in _PII_ENABLED_VALUES:
         pii_matches = scan_artifact(req.artifact)
         if pii_matches:

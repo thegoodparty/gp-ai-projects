@@ -13,18 +13,26 @@ from pmf_engine.control_plane.dispatch_handler import (
 )
 
 
+SYNTHETIC_MANIFEST_VERSION_ID = "test-manifest-v-abc123"
+SYNTHETIC_INSTRUCTION_VERSION_ID = "test-instruction-v-def456"
+
+
 def _routing_from_manifest(manifest: dict) -> dict:
     """Build the routing dict the dispatch handler expects from a manifest.
 
-    The handler reads: model, timeout_seconds, input_schema, scope (optional),
-    plus any pinned manifest_version_id / instruction_version_id from the
-    loader. This mirrors what `ManifestRoutingLoader.routing_for` returns.
+    Mirrors `ManifestRoutingLoader.routing_for` — including the pinned
+    manifest_version_id / instruction_version_id that close the
+    publish-during-run race. Tests assert these are forwarded into the
+    Fargate container env so a regression that drops them would fail here
+    instead of silently shipping an unpinned dispatch.
     """
     return {
         "model": manifest["model"],
         "timeout_seconds": manifest["timeout_seconds"],
         "input_schema": manifest["input_schema"],
         "scope": manifest.get("scope", {}),
+        "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
+        "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
     }
 
 
@@ -312,6 +320,9 @@ class TestHandler:
         assert "HARNESS" not in env_map  # dropped — runner hardcodes claude_sdk
         assert env_map["BROKER_TOKEN"] == "tok-run001"
         assert json.loads(env_map["PARAMS_JSON"]) == dict(VALID_PARAMS)
+        # Version pinning is the core race-defeater; assert end-to-end forwarding.
+        assert env_map["MANIFEST_VERSION_ID"] == SYNTHETIC_MANIFEST_VERSION_ID
+        assert env_map["INSTRUCTION_VERSION_ID"] == SYNTHETIC_INSTRUCTION_VERSION_ID
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
