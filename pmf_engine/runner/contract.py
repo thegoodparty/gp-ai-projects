@@ -109,7 +109,13 @@ def _collect_jsonschema_errors(data: dict, schema: dict) -> list[str]:
     from jsonschema import Draft7Validator
 
     out: list[str] = []
-    for err in sorted(Draft7Validator(schema).iter_errors(data), key=lambda e: list(e.absolute_path)):
+    # absolute_path mixes strings (object keys) and ints (array indices);
+    # str-coerce each element so sorted() can compare across types instead
+    # of crashing with TypeError mid-validation.
+    for err in sorted(
+        Draft7Validator(schema).iter_errors(data),
+        key=lambda e: [str(p) for p in e.absolute_path],
+    ):
         # Render the path the same way the GP-shape walker does:
         #   district.state, segments[1].name, score.dimensions[3].id
         path_parts: list[str] = []

@@ -507,7 +507,10 @@ def handler(event: dict, context) -> dict:
         input_errors = sorted(
             _input_validator(experiment_id, experiment.get("manifest_version_id"), input_schema)
             .iter_errors(message["params"]),
-            key=lambda e: list(e.absolute_path),
+            # absolute_path mixes strings (object keys) and ints (array
+            # indices); sort key MUST coerce or Python 3 raises TypeError on
+            # int<>str comparison and the whole batch crashes.
+            key=lambda e: [str(p) for p in e.absolute_path],
         )
         if input_errors:
             violations = [

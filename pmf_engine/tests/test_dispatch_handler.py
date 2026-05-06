@@ -1531,6 +1531,79 @@ class TestRunTaskFailureCleansUpMintedTicket:
         mock_broker.delete_run_token.assert_not_called()
 
 
+class TestInputSchemaSortKeyMixedTypes:
+    """jsonschema's ValidationError.absolute_path mixes strings (object keys)
+    and ints (array indices). A naive sort key like list(e.absolute_path)
+    raises TypeError on int<>str comparison, crashing the entire SQS batch.
+    The handler must sort with str-coerced path elements."""
+
+    def _loader_with_array_schema(self):
+        from unittest.mock import MagicMock
+        loader = MagicMock()
+        loader.routing_for.return_value = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            # Schema with both an array and an object — guarantees error
+            # paths that mix int (array index) and str (property name).
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["items", "name"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id"],
+                            "properties": {"id": {"type": "string"}},
+                        },
+                    },
+                    "name": {"type": "string"},
+                },
+            },
+            "scope": {},
+            "manifest_version_id": "v1",
+            "instruction_version_id": "v1",
+        }
+        loader.known_experiments.return_value = ["smoke_test"]
+        return loader
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_validation_errors_with_mixed_path_types_dont_crash(
+        self, mock_get_ecs, mock_broker_cls, mock_emit_metric, mock_send_error_callback,
+        monkeypatch,
+    ):
+        # Force the loader path so we hit the input_schema validator.
+        import pmf_engine.control_plane.dispatch_handler as dh
+        loader = self._loader_with_array_schema()
+        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
+        dh.reset_validator_cache_for_tests()
+        mock_broker_cls.return_value = _mock_broker_success()
+
+        event = _make_sqs_event({
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-mixed",
+            "run_id": "run-mixed-paths",
+            # Errors fall on: items (wrong type), items[0].id (missing),
+            # name (missing). Paths mix str and int.
+            "params": {"items": [{}, {"id": 42}]},
+        })
+
+        # If the sort key blows up, this raises TypeError uncaught.
+        result = handler(event, None)
+
+        # Validation should have caught the issues and emitted a callback,
+        # NOT crashed.
+        mock_send_error_callback.assert_called_once()
+        call = mock_send_error_callback.call_args
+        # Detail message should include the violations.
+        detail = call.args[1] if len(call.args) > 1 else call.kwargs.get("detail", "")
+        assert "input_schema" in detail.lower() or "name" in detail.lower()
+
+
 # ---------------------------------------------------------------------------
 # _resolve_routing — manifest loader is the single source of truth.
 #

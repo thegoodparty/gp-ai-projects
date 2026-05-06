@@ -234,6 +234,18 @@ def artifact_publish(
             exc_info=True,
         )
 
+    # Successful runs flow through here, not /run-status, so the per-ticket
+    # tracker entry would otherwise leak forever. Failure is harmless — the
+    # entry will be GC'd when the broker process restarts; reject path
+    # already raised before we got here.
+    try:
+        tracker.clear(ticket.pk)
+    except Exception:
+        logger.warning(
+            "tracker clear failed after publish run_id=%s",
+            ticket.run_id, exc_info=True,
+        )
+
     return PublishResponse(
         artifact_key=run_key,
         artifact_bucket=bucket,
