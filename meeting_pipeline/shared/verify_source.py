@@ -191,7 +191,6 @@ async def _find_past_agenda_from_platform(
             return None
         tenant = match.group(1)
         try:
-            # Get recent events — check multiple field names for agenda files
             resp = await client.get(
                 f"https://{tenant}.api.civicclerk.com/v1/Events/",
                 params={"$top": "50"},
@@ -200,10 +199,36 @@ async def _find_past_agenda_from_platform(
             resp.raise_for_status()
             data = resp.json()
             events = data.get("value", data) if isinstance(data, dict) else data
-            if isinstance(events, list):
-                for ev in events:
-                    for field in ("AgendaFile", "AgendaUrl", "agendaFile"):
-                        url = ev.get(field, "")
+            if not isinstance(events, list):
+                return None
+
+            # 1) Legacy tenants put the agenda URL inline on the event summary.
+            for ev in events:
+                for field in ("AgendaFile", "AgendaUrl", "agendaFile"):
+                    url = ev.get(field, "")
+                    if isinstance(url, str) and url.startswith("http"):
+                        return url
+
+            # 2) Portal tenants only expose agenda PDFs via per-event detail's
+            #    publishedFiles[].streamUrl (matches collect_civicclerk's flow).
+            #    Bound the cost — most cities will hit on the first few events.
+            for ev in events[:10]:
+                event_id = ev.get("id") or ev.get("EventId") or ev.get("Id")
+                if not event_id:
+                    continue
+                try:
+                    detail_resp = await client.get(
+                        f"https://{tenant}.api.civicclerk.com/v1/Events/{event_id}",
+                        timeout=10,
+                    )
+                    detail_resp.raise_for_status()
+                    detail = detail_resp.json()
+                except Exception:
+                    continue
+                published = detail.get("publishedFiles") or detail.get("PublishedFiles") or []
+                for f in published:
+                    if f.get("type") in ("Agenda", "Agenda Packet"):
+                        url = f.get("streamUrl") or f.get("url", "")
                         if isinstance(url, str) and url.startswith("http"):
                             return url
         except Exception:

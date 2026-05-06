@@ -326,6 +326,71 @@ class TestVerifySource:
         assert "is_scanned" in result
 
 
+class TestFindPastAgendaCivicClerk:
+    """_find_past_agenda_from_platform must drill into per-event publishedFiles
+    for portal CivicClerk tenants. Older logic only checked inline AgendaFile/
+    AgendaUrl/agendaFile fields on event summaries, which portal tenants never
+    populate — agenda PDFs only live in publishedFiles[].streamUrl on detail."""
+
+    def test_portal_tenant_uses_published_files(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        # Event summaries with no inline agenda fields (portal-style)
+        events_resp = MagicMock()
+        events_resp.json.return_value = {"value": [
+            {"id": 101, "eventName": "Council Meeting"},
+            {"id": 102, "eventName": "Special Session"},
+        ]}
+        events_resp.raise_for_status = MagicMock()
+
+        # Per-event detail #1 has no agenda; #2 has the streamUrl we want
+        detail_101 = MagicMock()
+        detail_101.json.return_value = {"id": 101, "publishedFiles": []}
+        detail_101.raise_for_status = MagicMock()
+        detail_102 = MagicMock()
+        detail_102.json.return_value = {
+            "id": 102,
+            "publishedFiles": [
+                {"type": "Minutes", "streamUrl": "https://example.com/minutes.pdf"},
+                {"type": "Agenda", "streamUrl": "https://example.com/agenda.pdf"},
+            ],
+        }
+        detail_102.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[events_resp, detail_101, detail_102])
+
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicclerk", {}, "https://demoxxx.portal.civicclerk.com", client,
+        ))
+        assert url == "https://example.com/agenda.pdf"
+
+    def test_legacy_tenant_uses_inline_agenda_field(self):
+        """Legacy CivicClerk tenants put the agenda URL inline on the event
+        summary as AgendaFile — must still work after the portal fix."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        events_resp = MagicMock()
+        events_resp.json.return_value = {"value": [
+            {"Id": 9, "AgendaFile": "https://legacy.example/agenda.pdf"},
+        ]}
+        events_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.get = AsyncMock(return_value=events_resp)
+
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicclerk", {}, "https://demoxxx.api.civicclerk.com", client,
+        ))
+        assert url == "https://legacy.example/agenda.pdf"
+        # Only one HTTP call needed — drilling into details should be skipped
+        assert client.get.call_count == 1
+
+
 class TestManifest:
     """manifest.py: _is_wrong_entity and validate_against_manifest."""
 
