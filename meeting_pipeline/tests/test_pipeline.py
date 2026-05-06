@@ -391,6 +391,47 @@ class TestFindPastAgendaCivicClerk:
         assert client.get.call_count == 1
 
 
+class TestFindPastAgendaCivicPlus:
+    """_find_past_agenda_from_platform must drill into the AgendaCenter AJAX
+    endpoint for CivicPlus. Older logic returned None outright, leaving every
+    civicplus city to fall through to the Firecrawl fallback (which often
+    can't navigate the JS-rendered AgendaCenter UI and reports 'no agenda URL
+    found to verify')."""
+
+    def test_civicplus_extracts_first_agenda_link(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        # AJAX response returning a meetings list with one agenda PDF link
+        # (plus a packet that should be ignored).
+        ajax_html = (
+            '<html><body>'
+            '<tr class="catAgendaRow">'
+            '<td>'
+            '<a href="/AgendaCenter/ViewFile/Agenda/_05012026-1234?packet=true">Packet</a>'
+            '<a href="/AgendaCenter/ViewFile/Agenda/_05012026-1234">Agenda</a>'
+            '</td></tr></body></html>'
+        )
+        ajax_resp = MagicMock()
+        ajax_resp.text = ajax_html
+        ajax_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.post = AsyncMock(return_value=ajax_resp)
+
+        # Bypass the heavyweight find_council_category by stubbing it to a
+        # known category id.
+        with patch(
+            "meeting_pipeline.collectors.civicplus_scraper.find_council_category",
+            new=AsyncMock(return_value=(7, "City Council")),
+        ):
+            url = asyncio.run(_find_past_agenda_from_platform(
+                "civicplus", {}, "https://www.cityofx.com/AgendaCenter", client,
+            ))
+        assert url == "https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/_05012026-1234"
+
+
 class TestManifest:
     """manifest.py: _is_wrong_entity and validate_against_manifest."""
 

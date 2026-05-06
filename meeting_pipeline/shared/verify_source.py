@@ -282,9 +282,42 @@ async def _find_past_agenda_from_platform(
             pass
         return None
 
-    if platform in ("civicplus",):
-        # CivicPlus agenda URLs from scan would already be caught
-        # Can't easily query without the full scraper setup
+    if platform == "civicplus":
+        # CivicPlus AgendaCenter exposes meetings via an AJAX endpoint, not the
+        # landing page. Land on /AgendaCenter, find the council category id,
+        # then POST /AgendaCenter/UpdateCategoryList to get the meeting list
+        # HTML and pluck the first ViewFile/Agenda PDF link.
+        parsed = urlparse(source_url)
+        domain = parsed.netloc.replace("www.", "", 1)
+        if not domain:
+            return None
+        try:
+            from meeting_pipeline.collectors.civicplus_scraper import (
+                _ensure_www, find_council_category,
+            )
+            category_id, _ = await find_council_category(client, domain)
+            www_domain = _ensure_www(domain)
+            resp = await client.post(
+                f"https://{www_domain}/AgendaCenter/UpdateCategoryList",
+                data={"year": str(datetime.now(UTC).year), "catID": str(category_id)},
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            # Pluck the first ViewFile/Agenda link that isn't a packet/html version.
+            for match in re.finditer(
+                r'href=["\'](/AgendaCenter/ViewFile/Agenda/[^"\']+)["\']',
+                resp.text,
+            ):
+                href = match.group(1)
+                if "packet=true" in href or "html=true" in href:
+                    continue
+                return f"https://{www_domain}{href}"
+        except Exception:
+            pass
         return None
 
     return None
