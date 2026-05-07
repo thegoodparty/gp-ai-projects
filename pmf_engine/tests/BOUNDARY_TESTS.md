@@ -48,13 +48,11 @@ Status: `[x]` = has test, `[ ]` = needs test.
 
 ## E. gp-api: Dependency Resolution
 
-| # | Condition | Status |
-|---|-----------|--------|
-| E1 | peer_city_benchmarking: no SUCCESS district_intel → 400 | [x] |
-| E2 | peer_city_benchmarking: SUCCESS district_intel → passes artifact ref | [x] |
-| E3 | meeting_briefing: no district_intel → dispatches without it (optional) | [x] |
-| E4 | meeting_briefing: SUCCESS district_intel → passes artifact ref | [x] |
-| E5 | district_intel dispatch → marks peer_city + meeting_briefing as STALE | [x] |
+Per-experiment dependency rules (e.g. one experiment depending on another's
+SUCCESS run, STALE invalidation when a producer is regenerated) live in
+gp-api and are exercised in gp-api tests. The PMF engine itself is
+dependency-agnostic — it accepts a `prior_artifact_versions` map on the
+dispatch message and treats it as opaque pinning data.
 
 ## F. gp-api: SQS Dispatch
 
@@ -139,11 +137,11 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | K8 | Array item missing field → ContractViolation | [x] |
 | K9 | None/empty schema → skip validation | [x] |
 | K10 | Extra fields allowed (not rejected) | [x] |
-| K11 | Per-experiment schema: voter_targeting valid artifact | [x] |
-| K12 | Per-experiment schema: walking_plan valid artifact | [x] |
-| K13 | Per-experiment schema: district_intel valid/invalid | [x] |
-| K14 | Per-experiment schema: peer_city_benchmarking valid/invalid | [x] |
-| K15 | Per-experiment schema: meeting_briefing valid/invalid | [x] |
+
+Per-experiment schema validation (one row per real experiment) lives in the
+runbooks repo, not here — the PMF engine validates whatever schema it's
+handed, and the synthetic schema in `conftest.py` is enough to exercise
+that validator behavior.
 
 ## L. Lambda Callback Handler (Fargate → gp-api)
 

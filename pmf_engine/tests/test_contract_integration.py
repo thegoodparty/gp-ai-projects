@@ -44,7 +44,8 @@ class TestRunnerContractValidation:
 
         await run_experiment(config, harness=mock_harness)
 
-        mock_publish.publish.assert_called_once_with({"greeting": "hello"})
+        mock_publish.publish.assert_called_once()
+        assert mock_publish.publish.call_args[0] == ({"greeting": "hello"},)
 
     @pytest.mark.asyncio
     async def test_invalid_artifact_reports_contract_violation(self, mock_publish, _mock_logs):
@@ -77,7 +78,8 @@ class TestRunnerContractValidation:
 
         await run_experiment(config, harness=mock_harness)
 
-        mock_publish.publish.assert_called_once_with({"result": "ok"})
+        mock_publish.publish.assert_called_once()
+        assert mock_publish.publish.call_args[0] == ({"result": "ok"},)
 
 
 @patch("pmf_engine.runner.main._upload_logs")

@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from broker.auth import AuthError, BrokerTokenAuth
 from broker.callback_sender import CallbackSender
+from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.anthropic_proxy import (
     get_anthropic_api_key,
@@ -15,7 +16,6 @@ from broker.endpoints.anthropic_proxy import (
     get_upstream_client,
     router as anthropic_router,
 )
-from broker.data_query_tracker import DataQueryTracker
 from broker.endpoints.artifact_publish import (
     get_artifact_bucket as publish_get_artifact_bucket,
     get_broker_token_raw as publish_get_broker_token_raw,
@@ -74,6 +74,12 @@ from broker.endpoints.upload_logs import (
     get_scope_ticket as upload_get_scope_ticket,
     router as upload_router,
 )
+from broker.endpoints.experiment_manifest import (
+    get_experiment_metadata_bucket as exp_get_experiment_metadata_bucket,
+    get_s3_client as exp_get_s3_client,
+    get_scope_ticket as exp_get_scope_ticket,
+    router as experiment_manifest_router,
+)
 from broker.secrets import load_secrets_from_env
 
 _LOCAL_ENVS = ("local", "development", "test")
@@ -118,7 +124,17 @@ async def lifespan(app: FastAPI):
     # `async def` and use httpx.AsyncClient's await/async-with APIs.
     http_client = httpx.AsyncClient(timeout=30)
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
+    # Per-ticket counter feeding the artifact_publish anti-fabrication gate.
+    # Process-local; broker restart mid-run rejects publish (strictly safer
+    # than accepting a synthetic artifact from an agent whose data calls
+    # all failed).
+    data_query_tracker = DataQueryTracker()
     artifact_bucket = os.environ.get("ARTIFACT_BUCKET", "gp-agent-artifacts-dev")
+    env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
+    experiment_metadata_bucket = os.environ.get(
+        "EXPERIMENT_METADATA_BUCKET",
+        f"agent-experiment-metadata-{env}",
+    )
 
     from fastapi import Request
     from broker.auth import AuthError
@@ -139,8 +155,6 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[get_broker_auth] = lambda: broker_auth
     app.dependency_overrides[get_upstream_client] = lambda: upstream_client
     app.dependency_overrides[get_anthropic_api_key] = lambda: secrets.anthropic_api_key
-
-    data_query_tracker = DataQueryTracker()
 
     app.dependency_overrides[publish_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[publish_get_s3_client] = lambda: s3_client
@@ -176,6 +190,10 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[upload_get_s3_client] = lambda: s3_client
     app.dependency_overrides[upload_get_artifact_bucket] = lambda: artifact_bucket
 
+    app.dependency_overrides[exp_get_scope_ticket] = _resolve_ticket_from_request
+    app.dependency_overrides[exp_get_s3_client] = lambda: s3_client
+    app.dependency_overrides[exp_get_experiment_metadata_bucket] = lambda: experiment_metadata_bucket
+
     app.dependency_overrides[pdf_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[pdf_get_httpx_client] = lambda: http_client
 
@@ -209,6 +227,7 @@ app.include_router(databricks_router)
 app.include_router(upload_router)
 app.include_router(pdf_router)
 app.include_router(http_router)
+app.include_router(experiment_manifest_router)
 
 
 @app.get("/health")

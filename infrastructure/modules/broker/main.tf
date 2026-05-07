@@ -50,6 +50,18 @@ variable "artifact_bucket_name" {
   type        = string
 }
 
+variable "experiment_metadata_bucket_name" {
+  description = "Name of the S3 metadata bucket holding PMF experiment manifests + instructions. Injected as EXPERIMENT_METADATA_BUCKET env var. Set this once the agent-experiment-metadata module is provisioned for the env."
+  type        = string
+  default     = ""
+}
+
+variable "experiment_metadata_read_policy_arn" {
+  description = "ARN of the managed IAM policy granting read access to the experiment metadata bucket (output by the agent-experiment-metadata module). Empty string skips the attachment (Phase 1 bring-up where the bucket isn't provisioned yet)."
+  type        = string
+  default     = ""
+}
+
 variable "sns_topic_arn" {
   description = "ARN of the SNS topic for alarm notifications. Empty string disables alarms."
   type        = string
@@ -258,6 +270,12 @@ resource "aws_iam_role_policy" "task_s3" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "task_experiment_metadata_read" {
+  count      = var.experiment_metadata_read_policy_arn != "" ? 1 : 0
+  role       = aws_iam_role.task_role.name
+  policy_arn = var.experiment_metadata_read_policy_arn
 }
 
 resource "aws_iam_role_policy" "task_sqs_results" {
@@ -621,6 +639,10 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name  = "ARTIFACT_BUCKET"
           value = var.artifact_bucket_name
+        },
+        {
+          name  = "EXPERIMENT_METADATA_BUCKET"
+          value = var.experiment_metadata_bucket_name
         }
       ]
 
