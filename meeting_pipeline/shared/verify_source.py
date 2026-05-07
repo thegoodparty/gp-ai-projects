@@ -21,7 +21,12 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+# A source is treated as stale if the most recent agenda we can find is older
+# than this. The right read of "verified" is "this source has produced a real
+# agenda recently" — not "this URL once pointed to a real PDF in 2019."
+_RECENCY_WINDOW_DAYS = 180
 from urllib.parse import urlparse
 
 import httpx
@@ -190,6 +195,7 @@ async def _find_past_agenda_from_platform(
         if not match:
             return None
         tenant = match.group(1)
+        cutoff = (datetime.now(UTC) - timedelta(days=_RECENCY_WINDOW_DAYS)).strftime("%Y-%m-%d")
         try:
             resp = await client.get(
                 f"https://{tenant}.api.civicclerk.com/v1/Events/",
@@ -202,17 +208,32 @@ async def _find_past_agenda_from_platform(
             if not isinstance(events, list):
                 return None
 
+            def _ev_date(ev: dict) -> str:
+                # Field names vary by tenant generation; try them all.
+                for f in ("eventDate", "startDateTime", "EventDate", "MeetingStartDate"):
+                    v = ev.get(f, "")
+                    if isinstance(v, str) and v:
+                        return v[:10]
+                return ""
+
+            # Recency gate: a source whose most recent event is older than the
+            # window is treated as stale and falls through to "no agenda found"
+            # so discover can flag it for re-discovery instead of marking it
+            # verified against a 2019 PDF.
+            recent_events = [ev for ev in events if _ev_date(ev) >= cutoff]
+            if not recent_events:
+                return None
+
             # 1) Legacy tenants put the agenda URL inline on the event summary.
-            for ev in events:
+            for ev in recent_events:
                 for field in ("AgendaFile", "AgendaUrl", "agendaFile"):
                     url = ev.get(field, "")
                     if isinstance(url, str) and url.startswith("http"):
                         return url
 
             # 2) Portal tenants only expose agenda PDFs via per-event detail's
-            #    publishedFiles[].streamUrl (matches collect_civicclerk's flow).
-            #    Bound the cost — most cities will hit on the first few events.
-            for ev in events[:10]:
+            #    publishedFiles[].streamUrl. Bound the cost.
+            for ev in recent_events[:10]:
                 event_id = ev.get("id") or ev.get("EventId") or ev.get("Id")
                 if not event_id:
                     continue
@@ -307,11 +328,14 @@ async def _find_past_agenda_from_platform(
             if not category_id:
                 category_id, _ = await find_council_category(client, domain)
             www_domain = _ensure_www(domain)
-            # Try current year first; some categories have data only in older
-            # years (e.g. site stopped maintaining the category in 2019). One
-            # AJAX call per year is cheap.
             current_year = datetime.now(UTC).year
-            for year in (current_year, current_year - 1, current_year - 2):
+            cutoff = (datetime.now(UTC) - timedelta(days=_RECENCY_WINDOW_DAYS)).strftime("%Y-%m-%d")
+            # Try current year first; cover the early-Jan edge case by also
+            # trying the previous year. URLs like /ViewFile/Agenda/_MMDDYYYY-id
+            # encode the meeting date — recency-filter on that date so we don't
+            # verify against ancient agendas (e.g. a category whose last
+            # meeting was 2019).
+            for year in (current_year, current_year - 1):
                 resp = await client.post(
                     f"https://{www_domain}/AgendaCenter/UpdateCategoryList",
                     data={"year": str(year), "catID": str(category_id)},
@@ -322,15 +346,16 @@ async def _find_past_agenda_from_platform(
                     timeout=15,
                 )
                 resp.raise_for_status()
-                # Pluck the first ViewFile/Agenda link that isn't a packet/html version.
                 for match in re.finditer(
-                    r'href=["\'](/AgendaCenter/ViewFile/Agenda/[^"\']+)["\']',
+                    r'href=["\'](/AgendaCenter/ViewFile/Agenda/_(\d{2})(\d{2})(\d{4})[^"\']*)["\']',
                     resp.text,
                 ):
-                    href = match.group(1)
+                    href, mm, dd, yyyy = match.groups()
                     if "packet=true" in href or "html=true" in href:
                         continue
-                    return f"https://{www_domain}{href}"
+                    agenda_date = f"{yyyy}-{mm}-{dd}"
+                    if agenda_date >= cutoff:
+                        return f"https://{www_domain}{href}"
         except Exception:
             pass
         return None

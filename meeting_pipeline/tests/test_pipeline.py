@@ -334,14 +334,17 @@ class TestFindPastAgendaCivicClerk:
 
     def test_portal_tenant_uses_published_files(self):
         import asyncio
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock, MagicMock
         from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
 
-        # Event summaries with no inline agenda fields (portal-style)
+        # Event summaries with no inline agenda fields (portal-style).
+        # Use a recent eventDate so the recency filter doesn't drop them.
+        recent = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
         events_resp = MagicMock()
         events_resp.json.return_value = {"value": [
-            {"id": 101, "eventName": "Council Meeting"},
-            {"id": 102, "eventName": "Special Session"},
+            {"id": 101, "eventName": "Council Meeting", "eventDate": recent},
+            {"id": 102, "eventName": "Special Session", "eventDate": recent},
         ]}
         events_resp.raise_for_status = MagicMock()
 
@@ -371,12 +374,14 @@ class TestFindPastAgendaCivicClerk:
         """Legacy CivicClerk tenants put the agenda URL inline on the event
         summary as AgendaFile — must still work after the portal fix."""
         import asyncio
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock, MagicMock
         from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
 
+        recent = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
         events_resp = MagicMock()
         events_resp.json.return_value = {"value": [
-            {"Id": 9, "AgendaFile": "https://legacy.example/agenda.pdf"},
+            {"Id": 9, "AgendaFile": "https://legacy.example/agenda.pdf", "MeetingStartDate": recent},
         ]}
         events_resp.raise_for_status = MagicMock()
 
@@ -390,6 +395,36 @@ class TestFindPastAgendaCivicClerk:
         # Only one HTTP call needed — drilling into details should be skipped
         assert client.get.call_count == 1
 
+    def test_stale_tenant_rejected_by_recency_filter(self):
+        """A tenant whose most recent event is older than the recency window
+        is treated as stale: even if events have inline AgendaFile URLs and
+        publishedFiles, return None so discover flags the source for
+        re-discovery instead of marking it verified against an ancient PDF."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        events_resp = MagicMock()
+        events_resp.json.return_value = {"value": [
+            # 2019 event — well outside 180-day recency window
+            {
+                "id": 1, "eventName": "Old Meeting",
+                "eventDate": "2019-06-01T00:00:00Z",
+                "agendaFile": "https://legacy.example/2019-agenda.pdf",
+            },
+        ]}
+        events_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.get = AsyncMock(return_value=events_resp)
+
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicclerk", {}, "https://demoxxx.portal.civicclerk.com", client,
+        ))
+        assert url is None
+        # Only one HTTP call — should not have drilled into per-event details.
+        assert client.get.call_count == 1
+
 
 class TestFindPastAgendaCivicPlus:
     """_find_past_agenda_from_platform must drill into the AgendaCenter AJAX
@@ -401,18 +436,23 @@ class TestFindPastAgendaCivicPlus:
     def test_civicplus_extracts_first_agenda_link_using_stored_category(self):
         """Fast path: when discover has already stored council_category_id in
         source.json config, verify uses it directly instead of running the
-        heavyweight find_council_category re-discovery (which fails on some
-        sites and is wasteful on the ones it doesn't)."""
+        heavyweight find_council_category re-discovery."""
         import asyncio
+        from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
         from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        # Build a URL with a recent meeting date (within the recency window).
+        # CivicPlus URL pattern is /ViewFile/Agenda/_MMDDYYYY-id
+        recent = datetime.now() - timedelta(days=30)
+        date_part = f"_{recent.strftime('%m%d%Y')}-1234"
 
         ajax_html = (
             '<html><body>'
             '<tr class="catAgendaRow">'
             '<td>'
-            '<a href="/AgendaCenter/ViewFile/Agenda/_05012026-1234?packet=true">Packet</a>'
-            '<a href="/AgendaCenter/ViewFile/Agenda/_05012026-1234">Agenda</a>'
+            f'<a href="/AgendaCenter/ViewFile/Agenda/{date_part}?packet=true">Packet</a>'
+            f'<a href="/AgendaCenter/ViewFile/Agenda/{date_part}">Agenda</a>'
             '</td></tr></body></html>'
         )
         ajax_resp = MagicMock()
@@ -428,7 +468,40 @@ class TestFindPastAgendaCivicPlus:
             "https://www.cityofx.com/AgendaCenter",
             client,
         ))
-        assert url == "https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/_05012026-1234"
+        assert url == f"https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/{date_part}"
+
+    def test_civicplus_rejects_stale_agenda_dates(self):
+        """A category whose most recent agenda date is older than the recency
+        window must not verify — that source has likely moved off the platform
+        or stopped posting, and verifying against a 2019 PDF would trick the
+        orchestrator into treating it as a live source."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        # Only old (2019) agenda links — all outside the 180-day window
+        ajax_html = (
+            '<tr class="catAgendaRow">'
+            '<a href="/AgendaCenter/ViewFile/Agenda/_06152019-9999">A</a>'
+            '</tr>'
+            '<tr class="catAgendaRow">'
+            '<a href="/AgendaCenter/ViewFile/Agenda/_03102019-8888">B</a>'
+            '</tr>'
+        )
+        ajax_resp = MagicMock()
+        ajax_resp.text = ajax_html
+        ajax_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.post = AsyncMock(return_value=ajax_resp)
+
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicplus",
+            {"council_category_id": 7},
+            "https://www.cityofx.com/AgendaCenter",
+            client,
+        ))
+        assert url is None
 
     def test_civicplus_falls_back_to_find_council_category(self):
         """Slow path: when config has no council_category_id, fall back to
