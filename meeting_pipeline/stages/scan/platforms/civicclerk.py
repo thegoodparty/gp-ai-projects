@@ -5,6 +5,7 @@ Returns list of meeting dicts with date, title, agenda_posted, agenda_url.
 No PDFs downloaded — that is the collection stage.
 """
 
+import asyncio
 import re
 from datetime import datetime, timedelta
 
@@ -98,6 +99,46 @@ async def scan_civicclerk(city: str, config: dict, source_url: str, client: http
             "event_id": event_id,
             "status": "past" if date < today_str else "upcoming",
         })
+
+    # Portal-tenant drilldown: the events list omits agendaFile for portal
+    # tenants — agenda PDFs only live in publishedFiles[].streamUrl on the
+    # per-event detail endpoint. Without this, every portal city scans as
+    # "0 posted" and never produces briefings.
+    #
+    # Cost-bound: only future events that the summary didn't already mark
+    # posted. Cap concurrency so a city with many upcoming meetings doesn't
+    # hammer the API.
+    if is_portal:
+        needs_drilldown = [
+            entry for entry in upcoming
+            if entry["status"] != "past"
+            and not entry["agenda_posted"]
+            and entry.get("event_id")
+        ]
+        if needs_drilldown:
+            sem = asyncio.Semaphore(5)
+
+            async def _fetch_detail(entry: dict):
+                async with sem:
+                    try:
+                        detail_resp = await client.get(
+                            f"https://{tenant}.api.civicclerk.com/v1/Events/{entry['event_id']}",
+                            timeout=10,
+                        )
+                        detail_resp.raise_for_status()
+                        detail = detail_resp.json()
+                    except Exception:
+                        return
+                    published = detail.get("publishedFiles") or detail.get("PublishedFiles") or []
+                    for f in published:
+                        if f.get("type") in ("Agenda", "Agenda Packet"):
+                            url = f.get("streamUrl") or f.get("url", "")
+                            if isinstance(url, str) and url.startswith("http"):
+                                entry["agenda_url"] = url
+                                entry["agenda_posted"] = True
+                                return
+
+            await asyncio.gather(*(_fetch_detail(e) for e in needs_drilldown))
 
     return upcoming
 

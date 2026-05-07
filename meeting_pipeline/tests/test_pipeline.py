@@ -656,6 +656,84 @@ class TestCivicClerkScanner:
         result = asyncio.run(scan_civicclerk("TestCity", {}, "https://example.com/no-civicclerk", client))
         assert result == []
 
+    def test_portal_tenant_drills_into_published_files(self):
+        """Portal tenants don't put agendaFile on the event summary — agenda
+        URLs only live on the per-event detail endpoint at
+        publishedFiles[].streamUrl. Without drilldown, every portal city
+        scans as 0 posted and never produces briefings."""
+        from datetime import datetime, timedelta
+        from meeting_pipeline.stages.scan.platforms.civicclerk import scan_civicclerk
+
+        # Two upcoming events with no inline agendaFile (portal-style).
+        future = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%dT00:00:00")
+        events_resp = MagicMock()
+        events_resp.json.return_value = {"value": [
+            {"id": 100, "startDateTime": future, "eventName": "Council Meeting"},
+            {"id": 101, "startDateTime": future, "eventName": "Special Session"},
+        ]}
+        events_resp.raise_for_status = MagicMock()
+
+        # Detail #100 has an Agenda; detail #101 has only Minutes.
+        detail_100 = MagicMock()
+        detail_100.json.return_value = {
+            "id": 100,
+            "publishedFiles": [
+                {"type": "Agenda", "streamUrl": "https://example.com/100-agenda.pdf"},
+            ],
+        }
+        detail_100.raise_for_status = MagicMock()
+        detail_101 = MagicMock()
+        detail_101.json.return_value = {
+            "id": 101,
+            "publishedFiles": [
+                {"type": "Minutes", "streamUrl": "https://example.com/101-minutes.pdf"},
+            ],
+        }
+        detail_101.raise_for_status = MagicMock()
+
+        # First .get is the events list; subsequent .get calls are details.
+        # Order of detail calls is concurrent so we route by URL.
+        async def fake_get(url, *args, **kwargs):
+            if "/Events/100" in url:
+                return detail_100
+            if "/Events/101" in url:
+                return detail_101
+            return events_resp
+
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=fake_get)
+
+        result = asyncio.run(scan_civicclerk(
+            "TestCity", {}, "https://demoxxx.portal.civicclerk.com", client,
+        ))
+        by_id = {e["event_id"]: e for e in result}
+        assert by_id["100"]["agenda_posted"] is True
+        assert by_id["100"]["agenda_url"] == "https://example.com/100-agenda.pdf"
+        assert by_id["101"]["agenda_posted"] is False
+        assert by_id["101"]["agenda_url"] is None
+
+    def test_portal_drilldown_skips_past_events(self):
+        """Past events shouldn't trigger drilldown — we only care about
+        future agendas, and drilldown is bounded to keep scan fast."""
+        from datetime import datetime, timedelta
+        from meeting_pipeline.stages.scan.platforms.civicclerk import scan_civicclerk
+
+        past = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%dT00:00:00")
+        events_resp = MagicMock()
+        events_resp.json.return_value = {"value": [
+            {"id": 50, "startDateTime": past, "eventName": "Past Council"},
+        ]}
+        events_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.get = AsyncMock(return_value=events_resp)
+
+        asyncio.run(scan_civicclerk(
+            "TestCity", {}, "https://demoxxx.portal.civicclerk.com", client,
+        ))
+        # Only the events list call — no /Events/50 detail call.
+        assert client.get.call_count == 1
+
 
 # =========================================================================
 # 4. COLLECT GATING TESTS
