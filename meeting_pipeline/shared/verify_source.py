@@ -284,9 +284,13 @@ async def _find_past_agenda_from_platform(
 
     if platform == "civicplus":
         # CivicPlus AgendaCenter exposes meetings via an AJAX endpoint, not the
-        # landing page. Land on /AgendaCenter, find the council category id,
-        # then POST /AgendaCenter/UpdateCategoryList to get the meeting list
-        # HTML and pluck the first ViewFile/Agenda PDF link.
+        # landing page. POST /AgendaCenter/UpdateCategoryList to get the meeting
+        # list HTML and pluck the first ViewFile/Agenda PDF link.
+        #
+        # Skip the legacy Archive.aspx product line — different URL pattern
+        # entirely; not addressable here.
+        if "/agendacenter" not in source_url.lower():
+            return None
         parsed = urlparse(source_url)
         domain = parsed.netloc.replace("www.", "", 1)
         if not domain:
@@ -295,7 +299,13 @@ async def _find_past_agenda_from_platform(
             from meeting_pipeline.collectors.civicplus_scraper import (
                 _ensure_www, find_council_category,
             )
-            category_id, _ = await find_council_category(client, domain)
+            # Fast path: discover already stored the council_category_id in
+            # source.json config. find_council_category is heavyweight (one
+            # GET + one POST per category) and fails on some sites; only
+            # invoke it when we don't already have an id.
+            category_id = config.get("council_category_id")
+            if not category_id:
+                category_id, _ = await find_council_category(client, domain)
             www_domain = _ensure_www(domain)
             resp = await client.post(
                 f"https://{www_domain}/AgendaCenter/UpdateCategoryList",

@@ -398,13 +398,15 @@ class TestFindPastAgendaCivicPlus:
     can't navigate the JS-rendered AgendaCenter UI and reports 'no agenda URL
     found to verify')."""
 
-    def test_civicplus_extracts_first_agenda_link(self):
+    def test_civicplus_extracts_first_agenda_link_using_stored_category(self):
+        """Fast path: when discover has already stored council_category_id in
+        source.json config, verify uses it directly instead of running the
+        heavyweight find_council_category re-discovery (which fails on some
+        sites and is wasteful on the ones it doesn't)."""
         import asyncio
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import AsyncMock
         from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
 
-        # AJAX response returning a meetings list with one agenda PDF link
-        # (plus a packet that should be ignored).
         ajax_html = (
             '<html><body>'
             '<tr class="catAgendaRow">'
@@ -420,16 +422,62 @@ class TestFindPastAgendaCivicPlus:
         client = MagicMock()
         client.post = AsyncMock(return_value=ajax_resp)
 
-        # Bypass the heavyweight find_council_category by stubbing it to a
-        # known category id.
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicplus",
+            {"council_category_id": 7},
+            "https://www.cityofx.com/AgendaCenter",
+            client,
+        ))
+        assert url == "https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/_05012026-1234"
+
+    def test_civicplus_falls_back_to_find_council_category(self):
+        """Slow path: when config has no council_category_id, fall back to
+        the heavyweight find_council_category."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        ajax_html = (
+            '<tr class="catAgendaRow">'
+            '<a href="/AgendaCenter/ViewFile/Agenda/_05012026-9999">A</a>'
+            '</tr>'
+        )
+        ajax_resp = MagicMock()
+        ajax_resp.text = ajax_html
+        ajax_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.post = AsyncMock(return_value=ajax_resp)
+
         with patch(
             "meeting_pipeline.collectors.civicplus_scraper.find_council_category",
-            new=AsyncMock(return_value=(7, "City Council")),
+            new=AsyncMock(return_value=(42, "City Council")),
         ):
             url = asyncio.run(_find_past_agenda_from_platform(
                 "civicplus", {}, "https://www.cityofx.com/AgendaCenter", client,
             ))
-        assert url == "https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/_05012026-1234"
+        assert url == "https://www.cityofx.com/AgendaCenter/ViewFile/Agenda/_05012026-9999"
+
+    def test_civicplus_skips_archive_aspx_urls(self):
+        """The legacy Archive.aspx product line is a different URL pattern;
+        the AgendaCenter drilldown can't help. Return None and let Firecrawl
+        fallback try."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from meeting_pipeline.shared.verify_source import _find_past_agenda_from_platform
+
+        client = MagicMock()
+        client.post = AsyncMock()
+
+        url = asyncio.run(_find_past_agenda_from_platform(
+            "civicplus",
+            {"council_category_id": 30},
+            "https://www.dodgecity.org/Archive.aspx?AMID=30",
+            client,
+        ))
+        assert url is None
+        # No HTTP calls should have been made — short-circuited.
+        assert client.post.call_count == 0
 
 
 class TestManifest:
