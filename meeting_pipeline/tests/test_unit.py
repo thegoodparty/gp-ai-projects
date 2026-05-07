@@ -660,6 +660,106 @@ class TestEscribeLookbackBounds:
 
 
 # ============================================================================
+# Security C1 — Haystaq query parameterization + state allowlist
+# ============================================================================
+
+class TestHaystaqStateAllowlist:
+    """Unknown state codes must raise — table names are interpolated and
+    can't be parameterized in SQL."""
+
+    def test_known_state_returns_table_names(self):
+        from meeting_pipeline.scripts.collect_haystaq_batch import table_names
+        u, s = table_names("OH")
+        assert "_oh_uniform" in u
+        assert "_oh_haystaq_dna_scores" in s
+
+    def test_lowercase_input_is_normalized(self):
+        from meeting_pipeline.scripts.collect_haystaq_batch import table_names
+        u, _ = table_names("ny")
+        assert "_ny_uniform" in u
+
+    def test_unknown_state_raises(self):
+        import pytest
+        from meeting_pipeline.scripts.collect_haystaq_batch import table_names
+        with pytest.raises(ValueError, match="Unknown state code"):
+            table_names("XX")
+
+    def test_injection_attempt_rejected(self):
+        """A state value containing SQL fragments must be rejected before
+        it reaches the query."""
+        import pytest
+        from meeting_pipeline.scripts.collect_haystaq_batch import table_names
+        with pytest.raises(ValueError):
+            table_names("OH; DROP TABLE x")
+
+
+# ============================================================================
+# Security C4 — Vote-imperative guard on AI-generated briefings
+# ============================================================================
+
+class TestVoteImperativeGuard:
+    """The pipeline must refuse to publish a briefing whose AI-generated
+    guidance fields recommend how to vote — either because prompt injection
+    succeeded or the LLM ignored EDITORIAL_RULES."""
+
+    def _briefing_with(self, **field_values):
+        """Build a minimal briefing dict with overridable field values."""
+        return {
+            "executiveSummary": {
+                "headline": field_values.get("exec_headline", "Routine consent agenda."),
+                "subheadline": field_values.get("exec_subheadline", "Two items of note."),
+            },
+            "priorityIssues": [{
+                "card": {
+                    "headline": field_values.get("card_headline", "FY26 budget update."),
+                    "whatYouNeedToDo": field_values.get("card_what", "Review the budget memo."),
+                    "askThisInTheRoom": field_values.get("card_ask", "Why is line item X up 12%?"),
+                    "tryThis": field_values.get("card_try", "Frame your remarks around fiscal stewardship."),
+                },
+                "detail": {
+                    "recommendation": field_values.get("detail_rec", "Consider asking for a fiscal-impact memo."),
+                    "actionItem": field_values.get("detail_action", "Request the FY25 vs FY26 line comparison."),
+                    "askThis": field_values.get("detail_ask", "What's driving the increase?"),
+                    "tryThis": field_values.get("detail_try", "Acknowledge the trade-offs publicly."),
+                },
+            }],
+        }
+
+    def test_clean_briefing_passes(self):
+        from meeting_pipeline.stages.briefing.generate import _scan_for_vote_imperatives
+        assert _scan_for_vote_imperatives(self._briefing_with()) == []
+
+    def test_describing_vote_mechanic_is_not_flagged(self):
+        """A briefing that says 'you're voting on X' or 'the council will
+        vote on X' is describing the agenda mechanic, not recommending
+        direction. Must NOT be flagged as a false positive."""
+        from meeting_pipeline.stages.briefing.generate import _scan_for_vote_imperatives
+        b = self._briefing_with(
+            card_what="You're voting on whether to approve the FY26 budget.",
+            detail_rec="The council will vote on Resolution 2026-12.",
+        )
+        assert _scan_for_vote_imperatives(b) == []
+
+    def test_vote_yes_is_flagged(self):
+        from meeting_pipeline.stages.briefing.generate import _scan_for_vote_imperatives
+        b = self._briefing_with(card_what="Vote yes on item 3 to support the budget.")
+        findings = _scan_for_vote_imperatives(b)
+        assert findings and "vote yes" in findings[0][1].lower()
+
+    def test_recommend_voting_is_flagged(self):
+        from meeting_pipeline.stages.briefing.generate import _scan_for_vote_imperatives
+        b = self._briefing_with(detail_rec="I recommend voting in favor of the resolution.")
+        findings = _scan_for_vote_imperatives(b)
+        assert findings and findings[0][0].endswith("recommendation")
+
+    def test_you_should_vote_is_flagged(self):
+        from meeting_pipeline.stages.briefing.generate import _scan_for_vote_imperatives
+        b = self._briefing_with(detail_action="You should vote against the rezoning.")
+        findings = _scan_for_vote_imperatives(b)
+        assert findings and findings[0][0].endswith("actionItem")
+
+
+# ============================================================================
 # orchestrator — skip-existing-briefings filter must compare exact basenames
 # (bug fix: substring `in` check was dropping smaller-slug siblings, e.g.
 # canton-OH skipped because north-canton-OH had a briefing for the same date)

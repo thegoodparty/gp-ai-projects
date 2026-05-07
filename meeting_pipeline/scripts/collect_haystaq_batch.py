@@ -151,9 +151,24 @@ def get_serve_csv_cities() -> list[dict]:
     return cities
 
 
+# Allowlist of state codes — both 2-letter abbreviations and the full names
+# we map from. Used to gate state_code before it's interpolated into a table
+# name (identifiers can't be parameterized in SQL, so allowlist-validate).
+_VALID_STATE_CODES = frozenset(STATE_ABBREVS.values())
+
+
 def table_names(state_code: str) -> tuple[str, str]:
-    """Return (uniform_table, scores_table) for a state."""
-    prefix = f"{CATALOG}.{SCHEMA}.stg_dbt_source__l2_s3_{state_code.lower()}"
+    """Return (uniform_table, scores_table) for a state.
+
+    Raises ValueError on unknown state codes — table names go directly into
+    the SQL query and identifiers can't be parameterized.
+    """
+    code = state_code.upper()
+    if code not in _VALID_STATE_CODES:
+        raise ValueError(
+            f"Unknown state code {state_code!r}; expected one of {sorted(_VALID_STATE_CODES)}"
+        )
+    prefix = f"{CATALOG}.{SCHEMA}.stg_dbt_source__l2_s3_{code.lower()}"
     return f"{prefix}_uniform", f"{prefix}_haystaq_dna_scores"
 
 
@@ -163,8 +178,10 @@ def table_names(state_code: str) -> tuple[str, str]:
 
 def query_issue_scores(client, city_name: str, state: str) -> dict | None:
     """Query Haystaq issue scores for one city. Returns None on failure."""
+    # state_code is allowlist-validated inside table_names. city_name comes
+    # from the CSV and goes through a parameter binding so quotes/escapes can't
+    # break out of the literal.
     uniform_table, scores_table = table_names(state)
-    filter_value = city_name.upper()
 
     all_scores = {**ISSUE_SCORES, **CONTEXT_SCORES}
     select_parts = ["COUNT(*) as voter_count"]
@@ -179,10 +196,10 @@ def query_issue_scores(client, city_name: str, state: str) -> dict | None:
         FROM {uniform_table} u
         JOIN {scores_table} s
           ON u.LALVOTERID = s.LALVOTERID
-        WHERE UPPER(u.Residence_Addresses_City) = "{filter_value}"
+        WHERE UPPER(u.Residence_Addresses_City) = %(city)s
     """
 
-    df = client.execute_query(query)
+    df = client.execute_query(query, params={"city": city_name.upper()})
 
     if df.empty or df.iloc[0]["voter_count"] == 0:
         return None

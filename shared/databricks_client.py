@@ -84,12 +84,18 @@ class DatabricksClient:
             self.logger.error(f"Connection test failed: {str(e)}")
             return False
     
-    def execute_query(self, query: str) -> pd.DataFrame:
+    def execute_query(self, query: str, params: dict | None = None) -> pd.DataFrame:
         """
         Execute SQL query and return results as DataFrame.
 
         Args:
-            query: SQL query string
+            query: SQL query string. Use %(name)s placeholders for values
+                that come from external sources (CSV rows, user input, etc.).
+                Identifiers (table/column names) cannot be parameterized; the
+                caller must allowlist-validate them.
+            params: Optional dict of values for the %(name)s placeholders.
+                Passed through to the Databricks SQL connector's
+                cursor.execute(operation, parameters), which escapes them.
 
         Returns:
             DataFrame with query results
@@ -100,7 +106,10 @@ class DatabricksClient:
 
         try:
             with connection.cursor() as cursor:
-                cursor.execute(query)
+                if params is None:
+                    cursor.execute(query)
+                else:
+                    cursor.execute(query, params)
 
                 columns = [desc[0] for desc in cursor.description]
                 data = cursor.fetchall()
