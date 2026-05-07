@@ -553,6 +553,76 @@ class TestFindPastAgendaCivicPlus:
         assert client.post.call_count == 0
 
 
+class TestFindAgendaPdfViaLlm:
+    """LLM fallback for finding agenda PDFs on `unknown`-platform landing
+    pages, which is where the heuristic regex / filename ranker tends to
+    fail (opaque filenames, agendas one click past the landing page)."""
+
+    def test_returns_url_when_llm_finds_one(self):
+        from unittest.mock import MagicMock, patch
+        from meeting_pipeline.shared.firecrawl_client import find_agenda_pdf_via_llm
+
+        fake_client = MagicMock()
+        fake_client.generate_structured_content.return_value = {
+            "agenda_url": "https://example.com/2026/may/agenda.pdf",
+        }
+        with patch("shared.llm_gemini.GeminiClient", return_value=fake_client):
+            result = find_agenda_pdf_via_llm(
+                markdown="...council agenda...",
+                links=["https://example.com/2026/may/agenda.pdf"],
+                city="Reno", state="NV",
+            )
+        assert result == "https://example.com/2026/may/agenda.pdf"
+
+    def test_returns_none_when_llm_says_null(self):
+        from unittest.mock import MagicMock, patch
+        from meeting_pipeline.shared.firecrawl_client import find_agenda_pdf_via_llm
+
+        fake_client = MagicMock()
+        fake_client.generate_structured_content.return_value = {"agenda_url": None}
+        with patch("shared.llm_gemini.GeminiClient", return_value=fake_client):
+            result = find_agenda_pdf_via_llm(
+                markdown="news page, no agenda visible",
+                links=["https://example.com/news"],
+                city="Reno", state="NV",
+            )
+        assert result is None
+
+    def test_returns_none_when_markdown_empty(self):
+        """If Firecrawl returned no markdown, skip the LLM call entirely
+        (don't burn tokens on nothing)."""
+        from meeting_pipeline.shared.firecrawl_client import find_agenda_pdf_via_llm
+        result = find_agenda_pdf_via_llm(markdown="", links=[], city="X", state="X")
+        assert result is None
+
+    def test_returns_none_on_llm_exception(self):
+        """An LLM error must not crash discover."""
+        from unittest.mock import MagicMock, patch
+        from meeting_pipeline.shared.firecrawl_client import find_agenda_pdf_via_llm
+
+        fake_client = MagicMock()
+        fake_client.generate_structured_content.side_effect = RuntimeError("api down")
+        with patch("shared.llm_gemini.GeminiClient", return_value=fake_client):
+            result = find_agenda_pdf_via_llm(
+                markdown="...", links=[], city="Reno", state="NV",
+            )
+        assert result is None
+
+    def test_rejects_non_url_response(self):
+        """LLM occasionally returns garbage; reject anything that isn't a
+        plausible HTTP URL."""
+        from unittest.mock import MagicMock, patch
+        from meeting_pipeline.shared.firecrawl_client import find_agenda_pdf_via_llm
+
+        fake_client = MagicMock()
+        fake_client.generate_structured_content.return_value = {"agenda_url": "not a url"}
+        with patch("shared.llm_gemini.GeminiClient", return_value=fake_client):
+            result = find_agenda_pdf_via_llm(
+                markdown="...", links=[], city="Reno", state="NV",
+            )
+        assert result is None
+
+
 class TestManifest:
     """manifest.py: _is_wrong_entity and validate_against_manifest."""
 

@@ -146,9 +146,95 @@ def validate_agenda_page(url: str, city: str, state: str) -> dict:
 
         pdf_urls = [link for link in links if isinstance(link, str) and ".pdf" in link.lower()]
 
-        return {"valid": valid, "most_recent_date": most_recent_date, "pdf_urls": pdf_urls[:10]}
+        return {
+            "valid": valid,
+            "most_recent_date": most_recent_date,
+            "pdf_urls": pdf_urls[:10],
+            # Surface the raw scrape so callers can run an LLM-based agenda
+            # extractor over it without re-fetching from Firecrawl.
+            "markdown": markdown,
+            "links": [link for link in links if isinstance(link, str)],
+        }
     except Exception as e:
-        return {"valid": False, "most_recent_date": None, "pdf_urls": [], "error": str(e)}
+        return {
+            "valid": False,
+            "most_recent_date": None,
+            "pdf_urls": [],
+            "markdown": "",
+            "links": [],
+            "error": str(e),
+        }
+
+
+def find_agenda_pdf_via_llm(
+    markdown: str,
+    links: list[str],
+    city: str,
+    state: str,
+) -> str | None:
+    """LLM fallback when regex/heuristic PDF detection fails.
+
+    Many big-city `unknown`-platform sites bury the agenda PDF link behind a
+    nav structure or use ambiguous filenames our scoring can't rank. Hand the
+    landing-page markdown + all extracted links to Gemini Flash Lite and ask
+    it to return the most-recent council agenda PDF URL.
+
+    Returns the URL string, or None if no plausible agenda PDF was identified.
+    Does NOT verify the PDF — that's the caller's job (verify_agenda_url).
+
+    Cheap (Flash Lite, ~$0.003/call). Only invoke when the cheap heuristic
+    paths failed.
+    """
+    if not markdown:
+        return None
+
+    # Truncate to keep input bounded — Gemini handles the size, we cap to
+    # control cost and stay under context limits.
+    md_excerpt = markdown[:30_000]
+    link_excerpt = links[:80]
+
+    prompt = (
+        f"You are looking at the agenda landing page of {city}, {state}.\n\n"
+        f"Page markdown (truncated):\n{md_excerpt}\n\n"
+        f"All links extracted from the page:\n"
+        + "\n".join(f"- {link}" for link in link_excerpt)
+        + "\n\n"
+        "Return the full URL of the most recent City Council meeting agenda "
+        "PDF (or packet). Rules:\n"
+        "  - Prefer the City Council, not Planning Commission, School Board, or "
+        "    other sub-bodies.\n"
+        "  - Prefer the most recent meeting available.\n"
+        "  - Return the URL exactly as it appears.\n"
+        "  - If no agenda PDF is visible, return null."
+    )
+
+    # Gemini's structured-output API doesn't accept JSON-Schema-style nullable
+    # unions like ["string","null"]. Use a Pydantic model with Optional[str]
+    # — that's what the GeminiClient is set up to translate cleanly.
+    from pydantic import BaseModel
+
+    class _AgendaUrlResult(BaseModel):
+        agenda_url: str | None = None
+
+    try:
+        # Use Flash (not Flash Lite) — this path runs at low frequency
+        # (only when heuristic discovery already failed) and Flash Lite has
+        # been hitting 503 capacity errors more often than Flash.
+        from shared.llm_gemini import GeminiClient, GeminiModelType
+        client = GeminiClient(default_model=GeminiModelType.FLASH)
+        result = client.generate_structured_content(prompt, response_schema=_AgendaUrlResult)
+    except Exception as e:
+        print(f"  [llm_agenda_finder] failed: {e}")
+        return None
+
+    if isinstance(result, dict):
+        url = result.get("agenda_url")
+    else:
+        url = getattr(result, "agenda_url", None)
+
+    if isinstance(url, str) and url.startswith("http"):
+        return url
+    return None
 
 
 def scrape_pdf_text(pdf_url: str) -> str | None:

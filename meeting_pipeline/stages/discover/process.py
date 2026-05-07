@@ -324,11 +324,28 @@ async def _run_verification(result: dict, http_client: httpx.AsyncClient) -> dic
             state = result.get("state", "")
             if source_url:
                 try:
-                    from meeting_pipeline.shared.firecrawl_client import validate_agenda_page
+                    from meeting_pipeline.shared.firecrawl_client import (
+                        find_agenda_pdf_via_llm,
+                        validate_agenda_page,
+                    )
                     fc_result = await asyncio.to_thread(validate_agenda_page, source_url, city, state)
                     pdf_urls = fc_result.get("pdf_urls", [])
                     if pdf_urls:
                         agenda_url = _pick_best_pdf(pdf_urls)
+                    # LLM fallback for the unknown / generic_html long tail —
+                    # `_pick_best_pdf` ranks by filename keywords, which fails
+                    # for cities whose agendas have opaque filenames or live
+                    # one click past the landing page. Hand the markdown +
+                    # links to Gemini Flash Lite and let it identify the
+                    # right agenda URL. Cheap; only fires when heuristics
+                    # came up empty.
+                    if not agenda_url:
+                        markdown = fc_result.get("markdown", "")
+                        links = fc_result.get("links", [])
+                        if markdown:
+                            agenda_url = await asyncio.to_thread(
+                                find_agenda_pdf_via_llm, markdown, links, city, state,
+                            )
                 except Exception:
                     pass
 
