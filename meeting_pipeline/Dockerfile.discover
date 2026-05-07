@@ -1,0 +1,39 @@
+# Discover stage — Fargate task that consumes the discover SQS queue.
+# Discovery uses Serper + Firecrawl over httpx; no browser automation is
+# required (an earlier Playwright/Chromium plan was scrapped).
+
+# Stage 1: Builder
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+COPY uv.lock ./
+COPY pyproject.toml ./
+COPY shared/pyproject.toml ./shared/
+COPY meeting_pipeline/pyproject.toml ./meeting_pipeline/
+
+COPY shared/ ./shared/
+COPY meeting_pipeline/ ./meeting_pipeline/
+
+RUN uv sync --frozen --no-dev --package meeting-pipeline
+
+# Stage 2: Runtime
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/shared /app/shared
+COPY --from=builder /app/meeting_pipeline /app/meeting_pipeline
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "-m", "meeting_pipeline.lambda_handlers.discover"]
