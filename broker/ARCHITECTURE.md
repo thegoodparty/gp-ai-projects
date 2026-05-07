@@ -92,7 +92,7 @@ Broker is fronted by an internal ALB with an ACM public cert for `broker-{env}.a
 
 **Why HTTPS on an internal ALB?** Scope tickets carry authority to query voter-data tables; plaintext HTTP 8080 inside the VPC would leak them on any ENI mirror, compromised neighbor service, or misconfigured flow-log sink. Public ACM certs are free and auto-renewing.
 
-**Forward path — per-task broker pools with ALB routing.** Today the ALB has one target group fronting a single broker service (scaled by CPU/memory). As experiment shapes diverge (e.g., Anthropic-proxy-heavy briefing runs vs. Databricks-heavy voter_targeting vs. future low-cost PDF parsers), we want to split the broker into pools with different resource profiles and route traffic by run_type. Two extension points are already in place:
+**Forward path — per-task broker pools with ALB routing.** Today the ALB has one target group fronting a single broker service (scaled by CPU/memory). As experiment shapes diverge (e.g., Anthropic-proxy-heavy briefing runs vs. Databricks-heavy data-extraction runs vs. future low-cost PDF parsers), we want to split the broker into pools with different resource profiles and route traffic by run_type. Two extension points are already in place:
 
 1. **ALB listener rules.** The HTTPS listener can host path-based or header-based rules (`condition { path_pattern }` or `condition { http_header }`). Example: `/databricks/*` → `broker-db-{env}` target group with more memory; `/anthropic/*` → `broker-proxy-{env}` target group with higher concurrency. Hostname stays the same, clients don't change — the ALB dispatches.
 2. **Header-routed pools.** Mint-time we can stamp a `X-Broker-Pool` header on the scope ticket and have the runner/dispatch include it on every request; ALB rules route on that header. Lets us A/B a new broker version or isolate a noisy experiment without a separate hostname.
@@ -136,7 +136,7 @@ All routes require `X-Broker-Token` (per-run UUIDv4) except `/health` and `/inte
 | `POST /anthropic/v1/messages` | Runner (via Claude SDK) | Proxies to `api.anthropic.com`, injects broker's `ANTHROPIC_API_KEY`; streams response back |
 | `POST /databricks/query` | Runner (via `pmf_runtime.databricks`) | Scope-aware SQL execution — broker rewrites WHERE clauses to inject `state`/`city` filters per scope ticket; rejects cross-scope queries |
 | `POST /artifact/publish` | Runner (via `pmf_runtime.publish`) | Validates artifact against contract schema, uploads to S3, sends callback to results queue |
-| `GET /artifact/read` | Runner (via `pmf_runtime.priors`) | Reads a prior experiment's artifact (for dependency chaining, e.g. peer_city_benchmarking depends on district_intel) |
+| `GET /artifact/read` | Runner (via `pmf_runtime.priors`) | Reads a prior experiment's artifact (for dependency chaining, e.g. one experiment reading a prior experiment's artifact — the dependency relation is encoded in gp-api, not the broker) |
 | `POST /run-status` | Runner | Update run status (RUNNING/CONTRACT_VIOLATION/etc.); broker sends callback to results queue |
 | `POST /internal/upload-logs` | Runner | Forward runner logs to S3 for debugging |
 

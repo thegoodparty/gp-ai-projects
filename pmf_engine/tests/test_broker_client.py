@@ -60,7 +60,7 @@ class TestMintRunTokenSuccess:
             result = client.mint_run_token(
                 run_id="run-001",
                 organization_slug="org-123",
-                experiment_id="voter_targeting",
+                experiment_id="smoke_test",
                 scope={"state": "NC", "cities": ["Hendersonville"]},
                 params={"city": "Hendersonville"},
                 exp_ttl_seconds=3600,
@@ -152,18 +152,18 @@ class TestMintRunTokenPriorArtifactVersions:
             client.mint_run_token(
                 run_id="run-peer-001",
                 organization_slug="org-1",
-                experiment_id="peer_city_benchmarking",
+                experiment_id="smoke_main",
                 scope={"state": "NC"},
                 params={"issues": ["housing"]},
                 prior_artifact_versions={
-                    "district_intel": "district_intel/org-1/run-a/artifact.json"
+                    "smoke_dep": "smoke_dep/org-1/run-a/artifact.json"
                 },
             )
 
         body = mock_post.call_args.kwargs["json"]
         assert "prior_artifact_versions" in body
         assert body["prior_artifact_versions"] == {
-            "district_intel": "district_intel/org-1/run-a/artifact.json"
+            "smoke_dep": "smoke_dep/org-1/run-a/artifact.json"
         }
 
     def test_mint_run_token_omits_prior_artifact_versions_when_none(self):
@@ -176,7 +176,7 @@ class TestMintRunTokenPriorArtifactVersions:
             client.mint_run_token(
                 run_id="run-001",
                 organization_slug="org-1",
-                experiment_id="voter_targeting",
+                experiment_id="smoke_test",
                 scope={"state": "NC"},
                 params={"city": "Hendersonville"},
             )

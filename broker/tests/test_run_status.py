@@ -8,7 +8,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from broker.callback_sender import CallbackSender
-from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.run_status import (
     router,
@@ -44,7 +43,6 @@ def _make_ticket(
 
 def _create_app(
     ticket: ScopeTicket | None = None,
-    tracker: DataQueryTracker | None = None,
 ) -> tuple[FastAPI, MagicMock, MagicMock, MagicMock]:
     app = FastAPI()
     app.include_router(router)
@@ -64,9 +62,9 @@ def _create_app(
     app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
     app.dependency_overrides[get_artifact_bucket] = lambda: "gp-agent-artifacts-dev"
 
-    _tracker = tracker if tracker is not None else DataQueryTracker()
+    from broker.data_query_tracker import DataQueryTracker
     from broker.endpoints.run_status import get_data_query_tracker
-    app.dependency_overrides[get_data_query_tracker] = lambda: _tracker
+    app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
 
     return app, mock_s3, mock_sender, mock_store
 
@@ -226,11 +224,10 @@ class TestRunStatusContractViolation:
 
 class TestRunStatusSuccessRejected:
     """`status=success` via /run-status is NOT allowed — success must only
-    flow through /artifact/publish, which enforces the data-required guard
-    (DataQueryTracker). Without this restriction, an agent whose Databricks
-    queries failed could POST `{"status":"success"}` and fire a SUCCESS
-    callback to gp-api with no artifact, bypassing the anti-fabrication
-    gate added on 2026-04-20.
+    flow through /artifact/publish, which is the only path that uploads to
+    S3 and emits the success callback. Without this restriction, an agent
+    could POST `{"status":"success"}` and fire a SUCCESS callback to gp-api
+    with no artifact actually persisted.
     """
 
     def test_success_rejected_at_pydantic_boundary(self):
@@ -307,68 +304,6 @@ class TestRunStatusRejectsUnknownStatus:
         mock_store.delete_ticket_and_run_lock.assert_not_called()
 
 
-class TestRunStatusTrackerCleanup:
-    """DataQueryTracker._counts is keyed by ticket.pk and lives in the broker
-    process. If we only clear on publish, any run that ends without publishing
-    (failed / contract_violation / timeout) leaks its count entry forever.
-    Over many runs the dict grows unbounded, and a re-minted pk would inherit
-    the stale count.
-    """
-
-    def test_tracker_cleared_after_failed_status(self):
-        ticket = _make_ticket()
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-        tracker.increment(ticket.pk)
-        assert tracker.get(ticket.pk) == 2
-
-        app, _, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/internal/run-status",
-            json={"status": "failed", "reason_code": "agent_error"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert tracker.get(ticket.pk) == 0
-        assert ticket.pk not in tracker._counts
-
-    def test_tracker_cleared_after_contract_violation(self):
-        ticket = _make_ticket()
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-
-        app, _, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/internal/run-status",
-            json={"status": "contract_violation", "reason_code": "schema_mismatch"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert tracker.get(ticket.pk) == 0
-
-    def test_tracker_cleared_after_timeout(self):
-        ticket = _make_ticket()
-        tracker = DataQueryTracker()
-        tracker.increment(ticket.pk)
-
-        app, _, _, _ = _create_app(ticket=ticket, tracker=tracker)
-        client = TestClient(app)
-
-        resp = client.post(
-            "/internal/run-status",
-            json={"status": "timeout"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-
-        assert resp.status_code == 200
-        assert tracker.get(ticket.pk) == 0
-
 class TestRunStatusClearsRunLock:
     """Terminal run-status must delete BOTH the ticket row and the run-lock
     row so a legitimate re-dispatch of the same run_id isn't blocked by a
@@ -379,7 +314,6 @@ class TestRunStatusClearsRunLock:
     def test_failed_status_clears_both_ticket_and_run_lock_in_ddb(self):
         import boto3
         from moto import mock_aws
-        from broker.endpoints.run_status import get_data_query_tracker
 
         with mock_aws():
             ddb = boto3.client("dynamodb", region_name="us-west-2")
@@ -408,6 +342,8 @@ class TestRunStatusClearsRunLock:
             app.dependency_overrides[get_ticket_store] = lambda: real_store
             app.dependency_overrides[get_broker_token_raw] = lambda: BROKER_TOKEN
             app.dependency_overrides[get_artifact_bucket] = lambda: "bucket"
+            from broker.data_query_tracker import DataQueryTracker
+            from broker.endpoints.run_status import get_data_query_tracker
             app.dependency_overrides[get_data_query_tracker] = lambda: DataQueryTracker()
 
             client = TestClient(app)

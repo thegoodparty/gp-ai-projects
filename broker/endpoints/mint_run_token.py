@@ -35,8 +35,8 @@ class MintRequest(BaseModel):
     timeout_seconds: int | None = None
     # Optional — map of dependency experiment_id -> pinned S3 artifact key.
     # When set, artifact_read enforces that dependents read the exact snapshot
-    # dispatched against, preserving the STALE invariant for
-    # peer_city_benchmarking / meeting_briefing.
+    # dispatched against, preserving the STALE invariant for any experiment
+    # with downstream dependencies.
     prior_artifact_versions: dict[str, str] | None = None
 
 
