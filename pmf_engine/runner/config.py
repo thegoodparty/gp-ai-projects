@@ -110,6 +110,19 @@ class RunnerConfig:
         max_turns = 50
         timeout_seconds = 600
 
+        environment_raw = os.environ.get("ENVIRONMENT", "dev")
+        environment_normalized = environment_raw.strip().lower()
+        broker_url_raw = os.environ.get("BROKER_URL", "")
+        broker_url = broker_url_raw.strip()
+
+        # Validate the BROKER_URL scheme BEFORE any broker fetch — otherwise a
+        # plaintext http:// in a deployment env would leak the broker token +
+        # manifest body in cleartext between here and the validation below.
+        # main.py already calls this earlier in the entrypoint; the second
+        # call here is defense-in-depth for any code path that constructs
+        # RunnerConfig directly (tests, future CLI, etc.).
+        validate_broker_url_scheme(broker_url, environment_raw)
+
         contract_schema = None
         contract_constraints = None
         if experiment_id:
@@ -141,13 +154,6 @@ class RunnerConfig:
             timeout_seconds = manifest.get("timeout_seconds", timeout_seconds)
             contract_schema = manifest.get("output_schema")
             contract_constraints = manifest.get("output_constraints")
-
-        environment_raw = os.environ.get("ENVIRONMENT", "dev")
-        environment_normalized = environment_raw.strip().lower()
-        broker_url_raw = os.environ.get("BROKER_URL", "")
-        broker_url = broker_url_raw.strip()
-
-        validate_broker_url_scheme(broker_url, environment_raw)
 
         ts_raw = os.environ.get("TIMEOUT_SECONDS", "").strip()
         if ts_raw:

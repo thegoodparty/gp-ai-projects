@@ -31,6 +31,23 @@ _OBJECT_CACHE_MAX = 512
 _INDEX_CACHE: dict[str, tuple[dict, float]] = {}
 _INDEX_TTL = 60.0
 
+# Process-cached CloudWatch client. boto3.client() does endpoint resolution +
+# credential fetching + TLS setup (~100-300ms) — cheap once, expensive per
+# call. Lazy-init at first metric emission so import-time has no AWS deps.
+_cw_client = None
+
+
+def _get_cw_client():
+    global _cw_client
+    if _cw_client is None:
+        _cw_client = boto3.client("cloudwatch")
+    return _cw_client
+
+
+def _reset_cw_client_for_tests() -> None:
+    global _cw_client
+    _cw_client = None
+
 
 def _emit_metric(metric_name: str, dimensions: list[dict]) -> None:
     """Emit a CloudWatch metric. Swallows all exceptions — metric emission must
@@ -38,8 +55,7 @@ def _emit_metric(metric_name: str, dimensions: list[dict]) -> None:
     (see broker/CLAUDE.md), so this is local instead of using shared.metrics.
     """
     try:
-        cw = boto3.client("cloudwatch")
-        cw.put_metric_data(
+        _get_cw_client().put_metric_data(
             Namespace="Broker",
             MetricData=[{
                 "MetricName": metric_name,
