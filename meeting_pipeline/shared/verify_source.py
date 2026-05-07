@@ -307,25 +307,30 @@ async def _find_past_agenda_from_platform(
             if not category_id:
                 category_id, _ = await find_council_category(client, domain)
             www_domain = _ensure_www(domain)
-            resp = await client.post(
-                f"https://{www_domain}/AgendaCenter/UpdateCategoryList",
-                data={"year": str(datetime.now(UTC).year), "catID": str(category_id)},
-                headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            # Pluck the first ViewFile/Agenda link that isn't a packet/html version.
-            for match in re.finditer(
-                r'href=["\'](/AgendaCenter/ViewFile/Agenda/[^"\']+)["\']',
-                resp.text,
-            ):
-                href = match.group(1)
-                if "packet=true" in href or "html=true" in href:
-                    continue
-                return f"https://{www_domain}{href}"
+            # Try current year first; some categories have data only in older
+            # years (e.g. site stopped maintaining the category in 2019). One
+            # AJAX call per year is cheap.
+            current_year = datetime.now(UTC).year
+            for year in (current_year, current_year - 1, current_year - 2):
+                resp = await client.post(
+                    f"https://{www_domain}/AgendaCenter/UpdateCategoryList",
+                    data={"year": str(year), "catID": str(category_id)},
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                # Pluck the first ViewFile/Agenda link that isn't a packet/html version.
+                for match in re.finditer(
+                    r'href=["\'](/AgendaCenter/ViewFile/Agenda/[^"\']+)["\']',
+                    resp.text,
+                ):
+                    href = match.group(1)
+                    if "packet=true" in href or "html=true" in href:
+                        continue
+                    return f"https://{www_domain}{href}"
         except Exception:
             pass
         return None
