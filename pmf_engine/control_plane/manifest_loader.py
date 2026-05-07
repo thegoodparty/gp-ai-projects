@@ -79,7 +79,14 @@ class ManifestRoutingLoader:
         self._s3 = s3_client
         self._ttl = ttl_seconds
         self._index_cache: tuple[list[_IndexEntry], float] | None = None
-        self._manifest_cache: dict[str, tuple[dict, float]] = {}
+        # Two distinct caches with distinct value shapes — each typed honestly
+        # so a future contributor can't dereference the wrong tuple. Sharing
+        # one dict keyed by string-prefix convention used to "work" only
+        # because the experiment_id regex (^[a-z][a-z0-9_]*$) rejected the
+        # leading underscore that separated the namespaces; that protection
+        # was upstream and brittle.
+        self._manifest_cache: dict[str, tuple[tuple[dict, str | None], float]] = {}
+        self._instruction_version_cache: dict[str, tuple[str | None, float]] = {}
 
     # ---------- public ----------
 
@@ -179,9 +186,8 @@ class ManifestRoutingLoader:
           retry and surfaces IAM / availability regressions instead of masking
           them as silently-degraded dispatches.
         """
-        cache_key = f"_instruction_{experiment_id}"
         now = time.monotonic()
-        cached = self._manifest_cache.get(cache_key)
+        cached = self._instruction_version_cache.get(experiment_id)
         if cached and now - cached[1] < self._ttl:
             return cached[0]
         try:
@@ -211,9 +217,9 @@ class ManifestRoutingLoader:
                 f"for '{experiment_id}': {code} (request_id={request_id})"
             ) from e
         version_id = response.get("VersionId")
-        if len(self._manifest_cache) >= _MANIFEST_CACHE_MAX:
-            self._manifest_cache.clear()
-        self._manifest_cache[cache_key] = (version_id, now)
+        if len(self._instruction_version_cache) >= _MANIFEST_CACHE_MAX:
+            self._instruction_version_cache.clear()
+        self._instruction_version_cache[experiment_id] = (version_id, now)
         return version_id
 
     def _get_object(self, key: str, label: str) -> tuple[bytes, str | None]:
