@@ -35,6 +35,7 @@ CLAUDE*.md
 *cache*/
 *smac3_output*/
 input*
+!meeting_qa/qa/inputs/
 *.zip
 enhanced_data/
 
