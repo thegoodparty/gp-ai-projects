@@ -39,6 +39,21 @@ def _redact_userinfo(url: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc))
 
 
+def _is_draft7_object_schema(schema: object) -> bool:
+    """Quick shape check: is this a JSON Schema Draft-07 object schema?
+
+    Without this guard, the legacy GP-shape format (`{"name": "string"}`) would
+    sail through `Draft7Validator` as a no-op — every artifact validates "valid"
+    because the schema declares no constraints. We want to reject those at
+    config load, not silently accept invalid artifacts in production.
+    """
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and isinstance(schema.get("properties"), dict)
+    )
+
+
 def validate_broker_url_scheme(broker_url: str, environment: str) -> None:
     """Raise BrokerUrlSchemeError if broker_url scheme is plaintext in a deployment env.
 
@@ -81,7 +96,6 @@ class RunnerConfig:
     broker_url: str = ""
     broker_token: str = ""
     contract_schema: dict | None = None
-    contract_constraints: dict | None = None
     max_turns: int = 50
     timeout_seconds: int = 600
 
@@ -124,7 +138,6 @@ class RunnerConfig:
         validate_broker_url_scheme(broker_url, environment_raw)
 
         contract_schema = None
-        contract_constraints = None
         if experiment_id:
             # The broker is the only source for manifest+instruction. The
             # broker reads s3://agent-experiment-metadata-{env}/<id>/* and
@@ -153,7 +166,12 @@ class RunnerConfig:
             max_turns = manifest.get("max_turns", max_turns)
             timeout_seconds = manifest.get("timeout_seconds", timeout_seconds)
             contract_schema = manifest.get("output_schema")
-            contract_constraints = manifest.get("output_constraints")
+            if contract_schema is not None and not _is_draft7_object_schema(contract_schema):
+                raise ValueError(
+                    f"Manifest output_schema is not JSON Schema Draft-07 "
+                    f"(must have type='object' and a properties dict at root); "
+                    f"got {contract_schema!r}"
+                )
 
         ts_raw = os.environ.get("TIMEOUT_SECONDS", "").strip()
         if ts_raw:
@@ -176,7 +194,6 @@ class RunnerConfig:
             broker_url=broker_url,
             broker_token=os.environ.get("BROKER_TOKEN", ""),
             contract_schema=contract_schema,
-            contract_constraints=contract_constraints,
             max_turns=max_turns,
             timeout_seconds=timeout_seconds,
         )

@@ -63,7 +63,7 @@ class TestPublishIntegration:
     @patch("pmf_engine.runner.main._upload_logs")
     @patch("pmf_engine.runner.main.publish")
     async def test_contract_violation_does_not_publish(self, mock_publish, _mock_logs):
-        config = _config(contract_schema={"greeting": "string"})
+        config = _config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": 42}',
             content_type="application/json",

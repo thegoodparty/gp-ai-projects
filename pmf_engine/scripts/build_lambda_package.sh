@@ -26,6 +26,7 @@ cp "$PMF_DIR/control_plane/dispatch_handler.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/broker_client.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/scope_derivation.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/manifest_loader.py" "$OUTPUT_DIR/"
+cp "$PMF_DIR/control_plane/jsonschema_errors.py" "$OUTPUT_DIR/"
 
 mkdir -p "$OUTPUT_DIR/shared"
 touch "$OUTPUT_DIR/shared/__init__.py"

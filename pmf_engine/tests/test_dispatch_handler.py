@@ -1603,6 +1603,43 @@ class TestInputSchemaSortKeyMixedTypes:
         detail = call.args[1] if len(call.args) > 1 else call.kwargs.get("detail", "")
         assert "input_schema" in detail.lower() or "name" in detail.lower()
 
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_violation_paths_use_bracketed_array_index_format(
+        self, mock_get_ecs, mock_broker_cls, mock_emit_metric, mock_send_error_callback,
+        monkeypatch,
+    ):
+        """The violation path format must match contract.py: array indices are
+        rendered as `field[1].subfield`, not `field.1.subfield`. Both
+        dispatch_handler and contract.py validate JSON Schema Draft-07 — they
+        must format paths identically so logs/operators don't see two styles."""
+        import pmf_engine.control_plane.dispatch_handler as dh
+        loader = self._loader_with_array_schema()
+        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
+        dh.reset_validator_cache_for_tests()
+        mock_broker_cls.return_value = _mock_broker_success()
+
+        event = _make_sqs_event({
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-fmt",
+            "run_id": "run-fmt-check",
+            # items[1].id is the wrong type (int instead of string).
+            "params": {"items": [{"id": "ok"}, {"id": 42}], "name": "alice"},
+        })
+
+        handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        detail = mock_send_error_callback.call_args.args[1]
+        assert "items[1].id" in detail, (
+            f"expected bracketed path 'items[1].id'; got detail={detail!r}"
+        )
+        assert "items.1.id" not in detail, (
+            f"old dotted-index format leaked through; got detail={detail!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _resolve_routing — manifest loader is the single source of truth.

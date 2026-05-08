@@ -23,7 +23,6 @@ class AgentHarness(Protocol):
         workspace_dir: str,
         params: dict,
         contract_schema: dict | None = None,
-        contract_constraints: dict | None = None,
         parent_span=None,
         experiment_id: str | None = None,
     ) -> HarnessResult: ...

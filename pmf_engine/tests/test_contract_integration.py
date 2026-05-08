@@ -33,7 +33,11 @@ def _make_config(**overrides):
 class TestRunnerContractValidation:
     @pytest.mark.asyncio
     async def test_valid_artifact_publishes_via_broker(self, mock_publish, _mock_logs):
-        schema = {"greeting": "string"}
+        schema = {
+            "type": "object",
+            "required": ["greeting"],
+            "properties": {"greeting": {"type": "string"}},
+        }
         config = _make_config(contract_schema=schema)
         artifact = json.dumps({"greeting": "hello"}).encode()
 
@@ -49,7 +53,11 @@ class TestRunnerContractValidation:
 
     @pytest.mark.asyncio
     async def test_invalid_artifact_reports_contract_violation(self, mock_publish, _mock_logs):
-        schema = {"greeting": "string", "count": "number"}
+        schema = {
+            "type": "object",
+            "required": ["greeting", "count"],
+            "properties": {"greeting": {"type": "string"}, "count": {"type": "number"}},
+        }
         config = _make_config(contract_schema=schema)
         artifact = json.dumps({"greeting": "hello"}).encode()
 
@@ -226,7 +234,19 @@ class TestSessionJsonlRedaction:
 
 class TestSystemPromptContractInjection:
     def test_contract_schema_included_in_prompt(self):
-        schema = {"name": "string", "items": [{"id": "number"}]}
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": "number"}},
+                    },
+                },
+            },
+        }
         prompt = build_system_prompt("Do the task.", contract_schema=schema)
         assert "## OUTPUT CONTRACT" in prompt
         assert '"name": "string"' in prompt
@@ -238,5 +258,6 @@ class TestSystemPromptContractInjection:
         assert "OUTPUT CONTRACT" not in prompt
 
     def test_instruction_still_present(self):
-        prompt = build_system_prompt("Do the specific task.", contract_schema={"x": "string"})
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+        prompt = build_system_prompt("Do the specific task.", contract_schema=schema)
         assert "Do the specific task." in prompt
