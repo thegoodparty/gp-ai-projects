@@ -1,12 +1,12 @@
-"""Parity tests: ensure _VALIDATOR_SCRIPT heredoc and contract.py produce identical results.
+"""Parity tests for the in-container validator script.
 
-The PMF engine has three copies of the contract validator:
-1. contract.py (canonical, used by runner post-hoc)
-2. _VALIDATOR_SCRIPT heredoc in main.py (written to workspace for agent self-validation)
-3. runbooks/scripts/python/validate_contract.py (CLI tool for local runs)
-
-These tests catch drift between copy #1 and #2 by running both against identical inputs.
-Copy #3 is tested in test_validator_parity_runbook.py.
+`_VALIDATOR_SCRIPT` (in `runner/main.py`) is a thin shim that imports
+`collect_contract_errors` from `runner.contract` and runs it via subprocess
+against `/workspace/output/*.json`. There is one validation implementation —
+this suite exercises the shim's subprocess plumbing (file discovery, exit
+codes, stdout format) by running the heredoc against the same cases the
+canonical `contract.py` is run against, and asserting the pass/fail verdict
+matches.
 """
 import json
 import os
@@ -20,17 +20,9 @@ from pmf_engine.runner.contract import validate_artifact_contract, ContractViola
 from pmf_engine.runner.main import _VALIDATOR_SCRIPT
 
 
-def _run_heredoc_validator(
-    data: dict,
-    schema: dict,
-    constraints: dict | None = None,
-) -> tuple[bool, str]:
-    """Write the heredoc script + data to a temp dir and run it as a subprocess.
-
-    Returns (passed: bool, output: str).
-    """
+def _run_heredoc_validator(data: dict, schema: dict) -> tuple[bool, str]:
+    """Write the heredoc script + data to a temp dir and run it as a subprocess."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Mimic the workspace layout the heredoc expects
         output_dir = os.path.join(tmpdir, "output")
         os.makedirs(output_dir)
 
@@ -39,10 +31,6 @@ def _run_heredoc_validator(
 
         with open(os.path.join(tmpdir, "contract_schema.json"), "w") as f:
             json.dump(schema, f)
-
-        if constraints:
-            with open(os.path.join(tmpdir, "contract_constraints.json"), "w") as f:
-                json.dump(constraints, f)
 
         with open(os.path.join(tmpdir, "validate_output.py"), "w") as f:
             f.write(_VALIDATOR_SCRIPT)
@@ -58,171 +46,188 @@ def _run_heredoc_validator(
         return passed, output
 
 
-def _run_contract_py(
-    data: dict,
-    schema: dict,
-    constraints: dict | None = None,
-) -> tuple[bool, str]:
+def _run_contract_py(data: dict, schema: dict) -> tuple[bool, str]:
     """Run contract.py's validate_artifact_contract and return (passed, error_msg)."""
     try:
-        validate_artifact_contract(json.dumps(data).encode(), schema, constraints)
+        validate_artifact_contract(json.dumps(data).encode(), schema)
         return True, ""
     except ContractViolation as e:
         return False, str(e)
 
 
-# --- Test cases: each is (description, data, schema, constraints, should_pass) ---
+def _OBJ(required, **props):
+    return {"type": "object", "required": required, "properties": props}
 
 _CASES = [
     (
         "basic_schema_pass",
         {"name": "Alice", "age": 30},
-        {"name": "string", "age": "number"},
-        None,
+        _OBJ(["name", "age"], name={"type": "string"}, age={"type": "number"}),
         True,
     ),
     (
         "missing_field_fails",
         {"name": "Alice"},
-        {"name": "string", "age": "number"},
-        None,
+        _OBJ(["name", "age"], name={"type": "string"}, age={"type": "number"}),
         False,
     ),
     (
         "wrong_type_fails",
         {"name": "Alice", "age": "thirty"},
-        {"name": "string", "age": "number"},
-        None,
+        _OBJ(["name", "age"], name={"type": "string"}, age={"type": "number"}),
         False,
     ),
     (
         "nested_object_pass",
         {"user": {"name": "Bob", "active": True}},
-        {"user": {"name": "string", "active": "boolean"}},
-        None,
+        _OBJ(
+            ["user"],
+            user=_OBJ(["name", "active"], name={"type": "string"}, active={"type": "boolean"}),
+        ),
         True,
     ),
     (
         "nested_missing_field_fails",
         {"user": {"name": "Bob"}},
-        {"user": {"name": "string", "active": "boolean"}},
-        None,
+        _OBJ(
+            ["user"],
+            user=_OBJ(["name", "active"], name={"type": "string"}, active={"type": "boolean"}),
+        ),
         False,
     ),
     (
         "array_of_objects_pass",
         {"items": [{"id": 1}, {"id": 2}]},
-        {"items": [{"id": "number"}]},
-        None,
+        _OBJ(
+            ["items"],
+            items={"type": "array", "items": _OBJ(["id"], id={"type": "number"})},
+        ),
         True,
     ),
     (
         "empty_array_fails",
         {"items": []},
-        {"items": [{"id": "number"}]},
-        None,
+        _OBJ(
+            ["items"],
+            items={"type": "array", "minItems": 1, "items": _OBJ(["id"], id={"type": "number"})},
+        ),
         False,
     ),
     (
-        "enum_constraint_pass",
+        "enum_pass",
         {"status": "active"},
-        {"status": "string"},
-        {"enums": [{"path": "status", "values": ["active", "inactive"]}]},
+        _OBJ(["status"], status={"type": "string", "enum": ["active", "inactive"]}),
         True,
     ),
     (
-        "enum_constraint_fails",
+        "enum_fails",
         {"status": "deleted"},
-        {"status": "string"},
-        {"enums": [{"path": "status", "values": ["active", "inactive"]}]},
+        _OBJ(["status"], status={"type": "string", "enum": ["active", "inactive"]}),
         False,
     ),
     (
-        "range_constraint_pass",
+        "range_pass",
         {"score": 85},
-        {"score": "number"},
-        {"ranges": [{"path": "score", "min": 0, "max": 100}]},
+        _OBJ(["score"], score={"type": "number", "minimum": 0, "maximum": 100}),
         True,
     ),
     (
-        "range_constraint_fails",
+        "range_fails",
         {"score": 150},
-        {"score": "number"},
-        {"ranges": [{"path": "score", "min": 0, "max": 100}]},
+        _OBJ(["score"], score={"type": "number", "minimum": 0, "maximum": 100}),
         False,
     ),
     (
-        "array_length_bracket_path_pass",
-        {
-            "issues": [
-                {"sources": [{"id": 1}, {"id": 2}]},
-                {"sources": [{"id": 3}, {"id": 4}]},
-            ]
-        },
-        {"issues": [{"sources": [{"id": "number"}]}]},
-        {"array_length": [{"path": "issues[].sources", "min": 2}]},
+        "array_min_items_pass",
+        {"items": [{"id": 1}, {"id": 2}]},
+        _OBJ(
+            ["items"],
+            items={
+                "type": "array",
+                "minItems": 2,
+                "items": _OBJ(["id"], id={"type": "number"}),
+            },
+        ),
         True,
     ),
     (
-        "array_length_bracket_path_fails_second_item",
+        "array_min_items_fails",
+        {"items": [{"id": 1}]},
+        _OBJ(
+            ["items"],
+            items={
+                "type": "array",
+                "minItems": 2,
+                "items": _OBJ(["id"], id={"type": "number"}),
+            },
+        ),
+        False,
+    ),
+    (
+        "nested_array_min_items_fails_second_item",
+        # Restoring the bracket-path coverage from the deleted constraints
+        # engine: validation must check minItems on EVERY nested sources[]
+        # array, not just the first. Old constraints API used path
+        # "issues[].sources" + min:2; Draft-07 expresses the same as
+        # nested items.properties.sources.minItems=2.
         {
             "issues": [
                 {"sources": [{"id": 1}, {"id": 2}]},
                 {"sources": [{"id": 3}]},
-            ]
+            ],
         },
-        {"issues": [{"sources": [{"id": "number"}]}]},
-        {"array_length": [{"path": "issues[].sources", "min": 2}]},
+        _OBJ(
+            ["issues"],
+            issues={
+                "type": "array",
+                "items": _OBJ(
+                    ["sources"],
+                    sources={
+                        "type": "array",
+                        "minItems": 2,
+                        "items": _OBJ(["id"], id={"type": "number"}),
+                    },
+                ),
+            },
+        ),
         False,
     ),
     (
-        "equals_count_pass",
-        {"total": 3, "items": [{"id": 1}, {"id": 2}, {"id": 3}]},
-        {"total": "number", "items": [{"id": "number"}]},
-        {"equals": [{"left": "total", "right": {"count": "items"}}]},
+        "nested_array_min_items_pass",
+        {
+            "issues": [
+                {"sources": [{"id": 1}, {"id": 2}]},
+                {"sources": [{"id": 3}, {"id": 4}]},
+            ],
+        },
+        _OBJ(
+            ["issues"],
+            issues={
+                "type": "array",
+                "items": _OBJ(
+                    ["sources"],
+                    sources={
+                        "type": "array",
+                        "minItems": 2,
+                        "items": _OBJ(["id"], id={"type": "number"}),
+                    },
+                ),
+            },
+        ),
         True,
-    ),
-    (
-        "equals_count_fails",
-        {"total": 5, "items": [{"id": 1}, {"id": 2}]},
-        {"total": "number", "items": [{"id": "number"}]},
-        {"equals": [{"left": "total", "right": {"count": "items"}}]},
-        False,
-    ),
-    (
-        "equals_sum_pass",
-        {"total": 6, "vals": [{"n": 1}, {"n": 2}, {"n": 3}]},
-        {"total": "number", "vals": [{"n": "number"}]},
-        {"equals": [{"left": "total", "right": {"sum": "vals[].n"}}]},
-        True,
-    ),
-    (
-        "exact_ids_pass",
-        {"items": [{"id": "a"}, {"id": "b"}]},
-        {"items": [{"id": "string"}]},
-        {"exact_ids": [{"path": "items[].id", "values": ["a", "b"]}]},
-        True,
-    ),
-    (
-        "exact_ids_fails",
-        {"items": [{"id": "a"}, {"id": "c"}]},
-        {"items": [{"id": "string"}]},
-        {"exact_ids": [{"path": "items[].id", "values": ["a", "b"]}]},
-        False,
     ),
 ]
 
 
 class TestValidatorParity:
     @pytest.mark.parametrize(
-        "name,data,schema,constraints,should_pass",
+        "name,data,schema,should_pass",
         _CASES,
         ids=[c[0] for c in _CASES],
     )
-    def test_heredoc_matches_contract_py(self, name, data, schema, constraints, should_pass):
-        """Both validators must agree on pass/fail for every test case."""
-        contract_passed, contract_err = _run_contract_py(data, schema, constraints)
-        heredoc_passed, heredoc_output = _run_heredoc_validator(data, schema, constraints)
+    def test_heredoc_matches_contract_py(self, name, data, schema, should_pass):
+        contract_passed, contract_err = _run_contract_py(data, schema)
+        heredoc_passed, heredoc_output = _run_heredoc_validator(data, schema)
 
         assert contract_passed == should_pass, (
             f"contract.py expected {'pass' if should_pass else 'fail'} "

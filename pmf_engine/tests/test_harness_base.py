@@ -10,7 +10,6 @@ class FakeHarness:
         workspace_dir: str,
         params: dict,
         contract_schema: dict | None = None,
-        contract_constraints: dict | None = None,
         parent_span=None,
     ) -> HarnessResult:
         return HarnessResult(

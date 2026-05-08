@@ -175,6 +175,41 @@ async def test_run_experiment_reports_failed_on_publish_failure(mock_publish, _m
 
 
 @pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_failure_then_report_status_failure_leaves_callback_unsent(
+    mock_publish, _mock_logs
+):
+    """Double-failure path: broker.publish raises, then broker.report_status
+    also raises. The terminal-callback marker MUST stay False so the outer
+    main() handler can attempt its own fallback callback. If the marker is set
+    eagerly via finally, main()'s `if not _is_callback_already_sent()` skips —
+    and the run goes PENDING forever in gp-api with no terminal status."""
+    from pmf_engine.runner.main import _is_callback_already_sent, _reset_callback_marker
+
+    _reset_callback_marker()
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"data": "ok"}',
+        content_type="application/json",
+        cost_usd=0.01,
+        num_turns=1,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_publish.publish.side_effect = Exception("Broker down")
+    mock_publish.report_status.side_effect = Exception("Broker still down")
+
+    with pytest.raises(Exception):
+        await run_experiment(config, harness=mock_harness)
+
+    assert _is_callback_already_sent() is False, (
+        "Marker must remain False when report_status itself failed — "
+        "otherwise main()'s fallback handler skips and the run is stuck PENDING."
+    )
+
+
+@pytest.mark.asyncio
 async def test_main_writes_instruction_to_workspace():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = _make_config(instruction="# Test Instruction\n\nDo the thing.")
@@ -220,7 +255,7 @@ async def test_main_sends_failed_status_on_timeout():
 @patch("pmf_engine.runner.main.publish")
 async def test_run_experiment_contract_violation_reports_status(mock_publish, _mock_logs):
     config = _make_config(
-        contract_schema={"greeting": "string"},
+        contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}},
     )
     fake_result = HarnessResult(
         artifact_bytes=b'{"greeting": 42}',
@@ -252,7 +287,7 @@ async def test_run_experiment_contract_violation_invalid_json_still_reports(mock
     skip report_status and mark_callback_sent, leaving the run PENDING
     forever in gp-api with no way to know why.
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=b'this is not valid json {{{',
         content_type="application/json",
@@ -284,7 +319,7 @@ async def test_run_experiment_contract_violation_none_artifact_bytes(mock_publis
     `None[:4096]` — which would skip report_status entirely and leave the run
     PENDING forever (the same failure mode Fix #6 was supposed to close).
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=None,  # type: ignore[arg-type]
         content_type="application/json",
@@ -314,7 +349,7 @@ async def test_run_experiment_contract_violation_str_artifact_bytes(mock_publish
     instead of bytes, .decode() on str raises AttributeError — same lost
     callback. Coerce defensively.
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes="not bytes, but str",  # type: ignore[arg-type]
         content_type="application/json",
@@ -509,7 +544,7 @@ async def test_run_experiment_traces_failure_to_braintrust(mock_publish, _mock_l
 @patch("pmf_engine.runner.main._upload_logs")
 @patch("pmf_engine.runner.main.publish")
 async def test_run_experiment_traces_contract_violation_to_braintrust(mock_publish, _mock_logs):
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=b'{"greeting": 42}',
         content_type="application/json",
@@ -609,12 +644,12 @@ class TestMainErrorPaths:
 
 
 class TestValidatorScriptShim:
-    def _write_workspace(self, tmpdir: Path, schema: dict, artifacts: dict,
-                         constraints: dict | None = None):
+    def _obj(self, required, **props):
+        return {"type": "object", "required": required, "properties": props}
+
+    def _write_workspace(self, tmpdir: Path, schema: dict, artifacts: dict):
         (tmpdir / "output").mkdir(exist_ok=True)
         (tmpdir / "contract_schema.json").write_text(json.dumps(schema))
-        if constraints is not None:
-            (tmpdir / "contract_constraints.json").write_text(json.dumps(constraints))
         for name, body in artifacts.items():
             (tmpdir / "output" / name).write_text(json.dumps(body))
         from pmf_engine.runner.main import _VALIDATOR_SCRIPT
@@ -635,7 +670,7 @@ class TestValidatorScriptShim:
     def test_passes_on_valid_artifact(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"greeting": "string", "count": "number"},
+            schema=self._obj(["greeting", "count"], greeting={"type": "string"}, count={"type": "number"}),
             artifacts={"result.json": {"greeting": "hello", "count": 5}},
         )
         result = self._run_validator(tmp_path)
@@ -645,7 +680,7 @@ class TestValidatorScriptShim:
     def test_fails_on_missing_field_and_lists_it(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"greeting": "string", "count": "number"},
+            schema=self._obj(["greeting", "count"], greeting={"type": "string"}, count={"type": "number"}),
             artifacts={"result.json": {"greeting": "hello"}},
         )
         result = self._run_validator(tmp_path)
@@ -656,7 +691,12 @@ class TestValidatorScriptShim:
     def test_fails_on_multiple_errors_and_lists_all(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"a": "string", "b": "number", "c": "boolean"},
+            schema=self._obj(
+                ["a", "b", "c"],
+                a={"type": "string"},
+                b={"type": "number"},
+                c={"type": "boolean"},
+            ),
             artifacts={"result.json": {}},
         )
         result = self._run_validator(tmp_path)
@@ -665,12 +705,14 @@ class TestValidatorScriptShim:
         assert "b" in result.stdout
         assert "c" in result.stdout
 
-    def test_fails_on_constraint_violation(self, tmp_path):
+    def test_fails_on_enum_violation(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"tier": "string"},
+            schema=self._obj(
+                ["tier"],
+                tier={"type": "string", "enum": ["bronze", "silver", "gold"]},
+            ),
             artifacts={"result.json": {"tier": "platinum"}},
-            constraints={"enums": [{"path": "tier", "values": ["bronze", "silver", "gold"]}]},
         )
         result = self._run_validator(tmp_path)
         assert result.returncode == 1
@@ -678,7 +720,7 @@ class TestValidatorScriptShim:
 
     def test_fails_when_output_dir_empty(self, tmp_path):
         (tmp_path / "output").mkdir()
-        (tmp_path / "contract_schema.json").write_text(json.dumps({"x": "string"}))
+        (tmp_path / "contract_schema.json").write_text(json.dumps(self._obj(["x"], x={"type": "string"})))
         from pmf_engine.runner.main import _VALIDATOR_SCRIPT
         (tmp_path / "validate_output.py").write_text(_VALIDATOR_SCRIPT)
         result = self._run_validator(tmp_path)
@@ -785,7 +827,7 @@ class TestCallbackLifecycleFix:
 
     @pytest.mark.asyncio
     async def test_validator_non_contract_violation_uploads_logs_and_reports_failed(self):
-        config = _make_config(contract_schema={"greeting": "string"})
+        config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": "hello"}',
             content_type="application/json",
@@ -957,7 +999,7 @@ class TestFailureCallbacksCarryDurationAndCost:
     @patch("pmf_engine.runner.main._upload_logs")
     @patch("pmf_engine.runner.main.publish")
     async def test_contract_violation_reports_duration_and_cost(self, mock_publish, _mock_logs):
-        config = _make_config(contract_schema={"greeting": "string"})
+        config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": 42}',
             content_type="application/json",

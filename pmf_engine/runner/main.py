@@ -24,7 +24,7 @@ _current_task: "asyncio.Task | None" = None
 _terminal_callback_sent = False
 
 _VALIDATOR_SCRIPT = '''#!/usr/bin/env python3
-"""Validate output artifact against the contract schema (+ optional constraints).
+"""Validate output artifact against the contract schema.
 Usage: python3 /workspace/validate_output.py
 Exits 0 on success, 1 on validation failure.
 
@@ -48,17 +48,11 @@ if not files:
 with open(os.path.join(_WORKSPACE, "contract_schema.json"), "rb") as _fh:
     schema = json.loads(_fh.read())
 
-constraints = None
-_constraints_path = os.path.join(_WORKSPACE, "contract_constraints.json")
-if os.path.exists(_constraints_path):
-    with open(_constraints_path, "rb") as _fh:
-        constraints = json.loads(_fh.read())
-
 exit_code = 0
 for path in files:
     with open(path, "rb") as _fh:
         artifact_bytes = _fh.read()
-    errors = collect_contract_errors(artifact_bytes, schema, constraints)
+    errors = collect_contract_errors(artifact_bytes, schema)
     if errors:
         print(f"FAIL: {path}")
         for err in errors[:30]:
@@ -67,8 +61,7 @@ for path in files:
             print(f"  ... and {len(errors) - 30} more errors")
         exit_code = 1
     else:
-        suffix = " (+constraints)" if constraints else ""
-        print(f"PASS: {path} — all fields valid{suffix}")
+        print(f"PASS: {path} — all fields valid")
 
 sys.exit(exit_code)
 '''
@@ -354,7 +347,6 @@ async def run_experiment(
                     workspace_dir=workspace_dir,
                     params=config.params,
                     contract_schema=config.contract_schema,
-                    contract_constraints=config.contract_constraints,
                     parent_span=span,
                     experiment_id=config.experiment_id,
                 )
@@ -376,7 +368,6 @@ async def run_experiment(
                 validate_artifact_contract(
                     result.artifact_bytes,
                     config.contract_schema,
-                    config.contract_constraints,
                 )
             except ContractViolation as e:
                 duration = time.monotonic() - start_time
@@ -459,20 +450,31 @@ async def run_experiment(
                     duration_seconds=duration,
                     cost_usd=result.cost_usd,
                 )
+                _mark_callback_sent()
                 logger.info(f"Published artifact via broker for run {config.run_id}")
             except Exception as e:
+                # Mark callback sent ONLY after report_status returns successfully.
+                # If report_status itself raises (e.g. broker is fully down),
+                # leave the marker False so main()'s outer handler still gets a
+                # chance to send a fallback terminal callback. Eagerly setting
+                # the marker via finally:_mark_callback_sent() would skip that
+                # fallback and leave the run PENDING forever in gp-api.
                 logger.exception(f"Broker publish failed for run {config.run_id}: {e}")
-                publish.report_status(
-                    "failed",
-                    reason_code="PublishFailed",
-                    detail=str(e),
-                    duration_seconds=duration,
-                    cost_usd=result.cost_usd,
-                )
-                _mark_callback_sent()
+                try:
+                    publish.report_status(
+                        "failed",
+                        reason_code="PublishFailed",
+                        detail=str(e),
+                        duration_seconds=duration,
+                        cost_usd=result.cost_usd,
+                    )
+                    _mark_callback_sent()
+                except Exception as report_err:
+                    logger.exception(
+                        f"report_status during publish-failure handling also failed "
+                        f"for run {config.run_id}: {report_err}"
+                    )
                 raise
-            finally:
-                _mark_callback_sent()
 
             span.log(output={
                 "status": "success",
@@ -630,7 +632,7 @@ async def main():
             sys.exit(1)
 
         if not config.instruction:
-            logger.error("No instruction available (not in env var or registry)")
+            logger.error("No instruction available (broker fetch failed and INSTRUCTION env var not set)")
             publish.report_status(
                 "failed",
                 reason_code="MissingConfig",
@@ -651,12 +653,6 @@ async def main():
             schema_path = os.path.join(workspace_dir, "contract_schema.json")
             with open(schema_path, "w") as f:
                 json.dump(config.contract_schema, f, indent=2)
-
-            if config.contract_constraints:
-                constraints_path = os.path.join(workspace_dir, "contract_constraints.json")
-                with open(constraints_path, "w") as f:
-                    json.dump(config.contract_constraints, f, indent=2)
-                logger.info(f"Wrote contract constraints to {constraints_path}")
 
             validator_path = os.path.join(workspace_dir, "validate_output.py")
             with open(validator_path, "w") as f:

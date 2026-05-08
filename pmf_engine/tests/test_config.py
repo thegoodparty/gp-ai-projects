@@ -93,6 +93,38 @@ def test_from_env_uses_defaults(monkeypatch):
     assert config.broker_token == ""
 
 
+def test_from_env_rejects_non_draft7_output_schema(monkeypatch):
+    """A manifest whose output_schema doesn't have type:'object' + properties at
+    the root would be vacuously accepted by Draft7Validator and silently pass
+    every artifact. Reject loudly at config load instead."""
+    bad_manifest = synthetic_manifest()
+    # Legacy GP-shape — a literal example dict, not a JSON Schema.
+    bad_manifest["output_schema"] = {"name": "string", "count": "number"}
+    bad_envelope = {
+        "manifest": {
+            "model": bad_manifest["model"],
+            "max_turns": bad_manifest["max_turns"],
+            "timeout_seconds": bad_manifest["timeout_seconds"],
+            "output_schema": bad_manifest["output_schema"],
+        },
+        "instruction": synthetic_instruction(),
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-bad-schema")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=bad_envelope,
+    ):
+        with pytest.raises(ValueError, match="output_schema"):
+            RunnerConfig.from_env()
+
+
 def test_from_env_raises_loud_on_invalid_json_params(monkeypatch):
     """Corrupted PARAMS_JSON must fail loud — a silent default to {} causes
     the agent to run on empty inputs and produce plausible but wrong artifacts
