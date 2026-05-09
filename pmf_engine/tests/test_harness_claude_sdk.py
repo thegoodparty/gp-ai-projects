@@ -106,14 +106,20 @@ async def test_run_returns_harness_result_on_success():
 
 
 @pytest.mark.asyncio
-async def test_run_raises_on_agent_error():
+async def test_run_raises_agent_execution_error_on_agent_error():
+    """Agent-side errors must surface as AgentExecutionError, not bare
+    RuntimeError. The runner's outer except reports `type(e).__name__` as the
+    callback reason_code; collapsing every harness-internal failure under
+    "RuntimeError" hurts alerting fidelity."""
+    from pmf_engine.runner.harness.claude_sdk import AgentExecutionError
+
     async def fake_query_error(prompt, options):
         yield _make_result_message(result="Something went wrong", is_error=True, num_turns=1, session_id="sess-err")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_error):
             harness = ClaudeSdkHarness()
-            with pytest.raises(RuntimeError, match="Something went wrong"):
+            with pytest.raises(AgentExecutionError, match="Something went wrong"):
                 await harness.run(
                     instruction="Do stuff",
                     model="sonnet",
@@ -124,7 +130,12 @@ async def test_run_raises_on_agent_error():
 
 
 @pytest.mark.asyncio
-async def test_run_raises_on_no_result_message():
+async def test_run_raises_agent_stream_truncated_on_no_result_message():
+    """A stream that ends without a ResultMessage is a distinct failure mode
+    from an agent-reported error. Use a separate exception type so alerting
+    can route differently."""
+    from pmf_engine.runner.harness.claude_sdk import AgentStreamTruncatedError
+
     async def fake_query_empty(prompt, options):
         return
         yield  # pragma: no cover
@@ -132,7 +143,7 @@ async def test_run_raises_on_no_result_message():
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_empty):
             harness = ClaudeSdkHarness()
-            with pytest.raises(RuntimeError, match="ended without result"):
+            with pytest.raises(AgentStreamTruncatedError, match="ended without result"):
                 await harness.run(
                     instruction="Do stuff",
                     model="sonnet",

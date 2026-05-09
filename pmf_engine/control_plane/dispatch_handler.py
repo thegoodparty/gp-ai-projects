@@ -22,6 +22,7 @@ except (ImportError, OSError):
 try:
     from .broker_client import BrokerClient, BrokerError
     from .scope_derivation import derive_scope
+    from .jsonschema_errors import format_validation_errors
     from .manifest_loader import (
         ManifestRoutingLoader,
         ManifestLoaderError,
@@ -31,6 +32,7 @@ try:
 except ImportError:
     from broker_client import BrokerClient, BrokerError
     from scope_derivation import derive_scope
+    from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
         ManifestRoutingLoader,
         ManifestLoaderError,
@@ -504,19 +506,11 @@ def handler(event: dict, context) -> dict:
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
-        input_errors = sorted(
-            _input_validator(experiment_id, experiment.get("manifest_version_id"), input_schema)
-            .iter_errors(message["params"]),
-            # absolute_path mixes strings (object keys) and ints (array
-            # indices); sort key MUST coerce or Python 3 raises TypeError on
-            # int<>str comparison and the whole batch crashes.
-            key=lambda e: [str(p) for p in e.absolute_path],
+        violations = format_validation_errors(
+            _input_validator(experiment_id, experiment.get("manifest_version_id"), input_schema),
+            message["params"],
         )
-        if input_errors:
-            violations = [
-                f"{'.'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
-                for e in input_errors
-            ]
+        if violations:
             logger.error(
                 f"input_schema validation failed for {experiment_id} "
                 f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
