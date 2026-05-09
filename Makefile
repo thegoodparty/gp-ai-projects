@@ -1,7 +1,8 @@
-.PHONY: help lint format type-check check test install-hooks uninstall-hooks
+.PHONY: help submodule-init lint format type-check check test install-hooks uninstall-hooks
 
 help:
 	@echo "Available commands:"
+	@echo "  make submodule-init   - Initialize the ai-rules git submodule"
 	@echo "  make install-hooks    - Install pre-commit hooks"
 	@echo "  make uninstall-hooks  - Uninstall pre-commit hooks"
 	@echo "  make lint             - Run ruff linter"
@@ -9,6 +10,10 @@ help:
 	@echo "  make type-check       - Run mypy type checker"
 	@echo "  make check            - Run all checks (lint + format + type)"
 	@echo "  make test             - Run pytest tests"
+
+submodule-init:
+	git submodule update --init --recursive
+	@echo "✅ ai-rules submodule initialized at: $$(cd ai-rules && git rev-parse --short HEAD)"
 
 install-hooks:
 	uv add --dev pre-commit
