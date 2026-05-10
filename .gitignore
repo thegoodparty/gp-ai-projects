@@ -25,8 +25,8 @@ local_testing.py
 #offline files
 offline_data*/
 
-#ai tooling
-CLAUDE*.md
+#ai tooling (CLAUDE.md is tracked; only ignore ad-hoc local notes that may have used CLAUDE-* names)
+CLAUDE-*.md
 
 #output files
 *output*/
