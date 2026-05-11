@@ -1914,3 +1914,133 @@ class TestWriteActionDispatchFlow:
         scope_arg = mock_broker_cls.return_value.mint_run_token.call_args.kwargs["scope"]
         assert "allowed_tables" in scope_arg
         assert "gp_api_allowed_endpoints" not in scope_arg
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_scope_derivation_valueerror_caught_not_propagated(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback, monkeypatch
+    ):
+        """ValueError from derive_gp_api_scope must NOT crash the Lambda.
+
+        Regression for the bug where the scope-derivation call sat outside any
+        try/except — a ValueError (e.g. whitespace-only campaign_id passing
+        `{"type": "string"}` JSON Schema but failing the `.strip()` guard)
+        propagated out of handler(), so the whole SQS batch failed with no
+        batchItemFailures returned and no error callback to gp-api.
+
+        Expected behavior matches the InputSchemaViolation path: log + metric +
+        error callback with stable dedup; batchItemFailures only if the SQS
+        send fails.
+        """
+        write_action_routing = {
+            "model": "sonnet",
+            "timeout_seconds": 1500,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["campaign_id", "clerk_user_id"],
+                "properties": {
+                    "campaign_id": {"type": "string"},
+                    "clerk_user_id": {"type": "string", "pattern": "^user_[A-Za-z0-9]+$"},
+                },
+            },
+            "scope": {},
+            "allowed_gp_api_endpoints": ["POST /v1/websites/domains/search"],
+            "permission_mode": "default",
+            "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
+            "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
+        }
+        loader = MagicMock()
+        loader.routing_for.side_effect = lambda eid: write_action_routing if eid == "compliance_smoke_test" else None
+        loader.known_experiments.return_value = ["compliance_smoke_test"]
+
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        monkeypatch.setattr(dh, "_manifest_loader", loader, raising=False)
+        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
+        dh.reset_validator_cache_for_tests()
+
+        mock_send_error_callback.return_value = True
+        mock_broker_cls.return_value = _mock_broker_success("tok-should-not-be-used")
+
+        event = _make_sqs_event(
+            {
+                "experiment_type": "compliance_smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-bad-campaign",
+                "params": {
+                    "campaign_id": "   ",
+                    "clerk_user_id": "user_abc123",
+                },
+            }
+        )
+
+        result = handler(event, None)
+
+        assert result["batchItemFailures"] == []
+        mock_broker_cls.return_value.mint_run_token.assert_not_called()
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        detail = mock_send_error_callback.call_args[0][1]
+        assert "scope derivation" in detail.lower()
+        assert "campaign_id" in detail
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "scope-derivation-run-bad-campaign"
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_scope_derivation_valueerror_batches_when_callback_fails(
+        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback, monkeypatch
+    ):
+        """When the error callback to gp-api fails, the message MUST land in
+        batchItemFailures so SQS retries it — matching the InputSchemaViolation
+        contract."""
+        write_action_routing = {
+            "model": "sonnet",
+            "timeout_seconds": 1500,
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["campaign_id", "clerk_user_id"],
+                "properties": {
+                    "campaign_id": {"type": "string"},
+                    "clerk_user_id": {"type": "string", "pattern": "^user_[A-Za-z0-9]+$"},
+                },
+            },
+            "scope": {},
+            "allowed_gp_api_endpoints": ["POST /v1/websites/domains/search"],
+            "permission_mode": "default",
+            "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
+            "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
+        }
+        loader = MagicMock()
+        loader.routing_for.side_effect = lambda eid: write_action_routing if eid == "compliance_smoke_test" else None
+        loader.known_experiments.return_value = ["compliance_smoke_test"]
+
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        monkeypatch.setattr(dh, "_manifest_loader", loader, raising=False)
+        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
+        dh.reset_validator_cache_for_tests()
+
+        mock_send_error_callback.return_value = False
+        mock_broker_cls.return_value = _mock_broker_success("tok-should-not-be-used")
+
+        event = _make_sqs_event(
+            {
+                "experiment_type": "compliance_smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-bad-campaign",
+                "params": {
+                    "campaign_id": "   ",
+                    "clerk_user_id": "user_abc123",
+                },
+            }
+        )
+
+        result = handler(event, None)
+
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        mock_broker_cls.return_value.mint_run_token.assert_not_called()
+        mock_get_ecs.return_value.run_task.assert_not_called()
