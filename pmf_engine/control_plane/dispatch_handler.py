@@ -546,19 +546,45 @@ def handler(event: dict, context) -> dict:
         # loader-side validator rejects `allowed_gp_api_endpoints: []`, so an
         # empty list cannot reach here in production, but using `is not None`
         # here removes ambiguity if a future contributor relaxes the validator.
-        gp_api_endpoints = experiment.get("allowed_gp_api_endpoints")
-        if gp_api_endpoints is not None:
-            scope = derive_gp_api_scope(
-                experiment_id,
-                message["params"],
-                allowed_endpoints=gp_api_endpoints,
+        #
+        # Both derive_* paths raise ValueError when params slip past
+        # `input_schema` but still violate scope-derivation's stricter checks
+        # (e.g. campaign_id="   " passes `{"type": "string"}` but fails the
+        # `.strip()` guard in derive_gp_api_scope; state/city/district control
+        # characters in derive_scope). An uncaught ValueError here would
+        # crash the Lambda invocation — no batchItemFailures, no error
+        # callback, every remaining record in the SQS batch unprocessed.
+        # Treat the same as an input_schema violation: client-fault, surface
+        # to gp-api with a stable dedup so FIFO retries don't duplicate.
+        try:
+            gp_api_endpoints = experiment.get("allowed_gp_api_endpoints")
+            if gp_api_endpoints is not None:
+                scope = derive_gp_api_scope(
+                    experiment_id,
+                    message["params"],
+                    allowed_endpoints=gp_api_endpoints,
+                )
+            else:
+                scope = derive_scope(
+                    experiment_id,
+                    message["params"],
+                    manifest_scope=experiment.get("scope"),
+                )
+        except ValueError as e:
+            logger.error(
+                f"Scope derivation failed for {experiment_id} "
+                f"(run: {message['run_id']}, organization: {message['organization_slug']}): {e}"
             )
-        else:
-            scope = derive_scope(
-                experiment_id,
-                message["params"],
-                manifest_scope=experiment.get("scope"),
+            emit_dispatch_metric("ScopeDerivationError", experiment_id)
+            sent = send_error_callback(
+                message,
+                f"Params for {experiment_id} failed scope derivation: {e}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"scope-derivation-{message['run_id']}",
             )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
+            continue
         prior_artifact_versions = message.get("prior_artifact_versions")
         try:
             broker = get_broker_client()
