@@ -8,13 +8,14 @@ Generates community event tasks using Gemini Google Search grounding.
 Prompts are loaded from Braintrust (with hardcoded fallbacks if unavailable).
 """
 
+import os
 from datetime import date
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from shared.llm_gemini_3 import Gemini3Client
-from shared.braintrust import load_prompt_from_braintrust
+from shared.braintrust import load_prompt_from_braintrust, trace_pipeline
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -95,6 +96,20 @@ class LlmEventResultList(BaseModel):
     events: List[LlmEventResult]
 
 
+class CampaignContext(BaseModel):
+    """Per-campaign context for the event-generation pipeline. Field names
+    match the camelCase shape that flows from gp-api → SQS → Braintrust
+    span input, so `model_dump()` produces the dict we log directly.
+    `electionDate` is required; everything else is optional and the prompt
+    builder substitutes a "not available" sentinel for missing values."""
+    electionDate: str
+    state: Optional[str] = None
+    city: Optional[str] = None
+    officeName: Optional[str] = None
+    officeLevel: Optional[str] = None
+    primaryElectionDate: Optional[str] = None
+
+
 class CampaignEventTask(BaseModel):
     """Final task shape matching gp-api's CampaignTask schema."""
     title: str
@@ -142,25 +157,21 @@ def _build_prompt_variables(
 
 
 async def generate_event_tasks(
-    election_date: date,
-    state: Optional[str] = None,
-    city: Optional[str] = None,
-    office_name: Optional[str] = None,
-    office_level: Optional[str] = None,
-    primary_election_date: Optional[str] = None,
+    ctx: CampaignContext,
     llm_client: Optional[Gemini3Client] = None,
 ) -> List[CampaignEventTask]:
     llm_client = llm_client or Gemini3Client()
 
     today = date.today()
+    election_date = date.fromisoformat(ctx.electionDate)
     variables = _build_prompt_variables(
         today=today,
         election_date=election_date,
-        state=state,
-        city=city,
-        office_name=office_name,
-        office_level=office_level,
-        primary_election_date=primary_election_date,
+        state=ctx.state,
+        city=ctx.city,
+        office_name=ctx.officeName,
+        office_level=ctx.officeLevel,
+        primary_election_date=ctx.primaryElectionDate,
     )
     logger.info(
         f"Generating events for {variables['city']}, {variables['state']} "
@@ -168,26 +179,51 @@ async def generate_event_tasks(
         f"election: {election_date})"
     )
 
-    raw_events = await _search_community_events(llm_client, variables)
-    event_tasks = await _filter_and_structure_events(
-        llm_client, variables, election_date, today, raw_events
-    )
+    with trace_pipeline(
+        "generate_event_tasks",
+        metadata={
+            "model": llm_client.default_model.value,
+            "environment": os.getenv("ENVIRONMENT", "local"),
+        },
+    ) as span:
+        # Log the highest level input to the pipeline (the CampaignContext) so it's visible in the trace.
+        span.log(input=ctx.model_dump())
+
+        raw_events = await _search_community_events(llm_client, variables)
+        event_tasks = await _filter_and_structure_events(
+            llm_client, variables, election_date, today, raw_events,
+        )
+
+        span.log(output={"tasks": [t.model_dump() for t in event_tasks]})
 
     stats = llm_client.get_usage_stats()
     logger.info(f"Generated {len(event_tasks)} event tasks | Gemini: {stats['api_calls']} calls, ${stats['total_cost']:.4f}")
     return event_tasks
 
 
-async def _search_community_events(llm_client: Gemini3Client, variables: dict) -> str:
+async def _search_community_events(
+    llm_client: Gemini3Client,
+    variables: dict,
+    rendered_prompt: Optional[str] = None,
+) -> str:
+    """Run the grounded-search step.
+
+    `rendered_prompt` is for eval/test use only — when supplied, it bypasses
+    Braintrust prompt loading and uses the given string directly. The prod
+    Lambda never passes it; handler.py calls generate_event_tasks with
+    explicit named kwargs that don't include rendered_prompt, so untrusted
+    SQS input cannot reach this parameter.
+    """
     logger.info(f"Searching for community events in {variables['city']}, {variables['state']}")
 
-    prompt = load_prompt_from_braintrust(
-        prompt_name="search-community-events",
-        fallback_prompt=SEARCH_PROMPT_FALLBACK,
-        variables=variables,
-    )
+    if rendered_prompt is None:
+        rendered_prompt = load_prompt_from_braintrust(
+            prompt_name="search-community-events",
+            fallback_prompt=SEARCH_PROMPT_FALLBACK,
+            variables=variables,
+        )
 
-    response = llm_client.generate_with_search(prompt)
+    response = llm_client.generate_with_search(rendered_prompt)
     return response.text
 
 
@@ -197,17 +233,25 @@ async def _filter_and_structure_events(
     election_date: date,
     today: date,
     raw_events: str,
+    rendered_prompt: Optional[str] = None,
 ) -> List[CampaignEventTask]:
+    """Run the filter/structure step.
+
+    `rendered_prompt` is for eval/test use only — when supplied, it bypasses
+    Braintrust prompt loading and uses the given string directly. Same
+    safety reasoning as _search_community_events.
+    """
     logger.info("Filtering and structuring events as tasks")
 
-    prompt = load_prompt_from_braintrust(
-        prompt_name="filter-and-structure-events",
-        fallback_prompt=FILTER_PROMPT_FALLBACK,
-        variables={**variables, "raw_events": raw_events},
-    )
+    if rendered_prompt is None:
+        rendered_prompt = load_prompt_from_braintrust(
+            prompt_name="filter-and-structure-events",
+            fallback_prompt=FILTER_PROMPT_FALLBACK,
+            variables={**variables, "raw_events": raw_events},
+        )
 
     raw_response = llm_client.generate_structured_content(
-        prompt=prompt,
+        prompt=rendered_prompt,
         response_schema=LlmEventResultList,
         system_instruction="Select community events and return them as structured data. Dates must be YYYY-MM-DD format.",
         temperature=0.0,

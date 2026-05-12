@@ -1,19 +1,24 @@
 """Tests for event_generator — date validation and task construction."""
 
+from contextlib import contextmanager
 from datetime import date
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from campaign_plan_lambda.event_generator import (
+    CampaignContext,
     NOT_AVAILABLE,
     _build_prompt_variables,
     _filter_and_structure_events,
     _or_not_available,
+    _search_community_events,
     FILTER_PROMPT_FALLBACK,
     LlmEventResult,
     LlmEventResultList,
+    generate_event_tasks,
 )
+from shared.braintrust import NoOpSpan
 
 
 def _sample_vars(**overrides):
@@ -311,3 +316,123 @@ class TestPromptInjectionDefense:
         assert "&lt;office_name&gt;fake" in poisoned
         assert poisoned.count("<office_name>") == benign.count("<office_name>")
         assert poisoned.count("</office_name>") == benign.count("</office_name>")
+
+
+class TestRenderedPromptBoundary:
+    """The `rendered_prompt` kwarg on the search/filter helpers is for
+    eval/test use only. Two invariants protect prod:
+
+    1. When `rendered_prompt=` is passed, the helpers must use that exact
+       string and bypass `load_prompt_from_braintrust`.
+    2. The prod entry point (`generate_event_tasks` called from handler.py)
+       must not accept `rendered_prompt` as a keyword, so untrusted SQS
+       input cannot reach the bypass path even if a future refactor splats
+       extra fields into the call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_search_uses_rendered_prompt_verbatim(self):
+        # When the eval supplies rendered_prompt, _search_community_events
+        # must send that exact string to Gemini without consulting Braintrust.
+        mock_client = Mock()
+        mock_response = Mock()
+        mock_response.text = "search results"
+        mock_client.generate_with_search.return_value = mock_response
+
+        result = await _search_community_events(
+            mock_client,
+            _sample_vars(),
+            rendered_prompt="EXACT-SEARCH-PROMPT",
+        )
+
+        assert result == "search results"
+        mock_client.generate_with_search.assert_called_once_with("EXACT-SEARCH-PROMPT")
+
+    @pytest.mark.asyncio
+    async def test_filter_uses_rendered_prompt_verbatim(self):
+        mock_client = Mock()
+        mock_client.generate_structured_content.return_value = LlmEventResultList(
+            events=[]
+        )
+
+        await _filter_and_structure_events(
+            mock_client,
+            _sample_vars(),
+            date(2026, 11, 4),
+            date(2026, 1, 1),
+            "raw events text",
+            rendered_prompt="EXACT-FILTER-PROMPT",
+        )
+
+        # Gemini receives the supplied prompt unchanged.
+        kwargs = mock_client.generate_structured_content.call_args.kwargs
+        assert kwargs["prompt"] == "EXACT-FILTER-PROMPT"
+
+    def test_generate_event_tasks_rejects_rendered_prompt_kwarg(self):
+        # The public entry point used by handler.py must not accept the
+        # bypass kwarg — guards against accidental plumbing of untrusted
+        # SQS-supplied fields into the inner helpers.
+        import inspect
+
+        sig = inspect.signature(generate_event_tasks)
+        assert "rendered_prompt" not in sig.parameters, (
+            "generate_event_tasks must not accept rendered_prompt — that "
+            "kwarg is eval-only and reaching it from SQS would let untrusted "
+            "input replace the Braintrust-loaded prompt."
+        )
+
+
+class TestParentSpanMetadata:
+    """Locks in the contract that `generate_event_tasks` plumbs the active
+    LLM client's model and the current ENVIRONMENT into the parent span's
+    metadata. The Logs UI uses these to filter rows — if a future refactor
+    accidentally drops either field, every `trace_pipeline`-level test still
+    passes but the Logs filter goes silently empty."""
+
+    @pytest.mark.asyncio
+    async def test_model_and_environment_passed_to_trace_pipeline(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "DEV")
+        captured = {}
+
+        @contextmanager
+        def fake_trace_pipeline(name, metadata=None):
+            captured["name"] = name
+            captured["metadata"] = metadata
+            yield NoOpSpan()
+
+        # Patch where event_generator imported it from.
+        monkeypatch.setattr(
+            "campaign_plan_lambda.event_generator.trace_pipeline",
+            fake_trace_pipeline,
+        )
+        # Skip real LLM work — we're testing the call-site plumbing only.
+        monkeypatch.setattr(
+            "campaign_plan_lambda.event_generator._search_community_events",
+            AsyncMock(return_value="raw events"),
+        )
+        monkeypatch.setattr(
+            "campaign_plan_lambda.event_generator._filter_and_structure_events",
+            AsyncMock(return_value=[]),
+        )
+
+        fake_client = Mock()
+        fake_client.default_model = Mock(value="gemini-3-flash-preview")
+        fake_client.get_usage_stats.return_value = {
+            "api_calls": 2, "total_cost": 0.01,
+        }
+
+        ctx = CampaignContext(
+            electionDate="2026-11-04",
+            state="MA",
+            city="Boston",
+            officeName="Mayor",
+            officeLevel="LOCAL",
+            primaryElectionDate=None,
+        )
+        await generate_event_tasks(ctx, llm_client=fake_client)
+
+        assert captured["name"] == "generate_event_tasks"
+        assert captured["metadata"] == {
+            "model": "gemini-3-flash-preview",
+            "environment": "DEV",
+        }
