@@ -8,8 +8,16 @@ from fastapi.responses import JSONResponse
 
 from broker.auth import AuthError, BrokerTokenAuth
 from broker.callback_sender import CallbackSender
+from broker.clerk_client import ClerkClient
 from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
+from broker.endpoints.agent_mcp_proxy import (
+    get_clerk_client as agent_mcp_get_clerk_client,
+    get_gp_api_base_url as agent_mcp_get_gp_api_base_url,
+    get_http_client as agent_mcp_get_http_client,
+    get_scope_ticket as agent_mcp_get_scope_ticket,
+    router as agent_mcp_router,
+)
 from broker.endpoints.anthropic_proxy import (
     get_anthropic_api_key,
     get_broker_auth,
@@ -39,6 +47,7 @@ from broker.endpoints.databricks_query import (
     router as databricks_router,
 )
 from broker.endpoints.mint_run_token import (
+    get_clerk_client,
     get_service_token_hash,
     get_ticket_store,
     router as mint_router,
@@ -129,6 +138,11 @@ async def lifespan(app: FastAPI):
     # than accepting a synthetic artifact from an agent whose data calls
     # all failed).
     data_query_tracker = DataQueryTracker()
+    clerk_client = ClerkClient(
+        secret_key=secrets.clerk_secret_key,
+        frontend_api_base=secrets.clerk_frontend_api_base,
+        agent_fleet_clerk_id=secrets.agent_fleet_clerk_id,
+    )
     artifact_bucket = os.environ.get("ARTIFACT_BUCKET", "gp-agent-artifacts-dev")
     env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
     experiment_metadata_bucket = os.environ.get(
@@ -150,6 +164,7 @@ async def lifespan(app: FastAPI):
 
     app.dependency_overrides[get_ticket_store] = lambda: store
     app.dependency_overrides[get_service_token_hash] = lambda: secrets.service_token_hash
+    app.dependency_overrides[get_clerk_client] = lambda: clerk_client
     app.dependency_overrides[delete_get_ticket_store] = lambda: store
     app.dependency_overrides[delete_get_service_token_hash] = lambda: secrets.service_token_hash
     app.dependency_overrides[get_broker_auth] = lambda: broker_auth
@@ -200,10 +215,16 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[http_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[http_get_httpx_client] = lambda: http_client
 
+    app.dependency_overrides[agent_mcp_get_scope_ticket] = _resolve_ticket_from_request
+    app.dependency_overrides[agent_mcp_get_clerk_client] = lambda: clerk_client
+    app.dependency_overrides[agent_mcp_get_gp_api_base_url] = lambda: secrets.gp_api_base_url
+    app.dependency_overrides[agent_mcp_get_http_client] = lambda: http_client
+
     yield
 
     await upstream_client.aclose()
     await http_client.aclose()
+    await clerk_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -228,6 +249,7 @@ app.include_router(upload_router)
 app.include_router(pdf_router)
 app.include_router(http_router)
 app.include_router(experiment_manifest_router)
+app.include_router(agent_mcp_router)
 
 
 @app.get("/health")

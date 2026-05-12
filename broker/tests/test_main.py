@@ -18,6 +18,10 @@ def _fake_secrets() -> BrokerSecrets:
         databricks_http_path="/sql/test",
         databricks_api_key="dapi-fake",
         service_token_hash="fakehash",
+        clerk_secret_key="sk_test_fake",
+        clerk_frontend_api_base="https://fake.clerk.app",
+        gp_api_base_url="https://gp-api-dev.goodparty.org",
+        agent_fleet_clerk_id="user_agent_fleet_test",
         results_queue_url="https://sqs.us-west-2.amazonaws.com/123/queue.fifo",
     )
 
