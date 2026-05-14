@@ -272,7 +272,6 @@ def _validate_scope(scope: dict, experiment_id: str) -> None:
 _WRITE_ACTION_FIELDS = (
     "system_prompt",
     "permission_mode",
-    "allowed_gp_api_endpoints",
     "allowed_external_tools",
 )
 # Claude Agent SDK supports "default" | "acceptEdits" | "plan" | "bypassPermissions".
@@ -287,11 +286,9 @@ _PERMISSION_MODE_VALUES = frozenset({"default", "bypassPermissions"})
 # Conventions, not platform limits. Picked to keep manifests reviewable and
 # to bound the runner's manifest fetch (broker GET /experiment/manifest).
 # system_prompt is the largest field; 50K leaves ~10× headroom over the
-# longest prompts we've seen in practice. Endpoint strings are HTTP
-# verb + path patterns (compare gp-api routes). Tool names match the Claude
-# SDK's tool identifiers, which are short.
+# longest prompts we've seen in practice. Tool names match the Claude SDK's
+# tool identifiers, which are short.
 _MAX_SYSTEM_PROMPT_LEN = 50_000
-_MAX_ENDPOINT_LEN = 200
 _MAX_TOOL_NAME_LEN = 64
 
 
@@ -302,31 +299,11 @@ def _validate_write_action_fields(manifest: dict, experiment_id: str) -> None:
     manifests and manual S3 edits before the Fargate task launches.
 
     Validates each field independently: callers may set any subset. The
-    discriminator for "this is a write-action experiment" is the presence
-    of `allowed_gp_api_endpoints`, but every field present must be well-formed
-    regardless of which others are present.
+    dispatch-time discriminator for "this is a write-action experiment" is
+    the presence of `system_prompt` OR `permission_mode` (see
+    `dispatch_handler._is_write_action`); every field present here must be
+    well-formed regardless of which others are present.
     """
-    endpoints = manifest.get("allowed_gp_api_endpoints")
-    if endpoints is not None:
-        if not isinstance(endpoints, list):
-            raise ManifestLoaderMalformedError(f"{experiment_id}: allowed_gp_api_endpoints must be a list")
-        # An empty list is rejected on purpose: presence of this field is the
-        # discriminator that flags a manifest as a write-action experiment
-        # (see dispatch_handler's gp-api scope branch). Allowing `[]` would
-        # create a silent fallthrough — the manifest claims "write-action with
-        # no endpoints" but the dispatcher routes it as a read-only Databricks
-        # experiment. Force authors to either set real endpoints or omit the
-        # field entirely. Contrast `allowed_external_tools=[]`, which is an
-        # explicit deny-all and is valid.
-        if not endpoints:
-            raise ManifestLoaderMalformedError(
-                f"{experiment_id}: allowed_gp_api_endpoints must be non-empty when present "
-                f"(omit the field for non-write-action manifests)"
-            )
-        for ep in endpoints:
-            if not isinstance(ep, str) or not ep.strip() or len(ep) > _MAX_ENDPOINT_LEN:
-                raise ManifestLoaderMalformedError(f"{experiment_id}: invalid allowed_gp_api_endpoints entry: {ep!r}")
-
     permission_mode = manifest.get("permission_mode")
     if permission_mode is not None:
         if not isinstance(permission_mode, str) or permission_mode not in _PERMISSION_MODE_VALUES:

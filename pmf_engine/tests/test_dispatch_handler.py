@@ -223,9 +223,7 @@ class TestParseDispatchMessage:
             "organization_slug": "org-123",
             "run_id": "run-001",
             "clerk_user_id": "user_test_dispatch",
-            "prior_artifact_versions": {
-                f"k{i}": f"e/r/artifact.json" for i in range(11)
-            },
+            "prior_artifact_versions": {f"k{i}": f"e/r/artifact.json" for i in range(11)},
         }
         with pytest.raises(ValueError, match="too large"):
             parse_dispatch_message(json.dumps(body))
@@ -308,13 +306,15 @@ class TestHandler:
             "failures": [],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -340,13 +340,15 @@ class TestHandler:
     def test_rejects_unknown_experiment(self, mock_get_ecs, mock_send_error_callback):
         mock_ecs = mock_get_ecs.return_value
 
-        event = _make_sqs_event({
-            "experiment_type": "nonexistent",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "nonexistent",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
         mock_ecs.run_task.assert_not_called()
@@ -360,13 +362,15 @@ class TestHandler:
     def test_unknown_experiment_id_added_to_batch_item_failures(self, mock_get_ecs, mock_send_error_callback):
         mock_ecs = mock_get_ecs.return_value
 
-        event = _make_sqs_event({
-            "experiment_type": "nonexistent",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "nonexistent",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
         assert len(result["batchItemFailures"]) == 1
@@ -389,13 +393,15 @@ class TestHandler:
         dh.logger.addHandler(capture)
         dh.logger.setLevel(logging.DEBUG)
         try:
-            event = _make_sqs_event({
-                "experiment_type": "nonexistent",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-                "params": {},
-            })
+            event = _make_sqs_event(
+                {
+                    "experiment_type": "nonexistent",
+                    "organization_slug": "org-123",
+                    "run_id": "run-001",
+                    "clerk_user_id": "user_test_dispatch",
+                    "params": {},
+                }
+            )
             handler(event, None)
         finally:
             dh.logger.removeHandler(capture)
@@ -427,13 +433,15 @@ class TestHandler:
             "failures": [{"reason": "RESOURCE:MEMORY"}],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert len(result["batchItemFailures"]) == 1
@@ -473,13 +481,15 @@ class TestHandler:
             "failures": [],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert len(result["batchItemFailures"]) == 1
@@ -509,7 +519,7 @@ class TestHandler:
                 "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
+                "clerk_user_id": "user_test_dispatch",
             }
             send_error_callback(message, "some error", "https://sqs.example.com/callback.fifo")
         finally:
@@ -530,13 +540,15 @@ class TestHandler:
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert len(result["batchItemFailures"]) == 1
@@ -554,13 +566,15 @@ class TestHandler:
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert len(result["batchItemFailures"]) == 1
@@ -578,13 +592,15 @@ class TestBrokerFlow:
             "failures": [],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -606,13 +622,15 @@ class TestBrokerFlow:
             400, "Param classifier rejected: nested objects", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -630,13 +648,15 @@ class TestBrokerFlow:
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = BrokerError(401, "Invalid service token")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -655,13 +675,15 @@ class TestBrokerFlow:
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = BrokerError(400, "Some detail", "")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
         mock_send_error_callback.assert_called_once()
@@ -672,16 +694,16 @@ class TestNonDictParamsGuard:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_string_params_rejected_with_stable_dedup(
-        self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
-    ):
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-xyz",
-            "clerk_user_id": "user_test_dispatch",
-            "params": "not a dict",
-        })
+    def test_string_params_rejected_with_stable_dedup(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-xyz",
+                "clerk_user_id": "user_test_dispatch",
+                "params": "not a dict",
+            }
+        )
 
         result = handler(event, None)
 
@@ -695,16 +717,16 @@ class TestNonDictParamsGuard:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_list_params_does_not_crash(
-        self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
-    ):
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": [1, 2, 3],
-        })
+    def test_list_params_does_not_crash(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": [1, 2, 3],
+            }
+        )
 
         result = handler(event, None)
 
@@ -724,13 +746,15 @@ class TestNonDictParamsGuard:
         mock_broker_cls.return_value = _mock_broker_success()
         mock_ecs = mock_get_ecs.return_value
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": None,
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": None,
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -751,13 +775,15 @@ class TestErrorCallbackStableDedup:
             "failures": [{"reason": "RESOURCE:MEMORY"}],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-abc",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-abc",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
         mock_send_error_callback.assert_called_once()
@@ -770,13 +796,15 @@ class TestErrorCallbackStableDedup:
         mock_broker_cls.return_value = _mock_broker_success()
         mock_get_ecs.return_value.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-abc",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-abc",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
         mock_send_error_callback.assert_called_once()
@@ -792,13 +820,15 @@ class TestErrorCallbackStableDedup:
             400, "rejected", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-abc",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-abc",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
         mock_send_error_callback.assert_called_once()
@@ -819,13 +849,15 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-xyz",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-xyz",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
         mock_get_ecs.return_value.run_task.assert_not_called()
@@ -848,13 +880,15 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
         monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-xyz",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-xyz",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
         mock_get_ecs.return_value.run_task.assert_not_called()
@@ -873,13 +907,15 @@ class TestMissingCriticalEnvVars:
         """
         monkeypatch.delenv("EXPERIMENT_METADATA_BUCKET", raising=False)
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-xyz",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-xyz",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
         mock_get_ecs.return_value.run_task.assert_not_called()
@@ -896,13 +932,15 @@ class TestParamsSizeLimit:
     def test_oversized_params_rejected_before_ecs(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
         oversized = {f"key_{i}": "x" * 900 for i in range(12)}
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-big",
-            "clerk_user_id": "user_test_dispatch",
-            "params": oversized,
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-big",
+                "clerk_user_id": "user_test_dispatch",
+                "params": oversized,
+            }
+        )
 
         result = handler(event, None)
 
@@ -928,13 +966,15 @@ class TestParamsSizeLimit:
         # use the optional `note` field rather than inventing a new key.
         small = {**VALID_PARAMS, "note": "x" * 100}
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-001",
-            "clerk_user_id": "user_test_dispatch",
-            "params": small,
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": small,
+            }
+        )
 
         result = handler(event, None)
         assert result["batchItemFailures"] == []
@@ -957,13 +997,15 @@ class TestRequiredParamsValidation:
     ):
         mock_broker_cls.return_value = _mock_broker_success()
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-missing-state",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-missing-state",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         handler(event, None)
 
@@ -985,13 +1027,15 @@ class TestRequiredParamsValidation:
         """The synthetic input_schema enforces `state` matches `^[A-Z]{2}$`."""
         mock_broker_cls.return_value = _mock_broker_success()
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-empty",
-            "run_id": "run-empty-strings",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {"state": ""},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-empty",
+                "run_id": "run-empty-strings",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {"state": ""},
+            }
+        )
 
         handler(event, None)
 
@@ -1007,13 +1051,15 @@ class TestRequiredParamsValidation:
             "failures": [],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-ok",
-            "run_id": "run-ok",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {"state": "WI"},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-ok",
+                "run_id": "run-ok",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {"state": "WI"},
+            }
+        )
 
         handler(event, None)
 
@@ -1031,13 +1077,15 @@ class TestTransientBrokerErrors:
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = httpx.ConnectError("DNS failed")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-transient",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-transient",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
 
@@ -1059,13 +1107,15 @@ class TestTransientBrokerErrors:
             400, "Param classifier rejected", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-terminal",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-terminal",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
 
@@ -1090,13 +1140,15 @@ class TestDispatchHandlerErrorPathResilience:
         mock_broker_cls.side_effect = KeyError("missing config key somewhere")
         mock_send_error_callback.return_value = True
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-prog-err",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-prog-err",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
 
@@ -1113,13 +1165,15 @@ class TestDispatchHandlerErrorPathResilience:
     ):
         mock_send_error_callback.return_value = False
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-missing-params",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-missing-params",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
 
@@ -1135,13 +1189,15 @@ class TestDispatchHandlerErrorPathResilience:
     def test_validation_error_with_successful_callback_does_not_retry(self, mock_get_ecs, mock_send_error_callback):
         mock_send_error_callback.return_value = True
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-missing-params-ok",
-            "clerk_user_id": "user_test_dispatch",
-            "params": {},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-missing-params-ok",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {},
+            }
+        )
 
         result = handler(event, None)
 
@@ -1335,13 +1391,15 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             ],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-iam-leak",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-iam-leak",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
 
@@ -1375,13 +1433,15 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             "RunTask",
         )
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-123",
-            "run_id": "run-iam-exc-leak",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-iam-exc-leak",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
 
@@ -1419,13 +1479,15 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         dh.logger.addHandler(collector)
         dh.logger.setLevel(logging.DEBUG)
         try:
-            event = _make_sqs_event({
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-log-detail",
-            "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            })
+            event = _make_sqs_event(
+                {
+                    "experiment_type": "smoke_test",
+                    "organization_slug": "org-123",
+                    "run_id": "run-log-detail",
+                    "clerk_user_id": "user_test_dispatch",
+                    "params": dict(VALID_PARAMS),
+                }
+            )
             handler(event, None)
         finally:
             dh.logger.removeHandler(collector)
@@ -1459,13 +1521,15 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "tasks": [],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-ecs-cap",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-ecs-cap",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
 
@@ -1481,13 +1545,15 @@ class TestRunTaskFailureCleansUpMintedTicket:
         mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.side_effect = RuntimeError("ECS control plane transient")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-ecs-boom",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-ecs-boom",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
 
@@ -1504,13 +1570,15 @@ class TestRunTaskFailureCleansUpMintedTicket:
         mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.side_effect = RuntimeError("ECS transient")
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-double-fail",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-double-fail",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         result = handler(event, None)
 
@@ -1530,13 +1598,15 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
         }
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-x",
-            "run_id": "run-ok",
-            "clerk_user_id": "user_test_dispatch",
-            "params": dict(VALID_PARAMS),
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-x",
+                "run_id": "run-ok",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
 
         handler(event, None)
 
@@ -1601,15 +1671,17 @@ class TestInputSchemaSortKeyMixedTypes:
         dh.reset_validator_cache_for_tests()
         mock_broker_cls.return_value = _mock_broker_success()
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-mixed",
-            "run_id": "run-mixed-paths",
-            "clerk_user_id": "user_test_dispatch",
-            # Errors fall on: items (wrong type), items[0].id (missing),
-            # name (missing). Paths mix str and int.
-            "params": {"items": [{}, {"id": 42}]},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-mixed",
+                "run_id": "run-mixed-paths",
+                "clerk_user_id": "user_test_dispatch",
+                # Errors fall on: items (wrong type), items[0].id (missing),
+                # name (missing). Paths mix str and int.
+                "params": {"items": [{}, {"id": 42}]},
+            }
+        )
 
         # If the sort key blows up, this raises TypeError uncaught.
         result = handler(event, None)
@@ -1645,14 +1717,16 @@ class TestInputSchemaSortKeyMixedTypes:
         dh.reset_validator_cache_for_tests()
         mock_broker_cls.return_value = _mock_broker_success()
 
-        event = _make_sqs_event({
-            "experiment_type": "smoke_test",
-            "organization_slug": "org-fmt",
-            "run_id": "run-fmt-check",
-            "clerk_user_id": "user_test_dispatch",
-            # items[1].id is the wrong type (int instead of string).
-            "params": {"items": [{"id": "ok"}, {"id": 42}], "name": "alice"},
-        })
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-fmt",
+                "run_id": "run-fmt-check",
+                "clerk_user_id": "user_test_dispatch",
+                # items[1].id is the wrong type (int instead of string).
+                "params": {"items": [{"id": "ok"}, {"id": 42}], "name": "alice"},
+            }
+        )
 
         handler(event, None)
 
@@ -1810,34 +1884,36 @@ class TestResolveRoutingFailures:
 # ---------------------------------------------------------------------------
 # Write-action dispatch flow (ENG-10128)
 #
-# When the routing dict carries `allowed_gp_api_endpoints`, the handler must
-# call derive_gp_api_scope (Clerk actor JWT path) instead of derive_scope
-# (Databricks path). The two scope shapes are field-disjoint so the broker
-# can dispatch on field presence — no separate route or discriminator needed.
+# When the routing dict carries `system_prompt` OR `permission_mode`, the
+# handler treats the experiment as write-action: scope is an empty dict
+# (the broker creates the Clerk actor token from MintRequest.clerk_user_id
+# and stores the resulting clerk_session_id on the ScopeTicket, then mints
+# fresh ~60s JWTs for each MCP call the runner makes to /agent/mcp). No
+# allowlist is enforced today — every @McpTool-decorated endpoint on gp-api
+# is callable by every agent run.
+#
+# Legacy read-action experiments continue through derive_scope (Databricks
+# shape).
 # ---------------------------------------------------------------------------
 
 
 class TestWriteActionDispatchFlow:
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_gp_api_routing_calls_broker_with_gp_api_scope(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+    def test_write_action_routing_calls_broker_with_empty_scope(self, mock_get_ecs, mock_broker_cls, monkeypatch):
         write_action_routing = {
             "model": "sonnet",
             "timeout_seconds": 1500,
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["campaign_id", "clerk_user_id"],
+                "required": ["campaign_id"],
                 "properties": {
                     "campaign_id": {"type": "string"},
-                    "clerk_user_id": {"type": "string", "pattern": "^user_[A-Za-z0-9]+$"},
                 },
             },
             "scope": {},
-            "allowed_gp_api_endpoints": [
-                "GET /v1/campaigns/:id/compliance-state",
-                "POST /v1/websites/domains/search",
-            ],
+            "system_prompt": "You are a compliance setup agent.",
             "permission_mode": "default",
             "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
             "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
@@ -1852,22 +1928,19 @@ class TestWriteActionDispatchFlow:
         monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
         dh.reset_validator_cache_for_tests()
 
-        mock_broker_cls.return_value = _mock_broker_success("tok-gp-api")
+        mock_broker_cls.return_value = _mock_broker_success("tok-write-action")
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
             "failures": [],
         }
 
-        params = {
-            "campaign_id": "0a4c1b2e-1111-4222-8333-444444444444",
-            "clerk_user_id": "user_abc123",
-        }
         event = _make_sqs_event(
             {
                 "experiment_type": "compliance_smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-write-001",
-                "params": params,
+                "clerk_user_id": "user_abc123",
+                "params": {"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
             }
         )
 
@@ -1875,24 +1948,19 @@ class TestWriteActionDispatchFlow:
 
         assert result["batchItemFailures"] == []
         mock_broker_cls.return_value.mint_run_token.assert_called_once()
-        scope_arg = mock_broker_cls.return_value.mint_run_token.call_args.kwargs["scope"]
-
-        assert scope_arg["gp_api_allowed_endpoints"] == [
-            "GET /v1/campaigns/:id/compliance-state",
-            "POST /v1/websites/domains/search",
-        ]
-        assert scope_arg["gp_api_allowed_campaign_id"] == "0a4c1b2e-1111-4222-8333-444444444444"
-        assert scope_arg["gp_api_acting_clerk_user_id"] == "user_abc123"
-        # Disjoint from Databricks shape — broker won't see contradictory fields.
-        for forbidden in ("allowed_tables", "max_rows", "state", "cities", "districts"):
-            assert forbidden not in scope_arg, f"unexpected {forbidden} in gp-api scope"
+        mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
+        assert mint_kwargs["scope"] == {}
+        # clerk_user_id flows through the MintRequest top-level field, not via
+        # scope — broker creates the Clerk actor token from it and stores the
+        # resulting session_id on the ScopeTicket.
+        assert mint_kwargs["clerk_user_id"] == "user_abc123"
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_legacy_databricks_routing_unchanged(self, mock_get_ecs, mock_broker_cls):
-        """A routing dict without allowed_gp_api_endpoints flows through
-        derive_scope (Databricks shape) — no behavior change for the existing
-        5 experiments."""
+        """A routing dict without system_prompt or permission_mode flows
+        through derive_scope (Databricks shape) — no behavior change for
+        the existing 5 read-only experiments."""
         mock_broker_cls.return_value = _mock_broker_success("tok-legacy")
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
@@ -1904,6 +1972,7 @@ class TestWriteActionDispatchFlow:
                 "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-legacy",
+                "clerk_user_id": "user_test_dispatch",
                 "params": dict(VALID_PARAMS),
             }
         )
@@ -1913,46 +1982,37 @@ class TestWriteActionDispatchFlow:
         mock_broker_cls.return_value.mint_run_token.assert_called_once()
         scope_arg = mock_broker_cls.return_value.mint_run_token.call_args.kwargs["scope"]
         assert "allowed_tables" in scope_arg
-        assert "gp_api_allowed_endpoints" not in scope_arg
+        assert scope_arg != {}
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_scope_derivation_valueerror_caught_not_propagated(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback, monkeypatch
-    ):
-        """ValueError from derive_gp_api_scope must NOT crash the Lambda.
+    def test_permission_mode_alone_routes_as_write_action(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+        """A manifest with `permission_mode` but no `system_prompt` is still a
+        write-action experiment per the loader's any-of projection rule, and
+        must produce an empty scope dict — not flow through derive_scope.
 
-        Regression for the bug where the scope-derivation call sat outside any
-        try/except — a ValueError (e.g. whitespace-only campaign_id passing
-        `{"type": "string"}` JSON Schema but failing the `.strip()` guard)
-        propagated out of handler(), so the whole SQS batch failed with no
-        batchItemFailures returned and no error callback to gp-api.
-
-        Expected behavior matches the InputSchemaViolation path: log + metric +
-        error callback with stable dedup; batchItemFailures only if the SQS
-        send fails.
-        """
-        write_action_routing = {
+        Regression guard for the discriminator drift the manifest loader
+        validates write-action fields independently; dispatch must match that
+        breadth for the write-action signals (system_prompt or
+        permission_mode), not just one of them."""
+        permission_mode_only_routing = {
             "model": "sonnet",
             "timeout_seconds": 1500,
             "input_schema": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["campaign_id", "clerk_user_id"],
-                "properties": {
-                    "campaign_id": {"type": "string"},
-                    "clerk_user_id": {"type": "string", "pattern": "^user_[A-Za-z0-9]+$"},
-                },
+                "required": ["campaign_id"],
+                "properties": {"campaign_id": {"type": "string"}},
             },
             "scope": {},
-            "allowed_gp_api_endpoints": ["POST /v1/websites/domains/search"],
             "permission_mode": "default",
             "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
             "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
         }
         loader = MagicMock()
-        loader.routing_for.side_effect = lambda eid: write_action_routing if eid == "compliance_smoke_test" else None
+        loader.routing_for.side_effect = (
+            lambda eid: permission_mode_only_routing if eid == "compliance_smoke_test" else None
+        )
         loader.known_experiments.return_value = ["compliance_smoke_test"]
 
         import pmf_engine.control_plane.dispatch_handler as dh
@@ -1961,86 +2021,23 @@ class TestWriteActionDispatchFlow:
         monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
         dh.reset_validator_cache_for_tests()
 
-        mock_send_error_callback.return_value = True
-        mock_broker_cls.return_value = _mock_broker_success("tok-should-not-be-used")
+        mock_broker_cls.return_value = _mock_broker_success("tok-permission-only")
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
 
         event = _make_sqs_event(
             {
                 "experiment_type": "compliance_smoke_test",
                 "organization_slug": "org-123",
-                "run_id": "run-bad-campaign",
-                "params": {
-                    "campaign_id": "   ",
-                    "clerk_user_id": "user_abc123",
-                },
+                "run_id": "run-pm-only",
+                "clerk_user_id": "user_abc123",
+                "params": {"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
             }
         )
 
         result = handler(event, None)
-
         assert result["batchItemFailures"] == []
-        mock_broker_cls.return_value.mint_run_token.assert_not_called()
-        mock_get_ecs.return_value.run_task.assert_not_called()
-        mock_send_error_callback.assert_called_once()
-        detail = mock_send_error_callback.call_args[0][1]
-        assert "scope derivation" in detail.lower()
-        assert "campaign_id" in detail
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "scope-derivation-run-bad-campaign"
-
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
-    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
-    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_scope_derivation_valueerror_batches_when_callback_fails(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback, monkeypatch
-    ):
-        """When the error callback to gp-api fails, the message MUST land in
-        batchItemFailures so SQS retries it — matching the InputSchemaViolation
-        contract."""
-        write_action_routing = {
-            "model": "sonnet",
-            "timeout_seconds": 1500,
-            "input_schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["campaign_id", "clerk_user_id"],
-                "properties": {
-                    "campaign_id": {"type": "string"},
-                    "clerk_user_id": {"type": "string", "pattern": "^user_[A-Za-z0-9]+$"},
-                },
-            },
-            "scope": {},
-            "allowed_gp_api_endpoints": ["POST /v1/websites/domains/search"],
-            "permission_mode": "default",
-            "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
-            "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
-        }
-        loader = MagicMock()
-        loader.routing_for.side_effect = lambda eid: write_action_routing if eid == "compliance_smoke_test" else None
-        loader.known_experiments.return_value = ["compliance_smoke_test"]
-
-        import pmf_engine.control_plane.dispatch_handler as dh
-
-        monkeypatch.setattr(dh, "_manifest_loader", loader, raising=False)
-        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
-        dh.reset_validator_cache_for_tests()
-
-        mock_send_error_callback.return_value = False
-        mock_broker_cls.return_value = _mock_broker_success("tok-should-not-be-used")
-
-        event = _make_sqs_event(
-            {
-                "experiment_type": "compliance_smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-bad-campaign",
-                "params": {
-                    "campaign_id": "   ",
-                    "clerk_user_id": "user_abc123",
-                },
-            }
-        )
-
-        result = handler(event, None)
-
-        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
-        mock_broker_cls.return_value.mint_run_token.assert_not_called()
-        mock_get_ecs.return_value.run_task.assert_not_called()
+        mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
+        assert mint_kwargs["scope"] == {}

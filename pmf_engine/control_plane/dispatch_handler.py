@@ -23,7 +23,7 @@ except (ImportError, OSError):
 
 try:
     from .broker_client import BrokerClient, BrokerError
-    from .scope_derivation import derive_gp_api_scope, derive_scope
+    from .scope_derivation import derive_scope
     from .jsonschema_errors import format_validation_errors
     from .manifest_loader import (
         ManifestRoutingLoader,
@@ -33,7 +33,7 @@ try:
     )
 except ImportError:
     from broker_client import BrokerClient, BrokerError
-    from scope_derivation import derive_gp_api_scope, derive_scope  # type: ignore[no-redef]
+    from scope_derivation import derive_scope  # type: ignore[no-redef]
     from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
         ManifestRoutingLoader,
@@ -49,6 +49,17 @@ _manifest_loader: ManifestRoutingLoader | None = None
 _broker_client: BrokerClient | None = None
 _validator_cache: dict[str, Draft7Validator] = {}
 _VALIDATOR_CACHE_MAX = 64
+
+# Fields whose presence on a projected routing dict signals a write-action
+# experiment. Mirrors manifest_loader._WRITE_ACTION_FIELDS minus
+# `allowed_external_tools`, which is a tool-list a read-action experiment
+# could plausibly carry (e.g. WebFetch on a Databricks experiment) and is
+# therefore not a write-action signal on its own.
+_WRITE_ACTION_DISCRIMINATORS = ("system_prompt", "permission_mode")
+
+
+def _is_write_action(experiment: dict) -> bool:
+    return any(experiment.get(f) is not None for f in _WRITE_ACTION_DISCRIMINATORS)
 
 
 def get_broker_client() -> BrokerClient:
@@ -384,12 +395,11 @@ def build_container_overrides(
     if experiment.get("instruction_version_id"):
         env.append({"name": "INSTRUCTION_VERSION_ID", "value": experiment["instruction_version_id"]})
     # Write-action manifest fields (system_prompt, permission_mode,
-    # allowed_gp_api_endpoints, allowed_external_tools — ENG-10128) are not
-    # forwarded as env vars on purpose: the runner fetches the full manifest
-    # itself via runner/manifest_loader.load_from_broker (pinned by
-    # MANIFEST_VERSION_ID above) and reads them directly. Duplicating them
-    # here would create a second source of truth and risk env-var size limits
-    # for system_prompt.
+    # allowed_external_tools — ENG-10128) are not forwarded as env vars on
+    # purpose: the runner fetches the full manifest itself via
+    # runner/manifest_loader.load_from_broker (pinned by MANIFEST_VERSION_ID
+    # above) and reads them directly. Duplicating them here would create a
+    # second source of truth and risk env-var size limits for system_prompt.
     return {"containerOverrides": [{"name": container_name, "environment": env}]}
 
 
@@ -538,34 +548,33 @@ def handler(event: dict, context) -> dict:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
-        # Write-action experiments (ENG-10128) carry `allowed_gp_api_endpoints`
-        # in their projected routing; broker scope is gp-api-shaped (Clerk actor
-        # token over the gp-api proxy) instead of Databricks-shaped. Read
-        # experiments fall through to the existing path unchanged.
+        # Write-action experiments (ENG-10128) get an empty scope dict. The
+        # broker creates the Clerk actor token from MintRequest.clerk_user_id
+        # and stores the resulting clerk_session_id on the ScopeTicket; it
+        # then mints fresh ~60s JWTs for each MCP call the runner makes to
+        # /agent/mcp. No per-experiment allowlist is enforced today — every
+        # @McpTool-decorated endpoint on gp-api is exposed to every agent
+        # run; a real allowlist is future work.
         #
-        # Field-presence (`is not None`), not truthiness, is the discriminator —
-        # matches the projector in manifest_loader._project_routing. The
-        # loader-side validator rejects `allowed_gp_api_endpoints: []`, so an
-        # empty list cannot reach here in production, but using `is not None`
-        # here removes ambiguity if a future contributor relaxes the validator.
+        # Discriminator: `system_prompt` OR `permission_mode` present in the
+        # projected routing dict. Both are Claude Agent SDK signals that only
+        # appear on write-action manifests. `allowed_external_tools` is NOT a
+        # discriminator — a future read-action experiment could plausibly
+        # declare extra non-gp-api tools (e.g. WebFetch) without being
+        # write-action. The manifest loader validates each write-action field
+        # independently, so we mirror its any-of pattern here for the fields
+        # that actually signal write-action semantics.
         #
-        # Both derive_* paths raise ValueError when params slip past
-        # `input_schema` but still violate scope-derivation's stricter checks
-        # (e.g. campaign_id="   " passes `{"type": "string"}` but fails the
-        # `.strip()` guard in derive_gp_api_scope; state/city/district control
-        # characters in derive_scope). An uncaught ValueError here would
+        # `derive_scope` raises ValueError when read-experiment params slip
+        # past `input_schema` but still violate stricter checks (state/city/
+        # district control characters). An uncaught ValueError here would
         # crash the Lambda invocation — no batchItemFailures, no error
         # callback, every remaining record in the SQS batch unprocessed.
         # Treat the same as an input_schema violation: client-fault, surface
         # to gp-api with a stable dedup so FIFO retries don't duplicate.
         try:
-            gp_api_endpoints = experiment.get("allowed_gp_api_endpoints")
-            if gp_api_endpoints is not None:
-                scope = derive_gp_api_scope(
-                    experiment_id,
-                    message["params"],
-                    allowed_endpoints=gp_api_endpoints,
-                )
+            if _is_write_action(experiment):
+                scope: dict = {}
             else:
                 scope = derive_scope(
                     experiment_id,

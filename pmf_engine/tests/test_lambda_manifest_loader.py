@@ -548,11 +548,17 @@ class TestScopeValidation:
 # Write-action experiment fields (compliance_setup-shaped — ENG-10128).
 #
 # Optional top-level manifest fields that signal a write-action experiment:
-#   - allowed_gp_api_endpoints: list[str]   (the discriminator; when present,
-#                                            this is a write-action manifest)
-#   - permission_mode: "default" | "bypassPermissions"   (Claude SDK)
-#   - system_prompt: str
-#   - allowed_external_tools: list[str]
+#   - system_prompt: str                                  (dispatch-time
+#                                                          discriminator)
+#   - permission_mode: "default" | "bypassPermissions"    (Claude SDK)
+#   - allowed_external_tools: list[str]                   (non-gp-api tools
+#                                                          the runner calls
+#                                                          directly)
+#
+# Note: there is no per-experiment gp-api endpoint allowlist. Every
+# @McpTool-decorated endpoint on gp-api is exposed to every agent run;
+# the broker mints per-call Clerk JWTs from clerk_session_id on the
+# ScopeTicket and forwards MCP traffic at /agent/mcp.
 #
 # Legacy Databricks/web-only manifests do not carry these fields and must
 # project unchanged through _project_routing.
@@ -563,10 +569,6 @@ def _write_action_overrides(**extras) -> dict:
     base = {
         "system_prompt": "You are a compliance setup agent.",
         "permission_mode": "default",
-        "allowed_gp_api_endpoints": [
-            "GET /v1/campaigns/:id/compliance-state",
-            "POST /v1/websites/domains/search",
-        ],
         "allowed_external_tools": ["WebFetch"],
     }
     base.update(extras)
@@ -596,27 +598,22 @@ class TestWriteActionFieldProjection:
 
         assert routing["system_prompt"] == "You are a compliance setup agent."
         assert routing["permission_mode"] == "default"
-        assert routing["allowed_gp_api_endpoints"] == [
-            "GET /v1/campaigns/:id/compliance-state",
-            "POST /v1/websites/domains/search",
-        ]
         assert routing["allowed_external_tools"] == ["WebFetch"]
 
     def test_projects_only_present_fields(self):
-        """A manifest with allowed_gp_api_endpoints but no permission_mode/system_prompt/
-        external_tools projects only the present field — no synthetic defaults."""
+        """A manifest with system_prompt but no permission_mode/external_tools
+        projects only the present field — no synthetic defaults."""
         s3 = _fake_s3_with_index(self._index())
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
         )
         s3.set_json(BUCKET, "compliance_smoke_test/manifest.json", manifest)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
 
         routing = loader.routing_for("compliance_smoke_test")
-        assert routing["allowed_gp_api_endpoints"] == ["GET /v1/foo"]
+        assert routing["system_prompt"] == "You are a compliance setup agent."
         assert "permission_mode" not in routing
-        assert "system_prompt" not in routing
         assert "allowed_external_tools" not in routing
 
     def test_omits_write_action_fields_when_absent(self):
@@ -633,7 +630,7 @@ class TestWriteActionFieldProjection:
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
 
         routing = loader.routing_for("smoke_test")
-        for field in ("system_prompt", "permission_mode", "allowed_gp_api_endpoints", "allowed_external_tools"):
+        for field in ("system_prompt", "permission_mode", "allowed_external_tools"):
             assert field not in routing, f"unexpected {field} in legacy routing"
 
 
@@ -655,56 +652,10 @@ class TestWriteActionFieldValidation:
         s3.set_json(BUCKET, "compliance_smoke_test/manifest.json", manifest)
         return ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
 
-    def test_rejects_non_list_allowed_gp_api_endpoints(self):
-        manifest = _manifest_payload(
-            "compliance_smoke_test",
-            allowed_gp_api_endpoints="not_a_list",
-        )
-        with pytest.raises(ManifestLoaderMalformedError, match="allowed_gp_api_endpoints"):
-            self._publish(manifest).routing_for("compliance_smoke_test")
-
-    def test_rejects_empty_allowed_gp_api_endpoints_list(self):
-        """An empty list is the silent-fallthrough footgun: it claims to be a
-        write-action manifest (field is present) but the dispatcher would
-        otherwise route it as a read-only Databricks experiment because the
-        list is falsy. Force authors to either set real endpoints or omit
-        the field. Contrast `allowed_external_tools=[]`, which is a valid
-        explicit deny-all."""
-        manifest = _manifest_payload(
-            "compliance_smoke_test",
-            allowed_gp_api_endpoints=[],
-        )
-        with pytest.raises(ManifestLoaderMalformedError, match="allowed_gp_api_endpoints"):
-            self._publish(manifest).routing_for("compliance_smoke_test")
-
-    def test_rejects_non_string_endpoint_entry(self):
-        manifest = _manifest_payload(
-            "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo", 42],
-        )
-        with pytest.raises(ManifestLoaderMalformedError, match="allowed_gp_api_endpoints"):
-            self._publish(manifest).routing_for("compliance_smoke_test")
-
-    def test_rejects_empty_endpoint_string(self):
-        manifest = _manifest_payload(
-            "compliance_smoke_test",
-            allowed_gp_api_endpoints=[""],
-        )
-        with pytest.raises(ManifestLoaderMalformedError, match="allowed_gp_api_endpoints"):
-            self._publish(manifest).routing_for("compliance_smoke_test")
-
-    def test_rejects_oversized_endpoint_string(self):
-        manifest = _manifest_payload(
-            "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/" + ("x" * 300)],
-        )
-        with pytest.raises(ManifestLoaderMalformedError, match="allowed_gp_api_endpoints"):
-            self._publish(manifest).routing_for("compliance_smoke_test")
-
     def test_rejects_unknown_permission_mode(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
             permission_mode="hax",
         )
         with pytest.raises(ManifestLoaderMalformedError, match="permission_mode"):
@@ -713,7 +664,7 @@ class TestWriteActionFieldValidation:
     def test_accepts_bypass_permissions_mode(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
             permission_mode="bypassPermissions",
         )
         routing = self._publish(manifest).routing_for("compliance_smoke_test")
@@ -722,7 +673,6 @@ class TestWriteActionFieldValidation:
     def test_rejects_non_string_system_prompt(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
             system_prompt=42,
         )
         with pytest.raises(ManifestLoaderMalformedError, match="system_prompt"):
@@ -731,7 +681,6 @@ class TestWriteActionFieldValidation:
     def test_rejects_empty_system_prompt(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
             system_prompt="   ",
         )
         with pytest.raises(ManifestLoaderMalformedError, match="system_prompt"):
@@ -740,7 +689,7 @@ class TestWriteActionFieldValidation:
     def test_rejects_non_list_allowed_external_tools(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
             allowed_external_tools="WebFetch",
         )
         with pytest.raises(ManifestLoaderMalformedError, match="allowed_external_tools"):
@@ -749,7 +698,7 @@ class TestWriteActionFieldValidation:
     def test_rejects_non_string_external_tool_entry(self):
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
             allowed_external_tools=["WebFetch", None],
         )
         with pytest.raises(ManifestLoaderMalformedError, match="allowed_external_tools"):
@@ -760,15 +709,15 @@ class TestWriteActionFieldValidation:
         the field being absent (which means 'unspecified, runner default')."""
         manifest = _manifest_payload(
             "compliance_smoke_test",
-            allowed_gp_api_endpoints=["GET /v1/foo"],
+            system_prompt="You are a compliance setup agent.",
             allowed_external_tools=[],
         )
         routing = self._publish(manifest).routing_for("compliance_smoke_test")
         assert routing["allowed_external_tools"] == []
 
-    def test_permission_mode_validated_even_without_endpoints(self):
-        """Defense in depth: a malformed permission_mode is rejected even if
-        allowed_gp_api_endpoints is absent — the field is still under our control."""
+    def test_permission_mode_validated_in_isolation(self):
+        """Defense in depth: a malformed permission_mode is rejected even
+        when it's the only write-action field on the manifest."""
         manifest = _manifest_payload(
             "compliance_smoke_test",
             permission_mode="hax",
