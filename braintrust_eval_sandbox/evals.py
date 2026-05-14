@@ -133,6 +133,9 @@ def _extract_template_text(prompt_obj: Any) -> str:
     return ""
 
 
+_UNSUPPORTED_SCHEMA_KEYWORDS = ("$ref", "$defs", "definitions")
+
+
 def _normalize_schema_for_gemini(node: Any) -> Any:
     """Rewrite standard JSON Schema into Gemini's structured-output dialect.
 
@@ -144,9 +147,14 @@ def _normalize_schema_for_gemini(node: Any) -> Any:
     `{"type": "string", "nullable": true}`. Already-Gemini-form schemas
     (with `nullable` already set) pass through unchanged.
 
-    Genuine type unions like `["string", "number"]` raise instead of silently
-    truncating — Gemini can't express them, and a clear error beats a
-    pydantic enum traceback three layers deep in the SDK.
+    Other shapes that raise here instead of letting the Gemini SDK fail with
+    an opaque pydantic traceback:
+      - Genuine type unions like `["string", "number"]` — Gemini can't
+        express them.
+      - Bare `["null"]` — pick a concrete type and use `nullable: true`.
+      - `$ref` / `$defs` / `definitions` — refs aren't resolved here; inline
+        the referenced schema (commonly produced by Pydantic's
+        `model_json_schema()`, which a PM may paste verbatim).
 
     Walks dicts and lists recursively; other node types pass through as-is.
     """
@@ -155,6 +163,17 @@ def _normalize_schema_for_gemini(node: Any) -> Any:
     if not isinstance(node, dict):
         return node
 
+    # Fail fast on unsupported keywords before doing any work. Checked at
+    # every recursion level so a $ref buried inside `properties` still fires.
+    for unsupported in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        if unsupported in node:
+            raise ValueError(
+                f"Gemini structured output does not support `{unsupported}`. "
+                f"Inline the referenced schema directly. If this came from "
+                f"Pydantic's `model_json_schema()`, expand `$defs` into the "
+                f"schema body before pasting."
+            )
+
     result = {k: _normalize_schema_for_gemini(v) for k, v in node.items()}
 
     type_val = result.get("type")
@@ -162,8 +181,19 @@ def _normalize_schema_for_gemini(node: Any) -> Any:
         non_null = [t for t in type_val if t != "null"]
         has_null = len(non_null) != len(type_val)
         if has_null and len(non_null) == 1:
+            # Standard nullable form: ["X", "null"] -> "X" with nullable flag.
             result["type"] = non_null[0]
             result["nullable"] = True
+        elif not has_null and len(non_null) == 1:
+            # Trivial single-element list: ["X"] -> "X". Some generators emit
+            # this; Gemini's SDK rejects lists outright.
+            result["type"] = non_null[0]
+        elif has_null and len(non_null) == 0:
+            raise ValueError(
+                f"Gemini structured output does not support a bare null type: "
+                f"{type_val!r}. Use a concrete type combined with "
+                f"`nullable: true` instead."
+            )
         elif len(non_null) > 1:
             raise ValueError(
                 f"Gemini structured output does not support type unions: {type_val!r}. "
@@ -219,11 +249,7 @@ def pipeline_task(input: dict, hooks: Any) -> dict:
     main_prompt_built = params["main_prompt"].build(**input)
     main_prompt_text = flatten_prompt_messages(main_prompt_built)
 
-    # Sandbox uses GEMINI_API_KEY_2 (separate quota from prod, set in
-    # Braintrust project env vars). Falls back to GEMINI_API_KEY for local
-    # `bt eval --dev` runs where only the standard key is in .env.
-    gemini_key = os.environ.get("GEMINI_API_KEY_2") or os.environ.get("GEMINI_API_KEY")
-    llm_client = Gemini3Client(api_key=gemini_key)
+    llm_client = Gemini3Client()
 
     with trace_pipeline(
         "pipeline_task",
@@ -322,8 +348,8 @@ EVAL_PARAMETERS: dict[str, Any] = {
         "name": "Main prompt",
         "description": (
             "Stage 1 prompt. Mustache variables resolve against the dataset "
-            "row's `input` dict. Bare {{var}} references are required; "
-            "{{#var}}...{{/var}}` sections are optional."
+            "row's `input` dict. Bare `{{var}}` references are required; "
+            "`{{#var}}...{{/var}}` sections are optional."
         ),
         "default": {
             "prompt": {
