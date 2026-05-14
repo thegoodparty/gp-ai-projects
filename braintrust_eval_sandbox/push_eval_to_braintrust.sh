@@ -20,6 +20,9 @@
 # under our two top-level packages so the bundler ships them regardless of
 # what the auto-walker missed.
 #
+# Sibling: campaign_plan_lambda/push_eval_to_braintrust.sh runs the same
+# monkey-patch. If you fix the patch here, update that one too.
+#
 # Run from project root:
 #   ./braintrust_eval_sandbox/push_eval_to_braintrust.sh
 #
