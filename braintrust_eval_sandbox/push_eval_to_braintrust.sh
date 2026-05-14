@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Push campaign_plan_lambda/evals.py to Braintrust as a sandbox eval.
+# Push braintrust_eval_sandbox/evals.py to Braintrust as a sandbox eval.
 #
 # Why the Python wrapper? The vanilla `braintrust push` CLI walks the import
 # graph of the eval file to decide which local source files to ship. Two
@@ -11,19 +11,20 @@
 #      short-circuits Eval() so the task body (and thus its transitive
 #      imports) never runs — only the eval module's top-level imports are
 #      observed, and even those get filtered out by problem #1.
-# Net effect: only `campaign_plan_lambda/__init__.py` and `shared/__init__.py`
-# end up in the zip, the sandbox crashes with `No module named
-# 'campaign_plan_lambda.evals'`, and we lose hours figuring it out.
+# Net effect: only `braintrust_eval_sandbox/__init__.py` and
+# `shared/__init__.py` end up in the zip, the sandbox crashes with `No
+# module named 'braintrust_eval_sandbox.evals'`, and we lose hours figuring
+# it out.
 #
 # Workaround: sanitize sys.path AND explicitly enumerate every .py file
 # under our two top-level packages so the bundler ships them regardless of
 # what the auto-walker missed.
 #
-# Sibling: braintrust_eval_sandbox/push_eval_to_braintrust.sh runs the same
+# Sibling: campaign_plan_lambda/push_eval_to_braintrust.sh runs the same
 # monkey-patch. If you fix the patch here, update that one too.
 #
 # Run from project root:
-#   ./campaign_plan_lambda/push_eval_to_braintrust.sh
+#   ./braintrust_eval_sandbox/push_eval_to_braintrust.sh
 #
 # Requires BRAINTRUST_API_KEY in env. The dev dep `braintrust[cli]` must be
 # installed (uv sync handles this).
@@ -32,8 +33,7 @@
 #   - GEMINI_API_KEY: set in Project Settings → Environment Variables.
 #   - ENVIRONMENT=eval: also in Environment Variables. Stamps every span
 #     emitted from sandbox runs with `metadata.environment="eval"` so the
-#     Logs view can filter eval rows separately from prod
-#     (DEV / QA / PROD comes from the Lambda's AWS env config).
+#     Logs view can filter eval rows separately from prod.
 
 set -euo pipefail
 
@@ -56,13 +56,12 @@ print(f'[push_eval] cleaned sys.path[0]={sys.path[0]!r}', file=sys.stderr, flush
 print(f'[push_eval] sys.path[1:]={sys.path[1:]!r}', file=sys.stderr, flush=True)
 
 # Explicit list of local source files the eval depends on. Add an entry when
-# evals.py or its callees gain a new local import. We use an allow-list (not
-# os.walk) so build artifacts under .build/, tests/, and unrelated shared
-# modules don't get sucked into the bundle.
+# evals.py or its callees gain a new local import. Allow-list (not os.walk)
+# so build artifacts under .build/, tests/, and unrelated shared modules
+# don't get sucked into the bundle.
 EVAL_SOURCE_FILES = [
-    'campaign_plan_lambda/__init__.py',
-    'campaign_plan_lambda/evals.py',
-    'campaign_plan_lambda/event_generator.py',
+    'braintrust_eval_sandbox/__init__.py',
+    'braintrust_eval_sandbox/evals.py',
     'shared/__init__.py',
     'shared/braintrust.py',
     'shared/llm_gemini_3.py',
@@ -102,8 +101,8 @@ print('[push_eval] patches applied; invoking main()', file=sys.stderr, flush=Tru
 from braintrust.cli.__main__ import main
 sys.argv = [
     'braintrust', 'push',
-    'campaign_plan_lambda/evals.py',
-    '--requirements', 'campaign_plan_lambda/evals.requirements.txt',
+    'braintrust_eval_sandbox/evals.py',
+    '--requirements', 'braintrust_eval_sandbox/evals.requirements.txt',
     '--if-exists', 'replace',
 ]
 sys.exit(main())
