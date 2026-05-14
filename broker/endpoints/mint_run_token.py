@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from broker.auth import get_service_token, verify_service_token
+from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import (
     ScopeTicket,
     ScopeTicketStore,
@@ -13,7 +14,10 @@ from broker.dynamodb_client import (
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
-MAX_TTL_SECONDS = 14400
+# 48h ceiling supports long-running campaign-plan and similar runs. The actual
+# ceiling is bounded by the Clerk session lifetime (default 7 days), not what
+# we set here — so 48h is comfortably within Clerk's bounds.
+MAX_TTL_SECONDS = 172800
 # The ticket must outlive the experiment's timeout so the agent's final
 # publish/report_status calls don't get 401'd mid-stride (which leaves the
 # DB row stuck RUNNING forever). Buffer covers validation + upload + callback.
@@ -29,6 +33,7 @@ class MintRequest(BaseModel):
     experiment_id: str = Field(..., pattern=IDENTIFIER_PATTERN)
     scope: dict
     params: dict
+    clerk_user_id: str = Field(...)
     exp_ttl_seconds: int = 3600
     # Optional — when provided, mint floors exp_ttl_seconds at
     # timeout_seconds + TTL_BUFFER_SECONDS so ticket survives the whole run.
@@ -54,12 +59,17 @@ def get_service_token_hash():
     raise NotImplementedError("must be overridden via dependency_overrides")  # pragma: no cover
 
 
+def get_clerk_client():
+    raise NotImplementedError("must be overridden via dependency_overrides")  # pragma: no cover
+
+
 @router.post("/mint-run-token", response_model=MintResponse)
 async def mint_run_token(
     request: MintRequest,
     service_token: str = Depends(get_service_token),
     token_hash: str = Depends(get_service_token_hash),
     store: ScopeTicketStore = Depends(get_ticket_store),
+    clerk_client: ClerkClient = Depends(get_clerk_client),
 ):
     if not verify_service_token(service_token, token_hash):
         raise HTTPException(status_code=401, detail="Invalid service token")
@@ -93,6 +103,28 @@ async def mint_run_token(
 
     exp = now + effective_ttl
 
+    try:
+        actor_token = await clerk_client.create_actor_token(request.clerk_user_id)
+    except ClerkClientError as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "clerk_actor_token_creation_failed",
+                "message": str(e),
+            },
+        ) from e
+
+    try:
+        session_info = await clerk_client.redeem_actor_token(actor_token["url"])
+    except ClerkClientError as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "clerk_actor_token_redemption_failed",
+                "message": str(e),
+            },
+        ) from e
+
     ticket = ScopeTicket(
         pk=broker_token,
         run_id=request.run_id,
@@ -104,6 +136,7 @@ async def mint_run_token(
         issued_at=now,
         issued_by="dispatch_lambda",
         prior_artifact_versions=request.prior_artifact_versions,
+        clerk_session_id=session_info["session_id"],
     )
 
     try:

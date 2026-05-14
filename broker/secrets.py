@@ -8,6 +8,10 @@ import boto3
 _REQUIRED_FIELDS = {
     "ANTHROPIC_API_KEY": "anthropic_api_key",
     "SERVICE_TOKEN_HASH": "service_token_hash",
+    "CLERK_SECRET_KEY": "clerk_secret_key",
+    "CLERK_FRONTEND_API_BASE": "clerk_frontend_api_base",
+    "GP_API_BASE_URL": "gp_api_base_url",
+    "AGENT_FLEET_CLERK_ID": "agent_fleet_clerk_id",
 }
 
 _OPTIONAL_FIELDS = {
@@ -25,6 +29,10 @@ _FIELD_MAP = {**_REQUIRED_FIELDS, **_OPTIONAL_FIELDS}
 class BrokerSecrets:
     anthropic_api_key: str
     service_token_hash: str
+    clerk_secret_key: str
+    clerk_frontend_api_base: str
+    gp_api_base_url: str
+    agent_fleet_clerk_id: str
     tavily_api_key: str = ""
     databricks_server_hostname: str = ""
     databricks_http_path: str = ""

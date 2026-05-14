@@ -1,13 +1,14 @@
 import hashlib
 import time
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from broker.auth import hash_service_token
+from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import (
     ScopeTicket,
     ScopeTicketStore,
@@ -16,6 +17,7 @@ from broker.dynamodb_client import (
 from broker.endpoints.mint_run_token import (
     MintRequest,
     MintResponse,
+    get_clerk_client,
     get_service_token_hash,
     get_ticket_store,
     router,
@@ -23,19 +25,34 @@ from broker.endpoints.mint_run_token import (
 
 SERVICE_TOKEN = "test-dispatch-lambda-token"
 SERVICE_TOKEN_HASH = hash_service_token(SERVICE_TOKEN)
+DEFAULT_CLERK_USER_ID = "user_test_abc123"
+DEFAULT_ACTOR_TOKEN_URL = "https://test.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
+
+
+def _make_fake_clerk(
+    session_id: str = "sess_default",
+    actor_token_url: str = DEFAULT_ACTOR_TOKEN_URL,
+) -> MagicMock:
+    fake = MagicMock(spec=ClerkClient)
+    fake.create_actor_token = AsyncMock(return_value={"url": actor_token_url})
+    fake.redeem_actor_token = AsyncMock(return_value={"session_id": session_id})
+    return fake
 
 
 def _create_test_app(
     store: ScopeTicketStore | None = None,
     token_hash: str = SERVICE_TOKEN_HASH,
+    clerk_client: ClerkClient | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
 
     _store = store or MagicMock(spec=ScopeTicketStore)
+    _clerk = clerk_client or _make_fake_clerk()
 
     app.dependency_overrides[get_ticket_store] = lambda: _store
     app.dependency_overrides[get_service_token_hash] = lambda: token_hash
+    app.dependency_overrides[get_clerk_client] = lambda: _clerk
 
     return app
 
@@ -47,6 +64,7 @@ def _mint_payload(**overrides) -> dict:
         "experiment_id": "voter_targeting",
         "scope": {"databricks": ["SELECT"], "tavily": True},
         "params": {"state": "CA", "district": "SD-15"},
+        "clerk_user_id": DEFAULT_CLERK_USER_ID,
     }
     base.update(overrides)
     return base
@@ -121,8 +139,8 @@ class TestMintRunTokenTTLCap:
     def test_ttl_above_max_is_rejected(self):
         """Caller asks for a TTL beyond MAX_TTL_SECONDS — reject loudly so a
         misconfigured dispatch (e.g., experiment with absurd timeout) is
-        visible as a 400 instead of silently clamping to 4h. Silent clamp
-        means agent thinks it has 24h and 401s mid-run; row sticks RUNNING
+        visible as a 400 instead of silently clamping. Silent clamp means
+        agent thinks it has more time and 401s mid-run; row sticks RUNNING
         forever in gp-api.
         """
         store = MagicMock(spec=ScopeTicketStore)
@@ -131,7 +149,7 @@ class TestMintRunTokenTTLCap:
 
         resp = client.post(
             "/internal/mint-run-token",
-            json=_mint_payload(exp_ttl_seconds=99999),
+            json=_mint_payload(exp_ttl_seconds=999999),
             headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
         )
         assert resp.status_code == 400
@@ -212,7 +230,7 @@ class TestMintRunTokenTTLVsTimeout:
 
         resp = client.post(
             "/internal/mint-run-token",
-            json=_mint_payload(exp_ttl_seconds=3600, timeout_seconds=15000),
+            json=_mint_payload(exp_ttl_seconds=3600, timeout_seconds=200000),
             headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
         )
         assert resp.status_code == 400
@@ -365,3 +383,89 @@ class TestMintRunTokenPriorArtifactVersions:
         assert resp.status_code == 200
         ticket: ScopeTicket = store.put_ticket.call_args[0][0]
         assert ticket.prior_artifact_versions is None
+
+
+class TestMintRunTokenActorTokenRedemption:
+    """The mint endpoint mints a Clerk actor token directly (broker-side, no
+    gp-api hop), redeems it for a session id, and persists the session id on
+    the ticket. The broker later uses this session id to mint fresh JWTs
+    (cached) for each outbound MCP/HTTP call.
+    """
+
+    def test_clerk_user_id_required(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        payload = _mint_payload()
+        del payload["clerk_user_id"]
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=payload,
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 422
+
+    def test_session_id_persisted_on_ticket(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        clerk = _make_fake_clerk(session_id="sess_abc123")
+        app = _create_test_app(store=store, clerk_client=clerk)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 200
+        clerk.create_actor_token.assert_awaited_once_with(DEFAULT_CLERK_USER_ID)
+        clerk.redeem_actor_token.assert_awaited_once_with(DEFAULT_ACTOR_TOKEN_URL)
+        ticket: ScopeTicket = store.put_ticket.call_args[0][0]
+        assert ticket.clerk_session_id == "sess_abc123"
+
+    def test_creation_failure_returns_502_with_reason(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        clerk = MagicMock(spec=ClerkClient)
+        clerk.create_actor_token = AsyncMock(
+            side_effect=ClerkClientError("upstream 422 user_not_found")
+        )
+        clerk.redeem_actor_token = AsyncMock()
+        app = _create_test_app(store=store, clerk_client=clerk)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["detail"]["reason"] == "clerk_actor_token_creation_failed"
+        clerk.redeem_actor_token.assert_not_awaited()
+        store.put_ticket.assert_not_called()
+
+    def test_redemption_failure_returns_502_with_reason(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        clerk = MagicMock(spec=ClerkClient)
+        clerk.create_actor_token = AsyncMock(
+            return_value={"url": DEFAULT_ACTOR_TOKEN_URL}
+        )
+        clerk.redeem_actor_token = AsyncMock(
+            side_effect=ClerkClientError("upstream 410 actor_token_already_used")
+        )
+        app = _create_test_app(store=store, clerk_client=clerk)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 502
+        body = resp.json()
+        assert body["detail"]["reason"] == "clerk_actor_token_redemption_failed"
+        store.put_ticket.assert_not_called()

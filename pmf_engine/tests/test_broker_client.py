@@ -63,6 +63,7 @@ class TestMintRunTokenSuccess:
                 experiment_id="smoke_test",
                 scope={"state": "NC", "cities": ["Hendersonville"]},
                 params={"city": "Hendersonville"},
+                clerk_user_id="user_test",
                 exp_ttl_seconds=3600,
             )
 
@@ -83,7 +84,7 @@ class TestMintRunTokenSuccess:
 
         with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response) as mock_post:
             client = BrokerClient("https://broker.example.com/", "token")
-            client.mint_run_token("run-1", "org-1", "exp-1", {}, {})
+            client.mint_run_token("run-1", "org-1", "exp-1", {}, {}, "user_test")
 
         url = mock_post.call_args.args[0]
         assert url == "https://broker.example.com/internal/mint-run-token"
@@ -99,7 +100,7 @@ class TestMintRunToken401:
             client = BrokerClient("https://broker.example.com", "bad-token")
 
             with pytest.raises(BrokerError) as exc_info:
-                client.mint_run_token("run-1", "org-1", "exp-1", {}, {})
+                client.mint_run_token("run-1", "org-1", "exp-1", {}, {}, "user_test")
 
             assert exc_info.value.status_code == 401
             assert "service token" in exc_info.value.detail.lower()
@@ -118,7 +119,7 @@ class TestMintRunToken400:
             client = BrokerClient("https://broker.example.com", "svc-token")
 
             with pytest.raises(BrokerError) as exc_info:
-                client.mint_run_token("run-1", "org-1", "exp-1", {}, {"bad": {"nested": True}})
+                client.mint_run_token("run-1", "org-1", "exp-1", {}, {"bad": {"nested": True}}, "user_test")
 
             assert exc_info.value.status_code == 400
             assert exc_info.value.user_safe_message == "Invalid experiment parameters"
@@ -135,7 +136,7 @@ class TestMintRunToken409:
             client = BrokerClient("https://broker.example.com", "svc-token")
 
             with pytest.raises(BrokerError) as exc_info:
-                client.mint_run_token("run-dup", "org-1", "exp-1", {}, {})
+                client.mint_run_token("run-dup", "org-1", "exp-1", {}, {}, "user_test")
 
             assert exc_info.value.status_code == 409
             assert "duplicate" in exc_info.value.detail.lower()
@@ -155,6 +156,7 @@ class TestMintRunTokenPriorArtifactVersions:
                 experiment_id="smoke_main",
                 scope={"state": "NC"},
                 params={"issues": ["housing"]},
+                clerk_user_id="user_test",
                 prior_artifact_versions={
                     "smoke_dep": "smoke_dep/org-1/run-a/artifact.json"
                 },
@@ -179,6 +181,7 @@ class TestMintRunTokenPriorArtifactVersions:
                 experiment_id="smoke_test",
                 scope={"state": "NC"},
                 params={"city": "Hendersonville"},
+                clerk_user_id="user_test",
             )
 
         body = mock_post.call_args.kwargs["json"]

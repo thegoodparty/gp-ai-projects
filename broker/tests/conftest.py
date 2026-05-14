@@ -31,5 +31,9 @@ def fake_secrets() -> BrokerSecrets:
         databricks_http_path="/sql/1.0/warehouses/test123",
         databricks_api_key="dapi-fake-key-for-testing",
         service_token_hash="a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        clerk_secret_key="sk_test_fake_clerk_secret",
+        clerk_frontend_api_base="https://fake.clerk.app",
+        gp_api_base_url="https://gp-api-dev.goodparty.org",
+        agent_fleet_clerk_id="user_agent_fleet_test",
         results_queue_url="https://sqs.us-west-2.amazonaws.com/333022194791/agent-results-dev.fifo",
     )

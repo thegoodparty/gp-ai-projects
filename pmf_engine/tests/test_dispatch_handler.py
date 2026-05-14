@@ -107,6 +107,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": {"topic": "education"},
         }
         result = parse_dispatch_message(json.dumps(body))
@@ -120,6 +121,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
         }
         result = parse_dispatch_message(json.dumps(body))
         assert result["params"] == {}
@@ -160,6 +162,7 @@ class TestParseDispatchMessage:
             "experiment_type": bad_experiment_type,
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
         }
         with pytest.raises(ValueError):
             parse_dispatch_message(json.dumps(body))
@@ -178,6 +181,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": bad_run_id,
+            "clerk_user_id": "user_test_dispatch",
         }
         with pytest.raises(ValueError, match="run_id"):
             parse_dispatch_message(json.dumps(body))
@@ -196,6 +200,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": bad_org_slug,
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
         }
         with pytest.raises(ValueError, match="organization_slug"):
             parse_dispatch_message(json.dumps(body))
@@ -205,6 +210,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": "Org-123_abc",
             "run_id": "run-ABC-001",
+            "clerk_user_id": "user_test_dispatch",
         }
         parsed = parse_dispatch_message(json.dumps(body))
         assert parsed["organization_slug"] == "Org-123_abc"
@@ -215,6 +221,7 @@ class TestParseDispatchMessage:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "prior_artifact_versions": {
                 f"k{i}": f"e/r/artifact.json" for i in range(11)
             },
@@ -238,6 +245,7 @@ class TestBuildContainerOverrides:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
             "params": {"district": "CA-12"},
         }
 
@@ -272,6 +280,7 @@ class TestBuildContainerOverrides:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         }
         overrides = build_container_overrides(
@@ -302,6 +311,7 @@ class TestHandler:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -333,6 +343,7 @@ class TestHandler:
             "experiment_type": "nonexistent",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -354,6 +365,7 @@ class TestHandler:
             "experiment_type": "nonexistent",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -383,6 +395,7 @@ class TestHandler:
                 "experiment_type": "nonexistent",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
                 "params": {},
             })
             handler(event, None)
@@ -428,6 +441,7 @@ class TestHandler:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -473,6 +487,7 @@ class TestHandler:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -504,6 +519,7 @@ class TestHandler:
                 "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             }
             send_error_callback(message, "some error", "https://sqs.example.com/callback.fifo")
         finally:
@@ -530,6 +546,7 @@ class TestHandler:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -553,6 +570,7 @@ class TestHandler:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -576,6 +594,7 @@ class TestBrokerFlow:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -602,6 +621,7 @@ class TestBrokerFlow:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -624,6 +644,7 @@ class TestBrokerFlow:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -645,6 +666,7 @@ class TestBrokerFlow:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -664,6 +686,7 @@ class TestNonDictParamsGuard:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
+            "clerk_user_id": "user_test_dispatch",
             "params": "not a dict",
         })
 
@@ -686,6 +709,7 @@ class TestNonDictParamsGuard:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": [1, 2, 3],
         })
 
@@ -711,6 +735,7 @@ class TestNonDictParamsGuard:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": None,
         })
 
@@ -739,6 +764,7 @@ class TestErrorCallbackStableDedup:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -759,6 +785,7 @@ class TestErrorCallbackStableDedup:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -781,6 +808,7 @@ class TestErrorCallbackStableDedup:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -808,6 +836,7 @@ class TestMissingCriticalEnvVars:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -837,6 +866,7 @@ class TestMissingCriticalEnvVars:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -861,6 +891,7 @@ class TestMissingCriticalEnvVars:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-xyz",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -885,6 +916,7 @@ class TestParamsSizeLimit:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-big",
+            "clerk_user_id": "user_test_dispatch",
             "params": oversized,
         })
 
@@ -919,6 +951,7 @@ class TestParamsSizeLimit:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
             "params": small,
         })
 
@@ -947,6 +980,7 @@ class TestRequiredParamsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-missing-state",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -976,6 +1010,7 @@ class TestRequiredParamsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "org-empty",
             "run_id": "run-empty-strings",
+            "clerk_user_id": "user_test_dispatch",
             "params": {"state": ""},
         })
 
@@ -999,6 +1034,7 @@ class TestRequiredParamsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "org-ok",
             "run_id": "run-ok",
+            "clerk_user_id": "user_test_dispatch",
             "params": {"state": "WI"},
         })
 
@@ -1022,6 +1058,7 @@ class TestTransientBrokerErrors:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-transient",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1048,6 +1085,7 @@ class TestTransientBrokerErrors:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-terminal",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1078,6 +1116,7 @@ class TestDispatchHandlerErrorPathResilience:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-prog-err",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1102,6 +1141,7 @@ class TestDispatchHandlerErrorPathResilience:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-missing-params",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -1125,6 +1165,7 @@ class TestDispatchHandlerErrorPathResilience:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-missing-params-ok",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         })
 
@@ -1201,6 +1242,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-1",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": {
                 "smoke_dep": "../../etc/passwd",
@@ -1214,6 +1256,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-2",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": {
                 "smoke_dep": "smoke_dep/other-org-run-id/artifact.json/../secrets.txt",
@@ -1227,6 +1270,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-3",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": {
                 "smoke_dep": "smoke_dep/abc-123/latest.json",
@@ -1240,6 +1284,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-4",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": {
                 "smoke_dep": "/abc-123/artifact.json",
@@ -1253,6 +1298,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_test",
             "organization_slug": "acme",
             "run_id": "run-5",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": {
                 "smoke_dep": "smoke_dep/d188bc17-87bd-4fe0-9b45-d34d3b301d98/artifact.json",
@@ -1266,6 +1312,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_dep",
             "organization_slug": "acme",
             "run_id": "run-6",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
         }
         result = parse_dispatch_message(json.dumps(body))
@@ -1276,6 +1323,7 @@ class TestPriorArtifactVersionsValidation:
             "experiment_type": "smoke_dep",
             "organization_slug": "acme",
             "run_id": "run-7",
+            "clerk_user_id": "user_test_dispatch",
             "params": {},
             "prior_artifact_versions": "not-a-dict",
         }
@@ -1317,6 +1365,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-iam-leak",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1357,6 +1406,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             "experiment_type": "smoke_test",
             "organization_slug": "org-123",
             "run_id": "run-iam-exc-leak",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1406,6 +1456,7 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
                 "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
                 "run_id": "run-log-detail",
+            "clerk_user_id": "user_test_dispatch",
                 "params": dict(VALID_PARAMS),
             })
             handler(event, None)
@@ -1445,6 +1496,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ecs-cap",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1470,6 +1522,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ecs-boom",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1496,6 +1549,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-double-fail",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1523,6 +1577,7 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "experiment_type": "smoke_test",
             "organization_slug": "org-x",
             "run_id": "run-ok",
+            "clerk_user_id": "user_test_dispatch",
             "params": dict(VALID_PARAMS),
         })
 
@@ -1587,6 +1642,7 @@ class TestInputSchemaSortKeyMixedTypes:
             "experiment_type": "smoke_test",
             "organization_slug": "org-mixed",
             "run_id": "run-mixed-paths",
+            "clerk_user_id": "user_test_dispatch",
             # Errors fall on: items (wrong type), items[0].id (missing),
             # name (missing). Paths mix str and int.
             "params": {"items": [{}, {"id": 42}]},
@@ -1625,6 +1681,7 @@ class TestInputSchemaSortKeyMixedTypes:
             "experiment_type": "smoke_test",
             "organization_slug": "org-fmt",
             "run_id": "run-fmt-check",
+            "clerk_user_id": "user_test_dispatch",
             # items[1].id is the wrong type (int instead of string).
             "params": {"items": [{"id": "ok"}, {"id": 42}], "name": "alice"},
         })
