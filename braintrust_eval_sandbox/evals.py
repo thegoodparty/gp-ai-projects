@@ -51,6 +51,7 @@ import re
 from typing import Any
 
 from braintrust import Eval, init_dataset
+from pydantic import BaseModel, Field
 
 from shared.braintrust import (
     flatten_prompt_messages,
@@ -69,18 +70,62 @@ MAIN_PROMPT_OUTPUT_VAR = "main_prompt_output"
 
 # Matches bare `{{var}}` references but not `{{#var}}`, `{{/var}}`, `{{^var}}`,
 # `{{!comment}}`, `{{>partial}}`, or `{{&unescaped}}` — those start with a
-# non-alphanumeric sigil, which the leading character class excludes. Section
-# vars (#, /, ^) are inherently optional in Mustache; we honor that and only
-# enforce presence for bare references.
+# non-alphanumeric sigil, which the leading character class excludes.
 _BARE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_]\w*)\s*\}\}")
+
+# Matches section openers `{{#var}}` and inverted-section openers `{{^var}}`.
+# Both forms guard their contents, so any variable named here is treated as
+# optional — even when bare {{var}} references appear inside the section
+# body (a common pattern: `{{#name}}Hello {{name}}!{{/name}}`).
+_SECTION_VAR_RE = re.compile(r"\{\{\s*[#^]\s*([a-zA-Z_]\w*)\s*\}\}")
 
 
 def _bare_vars(template: str) -> set[str]:
     return set(_BARE_VAR_RE.findall(template))
 
 
+def _section_vars(template: str) -> set[str]:
+    return set(_SECTION_VAR_RE.findall(template))
+
+
+def _extract_template_text(prompt_obj: Any) -> str:
+    """Concatenate the raw Mustache template strings from a Braintrust Prompt
+    object, before any rendering. The strict-key check runs on this — parsing
+    the post-render output would miss already-resolved-or-empty variables
+    (which is exactly the silent-failure mode we want to catch).
+
+    Handles both chat prompts (joins each message's content) and completion
+    prompts (single content string). Multimodal content parts (text/image
+    lists) are flattened to their text components.
+    """
+    inner = getattr(prompt_obj, "prompt", None)
+    if inner is None:
+        return ""
+    inner_type = getattr(inner, "type", None)
+    if inner_type == "completion":
+        return getattr(inner, "content", "") or ""
+    if inner_type == "chat":
+        parts: list[str] = []
+        for msg in getattr(inner, "messages", None) or []:
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                # Multimodal message: pick up the text parts.
+                for piece in content:
+                    text = getattr(piece, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
 def _require_keys(template: str, row_keys: set[str], *, label: str, reserved: set[str]) -> None:
-    referenced = _bare_vars(template) - reserved
+    # A variable declared as a section anywhere in the template is optional
+    # everywhere — even at bare-reference sites. Matches the user mental
+    # model "I wrapped it in a section, so it doesn't need to be in the row."
+    optional = _section_vars(template)
+    referenced = _bare_vars(template) - reserved - optional
     missing = referenced - row_keys
     if missing:
         raise ValueError(
@@ -110,11 +155,21 @@ async def pipeline_task(input: dict, hooks: Any) -> dict:
 
     row_keys = set(input.keys())
 
+    # Pre-render check: parse {{var}} references out of the raw template
+    # and verify the row supplies each one. Catches "I forgot to populate
+    # `city` in the dataset" before we burn an LLM call rendering empty
+    # placeholders.
+    main_template = _extract_template_text(params["main_prompt"])
+    _require_keys(main_template, row_keys, label="main_prompt", reserved=set())
+
     main_prompt_built = params["main_prompt"].build(**input)
     main_prompt_text = flatten_prompt_messages(main_prompt_built)
-    _require_keys(main_prompt_text, row_keys, label="main_prompt", reserved=set())
 
-    llm_client = Gemini3Client()
+    # Sandbox uses GEMINI_API_KEY_2 (separate quota from prod, set in
+    # Braintrust project env vars). Falls back to GEMINI_API_KEY for local
+    # `bt eval --dev` runs where only the standard key is in .env.
+    gemini_key = os.environ.get("GEMINI_API_KEY_2") or os.environ.get("GEMINI_API_KEY")
+    llm_client = Gemini3Client(api_key=gemini_key)
 
     with trace_pipeline(
         "pipeline_task",
@@ -141,15 +196,17 @@ async def pipeline_task(input: dict, hooks: Any) -> dict:
             span.log(output=output)
             return output
 
-        struct_input = {**input, MAIN_PROMPT_OUTPUT_VAR: main_text}
-        struct_built = params["structured_output_prompt"].build(**struct_input)
-        struct_text = flatten_prompt_messages(struct_built)
+        struct_template = _extract_template_text(params["structured_output_prompt"])
         _require_keys(
-            struct_text,
+            struct_template,
             row_keys,
             label="structured_output_prompt",
             reserved={MAIN_PROMPT_OUTPUT_VAR},
         )
+
+        struct_input = {**input, MAIN_PROMPT_OUTPUT_VAR: main_text}
+        struct_built = params["structured_output_prompt"].build(**struct_input)
+        struct_text = flatten_prompt_messages(struct_built)
 
         with hooks.span.start_span(name="structured_output") as struct_span:
             struct_span.log(input={"prompt": struct_text, "schema": schema})
@@ -165,20 +222,43 @@ async def pipeline_task(input: dict, hooks: Any) -> dict:
         return output
 
 
-# Plain dict literals — not typed constructors — so unset Optional fields
-# don't serialize as JSON `null`s and trip the playground's parameter
-# validator (which silently rejects the function from the "+ Task → Remote
-# eval" picker). Same shape rule as campaign_plan_lambda/evals.py.
-EVAL_PARAMETERS: dict[str, Any] = {
-    "main_prompt_search_enabled": {
-        "type": "boolean",
-        "name": "Main prompt: enable Google Search grounding",
-        "description": (
+# Braintrust's serializer dispatches on parameter "type":
+#   - "prompt" / "model" → dict literal accepted as-is
+#   - everything else → must be a Pydantic model class. The single-field-
+#     named-"value" convention unwraps so the UI shows a flat scalar/object
+#     editor (not a nested {value: ...} form). The unwrapped value is what
+#     arrives at the task via hooks.parameters.
+#
+# Why not typed constructors for the prompt entries? The campaign_plan_lambda
+# eval documents this: Braintrust's PromptParameter / PromptData /
+# PromptChatBlock / PromptMessage dataclasses serialize unset Optional fields
+# as JSON `null`s, which the playground's parameter validator silently
+# rejects (function disappears from the "+ Task → Remote eval" picker).
+# Dict literals omit the unset keys.
+class _SearchEnabledParam(BaseModel):
+    value: bool = Field(
+        default=True,
+        title="Main prompt: enable Google Search grounding",
+        description=(
             "Toggle Gemini grounded search on the stage 1 (main) prompt. "
             "Off = plain completion."
         ),
-        "default": True,
-    },
+    )
+
+
+class _StructuredOutputSchemaParam(BaseModel):
+    value: dict[str, Any] = Field(
+        default_factory=dict,
+        title="Structured output schema",
+        description=(
+            "JSON Schema for stage 2 output. Leave empty ({}) to skip stage "
+            "2 and return stage 1's text directly."
+        ),
+    )
+
+
+EVAL_PARAMETERS: dict[str, Any] = {
+    "main_prompt_search_enabled": _SearchEnabledParam,
     "main_prompt": {
         "type": "prompt",
         "name": "Main prompt",
@@ -219,15 +299,7 @@ EVAL_PARAMETERS: dict[str, Any] = {
             "options": {"model": "gemini-3-flash-preview"},
         },
     },
-    "structured_output_schema": {
-        "type": "json",
-        "name": "Structured output schema",
-        "description": (
-            "JSON Schema for stage 2 output. Leave empty ({}) to skip stage "
-            "2 and return stage 1's text directly."
-        ),
-        "default": {},
-    },
+    "structured_output_schema": _StructuredOutputSchemaParam,
 }
 
 
