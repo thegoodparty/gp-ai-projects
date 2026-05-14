@@ -43,32 +43,39 @@ async def http_fetch(
     ticket: ScopeTicket = Depends(get_scope_ticket),
     fetcher: BrowserFetcher = Depends(get_browser_fetcher),
 ):
-    await validate_url(req.url)
+    try:
+        await validate_url(req.url)
 
-    result = await fetcher.fetch(req.url, capture_download=False)
+        result = await fetcher.fetch(req.url, capture_download=False)
 
-    await validate_url(result.final_url)
+        await validate_url(result.final_url)
 
-    if len(result.body) > MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"response exceeded {MAX_BYTES} bytes",
+        if len(result.body) > MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"response exceeded {MAX_BYTES} bytes",
+            )
+
+        try:
+            body_text = result.body.decode("utf-8")
+        except UnicodeDecodeError:
+            body_text = result.body.decode("utf-8", errors="replace")
+
+        logger.info(
+            "http_fetch ok run_id=%s status=%d bytes=%d purpose=%s url=%s",
+            ticket.run_id, result.status, len(result.body), req.purpose or "", req.url,
         )
 
-    try:
-        body_text = result.body.decode("utf-8")
-    except UnicodeDecodeError:
-        body_text = result.body.decode("utf-8", errors="replace")
-
-    logger.info(
-        "http_fetch ok run_id=%s status=%d bytes=%d purpose=%s url=%s",
-        ticket.run_id, result.status, len(result.body), req.purpose or "", req.url,
-    )
-
-    return HttpFetchResponse(
-        status=result.status,
-        content_type=result.content_type,
-        body=body_text,
-        source_url=result.final_url,
-        byte_size=len(result.body),
-    )
+        return HttpFetchResponse(
+            status=result.status,
+            content_type=result.content_type,
+            body=body_text,
+            source_url=result.final_url,
+            byte_size=len(result.body),
+        )
+    except HTTPException as e:
+        logger.warning(
+            "http_fetch failed run_id=%s status=%d purpose=%s url=%s detail=%s",
+            ticket.run_id, e.status_code, req.purpose or "", req.url, e.detail,
+        )
+        raise

@@ -1,3 +1,4 @@
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -244,3 +245,74 @@ class TestAuth:
         client = TestClient(app)
         resp = client.post("/pdf/fetch", json={"url": SOURCE_URL})
         assert resp.status_code == 401
+
+
+class TestFailureLogging:
+    """On-call must be able to grep CloudWatch for 'pdf_fetch failed' to see
+    every 4xx/5xx the endpoint emits."""
+
+    def test_ssrf_rejection_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.pdf_fetch")
+        client = TestClient(_create_app())
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": "https://10.0.0.5/x.pdf"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 400
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "pdf_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1, f"expected one warning, got {[r.getMessage() for r in caplog.records]}"
+        msg = warnings[0].getMessage()
+        assert "run_id=run-pdf-001" in msg
+        assert "status=400" in msg
+        assert "url=https://10.0.0.5/x.pdf" in msg
+
+    def test_wrong_content_type_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.pdf_fetch")
+        fetcher = _FakeFetcher(
+            result=BrowserFetchResult(
+                status=200,
+                content_type="text/html",
+                body=b"<html>not a pdf</html>",
+                final_url=SOURCE_URL,
+            )
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": SOURCE_URL},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 415
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "pdf_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "status=415" in msg
+        assert "text/html" in msg
+
+    def test_upstream_502_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.pdf_fetch")
+        fetcher = _FakeFetcher(
+            raise_exc=HTTPException(status_code=502, detail="upstream nav failed"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/pdf/fetch",
+            json={"url": SOURCE_URL},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 502
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "pdf_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "status=502" in msg
+        assert "upstream nav failed" in msg

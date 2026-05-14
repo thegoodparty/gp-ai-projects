@@ -1,3 +1,4 @@
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -246,3 +247,74 @@ class TestAuth:
         client = TestClient(app)
         resp = client.post("/http/fetch", json={"url": "https://example.com/x"})
         assert resp.status_code == 401
+
+
+class TestFailureLogging:
+    """On-call must be able to grep CloudWatch for 'http_fetch failed' to see
+    every 4xx/5xx the endpoint emits. A previous refactor silently dropped the
+    warning log on the failure path; these tests pin it back."""
+
+    def test_ssrf_rejection_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.http_fetch")
+        client = TestClient(_create_app())
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://10.0.0.5/api"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 400
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1, f"expected one warning, got {[r.getMessage() for r in caplog.records]}"
+        msg = warnings[0].getMessage()
+        assert "run_id=run-http-001" in msg
+        assert "status=400" in msg
+        assert "url=https://10.0.0.5/api" in msg
+
+    def test_upstream_502_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.http_fetch")
+        fetcher = _FakeFetcher(
+            raise_exc=HTTPException(status_code=502, detail="upstream nav failed: timeout"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/x"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 502
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "status=502" in msg
+        assert "upstream nav failed" in msg
+
+    def test_oversized_response_emits_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger="broker.endpoints.http_fetch")
+        oversized = b"x" * (10 * 1024 * 1024 + 1)
+        fetcher = _FakeFetcher(
+            result=BrowserFetchResult(
+                status=200,
+                content_type="text/plain",
+                body=oversized,
+                final_url="https://example.com/big",
+            )
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/big"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 413
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "status=413" in warnings[0].getMessage()
