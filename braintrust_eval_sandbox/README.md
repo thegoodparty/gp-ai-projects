@@ -45,7 +45,9 @@ Schemas already written in Gemini's flavor (`nullable: true`) pass through uncha
 
 What is **not** supported and will raise a clear error:
 - Genuine type unions like `{"type": ["string", "number"]}` — Gemini cannot express them. Pick one type.
-- `$ref` and `$defs` — refs aren't resolved; inline the referenced schema.
+- Bare null type like `{"type": ["null"]}` — an empty-information schema. Combine a concrete type with `nullable: true` instead.
+- Empty type list `{"type": []}` — no type information at all.
+- `$ref`, `$defs`, or the legacy `definitions` keyword — refs aren't resolved; inline the referenced schema. (Pydantic's `model_json_schema()` emits `$defs` for nested objects, so paste from Pydantic after expanding.)
 
 ## PM workflow
 
