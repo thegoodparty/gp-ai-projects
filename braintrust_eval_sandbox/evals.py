@@ -120,6 +120,47 @@ def _extract_template_text(prompt_obj: Any) -> str:
     return ""
 
 
+def _normalize_schema_for_gemini(node: Any) -> Any:
+    """Rewrite standard JSON Schema into Gemini's structured-output dialect.
+
+    Gemini's types.Schema only accepts singular `type` values (STRING, NUMBER,
+    INTEGER, BOOLEAN, ARRAY, OBJECT, NULL) plus a separate `nullable` flag.
+    Standard JSON Schema expresses optionality as a type union — e.g.
+    `{"type": ["string", "null"]}` — which is what OpenAI's structured-output
+    API emits and what most PMs paste. This walker rewrites that union to
+    `{"type": "string", "nullable": true}`. Already-Gemini-form schemas
+    (with `nullable` already set) pass through unchanged.
+
+    Genuine type unions like `["string", "number"]` raise instead of silently
+    truncating — Gemini can't express them, and a clear error beats a
+    pydantic enum traceback three layers deep in the SDK.
+
+    Walks dicts and lists recursively; other node types pass through as-is.
+    """
+    if isinstance(node, list):
+        return [_normalize_schema_for_gemini(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    result = {k: _normalize_schema_for_gemini(v) for k, v in node.items()}
+
+    type_val = result.get("type")
+    if isinstance(type_val, list):
+        non_null = [t for t in type_val if t != "null"]
+        has_null = len(non_null) != len(type_val)
+        if has_null and len(non_null) == 1:
+            result["type"] = non_null[0]
+            result["nullable"] = True
+        elif len(non_null) > 1:
+            raise ValueError(
+                f"Gemini structured output does not support type unions: {type_val!r}. "
+                f"Use a single `type` value (optionally combined with `nullable: true` "
+                f"for nullable fields)."
+            )
+
+    return result
+
+
 def _require_keys(template: str, row_keys: set[str], *, label: str, reserved: set[str]) -> None:
     # A variable declared as a section anywhere in the template is optional
     # everywhere — even at bare-reference sites. Matches the user mental
@@ -208,11 +249,15 @@ async def pipeline_task(input: dict, hooks: Any) -> dict:
         struct_built = params["structured_output_prompt"].build(**struct_input)
         struct_text = flatten_prompt_messages(struct_built)
 
+        # Translate JSON Schema → Gemini schema. PMs paste the OpenAI/Anthropic
+        # flavor; Gemini's SDK needs nullable as a flag, not a union member.
+        gemini_schema = _normalize_schema_for_gemini(schema)
+
         with hooks.span.start_span(name="structured_output") as struct_span:
-            struct_span.log(input={"prompt": struct_text, "schema": schema})
+            struct_span.log(input={"prompt": struct_text, "schema": gemini_schema})
             structured = llm_client.generate_structured_content(
                 prompt=struct_text,
-                response_schema=schema,
+                response_schema=gemini_schema,
                 temperature=0.0,
             )
             struct_span.log(output={"structured": structured})

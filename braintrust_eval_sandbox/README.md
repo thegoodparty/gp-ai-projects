@@ -22,6 +22,31 @@ Output shape:
 {"output": {"name": "...", "date": "..."}}       // when stage 2 ran with a schema
 ```
 
+## Schema authoring
+
+Paste standard JSON Schema. The eval normalizes it to Gemini's structured-output dialect before calling the model — you do not need to know Gemini-specific syntax.
+
+The main translation handled automatically: nullable fields. Standard JSON Schema expresses optionality as `{"type": ["string", "null"]}`. The eval rewrites that to Gemini's form `{"type": "string", "nullable": true}` on every nested field.
+
+```json
+// What you paste — standard JSON Schema
+{
+  "type": "object",
+  "properties": {
+    "name":    {"type": "string"},
+    "score":   {"type": ["number", "null"]},
+    "tags":    {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["name"]
+}
+```
+
+Schemas already written in Gemini's flavor (`nullable: true`) pass through unchanged, so either form works.
+
+What is **not** supported and will raise a clear error:
+- Genuine type unions like `{"type": ["string", "number"]}` — Gemini cannot express them. Pick one type.
+- `$ref` and `$defs` — refs aren't resolved; inline the referenced schema.
+
 ## PM workflow
 
 1. Open the `braintrust-eval-sandbox` Braintrust project.
