@@ -8,14 +8,10 @@ _MAX_CITY_DISTRICT_LEN = 200
 
 def _validate_scope_string(field: str, value: str) -> None:
     if len(value) > _MAX_CITY_DISTRICT_LEN:
-        raise ValueError(
-            f"{field!r} exceeds max length {_MAX_CITY_DISTRICT_LEN}: got {len(value)} chars"
-        )
+        raise ValueError(f"{field!r} exceeds max length {_MAX_CITY_DISTRICT_LEN}: got {len(value)} chars")
     for ch in value:
         if ord(ch) < 32 or ord(ch) == 127:
-            raise ValueError(
-                f"{field!r} contains disallowed control character: {ch!r}"
-            )
+            raise ValueError(f"{field!r} contains disallowed control character: {ch!r}")
 
 
 def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None = None) -> dict:
@@ -36,9 +32,7 @@ def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None =
 
     state = params.get("state", "")
     if state and not _STATE_PATTERN.match(state):
-        raise ValueError(
-            f"state must be a 2-letter uppercase code or empty; got {state!r}"
-        )
+        raise ValueError(f"state must be a 2-letter uppercase code or empty; got {state!r}")
 
     city = params.get("city", "")
     if city:

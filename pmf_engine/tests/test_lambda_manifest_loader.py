@@ -155,11 +155,14 @@ def _fake_s3_with_index(index_payload: dict) -> FakeS3:
 # Happy path — index lookup + manifest fetch
 # ---------------------------------------------------------------------------
 
+
 class TestRoutingForSuccess:
     def test_returns_routing_fields_from_manifest(self):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         manifest = _manifest_payload("smoke_test", timeout_seconds=900, model="sonnet")
         s3 = _fake_s3_with_index(index)
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
@@ -174,9 +177,11 @@ class TestRoutingForSuccess:
         assert routing["input_schema"] == manifest["input_schema"]
 
     def test_returns_none_when_experiment_not_in_index(self):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         s3 = _fake_s3_with_index(index)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         assert loader.routing_for("nonexistent_experiment") is None
@@ -185,24 +190,30 @@ class TestRoutingForSuccess:
         """Every entry in index.json is dispatchable in the env it lives in.
         Per-experiment env gating was dropped — env scoping happens at the
         S3 bucket level (each env has its own metadata bucket)."""
-        index = _index_payload([
-            {"id": "smoke_a", "version": 1, "mode": "win", "manifest_key": "smoke_a/manifest.json"},
-            {"id": "smoke_b", "version": 1, "mode": "win", "manifest_key": "smoke_b/manifest.json"},
-            {"id": "smoke_c", "version": 1, "mode": "serve", "manifest_key": "smoke_c/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_a", "version": 1, "mode": "win", "manifest_key": "smoke_a/manifest.json"},
+                {"id": "smoke_b", "version": 1, "mode": "win", "manifest_key": "smoke_b/manifest.json"},
+                {"id": "smoke_c", "version": 1, "mode": "serve", "manifest_key": "smoke_c/manifest.json"},
+            ]
+        )
         s3 = _fake_s3_with_index(index)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         assert sorted(loader.known_experiments()) == ["smoke_a", "smoke_b", "smoke_c"]
+
 
 # ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
 
+
 class TestRoutingForCaching:
     def test_index_fetched_once_within_ttl(self):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         manifest = _manifest_payload("smoke_test")
         s3 = _fake_s3_with_index(index)
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
@@ -216,9 +227,11 @@ class TestRoutingForCaching:
         assert len(index_calls) == 1, f"expected index.json fetched once, got {len(index_calls)}"
 
     def test_manifest_cached_per_experiment(self):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         manifest = _manifest_payload("smoke_test")
         s3 = _fake_s3_with_index(index)
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
@@ -231,9 +244,11 @@ class TestRoutingForCaching:
         assert len(manifest_calls) == 1
 
     def test_cache_expires_after_ttl(self, monkeypatch):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         manifest = _manifest_payload("smoke_test")
         s3 = _fake_s3_with_index(index)
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
@@ -249,6 +264,7 @@ class TestRoutingForCaching:
         index_calls = s3.calls_for_key("index.json")
         assert len(index_calls) == 2
 
+
 # ---------------------------------------------------------------------------
 # Error handling
 #
@@ -257,6 +273,7 @@ class TestRoutingForCaching:
 # the parent ManifestLoaderError, so a regression that drops or swaps the
 # subclass surfaces here.
 # ---------------------------------------------------------------------------
+
 
 class TestRoutingForErrors:
     def test_index_missing_raises_malformed(self):
@@ -270,8 +287,7 @@ class TestRoutingForErrors:
             loader.routing_for("smoke_test")
 
         assert isinstance(exc.value, ManifestLoaderMalformedError), (
-            f"NoSuchKey on index.json must raise Malformed (publish-pipeline bug), "
-            f"got {type(exc.value).__name__}"
+            f"NoSuchKey on index.json must raise Malformed (publish-pipeline bug), got {type(exc.value).__name__}"
         )
         assert "index" in str(exc.value).lower()
 
@@ -286,17 +302,18 @@ class TestRoutingForErrors:
             loader.routing_for("smoke_test")
 
         assert isinstance(exc.value, ManifestLoaderTransientError), (
-            f"SlowDown on index.json must raise Transient (SQS will retry), "
-            f"got {type(exc.value).__name__}"
+            f"SlowDown on index.json must raise Transient (SQS will retry), got {type(exc.value).__name__}"
         )
 
     def test_manifest_missing_for_known_experiment_raises_malformed(self):
         """The index references a manifest that doesn't exist in S3 — this
         is a publish-pipeline bug: index.json was updated but the manifest
         upload failed or was deleted."""
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         s3 = _fake_s3_with_index(index)
         s3.set_error(BUCKET, "smoke_test/manifest.json", code="NoSuchKey")
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
@@ -305,15 +322,16 @@ class TestRoutingForErrors:
             loader.routing_for("smoke_test")
 
         assert isinstance(exc.value, ManifestLoaderMalformedError), (
-            f"NoSuchKey on a manifest the index references must raise Malformed, "
-            f"got {type(exc.value).__name__}"
+            f"NoSuchKey on a manifest the index references must raise Malformed, got {type(exc.value).__name__}"
         )
         assert "smoke_test" in str(exc.value).lower()
 
     def test_manifest_corrupt_raises_malformed(self):
-        index = _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        index = _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
         s3 = _fake_s3_with_index(index)
         s3.set_object(BUCKET, "smoke_test/manifest.json", b"not json")
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
@@ -343,6 +361,7 @@ class TestRoutingForErrors:
 
         assert "experiments" in str(exc.value).lower()
 
+
 # ---------------------------------------------------------------------------
 # Instruction VersionId pinning
 #
@@ -354,17 +373,20 @@ class TestRoutingForErrors:
 # entire pinning system. Asymmetric vs `_fetch_manifest` which raises.
 # ---------------------------------------------------------------------------
 
+
 class TestInstructionVersionIdPinning:
     def _index(self):
-        return _index_payload([
-            {
-                "id": "smoke_test",
-                "version": 1,
-                "mode": "win",
-                "manifest_key": "smoke_test/manifest.json",
-                "instruction_key": "smoke_test/instruction.md",
-            },
-        ])
+        return _index_payload(
+            [
+                {
+                    "id": "smoke_test",
+                    "version": 1,
+                    "mode": "win",
+                    "manifest_key": "smoke_test/manifest.json",
+                    "instruction_key": "smoke_test/instruction.md",
+                },
+            ]
+        )
 
     def _s3_with_manifest(self) -> FakeS3:
         s3 = _fake_s3_with_index(self._index())
@@ -415,8 +437,7 @@ class TestInstructionVersionIdPinning:
             loader.routing_for("smoke_test")
 
         assert isinstance(exc.value, ManifestLoaderTransientError), (
-            f"AccessDenied on instruction HEAD must raise Transient, "
-            f"got {type(exc.value).__name__}"
+            f"AccessDenied on instruction HEAD must raise Transient, got {type(exc.value).__name__}"
         )
         assert "AccessDenied" in str(exc.value) or "access" in str(exc.value).lower()
 
@@ -432,8 +453,7 @@ class TestInstructionVersionIdPinning:
             loader.routing_for("smoke_test")
 
         assert isinstance(exc.value, ManifestLoaderTransientError), (
-            f"ServiceUnavailable on instruction HEAD must raise Transient, "
-            f"got {type(exc.value).__name__}"
+            f"ServiceUnavailable on instruction HEAD must raise Transient, got {type(exc.value).__name__}"
         )
         assert "serviceunavailable" in str(exc.value).lower() or "service" in str(exc.value).lower()
 
@@ -442,18 +462,24 @@ class TestInstructionVersionIdPinning:
 # Scope validation (defense-in-depth on top of publish-time meta-schema)
 # ---------------------------------------------------------------------------
 
+
 class TestScopeValidation:
     def _index(self):
-        return _index_payload([
-            {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
-        ])
+        return _index_payload(
+            [
+                {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+            ]
+        )
 
     def test_valid_scope_passes_through(self):
         s3 = _fake_s3_with_index(self._index())
-        manifest = _manifest_payload("smoke_test", scope={
-            "allowed_tables": ["goodparty_data_catalog.dbt.synthetic_table"],
-            "max_rows": 1000,
-        })
+        manifest = _manifest_payload(
+            "smoke_test",
+            scope={
+                "allowed_tables": ["goodparty_data_catalog.dbt.synthetic_table"],
+                "max_rows": 1000,
+            },
+        )
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         routing = loader.routing_for("smoke_test")
@@ -469,9 +495,12 @@ class TestScopeValidation:
 
     def test_rejects_invalid_table_name_pattern(self):
         s3 = _fake_s3_with_index(self._index())
-        manifest = _manifest_payload("smoke_test", scope={
-            "allowed_tables": ["bad table name; DROP"],
-        })
+        manifest = _manifest_payload(
+            "smoke_test",
+            scope={
+                "allowed_tables": ["bad table name; DROP"],
+            },
+        )
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         with pytest.raises(ManifestLoaderMalformedError, match="allowed_tables"):
@@ -479,10 +508,13 @@ class TestScopeValidation:
 
     def test_rejects_max_rows_out_of_range(self):
         s3 = _fake_s3_with_index(self._index())
-        manifest = _manifest_payload("smoke_test", scope={
-            "allowed_tables": ["goodparty_data_catalog.dbt.t"],
-            "max_rows": 10_000_000,
-        })
+        manifest = _manifest_payload(
+            "smoke_test",
+            scope={
+                "allowed_tables": ["goodparty_data_catalog.dbt.t"],
+                "max_rows": 10_000_000,
+            },
+        )
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         with pytest.raises(ManifestLoaderMalformedError, match="max_rows"):
@@ -490,10 +522,13 @@ class TestScopeValidation:
 
     def test_rejects_max_rows_zero(self):
         s3 = _fake_s3_with_index(self._index())
-        manifest = _manifest_payload("smoke_test", scope={
-            "allowed_tables": ["goodparty_data_catalog.dbt.t"],
-            "max_rows": 0,
-        })
+        manifest = _manifest_payload(
+            "smoke_test",
+            scope={
+                "allowed_tables": ["goodparty_data_catalog.dbt.t"],
+                "max_rows": 0,
+            },
+        )
         s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         with pytest.raises(ManifestLoaderMalformedError, match="max_rows"):
@@ -507,3 +542,185 @@ class TestScopeValidation:
         loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
         routing = loader.routing_for("smoke_test")
         assert routing["scope"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Write-action experiment fields (compliance_setup-shaped — ENG-10128).
+#
+# Optional top-level manifest fields that signal a write-action experiment:
+#   - system_prompt: str                                  (dispatch-time
+#                                                          discriminator)
+#   - permission_mode: "default" | "bypassPermissions"    (Claude SDK)
+#   - allowed_external_tools: list[str]                   (non-gp-api tools
+#                                                          the runner calls
+#                                                          directly)
+#
+# Note: there is no per-experiment gp-api endpoint allowlist. Every
+# @McpTool-decorated endpoint on gp-api is exposed to every agent run;
+# the broker mints per-call Clerk JWTs from clerk_session_id on the
+# ScopeTicket and forwards MCP traffic at /agent/mcp.
+#
+# Legacy Databricks/web-only manifests do not carry these fields and must
+# project unchanged through _project_routing.
+# ---------------------------------------------------------------------------
+
+
+def _write_action_overrides(**extras) -> dict:
+    base = {
+        "system_prompt": "You are a compliance setup agent.",
+        "permission_mode": "default",
+        "allowed_external_tools": ["WebFetch"],
+    }
+    base.update(extras)
+    return base
+
+
+class TestWriteActionFieldProjection:
+    def _index(self):
+        return _index_payload(
+            [
+                {
+                    "id": "compliance_smoke_test",
+                    "version": 1,
+                    "mode": "serve",
+                    "manifest_key": "compliance_smoke_test/manifest.json",
+                },
+            ]
+        )
+
+    def test_projects_all_write_action_fields_when_present(self):
+        s3 = _fake_s3_with_index(self._index())
+        manifest = _manifest_payload("compliance_smoke_test", **_write_action_overrides())
+        s3.set_json(BUCKET, "compliance_smoke_test/manifest.json", manifest)
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("compliance_smoke_test")
+
+        assert routing["system_prompt"] == "You are a compliance setup agent."
+        assert routing["permission_mode"] == "default"
+        assert routing["allowed_external_tools"] == ["WebFetch"]
+
+    def test_projects_only_present_fields(self):
+        """A manifest with system_prompt but no permission_mode/external_tools
+        projects only the present field — no synthetic defaults."""
+        s3 = _fake_s3_with_index(self._index())
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+        )
+        s3.set_json(BUCKET, "compliance_smoke_test/manifest.json", manifest)
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("compliance_smoke_test")
+        assert routing["system_prompt"] == "You are a compliance setup agent."
+        assert "permission_mode" not in routing
+        assert "allowed_external_tools" not in routing
+
+    def test_omits_write_action_fields_when_absent(self):
+        """Legacy Databricks/web-only manifests must not gain new keys."""
+        s3 = _fake_s3_with_index(
+            _index_payload(
+                [
+                    {"id": "smoke_test", "version": 1, "mode": "win", "manifest_key": "smoke_test/manifest.json"},
+                ]
+            )
+        )
+        manifest = _manifest_payload("smoke_test")
+        s3.set_json(BUCKET, "smoke_test/manifest.json", manifest)
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+        for field in ("system_prompt", "permission_mode", "allowed_external_tools"):
+            assert field not in routing, f"unexpected {field} in legacy routing"
+
+
+class TestWriteActionFieldValidation:
+    def _index(self):
+        return _index_payload(
+            [
+                {
+                    "id": "compliance_smoke_test",
+                    "version": 1,
+                    "mode": "serve",
+                    "manifest_key": "compliance_smoke_test/manifest.json",
+                },
+            ]
+        )
+
+    def _publish(self, manifest):
+        s3 = _fake_s3_with_index(self._index())
+        s3.set_json(BUCKET, "compliance_smoke_test/manifest.json", manifest)
+        return ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+    def test_rejects_unknown_permission_mode(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+            permission_mode="hax",
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="permission_mode"):
+            self._publish(manifest).routing_for("compliance_smoke_test")
+
+    def test_accepts_bypass_permissions_mode(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+            permission_mode="bypassPermissions",
+        )
+        routing = self._publish(manifest).routing_for("compliance_smoke_test")
+        assert routing["permission_mode"] == "bypassPermissions"
+
+    def test_rejects_non_string_system_prompt(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt=42,
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="system_prompt"):
+            self._publish(manifest).routing_for("compliance_smoke_test")
+
+    def test_rejects_empty_system_prompt(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="   ",
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="system_prompt"):
+            self._publish(manifest).routing_for("compliance_smoke_test")
+
+    def test_rejects_non_list_allowed_external_tools(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+            allowed_external_tools="WebFetch",
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="allowed_external_tools"):
+            self._publish(manifest).routing_for("compliance_smoke_test")
+
+    def test_rejects_non_string_external_tool_entry(self):
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+            allowed_external_tools=["WebFetch", None],
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="allowed_external_tools"):
+            self._publish(manifest).routing_for("compliance_smoke_test")
+
+    def test_empty_external_tools_list_is_valid(self):
+        """An empty list explicitly denies external tools — different from
+        the field being absent (which means 'unspecified, runner default')."""
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            system_prompt="You are a compliance setup agent.",
+            allowed_external_tools=[],
+        )
+        routing = self._publish(manifest).routing_for("compliance_smoke_test")
+        assert routing["allowed_external_tools"] == []
+
+    def test_permission_mode_validated_in_isolation(self):
+        """Defense in depth: a malformed permission_mode is rejected even
+        when it's the only write-action field on the manifest."""
+        manifest = _manifest_payload(
+            "compliance_smoke_test",
+            permission_mode="hax",
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="permission_mode"):
+            self._publish(manifest).routing_for("compliance_smoke_test")

@@ -113,10 +113,12 @@ class ManifestRoutingLoader:
         if entry is None:
             return None
         manifest, manifest_version_id = self._fetch_manifest(
-            experiment_id, entry.get("manifest_key", f"{experiment_id}/manifest.json"),
+            experiment_id,
+            entry.get("manifest_key", f"{experiment_id}/manifest.json"),
         )
         instruction_version_id = self._fetch_instruction_version_id(
-            experiment_id, entry.get("instruction_key", f"{experiment_id}/instruction.md"),
+            experiment_id,
+            entry.get("instruction_key", f"{experiment_id}/instruction.md"),
         )
         routing = _project_routing(manifest, experiment_id=experiment_id)
         routing["manifest_version_id"] = manifest_version_id
@@ -160,9 +162,7 @@ class ManifestRoutingLoader:
         try:
             manifest = json.loads(body)
         except (json.JSONDecodeError, ValueError) as e:
-            raise ManifestLoaderMalformedError(
-                f"manifest for '{experiment_id}' is not valid JSON: {e}"
-            ) from e
+            raise ManifestLoaderMalformedError(f"manifest for '{experiment_id}' is not valid JSON: {e}") from e
         cached_value = (manifest, version_id)
         if len(self._manifest_cache) >= _MANIFEST_CACHE_MAX:
             self._manifest_cache.clear()
@@ -203,13 +203,21 @@ class ManifestRoutingLoader:
                 logger.warning(
                     "instruction object absent — proceeding without version pin: "
                     "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
-                    experiment_id, instruction_key, self._bucket, code, request_id,
+                    experiment_id,
+                    instruction_key,
+                    self._bucket,
+                    code,
+                    request_id,
                 )
                 return None
             logger.error(
                 "S3 HeadObject failed for instruction (NOT swallowed — version pin lost): "
                 "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
-                experiment_id, instruction_key, self._bucket, code, request_id,
+                experiment_id,
+                instruction_key,
+                self._bucket,
+                code,
+                request_id,
                 exc_info=True,
             )
             raise ManifestLoaderTransientError(
@@ -230,16 +238,16 @@ class ManifestRoutingLoader:
             request_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
             logger.error(
                 "S3 GetObject failed bucket=%s key=%s label=%s code=%s request_id=%s",
-                self._bucket, key, label, code, request_id,
+                self._bucket,
+                key,
+                label,
+                code,
+                request_id,
                 exc_info=True,
             )
             if code in ("NoSuchKey", "NoSuchVersion", "404"):
-                raise ManifestLoaderMalformedError(
-                    f"S3 object missing for {label}: code={code} key={key}"
-                ) from e
-            raise ManifestLoaderTransientError(
-                f"S3 GetObject failed for {label}: code={code}"
-            ) from e
+                raise ManifestLoaderMalformedError(f"S3 object missing for {label}: code={code} key={key}") from e
+            raise ManifestLoaderTransientError(f"S3 GetObject failed for {label}: code={code}") from e
         return response["Body"].read(), response.get("VersionId")
 
 
@@ -252,19 +260,76 @@ def _validate_scope(scope: dict, experiment_id: str) -> None:
     """
     tables = scope.get("allowed_tables", [])
     if not isinstance(tables, list):
-        raise ManifestLoaderMalformedError(
-            f"{experiment_id}: scope.allowed_tables must be a list"
-        )
+        raise ManifestLoaderMalformedError(f"{experiment_id}: scope.allowed_tables must be a list")
     for t in tables:
         if not isinstance(t, str) or not _TABLE_PATTERN.match(t):
-            raise ManifestLoaderMalformedError(
-                f"{experiment_id}: invalid scope.allowed_tables entry: {t!r}"
-            )
+            raise ManifestLoaderMalformedError(f"{experiment_id}: invalid scope.allowed_tables entry: {t!r}")
     max_rows = scope.get("max_rows", 50000)
     if not isinstance(max_rows, int) or not (1 <= max_rows <= 1_000_000):
-        raise ManifestLoaderMalformedError(
-            f"{experiment_id}: scope.max_rows must be int 1..1000000"
-        )
+        raise ManifestLoaderMalformedError(f"{experiment_id}: scope.max_rows must be int 1..1000000")
+
+
+_WRITE_ACTION_FIELDS = (
+    "system_prompt",
+    "permission_mode",
+    "allowed_external_tools",
+)
+# Claude Agent SDK supports "default" | "acceptEdits" | "plan" | "bypassPermissions".
+# We deliberately allowlist only the two we've reviewed for the Fargate sandbox:
+# "default" (interactive prompts disabled in a non-tty container, so this is
+# effectively deny-tool-use) and "bypassPermissions" (the existing PMF runner
+# default — agent runs unattended in an isolated container with a scoped IAM
+# role). Adding "acceptEdits"/"plan" requires a code-review pass on the harness
+# side, so we'd rather force that than let a manifest publish silently widen
+# the permission surface.
+_PERMISSION_MODE_VALUES = frozenset({"default", "bypassPermissions"})
+# Conventions, not platform limits. Picked to keep manifests reviewable and
+# to bound the runner's manifest fetch (broker GET /experiment/manifest).
+# system_prompt is the largest field; 50K leaves ~10× headroom over the
+# longest prompts we've seen in practice. Tool names match the Claude SDK's
+# tool identifiers, which are short.
+_MAX_SYSTEM_PROMPT_LEN = 50_000
+_MAX_TOOL_NAME_LEN = 64
+
+
+def _validate_write_action_fields(manifest: dict, experiment_id: str) -> None:
+    """Defense-in-depth validation for the optional write-action top-level
+    manifest fields (ENG-10128). Mirrors `_validate_scope`'s pattern: publish-
+    time meta-schema is the primary check; this catches stale/corrupted
+    manifests and manual S3 edits before the Fargate task launches.
+
+    Validates each field independently: callers may set any subset. The
+    dispatch-time discriminator for "this is a write-action experiment" is
+    the presence of `system_prompt` OR `permission_mode` (see
+    `dispatch_handler._is_write_action`); every field present here must be
+    well-formed regardless of which others are present.
+    """
+    permission_mode = manifest.get("permission_mode")
+    if permission_mode is not None:
+        if not isinstance(permission_mode, str) or permission_mode not in _PERMISSION_MODE_VALUES:
+            raise ManifestLoaderMalformedError(
+                f"{experiment_id}: permission_mode must be one of "
+                f"{sorted(_PERMISSION_MODE_VALUES)}; got {permission_mode!r}"
+            )
+
+    system_prompt = manifest.get("system_prompt")
+    if system_prompt is not None:
+        if (
+            not isinstance(system_prompt, str)
+            or not system_prompt.strip()
+            or len(system_prompt) > _MAX_SYSTEM_PROMPT_LEN
+        ):
+            raise ManifestLoaderMalformedError(
+                f"{experiment_id}: system_prompt must be a non-empty string ≤ {_MAX_SYSTEM_PROMPT_LEN} chars"
+            )
+
+    tools = manifest.get("allowed_external_tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise ManifestLoaderMalformedError(f"{experiment_id}: allowed_external_tools must be a list")
+        for t in tools:
+            if not isinstance(t, str) or not t.strip() or len(t) > _MAX_TOOL_NAME_LEN:
+                raise ManifestLoaderMalformedError(f"{experiment_id}: invalid allowed_external_tools entry: {t!r}")
 
 
 def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
@@ -280,7 +345,8 @@ def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
     scope = manifest.get("scope") or {}
     if scope:
         _validate_scope(scope, experiment_id or manifest.get("id", "<unknown>"))
-    return {
+
+    routing: dict = {
         "model": manifest.get("model", "sonnet"),
         "timeout_seconds": manifest.get("timeout_seconds", 600),
         # JSON Schema Draft-07 the dispatcher validates message["params"] against
@@ -290,3 +356,15 @@ def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
         # Empty/absent means no Databricks access (web-only experiment).
         "scope": scope,
     }
+
+    # Write-action experiment fields (ENG-10128). Validated and projected only
+    # when at least one is present, so legacy Databricks/web-only manifests
+    # produce a routing dict with the same keys they did before.
+    if any(manifest.get(f) is not None for f in _WRITE_ACTION_FIELDS):
+        _validate_write_action_fields(manifest, experiment_id or manifest.get("id", "<unknown>"))
+        for field in _WRITE_ACTION_FIELDS:
+            value = manifest.get(field)
+            if value is not None:
+                routing[field] = value
+
+    return routing

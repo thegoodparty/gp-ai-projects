@@ -13,9 +13,11 @@ _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 try:
     from shared.logger import get_logger
+
     logger = get_logger(__name__)
 except (ImportError, OSError):
     import logging
+
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ try:
     )
 except ImportError:
     from broker_client import BrokerClient, BrokerError
-    from scope_derivation import derive_scope
+    from scope_derivation import derive_scope  # type: ignore[no-redef]
     from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
         ManifestRoutingLoader,
@@ -47,6 +49,17 @@ _manifest_loader: ManifestRoutingLoader | None = None
 _broker_client: BrokerClient | None = None
 _validator_cache: dict[str, Draft7Validator] = {}
 _VALIDATOR_CACHE_MAX = 64
+
+# Fields whose presence on a projected routing dict signals a write-action
+# experiment. Mirrors manifest_loader._WRITE_ACTION_FIELDS minus
+# `allowed_external_tools`, which is a tool-list a read-action experiment
+# could plausibly carry (e.g. WebFetch on a Databricks experiment) and is
+# therefore not a write-action signal on its own.
+_WRITE_ACTION_DISCRIMINATORS = ("system_prompt", "permission_mode")
+
+
+def _is_write_action(experiment: dict) -> bool:
+    return any(experiment.get(f) is not None for f in _WRITE_ACTION_DISCRIMINATORS)
 
 
 def get_broker_client() -> BrokerClient:
@@ -142,20 +155,23 @@ def _resolve_routing(experiment_id: str, run_id: str = "") -> tuple[dict | None,
         known = sorted(loader.known_experiments()) if routing is None else []
         return routing, known
     except ManifestLoaderError as e:
-        error_type = (
-            "malformed" if isinstance(e, ManifestLoaderMalformedError)
-            else "transient"
-        )
+        error_type = "malformed" if isinstance(e, ManifestLoaderMalformedError) else "transient"
         logger.error(
             "manifest_loader_failure experiment_id=%s run_id=%s error_type=%s error=%s",
-            experiment_id, run_id, error_type, e,
+            experiment_id,
+            run_id,
+            error_type,
+            e,
             exc_info=True,
         )
-        _emit_metric("manifest_loader_fallback", [
-            {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
-            {"Name": "experiment_id", "Value": experiment_id},
-            {"Name": "error_type", "Value": error_type},
-        ])
+        _emit_metric(
+            "manifest_loader_fallback",
+            [
+                {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                {"Name": "experiment_id", "Value": experiment_id},
+                {"Name": "error_type", "Value": error_type},
+            ],
+        )
         raise
 
 
@@ -196,16 +212,21 @@ def _emit_metric(metric_name: str, dimensions: list[dict]):
     except Exception as e:
         logger.warning(
             "MetricEmissionFailed metric=%s exc_type=%s: %s",
-            metric_name, type(e).__name__, e,
+            metric_name,
+            type(e).__name__,
+            e,
             exc_info=True,
         )
 
 
 def emit_dispatch_metric(metric_name: str, experiment_id: str):
-    _emit_metric(metric_name, [
-        {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
-        {"Name": "ExperimentId", "Value": experiment_id},
-    ])
+    _emit_metric(
+        metric_name,
+        [
+            {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+            {"Name": "ExperimentId", "Value": experiment_id},
+        ],
+    )
 
 
 def send_error_callback(
@@ -234,18 +255,20 @@ def send_error_callback(
         return False
     try:
         run_id = message.get("run_id", "unknown")
-        body = json.dumps({
-            "type": "agentExperimentResult",
-            "data": {
-                "experimentId": message.get("experiment_type", "unknown"),
-                "runId": run_id,
-                "organizationSlug": message.get("organization_slug", "unknown"),
-                "status": "failed",
-                "error": error,
-                "detail": error,
-                "reasonCode": "DispatchError",
-            },
-        })
+        body = json.dumps(
+            {
+                "type": "agentExperimentResult",
+                "data": {
+                    "experimentId": message.get("experiment_type", "unknown"),
+                    "runId": run_id,
+                    "organizationSlug": message.get("organization_slug", "unknown"),
+                    "status": "failed",
+                    "error": error,
+                    "detail": error,
+                    "reasonCode": "DispatchError",
+                },
+            }
+        )
         get_sqs_client().send_message(
             QueueUrl=callback_queue_url,
             MessageBody=body,
@@ -257,6 +280,7 @@ def send_error_callback(
     except Exception as e:
         logger.exception(f"Failed to send error callback: {e}")
         return False
+
 
 ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 ECS_TASK_DEFINITION = os.environ.get("ECS_TASK_DEFINITION", "")
@@ -291,9 +315,7 @@ def _missing_critical_config() -> list[str]:
 
 MAX_PARAMS_JSON_BYTES = 6000
 
-_PRIOR_ARTIFACT_VALUE_RE = re.compile(
-    r"^[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_-]{1,64}/artifact\.json$"
-)
+_PRIOR_ARTIFACT_VALUE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_-]{1,64}/artifact\.json$")
 
 
 _PRIOR_ARTIFACT_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -303,17 +325,12 @@ def _validate_prior_artifact_versions(versions) -> None:
     if versions is None:
         return
     if not isinstance(versions, dict):
-        raise ValueError(
-            f"prior_artifact_versions must be an object, got {type(versions).__name__}"
-        )
+        raise ValueError(f"prior_artifact_versions must be an object, got {type(versions).__name__}")
     if len(versions) > 10:
         raise ValueError(f"prior_artifact_versions too large: {len(versions)} entries")
     for key, value in versions.items():
         if not isinstance(key, str) or not _PRIOR_ARTIFACT_KEY_RE.fullmatch(key):
-            raise ValueError(
-                f"prior_artifact_versions key must match "
-                f"[A-Za-z0-9_-]{{1,64}}: got {key!r}"
-            )
+            raise ValueError(f"prior_artifact_versions key must match [A-Za-z0-9_-]{{1,64}}: got {key!r}")
         if not isinstance(value, str) or not _PRIOR_ARTIFACT_VALUE_RE.fullmatch(value):
             raise ValueError(
                 f"prior_artifact_versions[{key!r}] must match "
@@ -377,9 +394,13 @@ def build_container_overrides(
         env.append({"name": "MANIFEST_VERSION_ID", "value": experiment["manifest_version_id"]})
     if experiment.get("instruction_version_id"):
         env.append({"name": "INSTRUCTION_VERSION_ID", "value": experiment["instruction_version_id"]})
-    return {
-        "containerOverrides": [{"name": container_name, "environment": env}]
-    }
+    # Write-action manifest fields (system_prompt, permission_mode,
+    # allowed_external_tools — ENG-10128) are not forwarded as env vars on
+    # purpose: the runner fetches the full manifest itself via
+    # runner/manifest_loader.load_from_broker (pinned by MANIFEST_VERSION_ID
+    # above) and reads them directly. Duplicating them here would create a
+    # second source of truth and risk env-var size limits for system_prompt.
+    return {"containerOverrides": [{"name": container_name, "environment": env}]}
 
 
 def handler(event: dict, context) -> dict:
@@ -434,8 +455,7 @@ def handler(event: dict, context) -> dict:
 
         if experiment is None:
             logger.error(
-                f"Unknown experiment '{experiment_id}' in message {message_id}. "
-                f"Known experiments: {known_ids}"
+                f"Unknown experiment '{experiment_id}' in message {message_id}. Known experiments: {known_ids}"
             )
             emit_dispatch_metric("UnknownExperiment", experiment_id)
             # Design choice (A): send error callback AND add to batch_item_failures.
@@ -496,8 +516,7 @@ def handler(event: dict, context) -> dict:
         input_schema = experiment.get("input_schema") or {}
         if not input_schema:
             logger.error(
-                f"manifest for {experiment_id} has no input_schema "
-                f"(run: {message['run_id']}). Treating as malformed."
+                f"manifest for {experiment_id} has no input_schema (run: {message['run_id']}). Treating as malformed."
             )
             send_error_callback(
                 message,
@@ -529,7 +548,54 @@ def handler(event: dict, context) -> dict:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
-        scope = derive_scope(experiment_id, message["params"], manifest_scope=experiment.get("scope"))
+        # Write-action experiments (ENG-10128) get an empty scope dict. The
+        # broker creates the Clerk actor token from MintRequest.clerk_user_id
+        # and stores the resulting clerk_session_id on the ScopeTicket; it
+        # then mints fresh ~60s JWTs for each MCP call the runner makes to
+        # /agent/mcp. No per-experiment allowlist is enforced today — every
+        # @McpTool-decorated endpoint on gp-api is exposed to every agent
+        # run; a real allowlist is future work.
+        #
+        # Discriminator: `system_prompt` OR `permission_mode` present in the
+        # projected routing dict. Both are Claude Agent SDK signals that only
+        # appear on write-action manifests. `allowed_external_tools` is NOT a
+        # discriminator — a future read-action experiment could plausibly
+        # declare extra non-gp-api tools (e.g. WebFetch) without being
+        # write-action. The manifest loader validates each write-action field
+        # independently, so we mirror its any-of pattern here for the fields
+        # that actually signal write-action semantics.
+        #
+        # `derive_scope` raises ValueError when read-experiment params slip
+        # past `input_schema` but still violate stricter checks (state/city/
+        # district control characters). An uncaught ValueError here would
+        # crash the Lambda invocation — no batchItemFailures, no error
+        # callback, every remaining record in the SQS batch unprocessed.
+        # Treat the same as an input_schema violation: client-fault, surface
+        # to gp-api with a stable dedup so FIFO retries don't duplicate.
+        try:
+            if _is_write_action(experiment):
+                scope: dict = {}
+            else:
+                scope = derive_scope(
+                    experiment_id,
+                    message["params"],
+                    manifest_scope=experiment.get("scope"),
+                )
+        except ValueError as e:
+            logger.error(
+                f"Scope derivation failed for {experiment_id} "
+                f"(run: {message['run_id']}, organization: {message['organization_slug']}): {e}"
+            )
+            emit_dispatch_metric("ScopeDerivationError", experiment_id)
+            sent = send_error_callback(
+                message,
+                f"Params for {experiment_id} failed scope derivation: {e}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"scope-derivation-{message['run_id']}",
+            )
+            if not sent:
+                batch_item_failures.append({"itemIdentifier": message_id})
+            continue
         prior_artifact_versions = message.get("prior_artifact_versions")
         try:
             broker = get_broker_client()
@@ -556,16 +622,12 @@ def handler(event: dict, context) -> dict:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
         except httpx.HTTPError as e:
-            logger.warning(
-                f"Transient network error during mint for run {message.get('run_id')}: {e}"
-            )
+            logger.warning(f"Transient network error during mint for run {message.get('run_id')}: {e}")
             emit_dispatch_metric("MintTransient", experiment_id)
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
         except Exception as e:
-            logger.exception(
-                f"Unexpected error during mint for run {message.get('run_id')}: {e}"
-            )
+            logger.exception(f"Unexpected error during mint for run {message.get('run_id')}: {e}")
             emit_dispatch_metric("MintUnexpected", experiment_id)
             send_error_callback(
                 message,
@@ -585,7 +647,9 @@ def handler(event: dict, context) -> dict:
             params_json=params_json,
         )
 
-        logger.info(f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})")
+        logger.info(
+            f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})"
+        )
 
         minted_broker_token = mint_result["broker_token"]
 

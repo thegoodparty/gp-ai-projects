@@ -4,9 +4,7 @@ from pmf_engine.control_plane.scope_derivation import derive_scope
 
 
 SYNTHETIC_MANIFEST_SCOPE = {
-    "allowed_tables": [
-        "goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"
-    ],
+    "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
     "max_rows": 50000,
 }
 
@@ -98,35 +96,44 @@ class TestInputValidation:
         scope = derive_scope("smoke_test", {"state": good_state})
         assert scope["state"] == good_state
 
-    @pytest.mark.parametrize("bad_city", [
-        "Durham\x00",
-        "Durham\nInjection",
-        "A" * 201,
-    ])
+    @pytest.mark.parametrize(
+        "bad_city",
+        [
+            "Durham\x00",
+            "Durham\nInjection",
+            "A" * 201,
+        ],
+    )
     def test_rejects_control_chars_or_excessive_length_city(self, bad_city):
         with pytest.raises(ValueError, match="city"):
             derive_scope("smoke_test", {"state": "NC", "city": bad_city})
 
-    @pytest.mark.parametrize("good_city", [
-        "Durham",
-        "New York",
-        "Fayetteville",
-        "St. Paul",
-        "O'Brien",
-        "San Jose-Campbell",
-        "Washington, D.C.",
-        "STURGEON BAY",
-        "A" * 200,
-    ])
+    @pytest.mark.parametrize(
+        "good_city",
+        [
+            "Durham",
+            "New York",
+            "Fayetteville",
+            "St. Paul",
+            "O'Brien",
+            "San Jose-Campbell",
+            "Washington, D.C.",
+            "STURGEON BAY",
+            "A" * 200,
+        ],
+    )
     def test_accepts_reasonable_city_names(self, good_city):
         scope = derive_scope("smoke_test", {"state": "NC", "city": good_city})
         assert scope["cities"] == [good_city]
 
-    @pytest.mark.parametrize("bad_district", [
-        "District\x00",
-        "D\n",
-        "D" * 201,
-    ])
+    @pytest.mark.parametrize(
+        "bad_district",
+        [
+            "District\x00",
+            "D\n",
+            "D" * 201,
+        ],
+    )
     def test_rejects_control_chars_or_excessive_length_district(self, bad_district):
         with pytest.raises(ValueError, match="district"):
             derive_scope("smoke_test", {"state": "NC", "district": bad_district})
