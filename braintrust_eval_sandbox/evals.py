@@ -111,11 +111,24 @@ def _extract_template_text(prompt_obj: Any) -> str:
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
-                # Multimodal message: pick up the text parts.
+                # Multimodal message: pick up the text parts. Content pieces
+                # come in three shapes: bare strings, dicts (`{"type": "text",
+                # "text": "..."}` — the JSON-on-the-wire form), and TextPart
+                # dataclass objects. Skipping the dict shape would silently
+                # bypass the strict-key check for any prompt authored as
+                # JSON, which is exactly the failure mode this function is
+                # supposed to prevent.
                 for piece in content:
-                    text = getattr(piece, "text", None)
-                    if isinstance(text, str):
-                        parts.append(text)
+                    if isinstance(piece, str):
+                        parts.append(piece)
+                    elif isinstance(piece, dict):
+                        text = piece.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                    else:
+                        text = getattr(piece, "text", None)
+                        if isinstance(text, str):
+                            parts.append(text)
         return "\n".join(parts)
     return ""
 
