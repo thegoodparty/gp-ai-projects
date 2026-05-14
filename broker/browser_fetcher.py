@@ -72,8 +72,8 @@ class PlaywrightBrowserFetcher:
     /tmp/fetch_alvin_stealth.py (Alvin TX agenda PDF).
     """
 
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+    def __init__(self, max_concurrent: int = 4) -> None:
+        self._semaphore = asyncio.Semaphore(max_concurrent)
         self._playwright = None
         self._browser = None
 
@@ -100,16 +100,30 @@ class PlaywrightBrowserFetcher:
         *,
         capture_download: bool = False,
     ) -> BrowserFetchResult:
+        async with self._semaphore:
+            return await self._fetch_impl(url, capture_download=capture_download)
+
+    async def _fetch_impl(
+        self,
+        url: str,
+        *,
+        capture_download: bool,
+    ) -> BrowserFetchResult:
         from playwright.async_api import Download, Route
         from playwright.async_api import Error as PlaywrightError
         from playwright_stealth import stealth_async  # type: ignore[import-untyped]
 
         if self._browser is None:
-            raise RuntimeError(
-                "PlaywrightBrowserFetcher.start() must be awaited before fetch()"
-            )
+            raise RuntimeError("PlaywrightBrowserFetcher.start() must be awaited before fetch()")
 
         violations: list[str] = []
+
+        def _raise_if_violation() -> None:
+            if violations:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"SSRF blocked mid-fetch: {violations[0]}",
+                )
 
         async def _route_handler(route: Route) -> None:
             req_url = route.request.url
@@ -141,11 +155,7 @@ class PlaywrightBrowserFetcher:
             except PlaywrightError as e:
                 nav_error = e
 
-            if violations:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"SSRF blocked mid-fetch: {violations[0]}",
-                )
+            _raise_if_violation()
 
             if capture_download:
                 # The download path is normal here — page.goto raises when
@@ -155,24 +165,15 @@ class PlaywrightBrowserFetcher:
                         if downloads:
                             break
                         await page.wait_for_timeout(100)
+                        _raise_if_violation()
 
                 if downloads:
                     dl = downloads[0]
                     final_url = dl.url
-                    try:
-                        await validate_url(final_url)
-                    except HTTPException:
-                        raise
-                    tmp_path = tempfile.mktemp(suffix=".bin")
-                    try:
-                        await dl.save_as(tmp_path)
-                        with open(tmp_path, "rb") as f:
-                            body = f.read()
-                    finally:
-                        try:
-                            os.unlink(tmp_path)
-                        except OSError:
-                            pass
+                    await validate_url(final_url)
+                    _raise_if_violation()
+                    body = await _read_download_bytes(dl)
+                    _raise_if_violation()
                     return BrowserFetchResult(
                         status=200,
                         content_type="application/pdf",
@@ -201,15 +202,14 @@ class PlaywrightBrowserFetcher:
                 )
 
             await page.wait_for_timeout(POST_NAV_SETTLE_MS)
+            _raise_if_violation()
 
             status = response.status
-            content_type = (
-                (response.headers.get("content-type") or "")
-                .split(";")[0]
-                .strip()
-                or "application/octet-stream"
-            )
+            content_type = (response.headers.get("content-type") or "").split(";")[
+                0
+            ].strip() or "application/octet-stream"
             body = await response.body()
+            _raise_if_violation()
             final_url = page.url
 
             return BrowserFetchResult(
@@ -223,3 +223,25 @@ class PlaywrightBrowserFetcher:
                 await context.close()
             except Exception:
                 logger.warning("failed to close browser context", exc_info=True)
+
+
+async def _read_download_bytes(download: object) -> bytes:
+    """Save Playwright Download to a safely-created temp file, read via
+    asyncio.to_thread so the sync I/O doesn't stall the event loop, and clean up.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        await download.save_as(tmp_path)  # type: ignore[attr-defined]
+        return await asyncio.to_thread(_read_file_bytes, tmp_path)
+    finally:
+        try:
+            await asyncio.to_thread(os.unlink, tmp_path)
+        except OSError:
+            pass
+
+
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
