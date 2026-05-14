@@ -674,6 +674,22 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name      = "SERVICE_TOKEN_HASH"
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:SERVICE_TOKEN_HASH::"
+        },
+        {
+          name      = "CLERK_SECRET_KEY"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:CLERK_SECRET_KEY::"
+        },
+        {
+          name      = "CLERK_FRONTEND_API_BASE"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:CLERK_FRONTEND_API_BASE::"
+        },
+        {
+          name      = "GP_API_BASE_URL"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:GP_API_BASE_URL::"
+        },
+        {
+          name      = "AGENT_FLEET_CLERK_ID"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:AGENT_FLEET_CLERK_ID::"
         }
       ]
     }
