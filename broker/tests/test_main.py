@@ -10,6 +10,14 @@ from broker.dynamodb_client import ScopeTicketStore
 from broker.secrets import BrokerSecrets
 
 
+class _NoopFetcher:
+    async def start(self) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
+
+
 def _fake_secrets() -> BrokerSecrets:
     return BrokerSecrets(
         anthropic_api_key="sk-ant-fake",
@@ -32,6 +40,7 @@ class TestHealthEndpoint:
         with (
             patch("broker.main.load_secrets_from_env", return_value=_fake_secrets()),
             patch("broker.main.ScopeTicketStore") as mock_store_cls,
+            patch("broker.main.PlaywrightBrowserFetcher", return_value=_NoopFetcher()),
         ):
             mock_store_cls.return_value = MagicMock(spec=ScopeTicketStore)
 
