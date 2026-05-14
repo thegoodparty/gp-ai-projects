@@ -178,6 +178,16 @@ def _normalize_schema_for_gemini(node: Any) -> Any:
 
     type_val = result.get("type")
     if isinstance(type_val, list):
+        # Empty list provides no type information. Falling through here would
+        # leave `type: []` in the result and surface as an opaque pydantic
+        # validation error in the Gemini SDK; raise with a clear message
+        # instead. Checked before the null-extraction branches so the error
+        # references the original input.
+        if len(type_val) == 0:
+            raise ValueError(
+                "Gemini structured output requires a concrete `type`: got an "
+                "empty list. Specify one type (optionally with `nullable: true`)."
+            )
         non_null = [t for t in type_val if t != "null"]
         has_null = len(non_null) != len(type_val)
         if has_null and len(non_null) == 1:
@@ -231,6 +241,17 @@ def pipeline_task(input: dict, hooks: Any) -> dict:
     import this file without an API key set — the push CLI imports with
     no env, and shared/braintrust.py's singleton no-ops without one.
     """
+    # Reject a row that collides with the reserved stage-1-output variable
+    # before any LLM work. Without this, stage 2 would silently overwrite
+    # the row's `main_prompt_output` key, and the PM would never know their
+    # dataset column had been discarded.
+    if MAIN_PROMPT_OUTPUT_VAR in input:
+        raise ValueError(
+            f"Dataset row has a key named '{MAIN_PROMPT_OUTPUT_VAR}', which "
+            f"is reserved for stage 1's output (it gets injected into the "
+            f"structured-output prompt). Rename the row column."
+        )
+
     init_braintrust(project=PROJECT)
 
     params = hooks.parameters
