@@ -19,8 +19,6 @@ variable "environment" {
   }
 }
 
-data "aws_caller_identity" "current" {}
-
 locals {
   bucket_name      = "agent-experiment-metadata-${var.environment}"
   read_policy_name = "AgentExperimentMetadataRead-${var.environment}"
