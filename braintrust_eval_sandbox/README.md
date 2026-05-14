@@ -68,18 +68,6 @@ Requires `BRAINTRUST_API_KEY` in `.env` and the `braintrust[cli]` dev dep instal
 
 When you add a new local import in `evals.py` (or its transitive deps), add the file path to `EVAL_SOURCE_FILES` in the push script. The bundle is an explicit allow-list — auto-walk doesn't work reliably here (see the wrapper's header comment for why).
 
-## Dataset row contract
-
-Rows follow Braintrust's standard shape: `{input: <dict>, expected: <anything>}`. Every top-level key in `input` is available as a Mustache variable in either prompt.
-
-```json
-{
-  "input": {"topic": "town halls in Cleveland", "month": "May 2026"},
-  "expected": {"name": "Justin Bibb", "date": "2026-05-22"}
-}
-```
-
-`expected` is free-form — scorers you write in the Braintrust UI decide its shape per dataset.
 
 ## Mustache variable contract
 
