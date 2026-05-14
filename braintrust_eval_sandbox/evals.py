@@ -190,7 +190,7 @@ def _require_keys(template: str, row_keys: set[str], *, label: str, reserved: se
         )
 
 
-async def pipeline_task(input: dict, hooks: Any) -> dict:
+def pipeline_task(input: dict, hooks: Any) -> dict:
     """Run the generic two-stage pipeline against one dataset row.
 
     Stage 1 calls Gemini with or without grounded search per the toggle.
