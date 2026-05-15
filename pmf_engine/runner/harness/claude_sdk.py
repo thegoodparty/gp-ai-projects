@@ -68,8 +68,8 @@ You have **{max_turns} tool-use turns** to complete this task. Each tool call (B
 
 **Network egress**: The container has NO direct internet access. `curl`, `wget`, and raw `httpx` calls to external hosts will fail. All external access goes through either:
 - `WebSearch(query)` (Claude SDK) — for discovering URLs and topical results. Returns search hits.
-- `pmf_runtime.http.get(url)` (via broker) — for HTML pages, JSON REST APIs (Legistar, LINC, etc.), and any URL retrieval. Broker's domain allowlist covers `.gov`, `.us`, Legistar, Granicus, PrimeGov, CivicPlus, BoardDocs, eSCRIBE, Municode. **This is the only sanctioned way to fetch a URL — `WebFetch` is not available.**
-- `pmf_runtime.pdf.download(url)` (via broker) — for PDFs. Same allowlist.
+- `pmf_runtime.http.get(url, purpose="")` (via broker) — for HTML pages, JSON REST APIs (Legistar, LINC, etc.), and any URL whose body is inline text. Broker's domain allowlist covers `.gov`, `.us`, Legistar, Granicus, PrimeGov, CivicPlus, BoardDocs, eSCRIBE, Municode. **This is the only sanctioned way to fetch a URL — `WebFetch` is not available.** Raises `ValueError` if the upstream returns a binary content-type (PDF, DOCX, XLSX, ZIP, etc.); in that case use `http.download` instead.
+- `pmf_runtime.http.download(url, dest=None, purpose="")` (via broker) — for any file you need to land on disk: PDF, DOCX, XLSX, ZIP, and other non-PDF document types. Streams bytes to `dest` (default: `<workspace>/downloads/<basename>.<ext>`, where `<ext>` is inferred from the upstream Content-Type). Same allowlist as `http.get`.
 - `pmf_runtime` (Databricks, priors, publish, Anthropic proxy) — structured data + artifact I/O.
 
 **Retrieving JSON from REST APIs** (Legistar, LINC, civic data portals):
@@ -81,19 +81,19 @@ import json
 events = json.loads(r["body"])
 ```
 
-**Retrieving PDFs** (staff reports, budget books, meeting minutes):
+**Retrieving files** (staff report PDFs, DOCX agendas, XLSX budgets, ZIPs):
 ```python
-from pmf_runtime import pdf
-result = pdf.download("https://legistar.granicus.com/cityoffayetteville/staff_report.pdf", purpose="item 8 staff report")
-# result = {{"path": "/workspace/downloads/staff_report.pdf", "byte_size": 823104, "source_url": "..."}}
+from pmf_runtime import http
+result = http.download("https://legistar.granicus.com/cityoffayetteville/staff_report.pdf", purpose="item 8 staff report")
+# result = {{"path": "/workspace/downloads/staff_report.pdf", "byte_size": 823104, "source_url": "...", "content_type": "application/pdf"}}
 ```
-Then extract text with `pdftotext`:
+For PDFs, extract text with `pdftotext`:
 ```bash
 pdftotext -layout /workspace/downloads/staff_report.pdf -            # whole document
 pdftotext -layout -f 120 -l 145 /workspace/downloads/budget.pdf -    # page range (use for large PDFs)
 ```
 
-**Reading files**: You do not have the Read tool. Use `cat` (via Bash) for text/JSON files. For PDFs, first `pmf_runtime.pdf.download(url)` to land the file, then `pdftotext` to extract — never attempt to read PDFs directly.
+**Reading files**: You do not have the Read tool. Use `cat` (via Bash) for text/JSON files. For PDFs, first `pmf_runtime.http.download(url)` to land the file, then `pdftotext` to extract — never attempt to read PDFs directly.
 
 ## OUTPUT
 

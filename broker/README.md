@@ -17,7 +17,7 @@ Neither field carries meaning to the broker. Consumers are free to use any strin
 ## Consumers
 
 - `pmf_engine/control_plane/broker_client.py` — PMF engine's dispatch Lambda mints run tokens via `POST /internal/mint-run-token`.
-- `pmf_engine/runner/pmf_runtime/` — PMF engine's Fargate runner calls `/artifact/publish`, `/artifact/read`, `/anthropic`, `/databricks/query`, `/http/fetch`, `/pdf/fetch`, `/run-status`, `/internal/upload-logs`.
+- `pmf_engine/runner/pmf_runtime/` — PMF engine's Fargate runner calls `/artifact/publish`, `/artifact/read`, `/anthropic`, `/databricks/query`, `/http/fetch`, `/run-status`, `/internal/upload-logs`.
 - Future: `engineer_agent` (currently calls Anthropic directly; migration planned).
 
 ## HTTP interface
