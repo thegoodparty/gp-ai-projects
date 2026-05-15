@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
+from broker.browser_fetcher import MAX_BYTES, BrowserFetcher
 from broker.dynamodb_client import ScopeTicket
-from broker.ssrf_guard import resolve_redirects
+from broker.ssrf_guard import validate_url
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/http", tags=["http"])
 
-MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-FETCH_TIMEOUT = 30.0
-MAX_REDIRECTS = 5
+_DOWNLOAD_STREAM_CHUNK = 1 * 1024 * 1024  # 1 MB
+
+__all__ = ["router", "get_scope_ticket", "get_browser_fetcher", "MAX_BYTES"]
 
 
 class HttpFetchRequest(BaseModel):
@@ -23,68 +27,110 @@ class HttpFetchRequest(BaseModel):
     purpose: str = ""
 
 
-class HttpFetchResponse(BaseModel):
-    status: int
-    content_type: str
-    body: str
-    source_url: str
-    byte_size: int
-
-
 def get_scope_ticket() -> ScopeTicket:  # pragma: no cover
     raise NotImplementedError("Must be overridden via dependency_overrides")
 
 
-def get_httpx_client() -> httpx.AsyncClient:  # pragma: no cover
+def get_browser_fetcher() -> BrowserFetcher:  # pragma: no cover
     raise NotImplementedError("Must be overridden via dependency_overrides")
 
 
-@router.post("/fetch", response_model=HttpFetchResponse)
+def _read_chunk(path: str, offset: int, size: int) -> bytes:
+    with open(path, "rb") as f:
+        f.seek(offset)
+        return f.read(size)
+
+
+async def _stream_file(path: str):
+    """Stream a file from disk in 1 MB chunks via asyncio.to_thread so we
+    never block the event loop on sync I/O. No aiofiles dep — uses the stdlib
+    open() shipped over to a worker thread."""
+    offset = 0
+    while True:
+        chunk = await asyncio.to_thread(_read_chunk, path, offset, _DOWNLOAD_STREAM_CHUNK)
+        if not chunk:
+            return
+        offset += len(chunk)
+        yield chunk
+
+
+@router.post("/fetch")
 async def http_fetch(
     req: HttpFetchRequest,
     ticket: ScopeTicket = Depends(get_scope_ticket),
-    client: httpx.AsyncClient = Depends(get_httpx_client),
+    fetcher: BrowserFetcher = Depends(get_browser_fetcher),
 ):
     try:
-        resp, current_url = await resolve_redirects(
-            client, "GET", req.url, FETCH_TIMEOUT, MAX_REDIRECTS
-        )
-    except httpx.HTTPError as e:
-        logger.warning(
-            "http_fetch upstream error run_id=%s url=%s: %s",
-            ticket.run_id, req.url, e,
-        )
-        raise HTTPException(status_code=502, detail=f"upstream request failed: {e}")
+        await validate_url(req.url)
 
-    content_length_header = resp.headers.get("content-length")
-    if content_length_header is not None:
+        result = await fetcher.fetch(req.url)
+
         try:
-            cl = int(content_length_header)
-        except ValueError:
-            cl = None
-        if cl is not None and cl > MAX_BYTES:
-            raise HTTPException(status_code=413, detail=f"response too large: {cl} > {MAX_BYTES}")
+            await validate_url(result.final_url)
+        except HTTPException:
+            # final URL is a private/blocked target — clean up any temp file
+            # the fetcher handed back before raising.
+            if result.body_path:
+                try:
+                    os.unlink(result.body_path)
+                except OSError:
+                    logger.warning(
+                        "failed to unlink download tmp_path=%s after SSRF post-validate",
+                        result.body_path,
+                    )
+            raise
 
-    raw = resp.content or b""
-    if len(raw) > MAX_BYTES:
-        raise HTTPException(status_code=413, detail=f"response exceeded {MAX_BYTES} bytes")
+        logger.info(
+            "http_fetch ok run_id=%s status=%d content_type=%s bytes=%d purpose=%s url=%s",
+            ticket.run_id,
+            result.status,
+            result.content_type,
+            result.byte_size,
+            req.purpose or "",
+            req.url,
+        )
 
+        headers = {
+            "X-Source-URL": result.final_url,
+            "X-Byte-Size": str(result.byte_size),
+            "X-Upstream-Status": str(result.status),
+        }
+
+        if result.body_path is not None:
+            # Download path: stream from disk; BackgroundTask unlinks the
+            # temp file after the response is fully sent.
+            return StreamingResponse(
+                _stream_file(result.body_path),
+                media_type=result.content_type,
+                headers=headers,
+                background=BackgroundTask(_unlink_quietly, result.body_path),
+            )
+
+        # Page-response path: single in-memory chunk.
+        body = result.body or b""
+
+        async def _iter():
+            yield body
+
+        return StreamingResponse(
+            _iter(),
+            media_type=result.content_type,
+            headers=headers,
+        )
+    except HTTPException as e:
+        logger.warning(
+            "http_fetch failed run_id=%s status=%d purpose=%s url=%s detail=%s",
+            ticket.run_id,
+            e.status_code,
+            req.purpose or "",
+            req.url,
+            e.detail,
+        )
+        raise
+
+
+def _unlink_quietly(path: str) -> None:
     try:
-        body_text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        body_text = raw.decode("utf-8", errors="replace")
-
-    logger.info(
-        "http_fetch ok run_id=%s status=%d bytes=%d purpose=%s url=%s",
-        ticket.run_id, resp.status_code, len(raw), req.purpose or "", req.url,
-    )
-
-    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or "application/octet-stream"
-
-    return HttpFetchResponse(
-        status=resp.status_code,
-        content_type=content_type,
-        body=body_text,
-        source_url=current_url,
-        byte_size=len(raw),
-    )
+        os.unlink(path)
+    except OSError:
+        logger.warning("failed to unlink download tmp_path=%s after response", path)

@@ -57,16 +57,12 @@ from broker.endpoints.delete_run_token import (
     get_ticket_store as delete_get_ticket_store,
     router as delete_router,
 )
-from broker.endpoints.pdf_fetch import (
-    get_httpx_client as pdf_get_httpx_client,
-    get_scope_ticket as pdf_get_scope_ticket,
-    router as pdf_router,
-)
 from broker.endpoints.http_fetch import (
-    get_httpx_client as http_get_httpx_client,
+    get_browser_fetcher as http_get_browser_fetcher,
     get_scope_ticket as http_get_scope_ticket,
     router as http_router,
 )
+from broker.browser_fetcher import PlaywrightBrowserFetcher  # noqa: I001
 from broker.endpoints.run_status import (
     get_artifact_bucket as status_get_artifact_bucket,
     get_broker_token_raw as status_get_broker_token_raw,
@@ -129,9 +125,12 @@ async def lifespan(app: FastAPI):
     upstream_client = httpx.AsyncClient(base_url="https://api.anthropic.com", timeout=300)
     s3_client = boto3.client("s3")
     sqs_client = boto3.client("sqs")
-    # Shared async client for pdf_fetch and http_fetch. Both endpoints are
-    # `async def` and use httpx.AsyncClient's await/async-with APIs.
+    # Shared async client used by anthropic_proxy and agent_mcp_proxy. The
+    # unified /http/fetch endpoint routes through PlaywrightBrowserFetcher
+    # below — plain httpx is 403'd by Cloudflare's JS challenge on muni sites.
     http_client = httpx.AsyncClient(timeout=30)
+    browser_fetcher = PlaywrightBrowserFetcher()
+    await browser_fetcher.start()
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
     # Per-ticket counter feeding the artifact_publish anti-fabrication gate.
     # Process-local; broker restart mid-run rejects publish (strictly safer
@@ -209,22 +208,21 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[exp_get_s3_client] = lambda: s3_client
     app.dependency_overrides[exp_get_experiment_metadata_bucket] = lambda: experiment_metadata_bucket
 
-    app.dependency_overrides[pdf_get_scope_ticket] = _resolve_ticket_from_request
-    app.dependency_overrides[pdf_get_httpx_client] = lambda: http_client
-
     app.dependency_overrides[http_get_scope_ticket] = _resolve_ticket_from_request
-    app.dependency_overrides[http_get_httpx_client] = lambda: http_client
+    app.dependency_overrides[http_get_browser_fetcher] = lambda: browser_fetcher
 
     app.dependency_overrides[agent_mcp_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[agent_mcp_get_clerk_client] = lambda: clerk_client
     app.dependency_overrides[agent_mcp_get_gp_api_base_url] = lambda: secrets.gp_api_base_url
     app.dependency_overrides[agent_mcp_get_http_client] = lambda: http_client
 
-    yield
-
-    await upstream_client.aclose()
-    await http_client.aclose()
-    await clerk_client.aclose()
+    try:
+        yield
+    finally:
+        await upstream_client.aclose()
+        await http_client.aclose()
+        await clerk_client.aclose()
+        await browser_fetcher.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -246,7 +244,6 @@ app.include_router(read_router)
 app.include_router(status_router)
 app.include_router(databricks_router)
 app.include_router(upload_router)
-app.include_router(pdf_router)
 app.include_router(http_router)
 app.include_router(experiment_manifest_router)
 app.include_router(agent_mcp_router)

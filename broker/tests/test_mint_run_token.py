@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock
@@ -392,9 +393,15 @@ class TestMintRunTokenActorTokenRedemption:
     (cached) for each outbound MCP/HTTP call.
     """
 
-    def test_clerk_user_id_required(self):
+    def test_clerk_user_id_optional_skips_clerk_dance(self):
+        """Callers that don't need MCP-proxy access (just /http/fetch, /pdf/fetch,
+        artifact_* etc.) can omit clerk_user_id. Mint then skips the Clerk
+        actor-token round trip, persists clerk_session_id=None on the ticket,
+        and returns 200. agent_mcp_proxy will 4xx tickets without a session id
+        with reason=ticket_missing_clerk_session_id."""
         store = MagicMock(spec=ScopeTicketStore)
-        app = _create_test_app(store=store)
+        clerk = _make_fake_clerk()
+        app = _create_test_app(store=store, clerk_client=clerk)
         client = TestClient(app)
 
         payload = _mint_payload()
@@ -405,7 +412,12 @@ class TestMintRunTokenActorTokenRedemption:
             json=payload,
             headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
         )
-        assert resp.status_code == 422
+
+        assert resp.status_code == 200
+        clerk.create_actor_token.assert_not_awaited()
+        clerk.redeem_actor_token.assert_not_awaited()
+        ticket: ScopeTicket = store.put_ticket.call_args[0][0]
+        assert ticket.clerk_session_id is None
 
     def test_session_id_persisted_on_ticket(self):
         store = MagicMock(spec=ScopeTicketStore)
@@ -428,9 +440,7 @@ class TestMintRunTokenActorTokenRedemption:
     def test_creation_failure_returns_502_with_reason(self):
         store = MagicMock(spec=ScopeTicketStore)
         clerk = MagicMock(spec=ClerkClient)
-        clerk.create_actor_token = AsyncMock(
-            side_effect=ClerkClientError("upstream 422 user_not_found")
-        )
+        clerk.create_actor_token = AsyncMock(side_effect=ClerkClientError("upstream 422 user_not_found"))
         clerk.redeem_actor_token = AsyncMock()
         app = _create_test_app(store=store, clerk_client=clerk)
         client = TestClient(app)
@@ -450,12 +460,8 @@ class TestMintRunTokenActorTokenRedemption:
     def test_redemption_failure_returns_502_with_reason(self):
         store = MagicMock(spec=ScopeTicketStore)
         clerk = MagicMock(spec=ClerkClient)
-        clerk.create_actor_token = AsyncMock(
-            return_value={"url": DEFAULT_ACTOR_TOKEN_URL}
-        )
-        clerk.redeem_actor_token = AsyncMock(
-            side_effect=ClerkClientError("upstream 410 actor_token_already_used")
-        )
+        clerk.create_actor_token = AsyncMock(return_value={"url": DEFAULT_ACTOR_TOKEN_URL})
+        clerk.redeem_actor_token = AsyncMock(side_effect=ClerkClientError("upstream 410 actor_token_already_used"))
         app = _create_test_app(store=store, clerk_client=clerk)
         client = TestClient(app)
 
@@ -469,3 +475,175 @@ class TestMintRunTokenActorTokenRedemption:
         body = resp.json()
         assert body["detail"]["reason"] == "clerk_actor_token_redemption_failed"
         store.put_ticket.assert_not_called()
+
+
+class TestFailureLogging:
+    """Every failure path on mint must surface a structured warning so on-call
+    can grep CloudWatch when a dispatch run mysteriously fails to mint. Without
+    these logs the endpoint is a black box — a non-2xx response goes out and
+    no operator-visible breadcrumb exists. Success is logged at info so the
+    optional-Clerk path (clerk_session=present|absent) is observable too.
+
+    Each assertion checks (a) a stable greppable failure-mode token and
+    (b) the run_id is included so a specific run can be traced end-to-end.
+    """
+
+    LOGGER_NAME = "broker.endpoints.mint_run_token"
+
+    def test_logs_warning_on_invalid_service_token(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        app = _create_test_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-bad-token"),
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+        assert any("invalid_service_token" in r.message for r in caplog.records if r.name == self.LOGGER_NAME), (
+            f"missing invalid_service_token warning; got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_logs_warning_on_ttl_above_cap(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-ttl-cap", exp_ttl_seconds=999999),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 400
+        assert any(
+            "ttl_above_cap" in r.message and "run_id=run-ttl-cap" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME
+        ), f"missing ttl_above_cap warning; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_warning_on_timeout_plus_buffer_above_cap(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(
+                run_id="run-timeout-cap",
+                exp_ttl_seconds=3600,
+                timeout_seconds=200000,
+            ),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 400
+        assert any(
+            "timeout_plus_buffer_above_cap" in r.message and "run_id=run-timeout-cap" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME
+        ), f"missing timeout_plus_buffer_above_cap warning; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_warning_on_clerk_creation_failure(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        clerk = MagicMock(spec=ClerkClient)
+        clerk.create_actor_token = AsyncMock(side_effect=ClerkClientError("upstream 422 user_not_found"))
+        clerk.redeem_actor_token = AsyncMock()
+        app = _create_test_app(store=store, clerk_client=clerk)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-clerk-fail"),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 502
+        assert any(
+            "clerk_actor_token_creation_failed" in r.message and "run_id=run-clerk-fail" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME
+        ), f"missing clerk_actor_token_creation_failed warning; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_warning_on_clerk_redemption_failure(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        clerk = MagicMock(spec=ClerkClient)
+        clerk.create_actor_token = AsyncMock(return_value={"url": DEFAULT_ACTOR_TOKEN_URL})
+        clerk.redeem_actor_token = AsyncMock(side_effect=ClerkClientError("upstream 410 actor_token_already_used"))
+        app = _create_test_app(store=store, clerk_client=clerk)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-redeem-fail"),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 502
+        assert any(
+            "clerk_actor_token_redemption_failed" in r.message and "run_id=run-redeem-fail" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME
+        ), f"missing clerk_actor_token_redemption_failed warning; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_warning_on_ticket_collision(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        store.put_ticket.side_effect = TicketAlreadyExistsError("already exists")
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-collision"),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 409
+        assert any(
+            "ticket_already_exists" in r.message and "run_id=run-collision" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME
+        ), f"missing ticket_already_exists warning; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_info_on_success_with_clerk_user_id(self, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(run_id="run-ok-clerk"),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        assert any(
+            "mint_run_token ok" in r.message
+            and "run_id=run-ok-clerk" in r.message
+            and "clerk_session=present" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME and r.levelno == logging.INFO
+        ), f"missing success info log with clerk_session=present; got: {[r.message for r in caplog.records]}"
+
+    def test_logs_info_on_success_without_clerk_user_id(self, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER_NAME)
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        payload = _mint_payload(run_id="run-ok-no-clerk")
+        del payload["clerk_user_id"]
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=payload,
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        assert any(
+            "mint_run_token ok" in r.message
+            and "run_id=run-ok-no-clerk" in r.message
+            and "clerk_session=absent" in r.message
+            for r in caplog.records
+            if r.name == self.LOGGER_NAME and r.levelno == logging.INFO
+        ), f"missing success info log with clerk_session=absent; got: {[r.message for r in caplog.records]}"
