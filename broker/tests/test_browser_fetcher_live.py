@@ -78,15 +78,38 @@ async def test_cloudflare_challenged_pdf_via_alvin_gov():
     try:
         result = await fetcher.fetch("https://www.alvin.gov/AgendaCenter/ViewFile/Agenda/_04162026-434")
 
+        # Alvin's PDF (24 MB) goes through the download path — Playwright
+        # captures it via page.on("download", ...) and the fetcher returns
+        # body_path (file on disk), not body (in-memory). Body would also
+        # blow the 10 MB PAGE_RESPONSE_MAX_BYTES cap if it tried the buffered
+        # path. Read magic bytes from disk.
         assert result.content_type == "application/pdf", result.content_type
-        assert len(result.body) > 1_000_000, (
-            f"expected multi-MB PDF, got {len(result.body)} bytes — Cloudflare "
-            "bypass likely broken (returned an HTML challenge page instead)"
+        assert result.body is None, "PDF must go through the download path, not buffered"
+        assert result.body_path is not None, (
+            "expected download path (body_path), not inline body — fetcher routing bug"
         )
-        assert result.body[:4] == b"%PDF", (
-            f"expected PDF magic, got {result.body[:16]!r} — Cloudflare bypass "
-            "likely broken or upstream returned an error page"
-        )
+        assert os.path.exists(result.body_path)
+        try:
+            file_size = os.path.getsize(result.body_path)
+            assert file_size > 1_000_000, (
+                f"expected multi-MB PDF, got {file_size} bytes — Cloudflare bypass "
+                "likely broken (returned a challenge response instead)"
+            )
+            assert result.byte_size == file_size, (
+                f"BrowserFetchResult.byte_size ({result.byte_size}) must match "
+                f"on-disk size ({file_size})"
+            )
+            with open(result.body_path, "rb") as f:
+                magic = f.read(4)
+            assert magic == b"%PDF", (
+                f"expected PDF magic, got {magic!r} — Cloudflare bypass "
+                "likely broken or upstream returned an error page"
+            )
+        finally:
+            try:
+                os.unlink(result.body_path)
+            except OSError:
+                pass
     finally:
         await fetcher.aclose()
 

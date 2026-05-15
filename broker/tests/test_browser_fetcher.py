@@ -1054,3 +1054,140 @@ class TestAcloseGate:
         await asyncio.wait_for(task, timeout=2)
         await asyncio.wait_for(close_task, timeout=2)
         assert fetch_returned_before_close["ok"]
+
+
+class TestDownloadTempFileLeakOnSSRFViolation:
+    """When _save_download_to_disk yields via asyncio.to_thread, a sub-resource
+    route-handler can append to violations[] during the yield. The next
+    _raise_if_violation() raises HTTP 400 — but body_path is already on disk.
+    The endpoint never sees the result, so its BackgroundTask cleanup never
+    runs. Without explicit cleanup at this checkpoint, the temp file leaks
+    forever (until container restart, or never on persistent TMPDIR).
+    """
+
+    @pytest.mark.asyncio
+    async def test_early_download_path_unlinks_on_post_save_ssrf_violation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_playwright_types(monkeypatch)
+
+        async def validate_url(url: str) -> None:
+            if "10.0.0.5" in url:
+                raise HTTPException(status_code=400, detail="private IP blocked")
+
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", validate_url)
+
+        download_url = "https://example.com/agenda.pdf"
+        payload = b"%PDF-1.4 fake"
+        browser_holder: list[_FakeBrowser] = []
+        page = _FakePage(response=None, url="https://example.com/")
+
+        async def goto(_url: str, *, timeout: int) -> None:
+            page.emit_download(_FakeDownload(download_url, payload))
+            return None
+
+        page.goto = goto  # type: ignore[method-assign]
+
+        # Capture the path that gets written so we can assert it's unlinked.
+        captured_paths: list[str] = []
+        from broker import browser_fetcher as bf_module
+        orig_save = bf_module._save_download_to_disk
+
+        async def save_then_violate(download):
+            path, size = await orig_save(download)
+            captured_paths.append(path)
+            # Simulate a sub-resource SSRF firing during the asyncio.to_thread
+            # yield inside _save_download_to_disk: invoke the route handler
+            # with a private IP so violations[] picks it up.
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            await handler(_FakeRoute("https://10.0.0.5/internal-subresource"))
+            return path, size
+
+        monkeypatch.setattr(
+            "broker.browser_fetcher._save_download_to_disk", save_then_violate
+        )
+
+        browser = _FakeBrowser(lambda: page)
+        browser_holder.append(browser)
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = browser  # type: ignore[assignment]
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch(download_url)
+        assert exc.value.status_code == 400
+        assert "SSRF blocked mid-fetch" in exc.value.detail
+        assert len(captured_paths) == 1, "save was called exactly once"
+        leaked = captured_paths[0]
+        assert not os.path.exists(leaked), (
+            f"download temp file leaked after post-save SSRF violation: {leaked}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_late_download_path_unlinks_on_post_save_ssrf_violation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same bug, post-settle path: late download fires during
+        wait_for_load_state, save_as runs, route handler appends a violation
+        during the asyncio.to_thread yield, _raise_if_violation must clean up
+        before raising."""
+        _patch_playwright_types(monkeypatch)
+
+        async def validate_url(url: str) -> None:
+            if "10.0.0.5" in url:
+                raise HTTPException(status_code=400, detail="private IP blocked")
+
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", validate_url)
+
+        download_url = "https://example.com/agenda.pdf"
+        payload = b"%PDF-1.4 fake"
+        browser_holder: list[_FakeBrowser] = []
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://example.com/", status=200,
+                headers={"content-type": "text/html"}, body=b"<html></html>",
+            ),
+            url="https://example.com/",
+        )
+        # Suppress download fires in the grace window so we end up on the
+        # post-settle late-download path. Return the FakeResponse so we take
+        # the page-response → settle branch (download will fire inside
+        # wait_for_load_state below).
+        async def goto(_url: str, *, timeout: int):
+            return page._response
+        page.goto = goto  # type: ignore[method-assign]
+
+        # Fire the download from inside wait_for_load_state (the post-settle path).
+        async def wait_for_load_state(state: str, *, timeout: int) -> None:
+            page._load_state_calls += 1
+            page.emit_download(_FakeDownload(download_url, payload))
+        page.wait_for_load_state = wait_for_load_state  # type: ignore[method-assign]
+        page._on_settle = None
+
+        captured_paths: list[str] = []
+        from broker import browser_fetcher as bf_module
+        orig_save = bf_module._save_download_to_disk
+
+        async def save_then_violate(download):
+            path, size = await orig_save(download)
+            captured_paths.append(path)
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            await handler(_FakeRoute("https://10.0.0.5/late-subresource"))
+            return path, size
+
+        monkeypatch.setattr(
+            "broker.browser_fetcher._save_download_to_disk", save_then_violate
+        )
+
+        browser = _FakeBrowser(lambda: page)
+        browser_holder.append(browser)
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = browser  # type: ignore[assignment]
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch("https://example.com/")
+        assert exc.value.status_code == 400
+        assert len(captured_paths) == 1
+        leaked = captured_paths[0]
+        assert not os.path.exists(leaked), (
+            f"late-download temp file leaked after post-save SSRF violation: {leaked}"
+        )

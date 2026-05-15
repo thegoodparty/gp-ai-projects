@@ -277,7 +277,20 @@ class PlaywrightBrowserFetcher:
                 await validate_url(final_url)
                 _raise_if_violation()
                 body_path, byte_size = await _save_download_to_disk(dl)
-                _raise_if_violation()
+                # asyncio.to_thread inside _save_download_to_disk yielded to
+                # the event loop. A sub-resource SSRF could have appended to
+                # violations[] during that window; the file is already on
+                # disk. Unlink before raising — the endpoint never sees the
+                # result so its BackgroundTask cleanup won't run.
+                if violations:
+                    try:
+                        await asyncio.to_thread(os.unlink, body_path)
+                    except OSError:
+                        logger.warning(
+                            "failed to unlink leaked download temp path=%s",
+                            body_path,
+                        )
+                    _raise_if_violation()
                 captured = captured_responses.get(final_url)
                 content_type = (
                     captured[0]
@@ -335,7 +348,18 @@ class PlaywrightBrowserFetcher:
                     await validate_url(final_url)
                     _raise_if_violation()
                     body_path, byte_size = await _save_download_to_disk(dl)
-                    _raise_if_violation()
+                    # See the early-download path: temp file is already on disk
+                    # if a sub-resource SSRF fired during the asyncio.to_thread
+                    # yield. Unlink before raising so the file doesn't leak.
+                    if violations:
+                        try:
+                            await asyncio.to_thread(os.unlink, body_path)
+                        except OSError:
+                            logger.warning(
+                                "failed to unlink leaked download temp path=%s",
+                                body_path,
+                            )
+                        _raise_if_violation()
                     captured = captured_responses.get(final_url)
                     ct = (
                         captured[0]
