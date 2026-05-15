@@ -1,3 +1,4 @@
+import logging
 import time
 import uuid
 
@@ -11,6 +12,8 @@ from broker.dynamodb_client import (
     ScopeTicketStore,
     TicketAlreadyExistsError,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -76,12 +79,24 @@ async def mint_run_token(
     clerk_client: ClerkClient = Depends(get_clerk_client),
 ):
     if not verify_service_token(service_token, token_hash):
+        logger.warning(
+            "mint_run_token invalid_service_token run_id=%s experiment_id=%s",
+            getattr(request, "run_id", "unknown"),
+            getattr(request, "experiment_id", "unknown"),
+        )
         raise HTTPException(status_code=401, detail="Invalid service token")
 
     broker_token = str(uuid.uuid4())
     now = int(time.time())
 
     if request.exp_ttl_seconds > MAX_TTL_SECONDS:
+        logger.warning(
+            "mint_run_token ttl_above_cap run_id=%s experiment_id=%s exp_ttl_seconds=%d max=%d",
+            request.run_id,
+            request.experiment_id,
+            request.exp_ttl_seconds,
+            MAX_TTL_SECONDS,
+        )
         raise HTTPException(
             status_code=400,
             detail=(
@@ -95,6 +110,15 @@ async def mint_run_token(
     if request.timeout_seconds is not None:
         required_ttl = request.timeout_seconds + TTL_BUFFER_SECONDS
         if required_ttl > MAX_TTL_SECONDS:
+            logger.warning(
+                "mint_run_token timeout_plus_buffer_above_cap run_id=%s "
+                "experiment_id=%s timeout_seconds=%d buffer=%d max=%d",
+                request.run_id,
+                request.experiment_id,
+                request.timeout_seconds,
+                TTL_BUFFER_SECONDS,
+                MAX_TTL_SECONDS,
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -112,6 +136,12 @@ async def mint_run_token(
         try:
             actor_token = await clerk_client.create_actor_token(request.clerk_user_id)
         except ClerkClientError as e:
+            logger.warning(
+                "mint_run_token clerk_actor_token_creation_failed run_id=%s experiment_id=%s cause=%s",
+                request.run_id,
+                request.experiment_id,
+                e,
+            )
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -123,6 +153,12 @@ async def mint_run_token(
         try:
             session_info = await clerk_client.redeem_actor_token(actor_token["url"])
         except ClerkClientError as e:
+            logger.warning(
+                "mint_run_token clerk_actor_token_redemption_failed run_id=%s experiment_id=%s cause=%s",
+                request.run_id,
+                request.experiment_id,
+                e,
+            )
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -149,7 +185,20 @@ async def mint_run_token(
     try:
         store.put_ticket(ticket)
     except TicketAlreadyExistsError:
+        logger.warning(
+            "mint_run_token ticket_already_exists run_id=%s experiment_id=%s",
+            request.run_id,
+            request.experiment_id,
+        )
         raise HTTPException(status_code=409, detail="Ticket already exists")
+
+    logger.info(
+        "mint_run_token ok run_id=%s experiment_id=%s exp=%d clerk_session=%s",
+        request.run_id,
+        request.experiment_id,
+        exp,
+        "present" if clerk_session_id else "absent",
+    )
 
     return MintResponse(
         broker_token=broker_token,
