@@ -33,7 +33,11 @@ class MintRequest(BaseModel):
     experiment_id: str = Field(..., pattern=IDENTIFIER_PATTERN)
     scope: dict
     params: dict
-    clerk_user_id: str = Field(...)
+    # Optional: when omitted, mint skips the Clerk actor-token round trip and
+    # the resulting ticket has clerk_session_id=None. Routes that need MCP-proxy
+    # auth (agent_mcp_proxy) will reject such tickets with a clear error;
+    # /http/fetch, /pdf/fetch, artifact_* don't need Clerk and work fine.
+    clerk_user_id: str | None = None
     exp_ttl_seconds: int = 3600
     # Optional — when provided, mint floors exp_ttl_seconds at
     # timeout_seconds + TTL_BUFFER_SECONDS so ticket survives the whole run.
@@ -103,27 +107,30 @@ async def mint_run_token(
 
     exp = now + effective_ttl
 
-    try:
-        actor_token = await clerk_client.create_actor_token(request.clerk_user_id)
-    except ClerkClientError as e:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "reason": "clerk_actor_token_creation_failed",
-                "message": str(e),
-            },
-        ) from e
+    clerk_session_id: str | None = None
+    if request.clerk_user_id:
+        try:
+            actor_token = await clerk_client.create_actor_token(request.clerk_user_id)
+        except ClerkClientError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "reason": "clerk_actor_token_creation_failed",
+                    "message": str(e),
+                },
+            ) from e
 
-    try:
-        session_info = await clerk_client.redeem_actor_token(actor_token["url"])
-    except ClerkClientError as e:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "reason": "clerk_actor_token_redemption_failed",
-                "message": str(e),
-            },
-        ) from e
+        try:
+            session_info = await clerk_client.redeem_actor_token(actor_token["url"])
+        except ClerkClientError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "reason": "clerk_actor_token_redemption_failed",
+                    "message": str(e),
+                },
+            ) from e
+        clerk_session_id = session_info["session_id"]
 
     ticket = ScopeTicket(
         pk=broker_token,
@@ -136,7 +143,7 @@ async def mint_run_token(
         issued_at=now,
         issued_by="dispatch_lambda",
         prior_artifact_versions=request.prior_artifact_versions,
-        clerk_session_id=session_info["session_id"],
+        clerk_session_id=clerk_session_id,
     )
 
     try:

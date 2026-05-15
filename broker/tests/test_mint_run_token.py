@@ -392,9 +392,15 @@ class TestMintRunTokenActorTokenRedemption:
     (cached) for each outbound MCP/HTTP call.
     """
 
-    def test_clerk_user_id_required(self):
+    def test_clerk_user_id_optional_skips_clerk_dance(self):
+        """Callers that don't need MCP-proxy access (just /http/fetch, /pdf/fetch,
+        artifact_* etc.) can omit clerk_user_id. Mint then skips the Clerk
+        actor-token round trip, persists clerk_session_id=None on the ticket,
+        and returns 200. agent_mcp_proxy will 4xx tickets without a session id
+        with reason=ticket_missing_clerk_session_id."""
         store = MagicMock(spec=ScopeTicketStore)
-        app = _create_test_app(store=store)
+        clerk = _make_fake_clerk()
+        app = _create_test_app(store=store, clerk_client=clerk)
         client = TestClient(app)
 
         payload = _mint_payload()
@@ -405,7 +411,12 @@ class TestMintRunTokenActorTokenRedemption:
             json=payload,
             headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
         )
-        assert resp.status_code == 422
+
+        assert resp.status_code == 200
+        clerk.create_actor_token.assert_not_awaited()
+        clerk.redeem_actor_token.assert_not_awaited()
+        ticket: ScopeTicket = store.put_ticket.call_args[0][0]
+        assert ticket.clerk_session_id is None
 
     def test_session_id_persisted_on_ticket(self):
         store = MagicMock(spec=ScopeTicketStore)
