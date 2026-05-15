@@ -1,4 +1,5 @@
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -42,7 +43,10 @@ def patched_broker():
         yield p
 
 
-def test_from_env_loads_all_fields(monkeypatch, patched_broker):
+def _set_full_env(monkeypatch):
+    """Shared setup for the from_env split tests below — every contract pinned
+    independently below was previously bundled into test_from_env_loads_all_fields
+    where a failure couldn't tell you which behavior broke."""
     monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
     monkeypatch.setenv("RUN_ID", "run-abc")
     monkeypatch.setenv("ORGANIZATION_SLUG", "org-123")
@@ -54,20 +58,82 @@ def test_from_env_loads_all_fields(monkeypatch, patched_broker):
     monkeypatch.setenv("BROKER_TOKEN", "tok-secret-123")
     monkeypatch.delenv("INSTRUCTION", raising=False)
 
+
+def test_from_env_pass_through_experiment_id_run_id_organization_slug(
+    monkeypatch, patched_broker
+):
+    """The three identity fields are read straight from env vars unchanged."""
+    _set_full_env(monkeypatch)
+
     config = RunnerConfig.from_env()
 
     assert config.experiment_id == SYNTHETIC_EXPERIMENT_ID
     assert config.run_id == "run-abc"
     assert config.organization_slug == "org-123"
-    # INSTRUCTION env var is no longer consulted when broker fetch happens.
-    # Broker envelope's instruction wins.
+
+
+def test_from_env_uses_broker_envelope_instruction_not_INSTRUCTION_env_var(
+    monkeypatch, patched_broker
+):
+    """Precedence rule: when EXPERIMENT_ID is set, the broker envelope's
+    instruction wins. The INSTRUCTION env var is deliberately ignored to
+    prevent stale-env footguns on re-runs."""
+    _set_full_env(monkeypatch)
+    # Even if a stale INSTRUCTION value sneaks into the env, it must not win.
+    monkeypatch.setenv("INSTRUCTION", "STALE — must be ignored")
+
+    config = RunnerConfig.from_env()
+
     assert config.instruction == synthetic_instruction()
-    assert config.params == {"district": "CA-12"}
-    assert config.harness == "claude_sdk"
-    # AGENT_MODEL was opus, but broker manifest overrides. The runner trusts
-    # the broker for model.
+    assert "STALE" not in config.instruction
+
+
+def test_from_env_broker_manifest_model_overrides_agent_model_env(
+    monkeypatch, patched_broker
+):
+    """Precedence rule: AGENT_MODEL env var loses to the broker manifest's
+    model. The runner trusts the broker for model choice so ops can swap
+    models per-experiment without redeploying the runner."""
+    _set_full_env(monkeypatch)
+    # AGENT_MODEL is set to opus in _set_full_env; manifest specifies its own.
+    assert os.environ.get("AGENT_MODEL") == "opus"
+
+    config = RunnerConfig.from_env()
+
     assert config.model == synthetic_manifest()["model"]
+    assert config.model != "opus", (
+        f"manifest model must override AGENT_MODEL env var; got {config.model!r}"
+    )
+
+
+def test_from_env_params_json_parses_to_dict(monkeypatch, patched_broker):
+    """PARAMS_JSON must decode into a plain dict and land on .params unchanged."""
+    _set_full_env(monkeypatch)
+
+    config = RunnerConfig.from_env()
+
+    assert config.params == {"district": "CA-12"}
+
+
+def test_from_env_environment_normalized_lowercase(monkeypatch, patched_broker):
+    """ENVIRONMENT is normalized to lowercase before being stored — the rest
+    of the codebase compares against lowercase tokens like 'prod' / 'dev'."""
+    _set_full_env(monkeypatch)
+    # Override with a mixed-case value to prove normalization happens.
+    monkeypatch.setenv("ENVIRONMENT", "PROD")
+
+    config = RunnerConfig.from_env()
+
     assert config.environment == "prod"
+
+
+def test_from_env_broker_url_and_token_pass_through(monkeypatch, patched_broker):
+    """BROKER_URL and BROKER_TOKEN are stored on the config so downstream
+    re-init / fallback paths can reuse the same credentials."""
+    _set_full_env(monkeypatch)
+
+    config = RunnerConfig.from_env()
+
     assert config.broker_url == "https://broker.goodparty.org"
     assert config.broker_token == "tok-secret-123"
 
@@ -123,6 +189,199 @@ def test_from_env_rejects_non_draft7_output_schema(monkeypatch):
     ):
         with pytest.raises(ValueError, match="output_schema"):
             RunnerConfig.from_env()
+
+
+@pytest.mark.parametrize("combinator", ["oneOf", "anyOf", "allOf"])
+def test_from_env_accepts_combinator_at_root_output_schema(monkeypatch, combinator):
+    """Schemas using oneOf/anyOf/allOf at the root (e.g. status-discriminated
+    artifact shapes like meeting_briefing and meeting_schedule) are real
+    Draft-07 schemas and must be accepted. They have no top-level
+    `type: 'object'` or `properties` dict — that's the whole point of the
+    combinator pattern. Only the legacy GP-shape dict should be rejected."""
+    manifest = synthetic_manifest()
+    combinator_schema = {
+        "title": "TestCombinatorSchema",
+        combinator: [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string", "const": "ok"},
+                    "data": {"type": "string"},
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string", "const": "error"},
+                    "error": {"type": "string"},
+                },
+            },
+        ],
+    }
+    envelope = {
+        "manifest": {
+            "model": manifest["model"],
+            "max_turns": manifest["max_turns"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "output_schema": combinator_schema,
+        },
+        "instruction": synthetic_instruction(),
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", f"run-{combinator}-schema")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.contract_schema == combinator_schema
+
+
+def test_from_env_rejects_empty_combinator_output_schema(monkeypatch):
+    """`{"oneOf": []}` is structurally a combinator but declares no constraints
+    — every artifact validates. Reject as a legacy-shape-equivalent."""
+    manifest = synthetic_manifest()
+    envelope = {
+        "manifest": {
+            "model": manifest["model"],
+            "max_turns": manifest["max_turns"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "output_schema": {"oneOf": []},
+        },
+        "instruction": synthetic_instruction(),
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-empty-oneof")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        with pytest.raises(ValueError, match="output_schema"):
+            RunnerConfig.from_env()
+
+
+def _envelope_with_output_schema(schema: dict) -> dict:
+    manifest = synthetic_manifest()
+    return {
+        "manifest": {
+            "model": manifest["model"],
+            "max_turns": manifest["max_turns"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "output_schema": schema,
+        },
+        "instruction": synthetic_instruction(),
+    }
+
+
+def _set_broker_env(monkeypatch, run_id: str = "run-x"):
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", run_id)
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+
+def test_from_env_rejects_combinator_with_empty_branch_objects(monkeypatch):
+    """`{"oneOf": [{}]}` is a combinator whose only branch is the empty schema —
+    Draft7Validator treats `{}` as a no-op so every artifact would validate.
+    The shape check must recurse into branches and reject this."""
+    envelope = _envelope_with_output_schema({"oneOf": [{}]})
+    _set_broker_env(monkeypatch, run_id="run-empty-branch-obj")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        with pytest.raises(ValueError, match="output_schema"):
+            RunnerConfig.from_env()
+
+
+def test_from_env_rejects_combinator_with_only_typeless_branches(monkeypatch):
+    """A branch with only metadata (`description`, `title`) and no `type` /
+    `properties` / nested combinator is structurally a no-op. Reject."""
+    envelope = _envelope_with_output_schema(
+        {"oneOf": [{"description": "x"}, {"title": "y"}]}
+    )
+    _set_broker_env(monkeypatch, run_id="run-typeless-branch")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        with pytest.raises(ValueError, match="output_schema"):
+            RunnerConfig.from_env()
+
+
+def test_from_env_accepts_nested_combinator(monkeypatch):
+    """Combinators may nest — `oneOf` of an `allOf` of a real object schema is
+    legitimate. The recursive shape check must accept it."""
+    nested_schema = {
+        "oneOf": [
+            {
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": {"k": {"type": "string"}},
+                    }
+                ]
+            }
+        ]
+    }
+    envelope = _envelope_with_output_schema(nested_schema)
+    _set_broker_env(monkeypatch, run_id="run-nested-combinator")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.contract_schema == nested_schema
+
+
+def test_combinator_validation_error_message_matches_function_contract(monkeypatch):
+    """Pin the error message wording so a future refactor of the shape check
+    can't silently drift the operator-facing error from what the function
+    actually accepts. The old message claimed `type='object'` was required —
+    after combinators landed, that lied to the operator."""
+    envelope = _envelope_with_output_schema({"name": "string", "count": "number"})
+    _set_broker_env(monkeypatch, run_id="run-msg-pin")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        with pytest.raises(ValueError) as exc_info:
+            RunnerConfig.from_env()
+
+    msg = str(exc_info.value)
+    # Message must mention BOTH supported shapes.
+    assert "type='object'" in msg
+    assert "properties" in msg
+    # And the combinator branch — old message omitted this entirely.
+    assert "oneOf/anyOf/allOf" in msg, (
+        f"error must name the combinator forms the function actually accepts; got: {msg!r}"
+    )
+    assert "well-formed branch" in msg or "non-empty" in msg
 
 
 def test_from_env_raises_loud_on_invalid_json_params(monkeypatch):
@@ -540,3 +799,200 @@ class TestRedactUserinfoEdgeCases:
             f"URL with no parseable hostname must default to safe placeholder, "
             f"got: {result!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Attachments — sidecar files in the broker envelope
+# ---------------------------------------------------------------------------
+#
+# RunnerConfig must thread the envelope's attachments dict through to the
+# runner unchanged so main.py can write each entry to /workspace/<basename>.
+# The default-empty contract is load-bearing for legacy local-dev runs that
+# don't go through the broker.
+
+
+def test_from_env_populates_attachments_from_envelope(monkeypatch):
+    """Broker-resolved attachments must be wired into RunnerConfig so main.py
+    can write them to the workspace. Basename-keyed dict, UTF-8 string bodies."""
+    envelope = _envelope_for_synthetic()
+    envelope["attachments"] = {
+        "reference_catalog.md": "# Reference\n\n- item 1\n- item 2\n",
+        "lookup.csv": "key,value\nalpha,1\n",
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-attachments")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-a")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.attachments == {
+        "reference_catalog.md": "# Reference\n\n- item 1\n- item 2\n",
+        "lookup.csv": "key,value\nalpha,1\n",
+    }
+
+
+def test_from_env_defaults_attachments_to_empty_dict_when_envelope_omits(monkeypatch):
+    """Broker responses from a not-yet-redeployed broker don't include the
+    `attachments` field. Runner must default to {} so main.py's iteration
+    works without a None-guard at every call site."""
+    envelope = _envelope_for_synthetic()
+    # Deliberately no `attachments` key — older brokers omit it.
+    assert "attachments" not in envelope
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-no-attachments")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-a")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.attachments == {}
+
+
+def test_runner_config_attachments_field_uses_default_factory_dict():
+    """Dataclass-level pin: the `attachments` field MUST use
+    `field(default_factory=dict)` so direct-construction code paths get an
+    empty dict (never None or a shared mutable default).
+
+    Companion behavioral test:
+        test_main_works_with_runner_config_default_attachments
+    in test_runner_main.py exercises main.py's iteration on the default to
+    catch any future runtime regression of the contract this pins."""
+    config = RunnerConfig(
+        experiment_id="x",
+        run_id="r",
+        organization_slug="o",
+        instruction="hi",
+    )
+    assert config.attachments == {}
+    # No shared-mutable-default footgun: two instances must not share storage.
+    other = RunnerConfig(
+        experiment_id="y",
+        run_id="r2",
+        organization_slug="o",
+        instruction="hi",
+    )
+    config.attachments["a.md"] = "leaked"
+    assert other.attachments == {}, (
+        "default_factory must yield a fresh dict per-instance; got shared state"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ATTACHMENT_VERSION_IDS env var → load_from_broker forwarding
+#
+# The dispatch Lambda serializes attachment_version_ids as a JSON object env
+# var (see test_dispatch_handler.TestBuildContainerOverrides). The runner
+# must deserialize that and forward it as a kwarg to load_from_broker, or
+# the broker silently falls through to "latest" and the publish-during-run
+# race re-opens for sidecar files.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patched_broker_capturing():
+    """Patch load_from_broker so tests can inspect every kwarg passed.
+
+    Unlike `patched_broker` (returns a fixed envelope), this fixture also
+    records the kwargs each call received. Use when the assertion is about
+    *what was passed to* load_from_broker, not just that RunnerConfig
+    populated correctly.
+    """
+    envelope = _envelope_for_synthetic()
+    captured: dict = {}
+
+    def fake_load(**kwargs):
+        captured.update(kwargs)
+        return envelope
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        side_effect=fake_load,
+    ):
+        yield captured
+
+
+def _base_env_for_attachment_tests(monkeypatch):
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-attachpin")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-a")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.delenv("INSTRUCTION", raising=False)
+
+
+def test_from_env_parses_attachment_version_ids_from_env(monkeypatch, patched_broker_capturing):
+    """When ATTACHMENT_VERSION_IDS env var holds a JSON object, RunnerConfig
+    must deserialize it and forward the dict to load_from_broker."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv(
+        "ATTACHMENT_VERSION_IDS",
+        json.dumps({"a.md": "V1", "b.csv": "V2"}, sort_keys=True),
+    )
+
+    RunnerConfig.from_env()
+
+    assert patched_broker_capturing["attachment_version_ids"] == {"a.md": "V1", "b.csv": "V2"}
+
+
+def test_from_env_with_empty_attachment_version_ids_passes_none(monkeypatch, patched_broker_capturing):
+    """Empty / unset ATTACHMENT_VERSION_IDS → load_from_broker called with
+    attachment_version_ids=None so the POST body omits the key (older brokers
+    that reject unexpected fields stay happy)."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.delenv("ATTACHMENT_VERSION_IDS", raising=False)
+
+    RunnerConfig.from_env()
+
+    assert patched_broker_capturing["attachment_version_ids"] is None
+
+
+def test_from_env_with_blank_attachment_version_ids_passes_none(monkeypatch, patched_broker_capturing):
+    """Whitespace-only env value is equivalent to unset."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("ATTACHMENT_VERSION_IDS", "   ")
+
+    RunnerConfig.from_env()
+
+    assert patched_broker_capturing["attachment_version_ids"] is None
+
+
+def test_from_env_raises_on_malformed_attachment_version_ids_json(monkeypatch):
+    """Garbage JSON in ATTACHMENT_VERSION_IDS must raise — silently falling
+    back to None would defeat the entire pinning system."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("ATTACHMENT_VERSION_IDS", "not json")
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=_envelope_for_synthetic(),
+    ):
+        with pytest.raises(ValueError, match="ATTACHMENT_VERSION_IDS"):
+            RunnerConfig.from_env()
+
+
+def test_from_env_raises_on_non_dict_attachment_version_ids(monkeypatch):
+    """JSON value that decodes to a non-dict (list/string/number) must raise."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("ATTACHMENT_VERSION_IDS", json.dumps([1, 2, 3]))
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=_envelope_for_synthetic(),
+    ):
+        with pytest.raises(ValueError, match="object"):
+            RunnerConfig.from_env()

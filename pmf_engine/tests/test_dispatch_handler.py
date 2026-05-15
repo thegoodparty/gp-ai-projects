@@ -294,6 +294,91 @@ class TestBuildContainerOverrides:
         assert "ARTIFACT_KEY_TEMPLATE" not in env_map
         assert "RESULTS_QUEUE_URL" not in env_map
 
+    def test_attachment_version_ids_serialized_to_env(self):
+        """When the routing dict carries attachment_version_ids,
+        build_container_overrides MUST emit ATTACHMENT_VERSION_IDS as a
+        JSON-encoded env var so the runner can pin its broker fetch."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "attachment_version_ids": {"lookup.csv": "Vlk", "notes.md": "Vnt"},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "ATTACHMENT_VERSION_IDS" in env_map
+        # sort_keys=True: env-var bytes must be deterministic across dispatches
+        # so idempotency checks / cache keys downstream don't churn on dict
+        # iteration order.
+        assert env_map["ATTACHMENT_VERSION_IDS"] == json.dumps(
+            {"lookup.csv": "Vlk", "notes.md": "Vnt"}, sort_keys=True
+        )
+
+    def test_attachment_version_ids_omitted_when_empty(self):
+        """Empty attachment_version_ids dict must NOT produce an env var
+        entry — empty env vars are noise and downstream parsing
+        (RunnerConfig.from_env) special-cases empty strings."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "attachment_version_ids": {},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "ATTACHMENT_VERSION_IDS" not in env_map
+
+    def test_attachment_version_ids_omitted_when_absent(self):
+        """No attachment_version_ids key on the routing dict → no env var.
+        Legacy experiments without attachments must dispatch unchanged."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "ATTACHMENT_VERSION_IDS" not in env_map
+
 
 class TestHandler:
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")

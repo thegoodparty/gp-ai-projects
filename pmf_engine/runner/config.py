@@ -39,19 +39,45 @@ def _redact_userinfo(url: str) -> str:
     return urlunparse(parsed._replace(netloc=netloc))
 
 
-def _is_draft7_object_schema(schema: object) -> bool:
-    """Quick shape check: is this a JSON Schema Draft-07 object schema?
+_COMBINATOR_KEYS = ("oneOf", "anyOf", "allOf")
+_MAX_COMBINATOR_DEPTH = 4
 
-    Without this guard, the legacy GP-shape format (`{"name": "string"}`) would
-    sail through `Draft7Validator` as a no-op — every artifact validates "valid"
-    because the schema declares no constraints. We want to reject those at
-    config load, not silently accept invalid artifacts in production.
+
+def _is_draft7_object_schema(schema: object, _depth: int = 0) -> bool:
+    """Quick shape check: is this a real Draft-07 schema, not the legacy GP shape?
+
+    Accepts:
+      - `{"type": "object", "properties": {...}}` — the common single-shape form.
+      - `{"oneOf": [...]}` / `{"anyOf": [...]}` / `{"allOf": [...]}` where every
+        branch itself satisfies this check — combinator-at-root schemas used to
+        discriminate between artifact variants (e.g. status-keyed shapes in
+        meeting_briefing and meeting_schedule). The recursion makes
+        `{"oneOf": [{}]}` (and other no-op-branch variants) get rejected the
+        same way `{"oneOf": []}` is — a branch of `{}` would let Draft7Validator
+        accept every artifact.
+
+    Rejects:
+      - The legacy GP-shape `{"name": "string", ...}` example-dict format, which
+        Draft7Validator treats as a no-op (every artifact validates).
+      - Empty combinators like `{"oneOf": []}` and no-op-branch combinators like
+        `{"oneOf": [{}]}` — structurally a combinator but declares no
+        constraints, so it's equivalent to the legacy form.
+
+    Defensive depth limit (4) guards against pathological nesting; real
+    manifests stay well under that.
     """
-    return (
-        isinstance(schema, dict)
-        and schema.get("type") == "object"
-        and isinstance(schema.get("properties"), dict)
-    )
+    if _depth > _MAX_COMBINATOR_DEPTH:
+        return False
+    if not isinstance(schema, dict):
+        return False
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        return True
+    for combinator in _COMBINATOR_KEYS:
+        branches = schema.get(combinator)
+        if isinstance(branches, list) and branches:
+            if all(_is_draft7_object_schema(b, _depth + 1) for b in branches):
+                return True
+    return False
 
 
 def validate_broker_url_scheme(broker_url: str, environment: str) -> None:
@@ -98,6 +124,11 @@ class RunnerConfig:
     contract_schema: dict | None = None
     max_turns: int = 50
     timeout_seconds: int = 600
+    # Sidecar files the broker shipped alongside instruction.md. Basename →
+    # UTF-8 body; the runner writes each one to /workspace/<basename> before
+    # spawning the agent. Default-empty so legacy code paths (INSTRUCTION env
+    # override for local-dev runs) work without explicit plumbing.
+    attachments: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> RunnerConfig:
@@ -138,6 +169,7 @@ class RunnerConfig:
         validate_broker_url_scheme(broker_url, environment_raw)
 
         contract_schema = None
+        attachments: dict[str, str] = {}
         if experiment_id:
             # The broker is the only source for manifest+instruction. The
             # broker reads s3://agent-experiment-metadata-{env}/<id>/* and
@@ -152,6 +184,31 @@ class RunnerConfig:
                     "BROKER_URL and BROKER_TOKEN must both be set. "
                     "Local-dev runs must point at scripts/local_runtime.py."
                 )
+            # ATTACHMENT_VERSION_IDS is the per-attachment pinning dict the
+            # dispatch Lambda serialized (sort_keys=True for byte-determinism).
+            # Parsing/validating here means a malformed env value raises early
+            # — before the broker call — rather than producing a confusing
+            # broker-side rejection. Empty/whitespace string is treated the
+            # same as unset, mirroring the MANIFEST_VERSION_ID convention.
+            attachment_version_ids_raw = os.environ.get("ATTACHMENT_VERSION_IDS", "").strip()
+            attachment_version_ids: dict[str, str] | None = None
+            if attachment_version_ids_raw:
+                try:
+                    parsed_avi = json.loads(attachment_version_ids_raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid ATTACHMENT_VERSION_IDS: {exc}"
+                    ) from exc
+                if not isinstance(parsed_avi, dict):
+                    raise ValueError(
+                        f"ATTACHMENT_VERSION_IDS must decode to an object, "
+                        f"got {type(parsed_avi).__name__}"
+                    )
+                # Defend against env-var tampering and narrow types for the
+                # type checker — dispatch is trusted but we cross a process
+                # boundary so this is cheap insurance.
+                attachment_version_ids = {str(k): str(v) for k, v in parsed_avi.items()}
+
             from pmf_engine.runner.manifest_loader import load_from_broker
             envelope = load_from_broker(
                 experiment_id=experiment_id,
@@ -159,17 +216,20 @@ class RunnerConfig:
                 broker_token=broker_token_for_manifest,
                 manifest_version_id=os.environ.get("MANIFEST_VERSION_ID", "").strip() or None,
                 instruction_version_id=os.environ.get("INSTRUCTION_VERSION_ID", "").strip() or None,
+                attachment_version_ids=attachment_version_ids,
             )
             manifest = envelope["manifest"]
             instruction = envelope["instruction"]
+            attachments = dict(envelope.get("attachments") or {})
             model = manifest.get("model", model)
             max_turns = manifest.get("max_turns", max_turns)
             timeout_seconds = manifest.get("timeout_seconds", timeout_seconds)
             contract_schema = manifest.get("output_schema")
             if contract_schema is not None and not _is_draft7_object_schema(contract_schema):
                 raise ValueError(
-                    f"Manifest output_schema is not JSON Schema Draft-07 "
-                    f"(must have type='object' and a properties dict at root); "
+                    f"Manifest output_schema must be a JSON Schema Draft-07 object: "
+                    f"either type='object' with a properties dict, or a non-empty "
+                    f"oneOf/anyOf/allOf with at least one well-formed branch; "
                     f"got {contract_schema!r}"
                 )
 
@@ -196,4 +256,5 @@ class RunnerConfig:
             contract_schema=contract_schema,
             max_turns=max_turns,
             timeout_seconds=timeout_seconds,
+            attachments=attachments,
         )

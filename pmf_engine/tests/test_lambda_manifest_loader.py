@@ -459,6 +459,181 @@ class TestInstructionVersionIdPinning:
 
 
 # ---------------------------------------------------------------------------
+# Attachment VersionId pinning
+#
+# Index entries can declare `attachment_keys: list[str]` pointing at sidecar
+# objects in S3 (e.g. lookup CSVs, reference markdown). To close the publish-
+# during-run race the same way we do for manifest+instruction, Lambda must
+# HEAD each attachment key, capture VersionIds, and forward them via the
+# routing dict so the runner can pin its broker fetch.
+#
+# Symmetric error contract to _fetch_instruction_version_id: a 404 on a
+# single attachment is benign (publish-pipeline bug, runner will discover it
+# when broker fetch fails) and that basename is omitted from the dict; any
+# other ClientError raises ManifestLoaderTransientError so SQS retries and
+# we never silently fall through to "latest" for the published sidecars.
+# ---------------------------------------------------------------------------
+
+
+class TestAttachmentVersionIdPinning:
+    def _index_with_attachments(self, attachment_keys: list[str]):
+        return _index_payload(
+            [
+                {
+                    "id": "smoke_test",
+                    "version": 1,
+                    "mode": "win",
+                    "manifest_key": "smoke_test/manifest.json",
+                    "instruction_key": "smoke_test/instruction.md",
+                    "attachment_keys": attachment_keys,
+                },
+            ]
+        )
+
+    def _s3_with_manifest_and_instruction(self, attachment_keys: list[str]) -> FakeS3:
+        s3 = _fake_s3_with_index(self._index_with_attachments(attachment_keys))
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        # Always make the instruction HEAD succeed so attachment behavior
+        # is isolated from instruction-side variance.
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="instr_v")
+        return s3
+
+    def test_routing_includes_attachment_version_ids_from_head(self):
+        """Happy path: each attachment_key gets HEADed; the resulting
+        VersionIds appear in routing['attachment_version_ids'] keyed by basename."""
+        keys = ["smoke_test/attachments/lookup.csv", "smoke_test/attachments/notes.md"]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        s3.set_object(BUCKET, keys[0], b"k,v\n", version_id="lookup_v_abc")
+        s3.set_object(BUCKET, keys[1], b"# notes", version_id="notes_v_xyz")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["attachment_version_ids"] == {
+            "lookup.csv": "lookup_v_abc",
+            "notes.md": "notes_v_xyz",
+        }
+        # Behavioral: HEAD was actually called against both attachment keys.
+        for k in keys:
+            assert s3.calls_for_key(k) == [("head_object", BUCKET, k)], (
+                f"expected exactly one head_object call for {k}"
+            )
+
+    def test_routing_omits_missing_attachment_but_keeps_others(self):
+        """A single attachment 404 is benign: that basename is omitted, other
+        attachments still get pinned. Mirrors the instruction-absent contract:
+        publish-pipeline bug, runner will surface the missing file at fetch
+        time. Dispatch must NOT raise."""
+        keys = ["smoke_test/attachments/lookup.csv", "smoke_test/attachments/notes.md"]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        # lookup.csv exists; notes.md is missing (404).
+        s3.set_object(BUCKET, keys[0], b"k,v\n", version_id="lookup_v_abc")
+        s3.set_error(BUCKET, keys[1], code="404", op="HeadObject")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["attachment_version_ids"] == {"lookup.csv": "lookup_v_abc"}, (
+            "missing attachment must be omitted from the dict; others must still be pinned"
+        )
+
+    def test_routing_raises_transient_on_attachment_access_denied(self):
+        """AccessDenied on an attachment HEAD means IAM drift — falling back
+        to 'latest' would silently defeat the version-pin guarantee. Must raise
+        Transient so SQS retries."""
+        keys = ["smoke_test/attachments/lookup.csv"]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        s3.set_error(BUCKET, keys[0], code="AccessDenied", op="HeadObject")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        with pytest.raises(ManifestLoaderError) as exc:
+            loader.routing_for("smoke_test")
+
+        assert isinstance(exc.value, ManifestLoaderTransientError), (
+            f"AccessDenied on attachment HEAD must raise Transient, got {type(exc.value).__name__}"
+        )
+
+    def test_routing_raises_transient_on_attachment_service_unavailable(self):
+        """ServiceUnavailable on an attachment HEAD must raise Transient so
+        SQS retries — silently dropping the version pin defeats the system."""
+        keys = ["smoke_test/attachments/lookup.csv"]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        s3.set_error(BUCKET, keys[0], code="ServiceUnavailable", op="HeadObject")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        with pytest.raises(ManifestLoaderError) as exc:
+            loader.routing_for("smoke_test")
+
+        assert isinstance(exc.value, ManifestLoaderTransientError)
+
+    def test_routing_returns_empty_dict_when_no_attachment_keys(self):
+        """A manifest without attachment_keys produces an empty dict, not a
+        missing key — the contract downstream (dispatch_handler) checks
+        truthiness, so empty-vs-missing must not matter."""
+        s3 = _fake_s3_with_index(
+            _index_payload(
+                [
+                    {
+                        "id": "smoke_test",
+                        "version": 1,
+                        "mode": "win",
+                        "manifest_key": "smoke_test/manifest.json",
+                        "instruction_key": "smoke_test/instruction.md",
+                    },
+                ]
+            )
+        )
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="iv")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["attachment_version_ids"] == {}
+
+    def test_routing_for_with_attachment_keys_still_returns_other_routing_fields(self):
+        """Pin: adding attachment handling must not alter the rest of the
+        routing dict shape. model/timeout_seconds/input_schema/scope/
+        manifest_version_id/instruction_version_id keep working."""
+        keys = ["smoke_test/attachments/lookup.csv"]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        s3.set_object(BUCKET, keys[0], b"x", version_id="lv1")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        # Pre-existing fields untouched.
+        assert routing["model"] == "sonnet"
+        assert routing["timeout_seconds"] == 900
+        assert "input_schema" in routing
+        assert "scope" in routing
+        assert "manifest_version_id" in routing
+        assert routing["instruction_version_id"] == "instr_v"
+        # New field present.
+        assert routing["attachment_version_ids"] == {"lookup.csv": "lv1"}
+
+    def test_routing_skips_attachment_key_with_wrong_prefix(self):
+        """Defense-in-depth: an attachment_key not under the experiment's
+        own attachments/ prefix is suspicious (publish-pipeline bug or
+        manual S3 edit). Skip it with a WARN rather than including it under
+        a misleading basename."""
+        keys = [
+            "smoke_test/attachments/good.md",
+            "other_experiment/attachments/leaked.md",  # wrong prefix
+        ]
+        s3 = self._s3_with_manifest_and_instruction(keys)
+        s3.set_object(BUCKET, keys[0], b"ok", version_id="good_v")
+        s3.set_object(BUCKET, keys[1], b"leak", version_id="leak_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["attachment_version_ids"] == {"good.md": "good_v"}, (
+            "wrong-prefix attachment key must be skipped, not exposed under a bare basename"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Scope validation (defense-in-depth on top of publish-time meta-schema)
 # ---------------------------------------------------------------------------
 

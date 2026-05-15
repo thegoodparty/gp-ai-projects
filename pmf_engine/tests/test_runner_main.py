@@ -6,13 +6,43 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pmf_engine.runner.config import RunnerConfig
 from pmf_engine.runner.harness.base import HarnessResult
 from pmf_engine.runner.main import run_experiment, get_harness, main
+
+
+class Clock:
+    """Controllable monotonic-clock fake.
+
+    Replaces the brittle `iter([100.0, 130.0, 130.0, 130.0])` pattern that
+    silently masked drift when a refactor added one more `time.monotonic()`
+    call (StopIteration → fallback default → test still passes for the
+    wrong reason).
+
+    Usage:
+        clock = Clock(start=100.0)
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
+            # tick the clock manually between assertions
+            clock.advance(30.0)
+            ...
+
+    Each `.now()` returns the *current* cursor — no consumption, no
+    StopIteration. The caller controls all advancement explicitly via
+    `.advance(seconds)`.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = start
+
+    def now(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _make_config(**overrides):
@@ -42,8 +72,6 @@ class TestUploadLogsObservability:
     keep the swallow (terminal callback is more important than logs) but
     make it observable.
     """
-
-    import logging as _logging  # class-local to avoid top-of-file churn
 
     def test_upload_logs_failure_warns_with_run_id_experiment_id_and_stacktrace(
         self, tmp_path
@@ -94,12 +122,6 @@ class TestUploadLogsObservability:
         assert "smoke_test" in msg, f"expected experiment_id in log, got: {msg}"
         assert "RuntimeError" in msg, f"expected exc_type in log, got: {msg}"
         assert warns[0].exc_info is not None, "expected exc_info=True so stacktrace is preserved"
-
-
-def test_get_harness_returns_claude_sdk():
-    harness = get_harness("claude_sdk")
-    from pmf_engine.runner.harness.claude_sdk import ClaudeSdkHarness
-    assert isinstance(harness, ClaudeSdkHarness)
 
 
 def test_get_harness_raises_on_unknown():
@@ -200,7 +222,7 @@ async def test_publish_failure_then_report_status_failure_leaves_callback_unsent
     mock_publish.publish.side_effect = Exception("Broker down")
     mock_publish.report_status.side_effect = Exception("Broker still down")
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="Broker down"):
         await run_experiment(config, harness=mock_harness)
 
     assert _is_callback_already_sent() is False, (
@@ -227,6 +249,380 @@ async def test_main_writes_instruction_to_workspace():
             assert f.read() == "# Test Instruction\n\nDo the thing."
 
 
+# ---------------------------------------------------------------------------
+# Attachments — runner writes sidecar files to /workspace/ before agent spawn
+# ---------------------------------------------------------------------------
+#
+# Contract: every entry in config.attachments lands as /workspace/<basename>
+# *before* run_experiment is invoked, so the agent can read it from turn 1.
+# The runner also re-checks the safety constraints the publisher/broker
+# already enforced — defense in depth, because the workspace is a real
+# filesystem.
+
+
+@pytest.mark.asyncio
+async def test_main_writes_attachments_to_workspace_before_running_experiment():
+    """Pin strict ordering: attachments land on disk AFTER from_env returns
+    but BEFORE run_experiment is invoked. Use two snapshot hooks:
+
+      1. from_env side_effect — fires before the workspace-setup section
+         runs. Attachments must NOT yet be on disk.
+      2. run_experiment side_effect — fires after the workspace-setup
+         section finishes. Attachments MUST be on disk.
+
+    The previous version only snapshotted at run_experiment, which couldn't
+    distinguish "writes happen before run" from "writes happen at any point
+    in main()". This catches a regression where attachment writes drift to
+    after run_experiment.start()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="# Hello",
+            attachments={
+                "catalog.md": "# Catalog\n\n- alpha\n- beta\n",
+                "lookup.csv": "k,v\n1,a\n",
+            },
+        )
+
+        files_before_setup: dict[str, str] = {}
+        files_at_run_time: dict[str, str] = {}
+
+        def _snapshot_before_setup():
+            for name in os.listdir(tmpdir):
+                path = os.path.join(tmpdir, name)
+                if os.path.isfile(path):
+                    with open(path) as fh:
+                        files_before_setup[name] = fh.read()
+            return config
+
+        async def _capture_workspace_state(*args, **kwargs):
+            for name in os.listdir(tmpdir):
+                path = os.path.join(tmpdir, name)
+                if os.path.isfile(path):
+                    with open(path) as fh:
+                        files_at_run_time[name] = fh.read()
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=_snapshot_before_setup,
+            ):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch(
+                            "pmf_engine.runner.main.run_experiment",
+                            side_effect=_capture_workspace_state,
+                        ):
+                            await main()
+
+        # BEFORE workspace setup: attachments must NOT be on disk yet.
+        assert "catalog.md" not in files_before_setup, (
+            f"attachments must not exist before from_env returns; got: "
+            f"{list(files_before_setup.keys())!r}"
+        )
+        assert "lookup.csv" not in files_before_setup
+        assert "instruction.md" not in files_before_setup
+
+        # AT run_experiment time: every attachment + instruction.md is on disk.
+        assert files_at_run_time.get("catalog.md") == "# Catalog\n\n- alpha\n- beta\n"
+        assert files_at_run_time.get("lookup.csv") == "k,v\n1,a\n"
+        assert files_at_run_time.get("instruction.md") == "# Hello"
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_reserved_basename_attachment():
+    """The publisher and broker already refuse these, but the runner
+    double-checks at write time. A broker drift that surfaces a reserved
+    basename must crash loudly, not silently clobber instruction.md.
+
+    The runner's main() catches the AttachmentSafetyViolation, reports
+    "failed" with reason_code='AttachmentSafetyViolation' so ops can grep
+    for the distinct cause, then re-raises — so callers see the original
+    exception, not a SystemExit."""
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="legit instruction",
+            attachments={"instruction.md": "MALICIOUS — would clobber instruction"},
+        )
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with pytest.raises(AttachmentSafetyViolation, match="reserved basename"):
+                                await main()
+
+        # The agent must NEVER have been spawned — the bad attachment is a
+        # routing-level bug, not something the agent can recover from.
+        mock_run.assert_not_called()
+        # The legit instruction.md write happened before the attachment
+        # write, so the file exists with the *legitimate* content — never
+        # the attempted clobber.
+        with open(os.path.join(tmpdir, "instruction.md")) as fh:
+            content = fh.read()
+        assert content == "legit instruction"
+        # And the runner must have reported failure with the distinct
+        # error type so the run doesn't hang in PENDING and ops can grep
+        # CloudWatch for AttachmentSafetyViolation specifically.
+        mock_publish.report_status.assert_called()
+        failed_call = mock_publish.report_status.call_args
+        assert failed_call[0][0] == "failed"
+        assert failed_call[1]["reason_code"] == "AttachmentSafetyViolation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_name", [
+    "../escape.md",        # parent-dir traversal
+    "/abs/path.md",        # absolute path
+    "nested/file.md",      # nested subdir (not a basename)
+])
+async def test_main_rejects_unsafe_attachment_basenames(unsafe_name):
+    """Path-safety belt-and-suspenders: the runner refuses any attachment
+    name that isn't a clean basename, even if the broker somehow forwards
+    one. Without this guard, a malformed broker response could write
+    outside /workspace/ entirely.
+
+    Pin reason_code='AttachmentSafetyViolation' so the unsafe-basename and
+    reserved-basename branches share the same greppable error type but
+    distinct error messages."""
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="legit",
+            attachments={unsafe_name: "would-escape-or-nest"},
+        )
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with pytest.raises(AttachmentSafetyViolation, match="unsafe basename"):
+                                await main()
+
+        mock_run.assert_not_called()
+        failed_calls = [
+            c for c in mock_publish.report_status.call_args_list
+            if c[0][0] == "failed"
+        ]
+        assert failed_calls
+        assert failed_calls[-1].kwargs.get("reason_code") == "AttachmentSafetyViolation"
+
+
+@pytest.mark.asyncio
+async def test_main_writes_attachments_with_utf8_encoding(tmp_path):
+    """Attachments may contain non-ASCII content (em-dashes, CJK, smart quotes).
+    The runner must explicitly write UTF-8 — otherwise on a locale-C container
+    the default `open()` encoding is ASCII and non-ASCII bodies crash mid-write,
+    leaving a partial file.
+    """
+    body = "Hello—world. 你好.\n"  # em-dash + "hello" in Chinese
+    config = _make_config(
+        instruction="# Hello",
+        attachments={"unicode.md": body},
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish"):
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                        await main()
+
+    written_path = tmp_path / "unicode.md"
+    on_disk_bytes = written_path.read_bytes()
+    # Exact UTF-8 byte sequence — proves no locale fallback happened.
+    assert on_disk_bytes == body.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_main_attachment_write_uses_exclusive_create(tmp_path):
+    """`open(..., "w")` silently truncates. `open(..., "x")` raises
+    FileExistsError on collision — a non-reserved-but-already-present file
+    must NOT be clobbered, even though the reserved-name set blocks the
+    obvious cases. Defense in depth for any file the runner/harness writes
+    that isn't in the reserved set."""
+    # Pre-create a file at the target attachment path with old content.
+    target = tmp_path / "preexisting.txt"
+    target.write_text("ORIGINAL — must not be clobbered")
+
+    config = _make_config(
+        instruction="# Hello",
+        attachments={"preexisting.txt": "new contents"},
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        with pytest.raises((FileExistsError, RuntimeError)):
+                            await main()
+
+    # File contents must be unchanged — the exclusive-create open raised
+    # *before* writing.
+    assert target.read_text() == "ORIGINAL — must not be clobbered"
+    # Agent must NOT have been spawned.
+    mock_run.assert_not_called()
+    # Runner must have surfaced a failed callback so the run doesn't hang
+    # PENDING in gp-api.
+    mock_publish.report_status.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_attachment_safety_violation_log_includes_error_type(tmp_path):
+    """When the runner rejects a reserved-name attachment, it must emit a
+    structured log with errorType=reserved_basename so ops can grep
+    CloudWatch for the specific cause without parsing free-form messages."""
+    import logging
+    import pmf_engine.runner.main as _main_mod
+
+    config = _make_config(
+        instruction="legit",
+        attachments={"instruction.md": "would clobber"},
+    )
+
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.ERROR)
+    _main_mod.logger.addHandler(handler)
+    try:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                            with pytest.raises(AttachmentSafetyViolation):
+                                await main()
+    finally:
+        _main_mod.logger.removeHandler(handler)
+
+    msgs = [r.getMessage() for r in captured]
+    joined = "\n".join(msgs)
+    assert "errorType=reserved_basename" in joined, (
+        f"expected structured log with errorType=reserved_basename; got: {msgs!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_partial_attachment_write_failure_does_not_invoke_run_experiment(tmp_path):
+    """If attachment N raises mid-loop, partial writes from N-1 and earlier
+    stay on disk (current behavior — workspace state is undefined). The
+    contract worth pinning: run_experiment must NOT be invoked and the
+    runner must report 'failed' with the safety-violation reason code.
+    """
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    config = _make_config(
+        instruction="instruction",
+        attachments={
+            "first.md": "first body",
+            "instruction.md": "RESERVED — must raise",
+            "third.md": "third body",
+        },
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        with pytest.raises(AttachmentSafetyViolation):
+                            await main()
+
+    # run_experiment never invoked.
+    mock_run.assert_not_called()
+
+    # report_status('failed') called with the new error class.
+    failed_calls = [
+        c for c in mock_publish.report_status.call_args_list
+        if c[0][0] == "failed"
+    ]
+    assert failed_calls, "expected a failed callback"
+    assert any(
+        c.kwargs.get("reason_code") == "AttachmentSafetyViolation"
+        for c in failed_calls
+    ), (
+        f"expected reason_code='AttachmentSafetyViolation'; got: "
+        f"{[c.kwargs.get('reason_code') for c in failed_calls]!r}"
+    )
+
+    # Document current partial-write behavior — first.md on disk, instruction.md
+    # is the legit one (written before the attachment loop ran), third.md
+    # never reached the disk. If a future "clean up on failure" change lands,
+    # this assertion forces a deliberate update.
+    assert (tmp_path / "first.md").exists()
+    assert (tmp_path / "instruction.md").read_text() == "instruction"
+    assert not (tmp_path / "third.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_main_works_with_runner_config_default_attachments(tmp_path):
+    """Integration pin for D13: when RunnerConfig is constructed without
+    attachments=... (the default factory produces an empty dict), main.py's
+    attachment-write loop must iterate cleanly — no AttributeError on None,
+    no extra files created, run_experiment still spawned. This catches
+    regressions where the default factory is removed without auditing the
+    callsite."""
+    # Construct WITHOUT attachments kwarg — exercises default_factory.
+    config = RunnerConfig(
+        experiment_id="hello_world",
+        run_id="run-default-attachments",
+        organization_slug="org-x",
+        instruction="# Hi",
+        broker_url="https://broker.test",
+        broker_token="tok",
+    )
+    # Sanity: the default factory produced an empty dict, not None.
+    assert config.attachments == {}
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish"):
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        await main()
+
+    mock_run.assert_called_once()
+    # Only instruction.md present — no spurious attachment files.
+    assert (tmp_path / "instruction.md").exists()
+    extra_files = [
+        p.name for p in tmp_path.iterdir()
+        if p.is_file() and p.name != "instruction.md"
+    ]
+    assert extra_files == [], (
+        f"default-attachments path must not create extra files; got: {extra_files!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_handles_empty_attachments_dict():
+    """The common case (experiment publishes no sidecars) must not regress.
+    Empty attachments dict → instruction.md written, run_experiment called,
+    no errors."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(instruction="just instruction", attachments={})
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            await main()
+
+        mock_run.assert_called_once()
+        assert os.path.exists(os.path.join(tmpdir, "instruction.md"))
+
+
 @pytest.mark.asyncio
 async def test_main_sends_failed_status_on_timeout():
     config = _make_config(instruction="Do stuff", timeout_seconds=1)
@@ -247,6 +643,10 @@ async def test_main_sends_failed_status_on_timeout():
     statuses = [c[0][0] for c in status_calls]
     assert "failed" in statuses
     failed_call = next(c for c in status_calls if c[0][0] == "failed")
+    # Primary contract: reason_code is the stable greppable field operators
+    # alert on. The free-form detail string is a secondary, human-readable
+    # signal.
+    assert failed_call[1]["reason_code"] == "Timeout"
     assert "timed out" in failed_call[1]["detail"]
 
 
@@ -954,7 +1354,7 @@ class TestCallbackLifecycleFix:
                         with patch("pmf_engine.runner.main.publish", mock_pub):
                             with patch("pmf_engine.runner.main.get_harness", return_value=mock_harness):
                                 with patch("pmf_engine.runner.main._upload_logs"):
-                                    with pytest.raises(Exception):
+                                    with pytest.raises(Exception, match="Broker down"):
                                         await main()
 
         assert statuses_reported.count("failed") == 1, (
@@ -975,18 +1375,17 @@ class TestFailureCallbacksCarryDurationAndCost:
     @patch("pmf_engine.runner.main.publish")
     async def test_harness_failure_reports_duration_seconds(self, mock_publish, _mock_logs):
         config = _make_config()
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            # The agent ran for 30s before crashing.
+            clock.advance(30.0)
+            raise RuntimeError("Agent crashed")
+
         mock_harness = AsyncMock()
-        mock_harness.run.side_effect = RuntimeError("Agent crashed")
+        mock_harness.run.side_effect = harness_run_advances_clock
 
-        monotonic_values = iter([100.0, 130.0, 130.0, 130.0])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 130.0
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             with pytest.raises(RuntimeError, match="Agent crashed"):
                 await run_experiment(config, harness=mock_harness)
 
@@ -1006,18 +1405,16 @@ class TestFailureCallbacksCarryDurationAndCost:
             cost_usd=0.13,
             num_turns=2,
         )
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            clock.advance(42.5)
+            return fake_result
+
         mock_harness = AsyncMock()
-        mock_harness.run.return_value = fake_result
+        mock_harness.run.side_effect = harness_run_advances_clock
 
-        monotonic_values = iter([100.0, 142.5, 142.5, 142.5])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 142.5
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             await run_experiment(config, harness=mock_harness)
 
         mock_publish.report_status.assert_called_once()
@@ -1037,19 +1434,17 @@ class TestFailureCallbacksCarryDurationAndCost:
             cost_usd=0.21,
             num_turns=1,
         )
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            clock.advance(15.0)
+            return fake_result
+
         mock_harness = AsyncMock()
-        mock_harness.run.return_value = fake_result
+        mock_harness.run.side_effect = harness_run_advances_clock
         mock_publish.publish.side_effect = Exception("Broker down")
 
-        monotonic_values = iter([100.0, 115.0, 115.0, 115.0])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 115.0
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             with pytest.raises(Exception, match="Broker down"):
                 await run_experiment(config, harness=mock_harness)
 
