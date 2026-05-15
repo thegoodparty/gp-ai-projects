@@ -125,6 +125,92 @@ def test_from_env_rejects_non_draft7_output_schema(monkeypatch):
             RunnerConfig.from_env()
 
 
+@pytest.mark.parametrize("combinator", ["oneOf", "anyOf", "allOf"])
+def test_from_env_accepts_combinator_at_root_output_schema(monkeypatch, combinator):
+    """Schemas using oneOf/anyOf/allOf at the root (e.g. status-discriminated
+    artifact shapes like meeting_briefing and meeting_schedule) are real
+    Draft-07 schemas and must be accepted. They have no top-level
+    `type: 'object'` or `properties` dict — that's the whole point of the
+    combinator pattern. Only the legacy GP-shape dict should be rejected."""
+    manifest = synthetic_manifest()
+    combinator_schema = {
+        "title": "TestCombinatorSchema",
+        combinator: [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string", "const": "ok"},
+                    "data": {"type": "string"},
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string", "const": "error"},
+                    "error": {"type": "string"},
+                },
+            },
+        ],
+    }
+    envelope = {
+        "manifest": {
+            "model": manifest["model"],
+            "max_turns": manifest["max_turns"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "output_schema": combinator_schema,
+        },
+        "instruction": synthetic_instruction(),
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", f"run-{combinator}-schema")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.contract_schema == combinator_schema
+
+
+def test_from_env_rejects_empty_combinator_output_schema(monkeypatch):
+    """`{"oneOf": []}` is structurally a combinator but declares no constraints
+    — every artifact validates. Reject as a legacy-shape-equivalent."""
+    manifest = synthetic_manifest()
+    envelope = {
+        "manifest": {
+            "model": manifest["model"],
+            "max_turns": manifest["max_turns"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "output_schema": {"oneOf": []},
+        },
+        "instruction": synthetic_instruction(),
+    }
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-empty-oneof")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "test")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        with pytest.raises(ValueError, match="output_schema"):
+            RunnerConfig.from_env()
+
+
 def test_from_env_raises_loud_on_invalid_json_params(monkeypatch):
     """Corrupted PARAMS_JSON must fail loud — a silent default to {} causes
     the agent to run on empty inputs and produce plausible but wrong artifacts

@@ -40,18 +40,30 @@ def _redact_userinfo(url: str) -> str:
 
 
 def _is_draft7_object_schema(schema: object) -> bool:
-    """Quick shape check: is this a JSON Schema Draft-07 object schema?
+    """Quick shape check: is this a real Draft-07 schema, not the legacy GP shape?
 
-    Without this guard, the legacy GP-shape format (`{"name": "string"}`) would
-    sail through `Draft7Validator` as a no-op — every artifact validates "valid"
-    because the schema declares no constraints. We want to reject those at
-    config load, not silently accept invalid artifacts in production.
+    Accepts:
+      - `{"type": "object", "properties": {...}}` — the common single-shape form.
+      - `{"oneOf": [...]}` / `{"anyOf": [...]}` / `{"allOf": [...]}` with at
+        least one branch — combinator-at-root schemas used to discriminate
+        between artifact variants (e.g. status-keyed shapes in meeting_briefing
+        and meeting_schedule).
+
+    Rejects:
+      - The legacy GP-shape `{"name": "string", ...}` example-dict format, which
+        Draft7Validator treats as a no-op (every artifact validates).
+      - Empty combinators like `{"oneOf": []}` — structurally a combinator but
+        declares no constraints, so it's equivalent to the legacy form.
     """
-    return (
-        isinstance(schema, dict)
-        and schema.get("type") == "object"
-        and isinstance(schema.get("properties"), dict)
-    )
+    if not isinstance(schema, dict):
+        return False
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        return True
+    for combinator in ("oneOf", "anyOf", "allOf"):
+        branches = schema.get(combinator)
+        if isinstance(branches, list) and branches:
+            return True
+    return False
 
 
 def validate_broker_url_scheme(broker_url: str, environment: str) -> None:
