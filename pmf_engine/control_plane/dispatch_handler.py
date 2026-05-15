@@ -328,7 +328,7 @@ def parse_dispatch_message(body: str) -> dict:
     except (json.JSONDecodeError, TypeError) as e:
         raise ValueError(f"Invalid message body: {e}")
 
-    for field in ("experiment_type", "organization_slug", "run_id", "clerk_user_id"):
+    for field in ("experiment_type", "organization_slug", "run_id"):
         if not data.get(field):
             raise ValueError(f"Missing required field: {field}")
 
@@ -338,8 +338,11 @@ def parse_dispatch_message(body: str) -> dict:
         raise ValueError("run_id must match [a-zA-Z0-9_-]{1,64}")
     if not isinstance(data["organization_slug"], str) or not _IDENTIFIER_RE.match(data["organization_slug"]):
         raise ValueError("organization_slug must match [a-zA-Z0-9_-]{1,64}")
-    if not isinstance(data["clerk_user_id"], str):
-        raise ValueError("clerk_user_id must be a string")
+    # clerk_user_id is optional. When omitted, broker mint skips the Clerk
+    # actor-token round trip and the ticket has clerk_session_id=None.
+    # Experiments that hit /agent-mcp will be 4xx'd by that route's guard.
+    if "clerk_user_id" in data and data["clerk_user_id"] is not None and not isinstance(data["clerk_user_id"], str):
+        raise ValueError("clerk_user_id must be a string when provided")
 
     if data.get("params") is None:
         data["params"] = {}
@@ -539,7 +542,7 @@ def handler(event: dict, context) -> dict:
                 experiment_id=experiment_id,
                 scope=scope,
                 params=message["params"],
-                clerk_user_id=message["clerk_user_id"],
+                clerk_user_id=message.get("clerk_user_id"),
                 exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
                 prior_artifact_versions=prior_artifact_versions,
             )
