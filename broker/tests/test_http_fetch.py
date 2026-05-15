@@ -1,4 +1,6 @@
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -31,6 +33,49 @@ def _make_ticket() -> ScopeTicket:
     )
 
 
+def _page_result(
+    body: bytes,
+    *,
+    status: int = 200,
+    content_type: str = "application/json",
+    final_url: str = "https://example.com/",
+) -> BrowserFetchResult:
+    return BrowserFetchResult(
+        status=status,
+        content_type=content_type,
+        final_url=final_url,
+        byte_size=len(body),
+        body=body,
+        body_path=None,
+    )
+
+
+def _download_result(
+    payload: bytes,
+    *,
+    status: int = 200,
+    content_type: str = "application/pdf",
+    final_url: str = "https://example.com/file.pdf",
+) -> tuple[BrowserFetchResult, str]:
+    """Write payload to a temp file and return (result, path) — caller must
+    unlink path AFTER the response is consumed (the endpoint normally does this
+    via BackgroundTask, but tests need explicit cleanup)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+    tmp.write(payload)
+    tmp.close()
+    return (
+        BrowserFetchResult(
+            status=status,
+            content_type=content_type,
+            final_url=final_url,
+            byte_size=len(payload),
+            body=None,
+            body_path=tmp.name,
+        ),
+        tmp.name,
+    )
+
+
 @dataclass
 class _FakeFetcher:
     result: BrowserFetchResult | None = None
@@ -51,10 +96,8 @@ def _create_app(fetcher: _FakeFetcher | None = None) -> FastAPI:
     app.dependency_overrides[get_scope_ticket] = _make_ticket
     if fetcher is None:
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/json",
-                body=b'[{"EventId": 1, "EventBodyName": "City Council"}]',
+            result=_page_result(
+                b'[{"EventId": 1, "EventBodyName": "City Council"}]',
                 final_url="https://hendersonville-nc.municodemeetings.com/",
             )
         )
@@ -63,11 +106,6 @@ def _create_app(fetcher: _FakeFetcher | None = None) -> FastAPI:
 
 
 class TestPublicDomainsAllowed:
-    """No domain allowlist — runner has no egress, response flows to a sandboxed
-    runner, and URL-based exfil via WebFetch already exists, so restricting by
-    domain would not close any risk class. SSRF to private IPs IS blocked
-    (see TestSSRFGuards below)."""
-
     def test_accepts_any_public_com_domain(self):
         client = TestClient(_create_app())
         resp = client.post(
@@ -79,10 +117,8 @@ class TestPublicDomainsAllowed:
 
     def test_accepts_gov_domain(self):
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/json",
-                body=b'{"records": []}',
+            result=_page_result(
+                b'{"records": []}',
                 final_url="https://linc.osbm.nc.gov/api/records",
             )
         )
@@ -96,15 +132,6 @@ class TestPublicDomainsAllowed:
 
 
 class TestSSRFGuards:
-    """Block SSRF into private / metadata / loopback IPs.
-
-    Post-Playwright migration: intra-fetch redirect SSRF is enforced inside
-    PlaywrightBrowserFetcher's route handler (see test_browser_fetcher). The
-    endpoint pre-validates the input URL and post-validates the final URL the
-    fetcher returns — both defense-in-depth even if the route handler also
-    aborted in flight.
-    """
-
     def test_rejects_rfc1918_private_ips(self):
         client = TestClient(_create_app())
         for url in [
@@ -158,17 +185,8 @@ class TestSSRFGuards:
             assert resp.status_code == 400, f"expected 400 for {url}"
 
     def test_rejects_when_browser_lands_on_private_ip(self):
-        """If the browser's final URL resolves to a private IP (post-redirect),
-        the endpoint must reject the response before returning the body. This
-        is the second SSRF gate, after the input-URL check and the route
-        handler's per-request abort."""
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/json",
-                body=b"{}",
-                final_url="https://10.0.0.5/internal",
-            )
+            result=_page_result(b"{}", final_url="https://10.0.0.5/internal"),
         )
         client = TestClient(_create_app(fetcher))
         resp = client.post(
@@ -180,18 +198,10 @@ class TestSSRFGuards:
 
 
 class TestResponseShape:
-    """Unified route streams raw upstream bytes back to the caller. No JSON
-    wrapping — body is the body, metadata rides on response headers."""
-
     def test_returns_raw_body_as_response_body(self):
         body = b'{"hello": "world"}'
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/json",
-                body=body,
-                final_url="https://example.com/final",
-            )
+            result=_page_result(body, final_url="https://example.com/final"),
         )
         client = TestClient(_create_app(fetcher))
         resp = client.post(
@@ -206,61 +216,64 @@ class TestResponseShape:
         assert resp.headers["x-byte-size"] == str(len(body))
         assert resp.headers["x-upstream-status"] == "200"
 
-    def test_returns_pdf_bytes_passthrough(self):
-        """Bug fix: previously /pdf/fetch hardcoded content-type=application/pdf
-        for downloads. Unified route must pass through whatever the fetcher
-        captured from the upstream response listener."""
+    def test_returns_pdf_bytes_passthrough_from_download_path(self):
+        """Download path streams bytes from disk."""
         pdf_bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>"
-        fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/pdf",
-                body=pdf_bytes,
-                final_url="https://legistar.granicus.com/x.pdf",
+        result, tmp_path = _download_result(
+            pdf_bytes,
+            content_type="application/pdf",
+            final_url="https://legistar.granicus.com/x.pdf",
+        )
+        try:
+            fetcher = _FakeFetcher(result=result)
+            client = TestClient(_create_app(fetcher))
+            resp = client.post(
+                "/http/fetch",
+                json={"url": "https://legistar.granicus.com/x.pdf"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
             )
-        )
-        client = TestClient(_create_app(fetcher))
-        resp = client.post(
-            "/http/fetch",
-            json={"url": "https://legistar.granicus.com/x.pdf"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert resp.status_code == 200
-        assert resp.content == pdf_bytes
-        assert resp.headers["content-type"] == "application/pdf"
-        assert resp.headers["x-source-url"] == "https://legistar.granicus.com/x.pdf"
-        assert resp.headers["x-byte-size"] == str(len(pdf_bytes))
+            assert resp.status_code == 200
+            assert resp.content == pdf_bytes
+            assert resp.headers["content-type"] == "application/pdf"
+            assert resp.headers["x-source-url"] == "https://legistar.granicus.com/x.pdf"
+            assert resp.headers["x-byte-size"] == str(len(pdf_bytes))
+            # BackgroundTask should have unlinked the temp file after response.
+            assert not os.path.exists(tmp_path), (
+                "download temp file must be unlinked via BackgroundTask after the response is sent"
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def test_returns_docx_content_type_passthrough(self):
-        """When upstream serves a DOCX download, the unified route must
-        preserve the real content-type — not mislabel it as application/pdf
-        like the old /pdf/fetch did."""
         docx_bytes = b"PK\x03\x04\x14\x00\x06\x00\x08\x00\x00\x00fake docx zip body"
         docx_ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type=docx_ct,
-                body=docx_bytes,
-                final_url="https://example.com/agenda.docx",
+        result, tmp_path = _download_result(
+            docx_bytes,
+            content_type=docx_ct,
+            final_url="https://example.com/agenda.docx",
+        )
+        try:
+            fetcher = _FakeFetcher(result=result)
+            client = TestClient(_create_app(fetcher))
+            resp = client.post(
+                "/http/fetch",
+                json={"url": "https://example.com/agenda.docx"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
             )
-        )
-        client = TestClient(_create_app(fetcher))
-        resp = client.post(
-            "/http/fetch",
-            json={"url": "https://example.com/agenda.docx"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert resp.status_code == 200
-        assert resp.content == docx_bytes
-        assert resp.headers["content-type"] == docx_ct
+            assert resp.status_code == 200
+            assert resp.content == docx_bytes
+            assert resp.headers["content-type"] == docx_ct
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def test_upstream_status_propagates_to_header(self):
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
+            result=_page_result(
+                b"<html>not found</html>",
                 status=404,
                 content_type="text/html",
-                body=b"<html>not found</html>",
                 final_url="https://example.com/missing",
             )
         )
@@ -270,21 +283,18 @@ class TestResponseShape:
             json={"url": "https://example.com/missing"},
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
-        # endpoint always returns 200 on successful fetch — upstream status is in header
         assert resp.status_code == 200
         assert resp.headers["x-upstream-status"] == "404"
 
 
 class TestSizeCap:
-    def test_body_over_250mb_rejected(self):
-        oversized = b"x" * (250 * 1024 * 1024 + 1)
+    """The fetcher enforces size caps internally (download MAX_BYTES,
+    page-response PAGE_RESPONSE_MAX_BYTES). The endpoint just propagates
+    a 413 if the fetcher raises one."""
+
+    def test_413_from_fetcher_propagates(self):
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="text/plain",
-                body=oversized,
-                final_url="https://example.com/big",
-            )
+            raise_exc=HTTPException(status_code=413, detail="response exceeded 250 MB"),
         )
         client = TestClient(_create_app(fetcher))
         resp = client.post(
@@ -293,24 +303,6 @@ class TestSizeCap:
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
         assert resp.status_code == 413
-
-    def test_body_at_250mb_accepted(self):
-        max_body = b"x" * (250 * 1024 * 1024)
-        fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="application/octet-stream",
-                body=max_body,
-                final_url="https://example.com/edge",
-            )
-        )
-        client = TestClient(_create_app(fetcher))
-        resp = client.post(
-            "/http/fetch",
-            json={"url": "https://example.com/edge"},
-            headers={"X-Broker-Token": BROKER_TOKEN},
-        )
-        assert resp.status_code == 200
 
 
 class TestUpstreamFailure:
@@ -342,9 +334,6 @@ class TestAuth:
 
 
 class TestFailureLogging:
-    """On-call must be able to grep CloudWatch for 'http_fetch failed' to see
-    every 4xx/5xx the endpoint emits."""
-
     def test_ssrf_rejection_emits_warning(self, caplog):
         caplog.set_level(logging.WARNING, logger="broker.endpoints.http_fetch")
         client = TestClient(_create_app())
@@ -386,14 +375,8 @@ class TestFailureLogging:
 
     def test_oversized_response_emits_warning(self, caplog):
         caplog.set_level(logging.WARNING, logger="broker.endpoints.http_fetch")
-        oversized = b"x" * (250 * 1024 * 1024 + 1)
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
-                content_type="text/plain",
-                body=oversized,
-                final_url="https://example.com/big",
-            )
+            raise_exc=HTTPException(status_code=413, detail="response exceeded 250 MB"),
         )
         client = TestClient(_create_app(fetcher))
         resp = client.post(
@@ -411,15 +394,11 @@ class TestFailureLogging:
 
 
 class TestFetcherCallShape:
-    """The unified fetcher protocol drops capture_download. Endpoint must
-    call fetch(url) with no extra kwargs."""
-
     def test_calls_fetcher_with_url_only(self):
         fetcher = _FakeFetcher(
-            result=BrowserFetchResult(
-                status=200,
+            result=_page_result(
+                b"<html></html>",
                 content_type="text/html",
-                body=b"<html></html>",
                 final_url="https://example.com/",
             )
         )
@@ -431,3 +410,44 @@ class TestFetcherCallShape:
         )
         assert resp.status_code == 200
         assert fetcher.calls == ["https://example.com/"]
+
+
+class TestDownloadStreaming:
+    """Download path streams from disk and cleans up the temp file."""
+
+    def test_download_temp_file_is_unlinked_after_response(self):
+        payload = b"chunk-streamed-payload" * 100
+        result, tmp_path = _download_result(payload, content_type="application/pdf")
+        try:
+            fetcher = _FakeFetcher(result=result)
+            client = TestClient(_create_app(fetcher))
+            resp = client.post(
+                "/http/fetch",
+                json={"url": "https://example.com/x.pdf"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+            assert resp.status_code == 200
+            assert resp.content == payload
+            assert not os.path.exists(tmp_path), (
+                "BackgroundTask must unlink the temp file after the response is fully sent"
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_download_byte_size_header_matches_file_size(self):
+        payload = b"a" * 1024  # 1 KB — well under 50 MB test limit
+        result, tmp_path = _download_result(payload, content_type="application/pdf")
+        try:
+            fetcher = _FakeFetcher(result=result)
+            client = TestClient(_create_app(fetcher))
+            resp = client.post(
+                "/http/fetch",
+                json={"url": "https://example.com/x.pdf"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+            assert resp.status_code == 200
+            assert resp.headers["x-byte-size"] == str(len(payload))
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)

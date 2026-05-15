@@ -216,12 +216,13 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[agent_mcp_get_gp_api_base_url] = lambda: secrets.gp_api_base_url
     app.dependency_overrides[agent_mcp_get_http_client] = lambda: http_client
 
-    yield
-
-    await upstream_client.aclose()
-    await http_client.aclose()
-    await clerk_client.aclose()
-    await browser_fetcher.aclose()
+    try:
+        yield
+    finally:
+        await upstream_client.aclose()
+        await http_client.aclose()
+        await clerk_client.aclose()
+        await browser_fetcher.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
