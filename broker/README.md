@@ -9,7 +9,7 @@ Agent-traffic proxy. Sits between autonomous agents (Claude Agent SDK running on
 
 The broker is **agnostic to the consumer's domain**. It sees two identifiers in a scope ticket:
 
-- `experiment_id` — consumer's run-type-id. PMF engine uses `"voter_targeting"`, `"walking_plan"`, etc.; a different consumer (engineer_agent, future services) would use whatever run-type namespace fits.
+- `experiment_id` — consumer's run-type-id. e.g. PMF engine experiments use the `experiment_id` from their manifest; a different consumer (engineer_agent, future services) would use whatever run-type namespace fits.
 - `organization_slug` — consumer's scope-owner-id. PMF engine uses an organization slug; a different consumer might use a workspace ID, a user ID, a ticket ID. The broker stores it as an opaque string for S3 key partitioning and access scoping.
 
 Neither field carries meaning to the broker. Consumers are free to use any string space; the broker only enforces uniqueness-within-ticket and URL-safety of the characters.
@@ -17,7 +17,7 @@ Neither field carries meaning to the broker. Consumers are free to use any strin
 ## Consumers
 
 - `pmf_engine/control_plane/broker_client.py` — PMF engine's dispatch Lambda mints run tokens via `POST /internal/mint-run-token`.
-- `pmf_engine/runner/pmf_runtime/` — PMF engine's Fargate runner calls `/artifact/publish`, `/artifact/read`, `/anthropic`, `/databricks/query`, `/http/fetch`, `/pdf/fetch`, `/run-status`, `/internal/upload-logs`.
+- `pmf_engine/runner/pmf_runtime/` — PMF engine's Fargate runner calls `/artifact/publish`, `/artifact/read`, `/anthropic`, `/databricks/query`, `/http/fetch`, `/run-status`, `/internal/upload-logs`.
 - Future: `engineer_agent` (currently calls Anthropic directly; migration planned).
 
 ## HTTP interface

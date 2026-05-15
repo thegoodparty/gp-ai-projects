@@ -48,13 +48,11 @@ Status: `[x]` = has test, `[ ]` = needs test.
 
 ## E. gp-api: Dependency Resolution
 
-| # | Condition | Status |
-|---|-----------|--------|
-| E1 | peer_city_benchmarking: no SUCCESS district_intel → 400 | [x] |
-| E2 | peer_city_benchmarking: SUCCESS district_intel → passes artifact ref | [x] |
-| E3 | meeting_briefing: no district_intel → dispatches without it (optional) | [x] |
-| E4 | meeting_briefing: SUCCESS district_intel → passes artifact ref | [x] |
-| E5 | district_intel dispatch → marks peer_city + meeting_briefing as STALE | [x] |
+Per-experiment dependency rules (e.g. one experiment depending on another's
+SUCCESS run, STALE invalidation when a producer is regenerated) live in
+gp-api and are exercised in gp-api tests. The PMF engine itself is
+dependency-agnostic — it accepts a `prior_artifact_versions` map on the
+dispatch message and treats it as opaque pinning data.
 
 ## F. gp-api: SQS Dispatch
 
@@ -139,11 +137,11 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | K8 | Array item missing field → ContractViolation | [x] |
 | K9 | None/empty schema → skip validation | [x] |
 | K10 | Extra fields allowed (not rejected) | [x] |
-| K11 | Per-experiment schema: voter_targeting valid artifact | [x] |
-| K12 | Per-experiment schema: walking_plan valid artifact | [x] |
-| K13 | Per-experiment schema: district_intel valid/invalid | [x] |
-| K14 | Per-experiment schema: peer_city_benchmarking valid/invalid | [x] |
-| K15 | Per-experiment schema: meeting_briefing valid/invalid | [x] |
+
+Per-experiment schema validation (one row per real experiment) lives in the
+runbooks repo, not here — the PMF engine validates whatever schema it's
+handed, and the synthetic schema in `conftest.py` is enough to exercise
+that validator behavior.
 
 ## L. Lambda Callback Handler (Fargate → gp-api)
 
@@ -233,6 +231,56 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | R3 | Status values match Zod enum (success, failed, contract_violation) | [x] |
 | R4 | Optional fields (artifactKey, artifactBucket, durationSeconds, error) pass Zod | [x] |
 
+## S. Publisher attachments contract (NEW)
+
+| # | Condition | Status | Test |
+|---|-----------|--------|------|
+| S1 | Reject symlinks under attachments/ (security) | [x] | test_publisher (publisher suite) |
+| S2 | Reject binary attachments (UTF-8 only) | [x] | test_publisher (publisher suite) |
+| S3 | Reject files exceeding 5 MB total cap (with size pre-check) | [x] | test_publisher (publisher suite) |
+| S4 | Reject reserved basenames (clobber instruction.md etc.) | [x] | test_publisher (publisher suite) |
+| S5 | Reject nested subdirs | [x] | test_publisher (publisher suite) |
+| S6 | Reject "output/" prefix (independent of nested rule) | [x] | test_publisher (publisher suite) |
+| S7 | Empty attachments dir no-op | [x] | test_publisher (publisher suite) |
+| S8 | Hash includes attachment bodies in sorted order | [x] | test_publisher (publisher suite) |
+| S9 | Removed attachment drops from index_keys | [x] | test_publisher (publisher suite) |
+
+## T. Broker attachments fetch (NEW)
+
+| # | Condition | Status | Test |
+|---|-----------|--------|------|
+| T1 | attachment_keys in index → fetched and returned by basename | [x] | test_broker (broker suite) |
+| T2 | No attachment_keys → empty attachments dict (not absent) | [x] | test_broker (broker suite) |
+| T3 | Wrong-prefix attachment_keys skipped + drift metric | [x] | test_broker (broker suite) |
+| T4 | Non-string attachment_keys entry skipped + drift metric | [x] | test_broker (broker suite) |
+| T5 | Non-list attachment_keys value handled | [x] | test_broker (broker suite) |
+| T6 | Unsafe basename (whitespace, control chars) skipped + drift metric | [x] | test_broker (broker suite) |
+| T7 | Per-object size cap (502 when exceeded) | [x] | test_broker (broker suite) |
+| T8 | Per-experiment count cap (truncates + metric) | [x] | test_broker (broker suite) |
+| T9 | attachment_version_ids forwarded to S3 GetObject as VersionId | [x] | test_broker (broker suite) |
+| T10 | resolved_attachment_version_ids surfaced in response | [x] | test_broker (broker suite) |
+
+## U. Runner attachment writes (NEW)
+
+| # | Condition | Status | Test |
+|---|-----------|--------|------|
+| U1 | Attachments written before run_experiment is invoked (ordering) | [x] | test_main_writes_attachments_to_workspace_before_running_experiment |
+| U2 | Reserved basename raises AttachmentSafetyViolation | [x] | test_main_rejects_reserved_basename_attachment |
+| U3 | Unsafe basename (path traversal/absolute/nested) raises AttachmentSafetyViolation | [x] | test_main_rejects_unsafe_attachment_basenames |
+| U4 | Path escape via realpath caught | [x] | test_main_rejects_reserved_basename_attachment + test_attachment_safety_violation_log_includes_error_type (path_escape branch logged) |
+| U5 | open("x", encoding="utf-8") — no silent clobber, no encoding ambiguity | [x] | test_main_attachment_write_uses_exclusive_create + test_main_writes_attachments_with_utf8_encoding |
+| U6 | ATTACHMENT_VERSION_IDS env var parsed and forwarded to broker | [x] | test_from_env_parses_attachment_version_ids_from_env (test_config.py) |
+
+## V. VersionId pinning round-trip (NEW)
+
+| # | Condition | Status | Test |
+|---|-----------|--------|------|
+| V1 | Dispatch handler serializes ATTACHMENT_VERSION_IDS env var | [x] | test_dispatch_handler (TestBuildContainerOverrides) |
+| V2 | Lambda manifest_loader captures attachment VersionIds via HEAD | [x] | test_lambda_manifest_loader |
+| V3 | Partial 404 on attachment → that basename omitted, others pinned | [x] | test_lambda_manifest_loader |
+| V4 | Round-trip dispatch→runner→broker preserves attachment_version_ids dict | [x] | test_dispatch_runner_env_roundtrip |
+| V5 | Older broker response (no attachments key) logs INFO and runs cleanly | [x] | test_from_env_defaults_attachments_to_empty_dict_when_envelope_omits (test_config.py) |
+
 ---
 
 ## Summary
@@ -257,4 +305,8 @@ Status: `[x]` = has test, `[ ]` = needs test.
 | P. Config Loading | 7 | 7 |
 | Q. Registry Sync | 4 | 4 |
 | R. Cross-Service Contract | 4 | 4 |
-| **Total** | **142** | **142** |
+| S. Publisher attachments | 9 | 9 |
+| T. Broker attachments fetch | 10 | 10 |
+| U. Runner attachment writes | 6 | 6 |
+| V. VersionId pinning round-trip | 5 | 5 |
+| **Total** | **172** | **172** |

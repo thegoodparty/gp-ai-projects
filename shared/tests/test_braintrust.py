@@ -6,12 +6,14 @@ from unittest.mock import MagicMock, patch, call
 from shared.braintrust import (
     BraintrustClient,
     NoOpSpan,
+    flatten_prompt_messages,
     init_braintrust,
     traced_llm_call,
     load_prompt_from_braintrust,
     flush_logs,
     is_enabled,
     get_client,
+    trace_pipeline,
 )
 
 
@@ -51,8 +53,9 @@ class FakeBraintrustLogger:
         self.spans: list[FakeSpan] = []
         self.flush_count = 0
 
-    def start_span(self, name):
+    def start_span(self, name, type=None):
         span = FakeSpan(name)
+        span.type = type
         self.spans.append(span)
         return span
 
@@ -806,3 +809,121 @@ class TestTracedCallExecutesInsideSpan:
 
             assert result == "ok"
             assert exit_calls == [(None, None, None)]
+
+
+def _enabled_client(monkeypatch):
+    """Return (BraintrustClient, FakeBraintrustModule) wired together so
+    `is_enabled()` returns True and span calls go to the fake logger."""
+    monkeypatch.setenv("BRAINTRUST_API_KEY", "test-key")
+    fake_module = FakeBraintrustModule()
+    with patch.dict("sys.modules", {"braintrust": fake_module}):
+        BraintrustClient.reset_instance()
+        init_braintrust(project="test")
+    return get_client(), fake_module
+
+
+class TestTracedCallSpanType:
+    """`traced_call` opens its span with `type="llm"` so Braintrust's Logs
+    UI groups LLM calls under the parent task span instead of treating each
+    one as a top-level row."""
+
+    def test_traced_call_uses_llm_span_type(self, monkeypatch):
+        client, fake_module = _enabled_client(monkeypatch)
+
+        client.traced_call(
+            name="test-call",
+            input_data={"q": "hello"},
+            llm_call_fn=lambda: "answer",
+        )
+
+        span = fake_module.logger.span_named("test-call")
+        assert span.type == "llm"
+
+
+class TestTracePipeline:
+    """`trace_pipeline` opens a parent span tagged `type="task"` so the
+    Logs UI groups inner LLM spans underneath it."""
+
+    def test_yields_noop_span_when_disabled(self, no_api_key):
+        with trace_pipeline("generate_event_tasks") as span:
+            assert isinstance(span, NoOpSpan)
+            # Body still runs, log calls are accepted as no-ops.
+            span.log(input={"city": "Boston"})
+
+    def test_opens_real_span_with_task_type(self, monkeypatch):
+        client, fake_module = _enabled_client(monkeypatch)
+
+        with trace_pipeline("generate_event_tasks") as span:
+            span.log(input={"city": "Boston"})
+            span.log(output={"tasks": []})
+
+        real = fake_module.logger.span_named("generate_event_tasks")
+        assert real.type == "task"
+        assert real.inputs == [{"city": "Boston"}]
+        assert real.outputs == [{"tasks": []}]
+        assert real.exit_count == 1
+
+    def test_caller_metadata_passed_through(self, monkeypatch):
+        # `trace_pipeline` is intentionally a thin wrapper — it forwards
+        # whatever metadata the caller supplies (no env-reading or other
+        # magic from inside shared library code).
+        client, fake_module = _enabled_client(monkeypatch)
+
+        with trace_pipeline(
+            "generate_event_tasks",
+            metadata={"environment": "DEV", "model": "gemini-3-flash-preview"},
+        ):
+            pass
+
+        real = fake_module.logger.span_named("generate_event_tasks")
+        assert real.metadatas == [
+            {"environment": "DEV", "model": "gemini-3-flash-preview"}
+        ]
+
+    def test_no_metadata_is_fine(self, monkeypatch):
+        client, fake_module = _enabled_client(monkeypatch)
+
+        with trace_pipeline("generate_event_tasks"):
+            pass
+
+        real = fake_module.logger.span_named("generate_event_tasks")
+        # No metadata supplied → no metadata logged.
+        assert real.metadatas == []
+
+
+class TestFlattenPromptMessages:
+    def test_string_input_returned_unchanged(self):
+        assert flatten_prompt_messages("hello world") == "hello world"
+
+    def test_dict_with_messages(self):
+        built = {"messages": [{"role": "system", "content": "hi"}]}
+        assert flatten_prompt_messages(built) == "hi"
+
+    def test_object_with_messages_attribute(self):
+        msg = MagicMock(content="from attr")
+        rendered = MagicMock(messages=[msg])
+        assert flatten_prompt_messages(rendered) == "from attr"
+
+    def test_multiple_messages_joined_with_newline(self):
+        built = {
+            "messages": [
+                {"role": "system", "content": "first"},
+                {"role": "user", "content": "second"},
+            ]
+        }
+        assert flatten_prompt_messages(built) == "first\nsecond"
+
+    def test_empty_messages_returns_empty_string(self):
+        # PM clearing the prompt textarea results in an empty messages
+        # list. We'd rather send "" to the LLM (and fail loudly) than ship
+        # the dict repr as the prompt.
+        assert flatten_prompt_messages({"messages": []}) == ""
+
+    def test_messages_key_present_but_none_returns_empty_string(self):
+        assert flatten_prompt_messages({"messages": None}) == ""
+
+    def test_no_messages_attribute_falls_back_to_str(self):
+        # Genuinely-unrecognized shape — last-resort str() is preserved
+        # so debugging traces stay informative instead of going silent.
+        rendered = object()
+        assert flatten_prompt_messages(rendered) == str(rendered)

@@ -133,9 +133,12 @@ async def databricks_query(
         )
         raise HTTPException(status_code=502, detail="Databricks query execution failed")
 
-    row_cap_hit = len(rows) >= ROW_CAP
-
+    # Successful query — increment the per-ticket tracker so artifact_publish
+    # knows real data backed at least one query for this run. Anti-fabrication
+    # gate keys off this counter.
     tracker.increment(ticket.pk)
+
+    row_cap_hit = len(rows) >= ROW_CAP
 
     return QueryResponse(
         columns=columns,

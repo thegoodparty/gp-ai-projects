@@ -20,7 +20,7 @@ from pmf_engine.runner.main import run_experiment, _collect_workspace_files
 
 def _config(**overrides) -> RunnerConfig:
     defaults = {
-        "experiment_id": "voter_targeting",
+        "experiment_id": "smoke_test",
         "run_id": "run-broker-001",
         "organization_slug": "org-broker-1",
         "instruction": "do the thing",
@@ -56,13 +56,14 @@ class TestPublishIntegration:
 
         await run_experiment(config, harness=mock_harness)
 
-        mock_publish.publish.assert_called_once_with(artifact_dict)
+        mock_publish.publish.assert_called_once()
+        assert mock_publish.publish.call_args[0] == (artifact_dict,)
 
     @pytest.mark.asyncio
     @patch("pmf_engine.runner.main._upload_logs")
     @patch("pmf_engine.runner.main.publish")
     async def test_contract_violation_does_not_publish(self, mock_publish, _mock_logs):
-        config = _config(contract_schema={"greeting": "string"})
+        config = _config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": 42}',
             content_type="application/json",

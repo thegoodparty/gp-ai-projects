@@ -1,7 +1,9 @@
 import json
 import logging
+import os
 from typing import Literal
 
+import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -12,13 +14,57 @@ from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 
 logger = logging.getLogger(__name__)
 
+# Process-cached CloudWatch client. boto3.client() does endpoint resolution +
+# credential fetching + TLS setup; cheap once, expensive per call. Lazy-init
+# at first metric emission so import-time has no AWS deps (matches the pattern
+# in broker/endpoints/experiment_manifest.py — broker has a no-cross-package-
+# deps rule so we don't lift to shared.metrics).
+_cw_client = None
+
+
+def _get_cw_client():
+    global _cw_client
+    if _cw_client is None:
+        _cw_client = boto3.client("cloudwatch")
+    return _cw_client
+
+
+def _reset_cw_client_for_tests() -> None:
+    global _cw_client
+    _cw_client = None
+
+
+def _emit_terminal_failure_metric(experiment_id: str, status: str) -> None:
+    """Emit ExperimentTerminalFailure to CloudWatch in the PMFEngine namespace.
+    Swallows all exceptions — metric emission must never break the response.
+    """
+    try:
+        _get_cw_client().put_metric_data(
+            Namespace="PMFEngine",
+            MetricData=[{
+                "MetricName": "ExperimentTerminalFailure",
+                "Value": 1,
+                "Unit": "Count",
+                "Dimensions": [
+                    {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "dev").strip().lower()},
+                    {"Name": "ExperimentId", "Value": experiment_id},
+                    {"Name": "Status", "Value": status},
+                ],
+            }],
+        )
+    except Exception as e:
+        logger.warning(
+            "ExperimentTerminalFailure metric emission failed experiment_id=%s status=%s exc_type=%s: %s",
+            experiment_id, status, type(e).__name__, e, exc_info=True,
+        )
+
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 # Agent may report any of these via /run-status. `success` is NOT in this set
-# — success must only flow through /artifact/publish so the data-required
-# guard (DataQueryTracker) can't be bypassed. `timeout` is accepted here but
-# translated to `failed` before the callback is sent, because gp-api's zod
-# consumer only accepts `success | failed | contract_violation`.
+# — success must only flow through /artifact/publish, which is the only path
+# that uploads to S3 and emits the success callback. `timeout` is accepted
+# here but translated to `failed` before the callback is sent, because
+# gp-api's zod consumer only accepts `success | failed | contract_violation`.
 AgentReportableStatus = Literal[
     "failed", "contract_violation", "timeout"
 ]
@@ -58,6 +104,7 @@ def get_broker_token_raw() -> str:  # pragma: no cover
 
 def get_artifact_bucket() -> str:  # pragma: no cover
     raise NotImplementedError
+
 
 def get_data_query_tracker() -> DataQueryTracker:  # pragma: no cover
     raise NotImplementedError
@@ -106,6 +153,20 @@ def run_status(
                     exc_info=True,
                 )
 
+    # Surface every terminal failure as a structured log line + CloudWatch
+    # metric. Without this, contract violations and agent failures land in
+    # gp-api's experiment_run table silently — nobody knows until a user
+    # complains. The metric is alarmed in infrastructure/modules/broker/main.tf
+    # → SNS → shared-slack-notifier → Slack.
+    logger.warning(
+        "run_status terminal status=%s reason_code=%s run_id=%s "
+        "experiment_id=%s organization_slug=%s duration_seconds=%s detail=%s",
+        req.status, req.reason_code or "",
+        ticket.run_id, ticket.experiment_id, ticket.organization_slug,
+        req.duration_seconds or 0, (req.detail or "")[:200],
+    )
+    _emit_terminal_failure_metric(ticket.experiment_id, req.status)
+
     # Translate `timeout` → `failed`+reason_code so gp-api's zod consumer
     # accepts the callback (zod enum has no `timeout`).
     if req.status == "timeout":
@@ -139,13 +200,15 @@ def run_status(
                 ticket.run_id, broker_token[:8],
                 exc_info=True,
             )
+        # Drop the per-ticket data-query counter so the dict doesn't grow
+        # unbounded across long-running broker tasks. Don't blow up on rare
+        # races — counter cleanup is hygiene, not load-bearing.
         try:
             tracker.clear(ticket.pk)
         except Exception:
-            logger.error(
+            logger.warning(
                 "tracker clear failed after terminal run_status run_id=%s",
-                ticket.run_id,
-                exc_info=True,
+                ticket.run_id, exc_info=True,
             )
 
     return RunStatusResponse(callback_sent=True)

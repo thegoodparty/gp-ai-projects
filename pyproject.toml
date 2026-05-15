@@ -41,10 +41,14 @@ dependencies = [
     "boto3>=1.40.50",
     "spacy>=3.8.7",
     "pillow>=10.0.0",
-    "braintrust>=0.3.10",
+    "braintrust>=0.12.1",
     "claude-agent-sdk>=0.1.19",
     "slack-sdk>=3.39.0",
+    "anthropic>=0.25.0",
+    "openpyxl>=3.1.0",
+    "pymupdf>=1.24.0",
     "sqlglot>=30.4.3",
+    "jsonschema>=4.26.0",
 ]
 
 [project.optional-dependencies]
@@ -56,7 +60,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent", "pmf_engine", "broker"]
+members = ["shared", "serve/v1_pipeline", "hubspot_ddhq_match", "clickup_bot", "engineer_agent", "meeting_qa", "pmf_engine", "broker"]
 
 [build-system]
 requires = ["hatchling"]
@@ -98,6 +102,7 @@ asyncio_mode = "auto"
 
 [dependency-groups]
 dev = [
+    "braintrust[cli]>=0.12.1",
     "pre-commit>=4.3.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=0.24.0",
@@ -107,5 +112,9 @@ dev = [
 ]
 campaign-plan-lambda = [
     "google-genai>=1.56.0",
-    "braintrust>=0.3.10",
+    "braintrust>=0.12.1",
+    # Used by shared/braintrust.py for local dev .env loading; was a
+    # transitive of braintrust<0.12 and stopped being one after the 0.16
+    # bump, so we now declare it explicitly.
+    "python-dotenv>=1.1.1",
 ]

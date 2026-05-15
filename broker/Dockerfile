@@ -16,6 +16,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -24,8 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/broker /app/broker
 
+# Install Chromium + its OS deps. `--with-deps` shells out to apt to install
+# the system libraries Chromium needs (libnss3, libatk-bridge2.0-0, fonts,
+# etc.). Run as root before switching to the broker user.
+RUN /app/.venv/bin/playwright install --with-deps chromium
+
 RUN useradd -m -s /bin/bash broker && \
-    chown -R broker:broker /app
+    chown -R broker:broker /app /ms-playwright
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"

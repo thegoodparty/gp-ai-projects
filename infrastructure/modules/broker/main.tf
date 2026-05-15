@@ -50,6 +50,18 @@ variable "artifact_bucket_name" {
   type        = string
 }
 
+variable "experiment_metadata_bucket_name" {
+  description = "Name of the S3 metadata bucket holding PMF experiment manifests + instructions. Injected as EXPERIMENT_METADATA_BUCKET env var. Set this once the agent-experiment-metadata module is provisioned for the env."
+  type        = string
+  default     = ""
+}
+
+variable "experiment_metadata_read_policy_arn" {
+  description = "ARN of the managed IAM policy granting read access to the experiment metadata bucket (output by the agent-experiment-metadata module). Empty string skips the attachment (Phase 1 bring-up where the bucket isn't provisioned yet)."
+  type        = string
+  default     = ""
+}
+
 variable "sns_topic_arn" {
   description = "ARN of the SNS topic for alarm notifications. Empty string disables alarms."
   type        = string
@@ -111,7 +123,7 @@ resource "aws_cloudwatch_log_group" "broker" {
 
 resource "aws_secretsmanager_secret" "broker" {
   name        = "broker-${var.environment}"
-  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH"
+  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID"
 
   tags = {
     Environment = var.environment
@@ -258,6 +270,12 @@ resource "aws_iam_role_policy" "task_s3" {
       }
     ]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "task_experiment_metadata_read" {
+  count      = var.experiment_metadata_read_policy_arn != "" ? 1 : 0
+  role       = aws_iam_role.task_role.name
+  policy_arn = var.experiment_metadata_read_policy_arn
 }
 
 resource "aws_iam_role_policy" "task_sqs_results" {
@@ -621,6 +639,10 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name  = "ARTIFACT_BUCKET"
           value = var.artifact_bucket_name
+        },
+        {
+          name  = "EXPERIMENT_METADATA_BUCKET"
+          value = var.experiment_metadata_bucket_name
         }
       ]
 
@@ -652,6 +674,22 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name      = "SERVICE_TOKEN_HASH"
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:SERVICE_TOKEN_HASH::"
+        },
+        {
+          name      = "CLERK_SECRET_KEY"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:CLERK_SECRET_KEY::"
+        },
+        {
+          name      = "CLERK_FRONTEND_API_BASE"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:CLERK_FRONTEND_API_BASE::"
+        },
+        {
+          name      = "GP_API_BASE_URL"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:GP_API_BASE_URL::"
+        },
+        {
+          name      = "AGENT_FLEET_CLERK_ID"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:AGENT_FLEET_CLERK_ID::"
         }
       ]
     }
@@ -949,6 +987,30 @@ resource "aws_cloudwatch_metric_alarm" "classifier_exception" {
   statistic           = "Sum"
   threshold           = 0
   alarm_actions       = [var.sns_topic_arn]
+
+  dimensions = {
+    Environment = var.environment
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "experiment_terminal_failure" {
+  count               = var.sns_topic_arn != "" ? 1 : 0
+  alarm_name          = "broker-experiment-terminal-failure-${var.environment}"
+  alarm_description   = "PMF experiment terminated with failed/contract_violation/timeout. Emitted by broker /internal/run-status — alarms on every occurrence so ops sees user-impacting failures in Slack within minutes (otherwise the only signal is a row in experiment_run.status=FAILED that nobody queries proactively)."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ExperimentTerminalFailure"
+  namespace           = "PMFEngine"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [var.sns_topic_arn]
+  ok_actions          = [var.sns_topic_arn]
 
   dimensions = {
     Environment = var.environment

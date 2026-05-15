@@ -106,14 +106,20 @@ async def test_run_returns_harness_result_on_success():
 
 
 @pytest.mark.asyncio
-async def test_run_raises_on_agent_error():
+async def test_run_raises_agent_execution_error_on_agent_error():
+    """Agent-side errors must surface as AgentExecutionError, not bare
+    RuntimeError. The runner's outer except reports `type(e).__name__` as the
+    callback reason_code; collapsing every harness-internal failure under
+    "RuntimeError" hurts alerting fidelity."""
+    from pmf_engine.runner.harness.claude_sdk import AgentExecutionError
+
     async def fake_query_error(prompt, options):
         yield _make_result_message(result="Something went wrong", is_error=True, num_turns=1, session_id="sess-err")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_error):
             harness = ClaudeSdkHarness()
-            with pytest.raises(RuntimeError, match="Something went wrong"):
+            with pytest.raises(AgentExecutionError, match="Something went wrong"):
                 await harness.run(
                     instruction="Do stuff",
                     model="sonnet",
@@ -124,7 +130,12 @@ async def test_run_raises_on_agent_error():
 
 
 @pytest.mark.asyncio
-async def test_run_raises_on_no_result_message():
+async def test_run_raises_agent_stream_truncated_on_no_result_message():
+    """A stream that ends without a ResultMessage is a distinct failure mode
+    from an agent-reported error. Use a separate exception type so alerting
+    can route differently."""
+    from pmf_engine.runner.harness.claude_sdk import AgentStreamTruncatedError
+
     async def fake_query_empty(prompt, options):
         return
         yield  # pragma: no cover
@@ -132,7 +143,7 @@ async def test_run_raises_on_no_result_message():
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_empty):
             harness = ClaudeSdkHarness()
-            with pytest.raises(RuntimeError, match="ended without result"):
+            with pytest.raises(AgentStreamTruncatedError, match="ended without result"):
                 await harness.run(
                     instruction="Do stuff",
                     model="sonnet",
@@ -201,18 +212,18 @@ class TestCollectOutputArtifact:
 
     def test_prefers_experiment_named_file_when_multiple_present(self):
         """Agent sometimes writes a helper file alongside the real artifact
-        (e.g., meeting_briefing wrote EXPERIMENT_SUMMARY.md next to
-        meeting_briefing.json). If the experiment_id matches one of the files,
-        that one is the artifact; the others are ignored with a log warning."""
+        (e.g., a SUMMARY.md next to <id>.json). If the experiment_id matches
+        one of the files, that one is the artifact; the others are ignored
+        with a log warning."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = os.path.join(tmpdir, "output")
             os.makedirs(output_dir)
-            with open(os.path.join(output_dir, "meeting_briefing.json"), "w") as f:
+            with open(os.path.join(output_dir, "smoke_test.json"), "w") as f:
                 f.write('{"ok": true}')
             with open(os.path.join(output_dir, "EXPERIMENT_SUMMARY.md"), "w") as f:
                 f.write("# Summary")
 
-            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="smoke_test")
             assert content_type == "application/json"
             assert json.loads(data) == {"ok": True}
 
@@ -228,7 +239,7 @@ class TestCollectOutputArtifact:
                 f.write("a,b\n")
 
             with pytest.raises(RuntimeError, match="Expected exactly one artifact"):
-                collect_output_artifact(tmpdir, experiment_id="voter_targeting")
+                collect_output_artifact(tmpdir, experiment_id="smoke_test")
 
     def test_single_file_returned_regardless_of_experiment_id(self):
         """Preserves existing single-file contract: if there's only one file,
@@ -239,7 +250,7 @@ class TestCollectOutputArtifact:
             with open(os.path.join(output_dir, "whatever.json"), "w") as f:
                 f.write('{"ok": true}')
 
-            data, content_type = collect_output_artifact(tmpdir, experiment_id="meeting_briefing")
+            data, content_type = collect_output_artifact(tmpdir, experiment_id="smoke_test")
             assert content_type == "application/json"
 
     def test_raises_when_output_dir_empty(self):
@@ -430,14 +441,21 @@ async def test_tool_spans_paired_by_tool_use_id_not_fifo():
 
 
 def test_allowed_tools_contains_expected_tools():
-    assert ALLOWED_TOOLS == ["Bash", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"]
+    assert ALLOWED_TOOLS == ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
 
 
-def test_allowed_tools_includes_web_retrieval():
-    # WebFetch + WebSearch go through Anthropic's servers (not the broker).
-    # The quarantine's containment guarantee still holds — runner has no egress
-    # and no IAM, so a compromised agent acting on fetched content can't exfiltrate.
-    assert "WebFetch" in ALLOWED_TOOLS
+def test_allowed_tools_excludes_webfetch():
+    # WebFetch is excluded: the Claude SDK's WebFetch tool calls claude.ai for
+    # URL safety pre-check from inside the runner container. The runner SG only
+    # permits egress to broker / VPC endpoints / S3 — it cannot reach claude.ai,
+    # so WebFetch always errors with "Unable to verify domain ... claude.ai".
+    # Agents must use pmf_runtime.http.get (broker /http/fetch) for URL retrieval.
+    assert "WebFetch" not in ALLOWED_TOOLS
+
+
+def test_allowed_tools_includes_web_search():
+    # WebSearch routes through api.anthropic.com (which the runner reaches via
+    # broker's anthropic proxy), so it functions inside the egress quarantine.
     assert "WebSearch" in ALLOWED_TOOLS
 
 

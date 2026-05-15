@@ -10,6 +10,14 @@ from broker.dynamodb_client import ScopeTicketStore
 from broker.secrets import BrokerSecrets
 
 
+class _NoopFetcher:
+    async def start(self) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
+
+
 def _fake_secrets() -> BrokerSecrets:
     return BrokerSecrets(
         anthropic_api_key="sk-ant-fake",
@@ -18,6 +26,10 @@ def _fake_secrets() -> BrokerSecrets:
         databricks_http_path="/sql/test",
         databricks_api_key="dapi-fake",
         service_token_hash="fakehash",
+        clerk_secret_key="sk_test_fake",
+        clerk_frontend_api_base="https://fake.clerk.app",
+        gp_api_base_url="https://gp-api-dev.goodparty.org",
+        agent_fleet_clerk_id="user_agent_fleet_test",
         results_queue_url="https://sqs.us-west-2.amazonaws.com/123/queue.fifo",
     )
 
@@ -28,6 +40,7 @@ class TestHealthEndpoint:
         with (
             patch("broker.main.load_secrets_from_env", return_value=_fake_secrets()),
             patch("broker.main.ScopeTicketStore") as mock_store_cls,
+            patch("broker.main.PlaywrightBrowserFetcher", return_value=_NoopFetcher()),
         ):
             mock_store_cls.return_value = MagicMock(spec=ScopeTicketStore)
 
