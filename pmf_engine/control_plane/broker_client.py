@@ -23,6 +23,7 @@ class BrokerClient:
         experiment_id: str,
         scope: dict,
         params: dict,
+        clerk_user_id: str | None,
         exp_ttl_seconds: int = 3600,
         prior_artifact_versions: dict[str, str] | None = None,
     ) -> dict:
@@ -32,6 +33,7 @@ class BrokerClient:
             "experiment_id": experiment_id,
             "scope": scope,
             "params": params,
+            "clerk_user_id": clerk_user_id,
             "exp_ttl_seconds": exp_ttl_seconds,
             "prior_artifact_versions": prior_artifact_versions,
         }

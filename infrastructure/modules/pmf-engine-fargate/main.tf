@@ -379,12 +379,32 @@ resource "aws_sns_topic_policy" "runner_failures" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid    = "AllowEventBridgePublish"
         Effect = "Allow"
         Principal = {
           Service = "events.amazonaws.com"
         }
         Action   = "SNS:Publish"
         Resource = aws_sns_topic.runner_failures.arn
+      },
+      {
+        # CloudWatch Alarms publish from cloudwatch.amazonaws.com — needed
+        # so the dispatch Lambda's `Errors > 0` alarm (and the SQS DLQ depth
+        # alarm) can actually deliver to Slack via shared-slack-notifier.
+        # Without this, alarms transition to ALARM but the SNS publish fails
+        # silently and Slack never sees the page.
+        Sid    = "AllowCloudWatchAlarmPublish"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudwatch.amazonaws.com"
+        }
+        Action   = "SNS:Publish"
+        Resource = aws_sns_topic.runner_failures.arn
+        Condition = {
+          StringEquals = {
+            "AWS:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
       }
     ]
   })
@@ -399,7 +419,7 @@ resource "aws_sns_topic_subscription" "shared_slack_notifier" {
 
 resource "aws_lambda_permission" "allow_sns_invoke_slack" {
   count         = var.shared_slack_notifier_lambda_arn != "" ? 1 : 0
-  statement_id  = "AllowSNSInvokeFromPmfEngineFailures"
+  statement_id  = "AllowSNSInvokeFromPmfEngineFailures-${var.environment}"
   action        = "lambda:InvokeFunction"
   function_name = var.shared_slack_notifier_lambda_arn
   principal     = "sns.amazonaws.com"

@@ -4,7 +4,7 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, Callable, TypeVar
+from typing import Optional, Dict, Any, Callable, Iterator, TypeVar
 
 from dotenv import load_dotenv
 from shared.logger import get_logger
@@ -14,6 +14,42 @@ load_dotenv()
 logger = get_logger(__name__)
 
 T = TypeVar('T')
+
+
+def flatten_prompt_messages(rendered: Any) -> str:
+    """Collapse a Braintrust `prompt.build()` result into a single string.
+    Handles three shapes: a plain string, a dict with `messages`, or any
+    object exposing a `.messages` attribute. Returns "" for a recognized
+    but empty messages container (e.g. PM cleared the prompt textarea —
+    we'd rather send nothing to the LLM and fail loudly than ship a dict
+    repr as the prompt). Falls back to `str(rendered)` only when the input
+    has no recognizable shape at all."""
+    if isinstance(rendered, str):
+        return rendered
+
+    has_messages_shape = (
+        isinstance(rendered, dict) and "messages" in rendered
+    ) or (
+        not isinstance(rendered, dict) and hasattr(rendered, "messages")
+    )
+    if not has_messages_shape:
+        return str(rendered)
+
+    if isinstance(rendered, dict):
+        msgs = rendered.get("messages") or []
+    else:
+        msgs = rendered.messages or []
+
+    contents = []
+    for msg in msgs:
+        if isinstance(msg, dict):
+            contents.append(msg.get("content", "") or "")
+        elif hasattr(msg, "content"):
+            contents.append(str(msg.content) if msg.content else "")
+        else:
+            contents.append(str(msg))
+    return "\n".join(c for c in contents if c)
+
 
 
 class NoOpSpan:
@@ -125,8 +161,10 @@ class BraintrustClient:
         if not self._enabled or self._braintrust_logger is None:
             return llm_call_fn()
 
+        # `type="llm"` lets Braintrust's Logs UI group these under a parent
+        # task span instead of treating each call as a top-level row.
         try:
-            span = self._braintrust_logger.start_span(name=name)
+            span = self._braintrust_logger.start_span(name=name, type="llm")
             span.__enter__()
         except Exception as e:
             logger.warning(f"Braintrust span creation failed: {e}")
@@ -173,13 +211,25 @@ class BraintrustClient:
         input_data: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         tags: Optional[list] = None,
+        span_type: Optional[str] = None,
     ):
+        """Open a Braintrust span as a context manager.
+
+        `span_type` categorizes the span for Braintrust's UI: `task`
+        parents surface as list-level rows, `llm` children nest under
+        them and feed into per-call rollups (token counts, cost,
+        latency). Omit to let the SDK pick its default. (Named
+        `span_type` rather than `type` to avoid shadowing the builtin.)
+        """
         if not self._enabled or self._braintrust_logger is None:
             yield NoOpSpan()
             return
 
+        span_kwargs: Dict[str, Any] = {"name": name}
+        if span_type is not None:
+            span_kwargs["type"] = span_type
         try:
-            span = self._braintrust_logger.start_span(name=name)
+            span = self._braintrust_logger.start_span(**span_kwargs)
             span.__enter__()
         except Exception as e:
             logger.warning(f"Braintrust traced_span failed: {e}")
@@ -201,11 +251,17 @@ class BraintrustClient:
 
         try:
             yield span
-        finally:
+        except Exception as e:
+            try:
+                span.__exit__(type(e), e, e.__traceback__)
+            except Exception as exit_err:
+                logger.debug(f"Braintrust traced_span exit (error path) failed: {exit_err}")
+            raise
+        else:
             try:
                 span.__exit__(None, None, None)
             except Exception as exit_err:
-                logger.debug(f"Braintrust traced_span exit failed: {exit_err}")
+                logger.debug(f"Braintrust traced_span exit (success path) failed: {exit_err}")
 
     def _serialize_output(self, result: Any) -> Dict[str, Any]:
         if result is None:
@@ -232,15 +288,14 @@ class BraintrustClient:
         self,
         prompt_name: str,
         fallback_prompt: str,
-        variables: Optional[Dict[str, Any]] = None
+        variables: Optional[Dict[str, Any]] = None,
     ) -> str:
         if not self._enabled or self._braintrust_module is None:
             return self._render_prompt(fallback_prompt, variables)
 
         try:
             prompt = self._braintrust_module.load_prompt(
-                project=self._project,
-                slug=prompt_name
+                project=self._project, slug=prompt_name
             )
 
             if prompt is None:
@@ -248,22 +303,7 @@ class BraintrustClient:
                 return self._render_prompt(fallback_prompt, variables)
 
             rendered = prompt.build(**(variables or {}))
-
-            if isinstance(rendered, str):
-                return rendered
-
-            if hasattr(rendered, 'messages') and rendered.messages:
-                contents = []
-                for msg in rendered.messages:
-                    if isinstance(msg, dict):
-                        contents.append(msg.get('content', ''))
-                    elif hasattr(msg, 'content'):
-                        contents.append(str(msg.content))
-                    else:
-                        contents.append(str(msg))
-                return "\n".join(contents)
-
-            return str(rendered)
+            return flatten_prompt_messages(rendered)
 
         except Exception as e:
             logger.warning(f"Failed to load prompt '{prompt_name}' from Braintrust: {e}")
@@ -404,9 +444,11 @@ def traced_llm_call(
 def load_prompt_from_braintrust(
     prompt_name: str,
     fallback_prompt: str,
-    variables: Optional[Dict[str, Any]] = None
+    variables: Optional[Dict[str, Any]] = None,
 ) -> str:
-    return BraintrustClient.get_instance().load_prompt(prompt_name, fallback_prompt, variables)
+    return BraintrustClient.get_instance().load_prompt(
+        prompt_name, fallback_prompt, variables
+    )
 
 
 def flush_logs() -> None:
@@ -419,6 +461,22 @@ def is_enabled() -> bool:
 
 def get_client() -> BraintrustClient:
     return BraintrustClient.get_instance()
+
+
+@contextmanager
+def trace_pipeline(
+    name: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Iterator[Any]:
+    """Open a parent Braintrust span tagged `type="task"` so Braintrust's
+    Logs UI groups the LLM children under it instead of showing each one
+    as its own top-level row. Inner traced LLM calls automatically nest
+    via Braintrust's contextvar-based propagation. Yields a no-op span
+    when Braintrust is disabled (e.g. no API key in tests)."""
+    with BraintrustClient.get_instance().traced_span(
+        name, span_type="task", metadata=metadata
+    ) as span:
+        yield span
 
 
 def cache_prompt(

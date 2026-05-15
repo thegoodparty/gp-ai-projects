@@ -135,6 +135,63 @@ aws logs tail /aws/lambda/campaign-plan-dev --follow --region us-west-2 --profil
 aws s3 ls s3://campaign-plan-results-dev/results/99999/ --region us-west-2 --profile gp-readonly
 ```
 
+## Iterating on prompts via Braintrust evals
+
+The pipeline ships with a Braintrust sandbox eval (`evals.py`) so PMs can iterate on prompts in the Braintrust playground without engineer involvement. Each eval run executes the same `search → filter → cleanup` flow the Lambda runs in prod, against a curated dataset, with the PM-edited prompts substituted in via the playground form.
+
+### One-time setup (per Braintrust project)
+
+In Braintrust UI → `campaign-plan` project → Settings → Environment Variables:
+
+- `GEMINI_API_KEY` — for the sandbox to call Gemini.
+- `ENVIRONMENT=eval` — stamps `metadata.environment="eval"` on every span emitted from sandbox runs so they're filterable in Logs separately from prod runs (`DEV` / `QA` / `PROD` come from the Lambda's AWS env config).
+
+You also need a dataset under the same project with rows shaped like `{electionDate, state, city, officeName, officeLevel, primaryElectionDate}`. Drag-to-dataset from the parent `generate_event_tasks` span in any prod trace produces correctly-shaped rows.
+
+### Engineer workflow — push eval changes
+
+After modifying `evals.py`, `event_generator.py`, or anything in `shared/braintrust.py`:
+
+```bash
+./campaign_plan_lambda/push_eval_to_braintrust.sh
+```
+
+This bundles the eval and uploads it to Braintrust's hosted Lambda sandbox. The script is a Python wrapper around `braintrust push` that works around two SDK quirks (sys.path pollution from uv, and the lazy-load short-circuit when scanning local imports). See the comments in the script for details.
+
+`evals.requirements.txt` is the pip-style manifest the sandbox installs into its venv. Keep it in sync with `pyproject.toml`'s `campaign-plan-lambda` group when bumping versions.
+
+### PM workflow — run the eval
+
+In Braintrust UI:
+
+1. Navigate to `campaign-plan` project → Playground.
+2. **+ Task** → **Remote eval** submenu → pick the registered eval.
+3. Edit `search_prompt` and/or `filter_prompt` in the form (mustache `{{var}}` placeholders).
+4. Pick a dataset, hit **Run**.
+
+Results land as a Braintrust experiment with per-row scores (`count_in_range`, `dates_in_range`, `urls_valid`, `title_overlap`). Compare experiments side-by-side in the UI to evaluate prompt changes.
+
+### Promotion to prod
+
+Once a prompt looks good via eval, save the content into the Braintrust prompt registry under slugs `search-community-events` and `filter-and-structure-events`. The Lambda picks up the latest version on the next invocation via `load_prompt_from_braintrust`.
+
+⚠️ **Prompt updates take effect immediately** on the next Lambda call — there's no environment-pinning yet. Treat the prompt registry as a production-affecting surface and coordinate prompt changes with deploys. Future ticket: wire up Braintrust's deploy-to-environment feature for prompt-version pinning.
+
+### Reading traces
+
+Every Lambda invocation produces a parent `generate_event_tasks` span (type `task`) with two child LLM spans (type `llm`) nested under it:
+
+```
+generate_event_tasks                  input = {electionDate, city, state, ...}
+                                      output = {tasks: [...]}
+                                      metadata.environment = DEV/QA/PROD/eval
+                                      metadata.model = gemini-3-flash-preview
+├── generate_with_search              input = {prompt: "..."}, output = {text, search_queries, sources}
+└── generate_structured_content       input = {prompt: "..."}, output = {events: [...]}
+```
+
+Filter the Logs view by `metadata.environment` to isolate prod vs eval runs, or by `metadata.model` to compare model performance. Click into any parent span to drill into the two LLM children for prompt-and-response detail.
+
 ## SQS message format
 
 ### Input (from gp-api)

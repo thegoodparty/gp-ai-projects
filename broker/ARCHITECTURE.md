@@ -92,7 +92,7 @@ Broker is fronted by an internal ALB with an ACM public cert for `broker-{env}.a
 
 **Why HTTPS on an internal ALB?** Scope tickets carry authority to query voter-data tables; plaintext HTTP 8080 inside the VPC would leak them on any ENI mirror, compromised neighbor service, or misconfigured flow-log sink. Public ACM certs are free and auto-renewing.
 
-**Forward path — per-task broker pools with ALB routing.** Today the ALB has one target group fronting a single broker service (scaled by CPU/memory). As experiment shapes diverge (e.g., Anthropic-proxy-heavy briefing runs vs. Databricks-heavy voter_targeting vs. future low-cost PDF parsers), we want to split the broker into pools with different resource profiles and route traffic by run_type. Two extension points are already in place:
+**Forward path — per-task broker pools with ALB routing.** Today the ALB has one target group fronting a single broker service (scaled by CPU/memory). As experiment shapes diverge (e.g., Anthropic-proxy-heavy briefing runs vs. Databricks-heavy data-extraction runs vs. future low-cost PDF parsers), we want to split the broker into pools with different resource profiles and route traffic by run_type. Two extension points are already in place:
 
 1. **ALB listener rules.** The HTTPS listener can host path-based or header-based rules (`condition { path_pattern }` or `condition { http_header }`). Example: `/databricks/*` → `broker-db-{env}` target group with more memory; `/anthropic/*` → `broker-proxy-{env}` target group with higher concurrency. Hostname stays the same, clients don't change — the ALB dispatches.
 2. **Header-routed pools.** Mint-time we can stamp a `X-Broker-Pool` header on the scope ticket and have the runner/dispatch include it on every request; ALB rules route on that header. Lets us A/B a new broker version or isolate a noisy experiment without a separate hostname.
@@ -115,11 +115,11 @@ The Lambda has a `vpc_config` attaching it to the VPC with its own SG (`pmf-disp
 
 Broker mounts the Anthropic proxy router at `/anthropic`. Dispatch Lambda sets `ANTHROPIC_BASE_URL = https://broker-{env}.ai.goodparty.org/anthropic` as a container override on the runner task. Claude Agent SDK transparently routes its `/v1/messages` calls under that base URL. Anthropic API key lives only in the broker's env (from `broker-{env}` secret).
 
-### 6. WebFetch + WebSearch allowed; no broker research/fetch route
+### 6. WebSearch allowed via Anthropic proxy; URL fetches go through broker `/http/fetch`
 
-Runner's `ALLOWED_TOOLS` includes `WebFetch` and `WebSearch` (Claude SDK built-ins). These route HTTP traffic through Anthropic's servers, not through the broker — Anthropic fetches the URL and returns extracted content to the model via chat completion.
+Runner's `ALLOWED_TOOLS` includes `WebSearch` (Claude SDK built-in). WebSearch is server-side at Anthropic — search queries piggyback on the `/messages` API call (already broker-proxied through `/anthropic/v1/messages`), and results return inline. The runner never makes a separate outbound request for search.
 
-The broker's content classifier does **not** see this fetched content. The containment guarantee still holds: even if Anthropic returns malicious content and the agent follows the injection, the runner can't exfiltrate (no egress, no IAM) and the broker's artifact validator catches malformed outputs.
+`WebFetch` is **not** in `ALLOWED_TOOLS`. Claude SDK runs WebFetch client-side in the runner container and requires direct egress to `claude.ai` for URL safety pre-checks — egress the runner SG explicitly denies. All URL retrieval now goes through `pmf_runtime.http.get(url)` and `pmf_runtime.http.download(url)`, which both call broker `/http/fetch`. `/http/fetch` is the sole URL retrieval route: it handles inline-rendered responses (HTML, JSON) and download-triggering responses (PDF, DOCX, XLSX, ZIP, etc.) transparently via Playwright's download event capture, streaming the bytes back with the upstream Content-Type preserved. The broker is the sole egress path; every URL fetch is auditable.
 
 Broker no longer exposes `research_fetch` or `research_search` endpoints.
 
@@ -136,7 +136,7 @@ All routes require `X-Broker-Token` (per-run UUIDv4) except `/health` and `/inte
 | `POST /anthropic/v1/messages` | Runner (via Claude SDK) | Proxies to `api.anthropic.com`, injects broker's `ANTHROPIC_API_KEY`; streams response back |
 | `POST /databricks/query` | Runner (via `pmf_runtime.databricks`) | Scope-aware SQL execution — broker rewrites WHERE clauses to inject `state`/`city` filters per scope ticket; rejects cross-scope queries |
 | `POST /artifact/publish` | Runner (via `pmf_runtime.publish`) | Validates artifact against contract schema, uploads to S3, sends callback to results queue |
-| `GET /artifact/read` | Runner (via `pmf_runtime.priors`) | Reads a prior experiment's artifact (for dependency chaining, e.g. peer_city_benchmarking depends on district_intel) |
+| `GET /artifact/read` | Runner (via `pmf_runtime.priors`) | Reads a prior experiment's artifact (for dependency chaining, e.g. one experiment reading a prior experiment's artifact — the dependency relation is encoded in gp-api, not the broker) |
 | `POST /run-status` | Runner | Update run status (RUNNING/CONTRACT_VIOLATION/etc.); broker sends callback to results queue |
 | `POST /internal/upload-logs` | Runner | Forward runner logs to S3 for debugging |
 
@@ -221,5 +221,5 @@ Note: runner → broker traffic inside the VPC is HTTP (no TLS). Not a leak — 
 2. **Braintrust tracing.** Stripped from runner (required IAM the quarantine doesn't allow). If we want per-run Claude API traces visible in Braintrust, route via broker — broker's Anthropic proxy can forward headers / tag requests.
 3. **gp-api integration.** `agent-results-{env}.fifo` is currently unconsumed. gp-api consumer wiring + experiment endpoint schemas are tracked separately.
 4. **Dedicated PMF VPC (Phase 3 hardening).** Move PMF to its own VPC so Route53 DNS Firewall can attach with a block-all-except-broker rule. Not blocking for dev/qa/prod MVP.
-5. **SSRF hardening (batch 1b).** `broker/endpoints/http_fetch.py` and `pdf_fetch.py` do SSRF URL validation via `getaddrinfo` then let httpx re-resolve — DNS rebinding window. Pending: resolve once, pin to safe IP via custom httpx resolver. Also: IPv4-mapped IPv6 (`::ffff:169.254.169.254`) bypasses the private-range check because Python's `is_private` returns False for v6-mapped; need explicit `ip.ipv4_mapped` handling.
+5. **SSRF hardening (batch 1b).** `broker/endpoints/http_fetch.py` does SSRF URL validation via `getaddrinfo` then lets httpx re-resolve — DNS rebinding window. Pending: resolve once, pin to safe IP via custom httpx resolver. Also: IPv4-mapped IPv6 (`::ffff:169.254.169.254`) bypasses the private-range check because Python's `is_private` returns False for v6-mapped; need explicit `ip.ipv4_mapped` handling.
 6. **Secret split.** Broker secret currently holds all 6 API keys + `SERVICE_TOKEN_HASH` in one ARN. Splitting `SERVICE_TOKEN_HASH` into its own secret narrows blast radius if the broker container ever leaks its env.

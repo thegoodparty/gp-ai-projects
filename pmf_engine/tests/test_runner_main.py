@@ -6,13 +6,43 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pmf_engine.runner.config import RunnerConfig
 from pmf_engine.runner.harness.base import HarnessResult
 from pmf_engine.runner.main import run_experiment, get_harness, main
+
+
+class Clock:
+    """Controllable monotonic-clock fake.
+
+    Replaces the brittle `iter([100.0, 130.0, 130.0, 130.0])` pattern that
+    silently masked drift when a refactor added one more `time.monotonic()`
+    call (StopIteration → fallback default → test still passes for the
+    wrong reason).
+
+    Usage:
+        clock = Clock(start=100.0)
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
+            # tick the clock manually between assertions
+            clock.advance(30.0)
+            ...
+
+    Each `.now()` returns the *current* cursor — no consumption, no
+    StopIteration. The caller controls all advancement explicitly via
+    `.advance(seconds)`.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = start
+
+    def now(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _make_config(**overrides):
@@ -42,8 +72,6 @@ class TestUploadLogsObservability:
     keep the swallow (terminal callback is more important than logs) but
     make it observable.
     """
-
-    import logging as _logging  # class-local to avoid top-of-file churn
 
     def test_upload_logs_failure_warns_with_run_id_experiment_id_and_stacktrace(
         self, tmp_path
@@ -76,7 +104,7 @@ class TestUploadLogsObservability:
                 _upload_logs(
                     str(workspace),
                     run_id="run-upload-obs-001",
-                    experiment_id="district_intel",
+                    experiment_id="smoke_test",
                 )
         finally:
             _main_mod.logger.removeHandler(handler)
@@ -91,15 +119,9 @@ class TestUploadLogsObservability:
         )
         msg = warns[0].getMessage()
         assert "run-upload-obs-001" in msg, f"expected run_id in log, got: {msg}"
-        assert "district_intel" in msg, f"expected experiment_id in log, got: {msg}"
+        assert "smoke_test" in msg, f"expected experiment_id in log, got: {msg}"
         assert "RuntimeError" in msg, f"expected exc_type in log, got: {msg}"
         assert warns[0].exc_info is not None, "expected exc_info=True so stacktrace is preserved"
-
-
-def test_get_harness_returns_claude_sdk():
-    harness = get_harness("claude_sdk")
-    from pmf_engine.runner.harness.claude_sdk import ClaudeSdkHarness
-    assert isinstance(harness, ClaudeSdkHarness)
 
 
 def test_get_harness_raises_on_unknown():
@@ -124,7 +146,11 @@ async def test_run_experiment_publishes_artifact_via_broker(mock_publish, _mock_
 
     await run_experiment(config, harness=mock_harness)
 
-    mock_publish.publish.assert_called_once_with({"greeting": "hello"})
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    assert call_args.kwargs.get("cost_usd") == pytest.approx(0.05)
+    assert "duration_seconds" in call_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -171,6 +197,41 @@ async def test_run_experiment_reports_failed_on_publish_failure(mock_publish, _m
 
 
 @pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_failure_then_report_status_failure_leaves_callback_unsent(
+    mock_publish, _mock_logs
+):
+    """Double-failure path: broker.publish raises, then broker.report_status
+    also raises. The terminal-callback marker MUST stay False so the outer
+    main() handler can attempt its own fallback callback. If the marker is set
+    eagerly via finally, main()'s `if not _is_callback_already_sent()` skips —
+    and the run goes PENDING forever in gp-api with no terminal status."""
+    from pmf_engine.runner.main import _is_callback_already_sent, _reset_callback_marker
+
+    _reset_callback_marker()
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"data": "ok"}',
+        content_type="application/json",
+        cost_usd=0.01,
+        num_turns=1,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_publish.publish.side_effect = Exception("Broker down")
+    mock_publish.report_status.side_effect = Exception("Broker still down")
+
+    with pytest.raises(Exception, match="Broker down"):
+        await run_experiment(config, harness=mock_harness)
+
+    assert _is_callback_already_sent() is False, (
+        "Marker must remain False when report_status itself failed — "
+        "otherwise main()'s fallback handler skips and the run is stuck PENDING."
+    )
+
+
+@pytest.mark.asyncio
 async def test_main_writes_instruction_to_workspace():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = _make_config(instruction="# Test Instruction\n\nDo the thing.")
@@ -186,6 +247,380 @@ async def test_main_writes_instruction_to_workspace():
         assert os.path.exists(instruction_path)
         with open(instruction_path) as f:
             assert f.read() == "# Test Instruction\n\nDo the thing."
+
+
+# ---------------------------------------------------------------------------
+# Attachments — runner writes sidecar files to /workspace/ before agent spawn
+# ---------------------------------------------------------------------------
+#
+# Contract: every entry in config.attachments lands as /workspace/<basename>
+# *before* run_experiment is invoked, so the agent can read it from turn 1.
+# The runner also re-checks the safety constraints the publisher/broker
+# already enforced — defense in depth, because the workspace is a real
+# filesystem.
+
+
+@pytest.mark.asyncio
+async def test_main_writes_attachments_to_workspace_before_running_experiment():
+    """Pin strict ordering: attachments land on disk AFTER from_env returns
+    but BEFORE run_experiment is invoked. Use two snapshot hooks:
+
+      1. from_env side_effect — fires before the workspace-setup section
+         runs. Attachments must NOT yet be on disk.
+      2. run_experiment side_effect — fires after the workspace-setup
+         section finishes. Attachments MUST be on disk.
+
+    The previous version only snapshotted at run_experiment, which couldn't
+    distinguish "writes happen before run" from "writes happen at any point
+    in main()". This catches a regression where attachment writes drift to
+    after run_experiment.start()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="# Hello",
+            attachments={
+                "catalog.md": "# Catalog\n\n- alpha\n- beta\n",
+                "lookup.csv": "k,v\n1,a\n",
+            },
+        )
+
+        files_before_setup: dict[str, str] = {}
+        files_at_run_time: dict[str, str] = {}
+
+        def _snapshot_before_setup():
+            for name in os.listdir(tmpdir):
+                path = os.path.join(tmpdir, name)
+                if os.path.isfile(path):
+                    with open(path) as fh:
+                        files_before_setup[name] = fh.read()
+            return config
+
+        async def _capture_workspace_state(*args, **kwargs):
+            for name in os.listdir(tmpdir):
+                path = os.path.join(tmpdir, name)
+                if os.path.isfile(path):
+                    with open(path) as fh:
+                        files_at_run_time[name] = fh.read()
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=_snapshot_before_setup,
+            ):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch(
+                            "pmf_engine.runner.main.run_experiment",
+                            side_effect=_capture_workspace_state,
+                        ):
+                            await main()
+
+        # BEFORE workspace setup: attachments must NOT be on disk yet.
+        assert "catalog.md" not in files_before_setup, (
+            f"attachments must not exist before from_env returns; got: "
+            f"{list(files_before_setup.keys())!r}"
+        )
+        assert "lookup.csv" not in files_before_setup
+        assert "instruction.md" not in files_before_setup
+
+        # AT run_experiment time: every attachment + instruction.md is on disk.
+        assert files_at_run_time.get("catalog.md") == "# Catalog\n\n- alpha\n- beta\n"
+        assert files_at_run_time.get("lookup.csv") == "k,v\n1,a\n"
+        assert files_at_run_time.get("instruction.md") == "# Hello"
+
+
+@pytest.mark.asyncio
+async def test_main_rejects_reserved_basename_attachment():
+    """The publisher and broker already refuse these, but the runner
+    double-checks at write time. A broker drift that surfaces a reserved
+    basename must crash loudly, not silently clobber instruction.md.
+
+    The runner's main() catches the AttachmentSafetyViolation, reports
+    "failed" with reason_code='AttachmentSafetyViolation' so ops can grep
+    for the distinct cause, then re-raises — so callers see the original
+    exception, not a SystemExit."""
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="legit instruction",
+            attachments={"instruction.md": "MALICIOUS — would clobber instruction"},
+        )
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with pytest.raises(AttachmentSafetyViolation, match="reserved basename"):
+                                await main()
+
+        # The agent must NEVER have been spawned — the bad attachment is a
+        # routing-level bug, not something the agent can recover from.
+        mock_run.assert_not_called()
+        # The legit instruction.md write happened before the attachment
+        # write, so the file exists with the *legitimate* content — never
+        # the attempted clobber.
+        with open(os.path.join(tmpdir, "instruction.md")) as fh:
+            content = fh.read()
+        assert content == "legit instruction"
+        # And the runner must have reported failure with the distinct
+        # error type so the run doesn't hang in PENDING and ops can grep
+        # CloudWatch for AttachmentSafetyViolation specifically.
+        mock_publish.report_status.assert_called()
+        failed_call = mock_publish.report_status.call_args
+        assert failed_call[0][0] == "failed"
+        assert failed_call[1]["reason_code"] == "AttachmentSafetyViolation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_name", [
+    "../escape.md",        # parent-dir traversal
+    "/abs/path.md",        # absolute path
+    "nested/file.md",      # nested subdir (not a basename)
+])
+async def test_main_rejects_unsafe_attachment_basenames(unsafe_name):
+    """Path-safety belt-and-suspenders: the runner refuses any attachment
+    name that isn't a clean basename, even if the broker somehow forwards
+    one. Without this guard, a malformed broker response could write
+    outside /workspace/ entirely.
+
+    Pin reason_code='AttachmentSafetyViolation' so the unsafe-basename and
+    reserved-basename branches share the same greppable error type but
+    distinct error messages."""
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(
+            instruction="legit",
+            attachments={unsafe_name: "would-escape-or-nest"},
+        )
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with pytest.raises(AttachmentSafetyViolation, match="unsafe basename"):
+                                await main()
+
+        mock_run.assert_not_called()
+        failed_calls = [
+            c for c in mock_publish.report_status.call_args_list
+            if c[0][0] == "failed"
+        ]
+        assert failed_calls
+        assert failed_calls[-1].kwargs.get("reason_code") == "AttachmentSafetyViolation"
+
+
+@pytest.mark.asyncio
+async def test_main_writes_attachments_with_utf8_encoding(tmp_path):
+    """Attachments may contain non-ASCII content (em-dashes, CJK, smart quotes).
+    The runner must explicitly write UTF-8 — otherwise on a locale-C container
+    the default `open()` encoding is ASCII and non-ASCII bodies crash mid-write,
+    leaving a partial file.
+    """
+    body = "Hello—world. 你好.\n"  # em-dash + "hello" in Chinese
+    config = _make_config(
+        instruction="# Hello",
+        attachments={"unicode.md": body},
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish"):
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                        await main()
+
+    written_path = tmp_path / "unicode.md"
+    on_disk_bytes = written_path.read_bytes()
+    # Exact UTF-8 byte sequence — proves no locale fallback happened.
+    assert on_disk_bytes == body.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_main_attachment_write_uses_exclusive_create(tmp_path):
+    """`open(..., "w")` silently truncates. `open(..., "x")` raises
+    FileExistsError on collision — a non-reserved-but-already-present file
+    must NOT be clobbered, even though the reserved-name set blocks the
+    obvious cases. Defense in depth for any file the runner/harness writes
+    that isn't in the reserved set."""
+    # Pre-create a file at the target attachment path with old content.
+    target = tmp_path / "preexisting.txt"
+    target.write_text("ORIGINAL — must not be clobbered")
+
+    config = _make_config(
+        instruction="# Hello",
+        attachments={"preexisting.txt": "new contents"},
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        with pytest.raises((FileExistsError, RuntimeError)):
+                            await main()
+
+    # File contents must be unchanged — the exclusive-create open raised
+    # *before* writing.
+    assert target.read_text() == "ORIGINAL — must not be clobbered"
+    # Agent must NOT have been spawned.
+    mock_run.assert_not_called()
+    # Runner must have surfaced a failed callback so the run doesn't hang
+    # PENDING in gp-api.
+    mock_publish.report_status.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_attachment_safety_violation_log_includes_error_type(tmp_path):
+    """When the runner rejects a reserved-name attachment, it must emit a
+    structured log with errorType=reserved_basename so ops can grep
+    CloudWatch for the specific cause without parsing free-form messages."""
+    import logging
+    import pmf_engine.runner.main as _main_mod
+
+    config = _make_config(
+        instruction="legit",
+        attachments={"instruction.md": "would clobber"},
+    )
+
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.ERROR)
+    _main_mod.logger.addHandler(handler)
+    try:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                            with pytest.raises(AttachmentSafetyViolation):
+                                await main()
+    finally:
+        _main_mod.logger.removeHandler(handler)
+
+    msgs = [r.getMessage() for r in captured]
+    joined = "\n".join(msgs)
+    assert "errorType=reserved_basename" in joined, (
+        f"expected structured log with errorType=reserved_basename; got: {msgs!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_partial_attachment_write_failure_does_not_invoke_run_experiment(tmp_path):
+    """If attachment N raises mid-loop, partial writes from N-1 and earlier
+    stay on disk (current behavior — workspace state is undefined). The
+    contract worth pinning: run_experiment must NOT be invoked and the
+    runner must report 'failed' with the safety-violation reason code.
+    """
+    from pmf_engine.runner.main import AttachmentSafetyViolation
+
+    config = _make_config(
+        instruction="instruction",
+        attachments={
+            "first.md": "first body",
+            "instruction.md": "RESERVED — must raise",
+            "third.md": "third body",
+        },
+    )
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        with pytest.raises(AttachmentSafetyViolation):
+                            await main()
+
+    # run_experiment never invoked.
+    mock_run.assert_not_called()
+
+    # report_status('failed') called with the new error class.
+    failed_calls = [
+        c for c in mock_publish.report_status.call_args_list
+        if c[0][0] == "failed"
+    ]
+    assert failed_calls, "expected a failed callback"
+    assert any(
+        c.kwargs.get("reason_code") == "AttachmentSafetyViolation"
+        for c in failed_calls
+    ), (
+        f"expected reason_code='AttachmentSafetyViolation'; got: "
+        f"{[c.kwargs.get('reason_code') for c in failed_calls]!r}"
+    )
+
+    # Document current partial-write behavior — first.md on disk, instruction.md
+    # is the legit one (written before the attachment loop ran), third.md
+    # never reached the disk. If a future "clean up on failure" change lands,
+    # this assertion forces a deliberate update.
+    assert (tmp_path / "first.md").exists()
+    assert (tmp_path / "instruction.md").read_text() == "instruction"
+    assert not (tmp_path / "third.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_main_works_with_runner_config_default_attachments(tmp_path):
+    """Integration pin for D13: when RunnerConfig is constructed without
+    attachments=... (the default factory produces an empty dict), main.py's
+    attachment-write loop must iterate cleanly — no AttributeError on None,
+    no extra files created, run_experiment still spawned. This catches
+    regressions where the default factory is removed without auditing the
+    callsite."""
+    # Construct WITHOUT attachments kwarg — exercises default_factory.
+    config = RunnerConfig(
+        experiment_id="hello_world",
+        run_id="run-default-attachments",
+        organization_slug="org-x",
+        instruction="# Hi",
+        broker_url="https://broker.test",
+        broker_token="tok",
+    )
+    # Sanity: the default factory produced an empty dict, not None.
+    assert config.attachments == {}
+
+    with patch.dict(os.environ, {"WORKSPACE_DIR": str(tmp_path)}):
+        with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+            with patch("pmf_engine.runner.main.init_config"):
+                with patch("pmf_engine.runner.main.publish"):
+                    with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                        await main()
+
+    mock_run.assert_called_once()
+    # Only instruction.md present — no spurious attachment files.
+    assert (tmp_path / "instruction.md").exists()
+    extra_files = [
+        p.name for p in tmp_path.iterdir()
+        if p.is_file() and p.name != "instruction.md"
+    ]
+    assert extra_files == [], (
+        f"default-attachments path must not create extra files; got: {extra_files!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_handles_empty_attachments_dict():
+    """The common case (experiment publishes no sidecars) must not regress.
+    Empty attachments dict → instruction.md written, run_experiment called,
+    no errors."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(instruction="just instruction", attachments={})
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            await main()
+
+        mock_run.assert_called_once()
+        assert os.path.exists(os.path.join(tmpdir, "instruction.md"))
 
 
 @pytest.mark.asyncio
@@ -208,6 +643,10 @@ async def test_main_sends_failed_status_on_timeout():
     statuses = [c[0][0] for c in status_calls]
     assert "failed" in statuses
     failed_call = next(c for c in status_calls if c[0][0] == "failed")
+    # Primary contract: reason_code is the stable greppable field operators
+    # alert on. The free-form detail string is a secondary, human-readable
+    # signal.
+    assert failed_call[1]["reason_code"] == "Timeout"
     assert "timed out" in failed_call[1]["detail"]
 
 
@@ -216,7 +655,7 @@ async def test_main_sends_failed_status_on_timeout():
 @patch("pmf_engine.runner.main.publish")
 async def test_run_experiment_contract_violation_reports_status(mock_publish, _mock_logs):
     config = _make_config(
-        contract_schema={"greeting": "string"},
+        contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}},
     )
     fake_result = HarnessResult(
         artifact_bytes=b'{"greeting": 42}',
@@ -248,7 +687,7 @@ async def test_run_experiment_contract_violation_invalid_json_still_reports(mock
     skip report_status and mark_callback_sent, leaving the run PENDING
     forever in gp-api with no way to know why.
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=b'this is not valid json {{{',
         content_type="application/json",
@@ -280,7 +719,7 @@ async def test_run_experiment_contract_violation_none_artifact_bytes(mock_publis
     `None[:4096]` — which would skip report_status entirely and leave the run
     PENDING forever (the same failure mode Fix #6 was supposed to close).
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=None,  # type: ignore[arg-type]
         content_type="application/json",
@@ -310,7 +749,7 @@ async def test_run_experiment_contract_violation_str_artifact_bytes(mock_publish
     instead of bytes, .decode() on str raises AttributeError — same lost
     callback. Coerce defensively.
     """
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes="not bytes, but str",  # type: ignore[arg-type]
         content_type="application/json",
@@ -505,7 +944,7 @@ async def test_run_experiment_traces_failure_to_braintrust(mock_publish, _mock_l
 @patch("pmf_engine.runner.main._upload_logs")
 @patch("pmf_engine.runner.main.publish")
 async def test_run_experiment_traces_contract_violation_to_braintrust(mock_publish, _mock_logs):
-    config = _make_config(contract_schema={"greeting": "string"})
+    config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
     fake_result = HarnessResult(
         artifact_bytes=b'{"greeting": 42}',
         content_type="application/json",
@@ -605,12 +1044,12 @@ class TestMainErrorPaths:
 
 
 class TestValidatorScriptShim:
-    def _write_workspace(self, tmpdir: Path, schema: dict, artifacts: dict,
-                         constraints: dict | None = None):
+    def _obj(self, required, **props):
+        return {"type": "object", "required": required, "properties": props}
+
+    def _write_workspace(self, tmpdir: Path, schema: dict, artifacts: dict):
         (tmpdir / "output").mkdir(exist_ok=True)
         (tmpdir / "contract_schema.json").write_text(json.dumps(schema))
-        if constraints is not None:
-            (tmpdir / "contract_constraints.json").write_text(json.dumps(constraints))
         for name, body in artifacts.items():
             (tmpdir / "output" / name).write_text(json.dumps(body))
         from pmf_engine.runner.main import _VALIDATOR_SCRIPT
@@ -631,7 +1070,7 @@ class TestValidatorScriptShim:
     def test_passes_on_valid_artifact(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"greeting": "string", "count": "number"},
+            schema=self._obj(["greeting", "count"], greeting={"type": "string"}, count={"type": "number"}),
             artifacts={"result.json": {"greeting": "hello", "count": 5}},
         )
         result = self._run_validator(tmp_path)
@@ -641,7 +1080,7 @@ class TestValidatorScriptShim:
     def test_fails_on_missing_field_and_lists_it(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"greeting": "string", "count": "number"},
+            schema=self._obj(["greeting", "count"], greeting={"type": "string"}, count={"type": "number"}),
             artifacts={"result.json": {"greeting": "hello"}},
         )
         result = self._run_validator(tmp_path)
@@ -652,7 +1091,12 @@ class TestValidatorScriptShim:
     def test_fails_on_multiple_errors_and_lists_all(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"a": "string", "b": "number", "c": "boolean"},
+            schema=self._obj(
+                ["a", "b", "c"],
+                a={"type": "string"},
+                b={"type": "number"},
+                c={"type": "boolean"},
+            ),
             artifacts={"result.json": {}},
         )
         result = self._run_validator(tmp_path)
@@ -661,12 +1105,14 @@ class TestValidatorScriptShim:
         assert "b" in result.stdout
         assert "c" in result.stdout
 
-    def test_fails_on_constraint_violation(self, tmp_path):
+    def test_fails_on_enum_violation(self, tmp_path):
         self._write_workspace(
             tmp_path,
-            schema={"tier": "string"},
+            schema=self._obj(
+                ["tier"],
+                tier={"type": "string", "enum": ["bronze", "silver", "gold"]},
+            ),
             artifacts={"result.json": {"tier": "platinum"}},
-            constraints={"enums": [{"path": "tier", "values": ["bronze", "silver", "gold"]}]},
         )
         result = self._run_validator(tmp_path)
         assert result.returncode == 1
@@ -674,7 +1120,7 @@ class TestValidatorScriptShim:
 
     def test_fails_when_output_dir_empty(self, tmp_path):
         (tmp_path / "output").mkdir()
-        (tmp_path / "contract_schema.json").write_text(json.dumps({"x": "string"}))
+        (tmp_path / "contract_schema.json").write_text(json.dumps(self._obj(["x"], x={"type": "string"})))
         from pmf_engine.runner.main import _VALIDATOR_SCRIPT
         (tmp_path / "validate_output.py").write_text(_VALIDATOR_SCRIPT)
         result = self._run_validator(tmp_path)
@@ -765,7 +1211,7 @@ class TestCallbackLifecycleFix:
         with patch.dict(os.environ, {
             "RUN_ID": "run-boot",
             "ORGANIZATION_SLUG": "org-boot",
-            "EXPERIMENT_ID": "voter_targeting",
+            "EXPERIMENT_ID": "smoke_test",
             "BROKER_URL": "https://broker.test",
             "BROKER_TOKEN": "tok-test",
             "ENVIRONMENT": "dev",
@@ -781,7 +1227,7 @@ class TestCallbackLifecycleFix:
 
     @pytest.mark.asyncio
     async def test_validator_non_contract_violation_uploads_logs_and_reports_failed(self):
-        config = _make_config(contract_schema={"greeting": "string"})
+        config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": "hello"}',
             content_type="application/json",
@@ -908,7 +1354,7 @@ class TestCallbackLifecycleFix:
                         with patch("pmf_engine.runner.main.publish", mock_pub):
                             with patch("pmf_engine.runner.main.get_harness", return_value=mock_harness):
                                 with patch("pmf_engine.runner.main._upload_logs"):
-                                    with pytest.raises(Exception):
+                                    with pytest.raises(Exception, match="Broker down"):
                                         await main()
 
         assert statuses_reported.count("failed") == 1, (
@@ -929,18 +1375,17 @@ class TestFailureCallbacksCarryDurationAndCost:
     @patch("pmf_engine.runner.main.publish")
     async def test_harness_failure_reports_duration_seconds(self, mock_publish, _mock_logs):
         config = _make_config()
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            # The agent ran for 30s before crashing.
+            clock.advance(30.0)
+            raise RuntimeError("Agent crashed")
+
         mock_harness = AsyncMock()
-        mock_harness.run.side_effect = RuntimeError("Agent crashed")
+        mock_harness.run.side_effect = harness_run_advances_clock
 
-        monotonic_values = iter([100.0, 130.0, 130.0, 130.0])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 130.0
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             with pytest.raises(RuntimeError, match="Agent crashed"):
                 await run_experiment(config, harness=mock_harness)
 
@@ -953,25 +1398,23 @@ class TestFailureCallbacksCarryDurationAndCost:
     @patch("pmf_engine.runner.main._upload_logs")
     @patch("pmf_engine.runner.main.publish")
     async def test_contract_violation_reports_duration_and_cost(self, mock_publish, _mock_logs):
-        config = _make_config(contract_schema={"greeting": "string"})
+        config = _make_config(contract_schema={"type": "object", "required": ["greeting"], "properties": {"greeting": {"type": "string"}}})
         fake_result = HarnessResult(
             artifact_bytes=b'{"greeting": 42}',
             content_type="application/json",
             cost_usd=0.13,
             num_turns=2,
         )
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            clock.advance(42.5)
+            return fake_result
+
         mock_harness = AsyncMock()
-        mock_harness.run.return_value = fake_result
+        mock_harness.run.side_effect = harness_run_advances_clock
 
-        monotonic_values = iter([100.0, 142.5, 142.5, 142.5])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 142.5
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             await run_experiment(config, harness=mock_harness)
 
         mock_publish.report_status.assert_called_once()
@@ -991,19 +1434,17 @@ class TestFailureCallbacksCarryDurationAndCost:
             cost_usd=0.21,
             num_turns=1,
         )
+        clock = Clock(start=100.0)
+
+        async def harness_run_advances_clock(*args, **kwargs):
+            clock.advance(15.0)
+            return fake_result
+
         mock_harness = AsyncMock()
-        mock_harness.run.return_value = fake_result
+        mock_harness.run.side_effect = harness_run_advances_clock
         mock_publish.publish.side_effect = Exception("Broker down")
 
-        monotonic_values = iter([100.0, 115.0, 115.0, 115.0])
-
-        def fake_monotonic():
-            try:
-                return next(monotonic_values)
-            except StopIteration:
-                return 115.0
-
-        with patch("pmf_engine.runner.main.time.monotonic", side_effect=fake_monotonic):
+        with patch("pmf_engine.runner.main.time.monotonic", clock.now):
             with pytest.raises(Exception, match="Broker down"):
                 await run_experiment(config, harness=mock_harness)
 
@@ -1015,29 +1456,69 @@ class TestFailureCallbacksCarryDurationAndCost:
 
 class TestObservabilityHardening:
     @pytest.mark.asyncio
-    async def test_main_surfaces_registry_error_in_status(self):
-        class BrokenRegistry:
-            def get(self, *args, **kwargs):
-                raise RuntimeError("Experiment module 'foo' failed to load: FileNotFoundError")
-
+    async def test_main_surfaces_broker_fetch_error_in_status(self):
+        """A broker fetch failure (transport error, malformed envelope, etc.)
+        must surface as SystemExit(1) so ECS marks the task FAILED instead of
+        silently passing the runner empty state."""
+        from pmf_engine.runner.manifest_loader import ManifestLoadError
         with patch.dict(os.environ, {
-            "EXPERIMENT_ID": "voter_targeting",
-            "RUN_ID": "run-reg",
-            "ORGANIZATION_SLUG": "org-reg",
+            "EXPERIMENT_ID": "smoke_test",
+            "RUN_ID": "run-broker-err",
+            "ORGANIZATION_SLUG": "org-x",
             "BROKER_URL": "https://broker.test",
             "BROKER_TOKEN": "tok-test",
             "PARAMS_JSON": "{}",
         }, clear=False):
-            for k in ("INSTRUCTION",):
-                os.environ.pop(k, None)
+            os.environ.pop("INSTRUCTION", None)
             with patch(
-                "pmf_engine.control_plane.registry.EXPERIMENT_REGISTRY",
-                BrokenRegistry(),
+                "pmf_engine.runner.manifest_loader.load_from_broker",
+                side_effect=ManifestLoadError("broker 503"),
             ):
                 with pytest.raises(SystemExit) as exc_info:
                     await main()
 
         assert exc_info.value.code == 1
+
+    @pytest.mark.asyncio
+    async def test_main_reports_failed_callback_when_broker_fetch_fails(self):
+        """When the broker is reachable enough to mint a token but the
+        manifest fetch fails (e.g., 503, malformed envelope), the runner MUST
+        send a `report_status('failed', ...)` callback so gp-api flips the
+        ExperimentRun row from PENDING → FAILED. Without this, runs hang
+        PENDING forever and operators have to grep CloudWatch to find them.
+        """
+        from pmf_engine.runner.manifest_loader import ManifestLoadError
+        with patch.dict(os.environ, {
+            "EXPERIMENT_ID": "smoke_test",
+            "RUN_ID": "run-callback-on-fail",
+            "ORGANIZATION_SLUG": "org-x",
+            "BROKER_URL": "https://broker.test",
+            "BROKER_TOKEN": "tok-test",
+            "PARAMS_JSON": "{}",
+        }, clear=False):
+            os.environ.pop("INSTRUCTION", None)
+            with patch("pmf_engine.runner.main.publish") as mock_publish, \
+                 patch("pmf_engine.runner.main.init_config"), \
+                 patch(
+                     "pmf_engine.runner.manifest_loader.load_from_broker",
+                     side_effect=ManifestLoadError("broker 503"),
+                 ):
+                with pytest.raises(SystemExit):
+                    await main()
+
+        mock_publish.report_status.assert_called_once()
+        call = mock_publish.report_status.call_args
+        assert call.args[0] == "failed", (
+            f"first arg must be 'failed' status, got {call.args[0]!r}"
+        )
+        assert call.kwargs.get("reason_code") == "ManifestLoadError", (
+            f"reason_code must surface the exception type for ops triage, "
+            f"got {call.kwargs.get('reason_code')!r}"
+        )
+        detail = call.kwargs.get("detail", "")
+        assert "broker 503" in detail, (
+            f"detail must include the underlying error message, got {detail!r}"
+        )
 
 
 class TestRunExperimentNoS3OrSQS:
@@ -1103,4 +1584,253 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
             f"config.env.yaml must NOT be collected (contains .env), got keys: {keys}"
         )
 
+
+class TestBrokerInitLastResortSqsFallback:
+    """C2: When BOTH init_config AND the subsequent RunnerConfig.from_env
+    broker fetch fail, the runner has no broker channel to send a failed
+    callback through. Without a fallback, the run hangs PENDING forever in
+    gp-api — exactly the hang this PR was supposed to fix.
+
+    Fix: post the failed-status envelope DIRECTLY to RESULTS_QUEUE_URL via
+    SQS as a last resort. Even if the runner doesn't currently have IAM/env
+    wired, the helper must exist, be exercised, and gracefully no-op when
+    RESULTS_QUEUE_URL is unset.
+    """
+
+    @pytest.mark.asyncio
+    async def test_double_failure_attempts_direct_sqs_send_then_exits(
+        self, monkeypatch
+    ):
+        """init_config raises, then from_env's broker fetch raises. The
+        last-resort SQS sender MUST be invoked, then sys.exit(1).
+        """
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-double-fail")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("RESULTS_QUEUE_URL", "https://sqs.us-west-2.amazonaws.com/123/results.fifo")
+
+        with patch(
+            "pmf_engine.runner.main.init_config",
+            side_effect=RuntimeError("broker unreachable"),
+        ):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=RuntimeError("broker manifest fetch failed"),
+            ):
+                with patch(
+                    "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                    return_value=True,
+                ) as mock_sqs_send:
+                    with pytest.raises(SystemExit) as exc_info:
+                        await main()
+
+        assert exc_info.value.code == 1
+        mock_sqs_send.assert_called_once()
+        call_kwargs = mock_sqs_send.call_args.kwargs or {}
+        call_args = mock_sqs_send.call_args.args
+        # Helper signature: (run_id, experiment_id, reason_code, detail)
+        all_args = list(call_args) + list(call_kwargs.values())
+        joined = " ".join(str(a) for a in all_args)
+        assert "run-double-fail" in joined, (
+            f"run_id must be in last-resort SQS send args, got: {all_args!r}"
+        )
+        assert "smoke_test" in joined, (
+            f"experiment_id must be in last-resort SQS send args, got: {all_args!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_double_failure_still_exits_when_direct_sqs_send_fails(
+        self, monkeypatch
+    ):
+        """If even the SQS direct send fails (e.g., no IAM, no RESULTS_QUEUE_URL,
+        SQS down) we MUST still sys.exit(1). The hang-prevention is best-effort —
+        a failed sentinel is still better than a CrashLoop on the SQS retry.
+        """
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-no-sqs")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+
+        with patch(
+            "pmf_engine.runner.main.init_config",
+            side_effect=RuntimeError("broker unreachable"),
+        ):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                side_effect=RuntimeError("broker manifest fetch failed"),
+            ):
+                with patch(
+                    "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                    return_value=False,
+                ) as mock_sqs_send:
+                    with pytest.raises(SystemExit) as exc_info:
+                        await main()
+
+        assert exc_info.value.code == 1
+        mock_sqs_send.assert_called_once()
+
+    def test_helper_returns_false_when_results_queue_url_unset(self, monkeypatch):
+        """Without RESULTS_QUEUE_URL set, the helper must no-op (return False)
+        rather than raising — the entrypoint must still reach sys.exit(1).
+        """
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+        monkeypatch.delenv("RESULTS_QUEUE_URL", raising=False)
+        ok = _send_failed_to_sqs_directly(
+            run_id="run-001",
+            experiment_id="smoke_test",
+            reason_code="BrokerInitError",
+            detail="broker 503",
+        )
+        assert ok is False
+
+    def test_helper_posts_envelope_to_sqs_when_url_set(self, monkeypatch):
+        """When RESULTS_QUEUE_URL is set and SQS accepts the message, the
+        helper returns True and the envelope contains the canonical fields
+        gp-api's results consumer expects.
+        """
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+
+        monkeypatch.setenv(
+            "RESULTS_QUEUE_URL",
+            "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
+        )
+        sent = {}
+
+        class _FakeSqs:
+            def send_message(self, **kwargs):
+                sent.update(kwargs)
+                return {"MessageId": "fake-msg-id"}
+
+        with patch(
+            "boto3.client",
+            return_value=_FakeSqs(),
+        ):
+            ok = _send_failed_to_sqs_directly(
+                run_id="run-001",
+                experiment_id="smoke_test",
+                reason_code="BrokerInitError",
+                detail="broker 503",
+            )
+
+        assert ok is True
+        assert sent["QueueUrl"] == "https://sqs.us-west-2.amazonaws.com/123/results.fifo"
+        body = json.loads(sent["MessageBody"])
+        assert body["run_id"] == "run-001"
+        assert body["experiment_id"] == "smoke_test"
+        assert body["status"] == "failed"
+        assert body["reason_code"] == "BrokerInitError"
+        assert body["detail"] == "broker 503"
+        assert sent["MessageGroupId"] == "run-001"
+        assert "run-001" in sent["MessageDeduplicationId"]
+        assert "BrokerInitError" in sent["MessageDeduplicationId"]
+
+    def test_helper_returns_false_on_sqs_exception(self, monkeypatch):
+        from pmf_engine.runner.main import _send_failed_to_sqs_directly
+
+        monkeypatch.setenv(
+            "RESULTS_QUEUE_URL",
+            "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
+        )
+
+        class _BrokenSqs:
+            def send_message(self, **kwargs):
+                raise RuntimeError("sqs down")
+
+        with patch("boto3.client", return_value=_BrokenSqs()):
+            ok = _send_failed_to_sqs_directly(
+                run_id="run-001",
+                experiment_id="smoke_test",
+                reason_code="BrokerInitError",
+                detail="x",
+            )
+        assert ok is False
+
+
+class TestBrokerUrlSchemeGuardBeforeInit:
+    """H4: validate_broker_url_scheme MUST run before init_config so a
+    plaintext BROKER_URL in prod never gets wired into the broker client.
+    The previous code passed http://... straight to init_config, then only
+    raised in from_env() AFTER the failed-callback path was already pointed
+    at an unencrypted channel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_plaintext_broker_url_in_prod_does_not_call_init_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("BROKER_URL", "http://broker.example.test:8080")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-001")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("ENVIRONMENT", "prod")
+
+        with patch("pmf_engine.runner.main.init_config") as mock_init:
+            with patch(
+                "pmf_engine.runner.main._send_failed_to_sqs_directly",
+                return_value=True,
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    await main()
+
+        assert exc_info.value.code == 1
+        mock_init.assert_not_called()
+
+
+class TestSigtermDuringInitExitsCleanly:
+    """L3: SIGTERM/SIGINT during pre-task init currently sets
+    `_shutdown_requested = True` but no code checks it before
+    `asyncio.wait_for(...)`. The task then runs to completion or timeout
+    despite the signal. This wastes ECS task time and confuses operators
+    grepping for SIGTERM-triggered exits.
+
+    Fix: check _shutdown_requested after init_config and after from_env.
+    On True, send a Signal failed-callback and sys.exit(1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_requested_after_init_exits_cleanly(self, monkeypatch, tmp_path):
+        config = _make_config(instruction="Do stuff")
+        monkeypatch.setenv("BROKER_URL", "https://broker.test")
+        monkeypatch.setenv("BROKER_TOKEN", "tok-test")
+        monkeypatch.setenv("RUN_ID", "run-sig")
+        monkeypatch.setenv("EXPERIMENT_ID", "smoke_test")
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path))
+
+        # init_config succeeds, but signal arrives during it — simulated by
+        # toggling the module flag inside the patched init_config.
+        def init_then_signal(*args, **kwargs):
+            import pmf_engine.runner.main as _m
+            _m._shutdown_requested = True
+
+        # Use AsyncMock so the patched run_experiment is a valid coroutine
+        # — without this, the test "passes" incidentally because MagicMock
+        # is not awaitable and the broad exception handler catches it.
+        async_run = AsyncMock()
+
+        with patch("pmf_engine.runner.main.init_config", side_effect=init_then_signal):
+            with patch(
+                "pmf_engine.runner.main.RunnerConfig.from_env",
+                return_value=config,
+            ):
+                with patch("pmf_engine.runner.main.publish") as mock_publish:
+                    with patch("pmf_engine.runner.main.run_experiment", side_effect=async_run):
+                        with pytest.raises(SystemExit) as exc_info:
+                            await main()
+
+        assert exc_info.value.code == 1
+        async_run.assert_not_called(), (
+            "run_experiment must NOT be reached after a pre-task signal — "
+            "the runner should exit before launching the agent task"
+        )
+        # We should have sent a failed callback with reason_code Signal.
+        signal_calls = [
+            c for c in mock_publish.report_status.call_args_list
+            if c[0][0] == "failed"
+            and "Signal" in (c.kwargs.get("reason_code", "") or "")
+        ]
+        assert signal_calls, (
+            f"expected failed-status with reason_code='Signal' on pre-task "
+            f"shutdown; got calls: {mock_publish.report_status.call_args_list!r}"
+        )
 

@@ -13,6 +13,10 @@ FULL_SECRET = {
     "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/abc",
     "DATABRICKS_API_KEY": "dapi-test",
     "SERVICE_TOKEN_HASH": "abc123hash",
+    "CLERK_SECRET_KEY": "sk_test_clerk",
+    "CLERK_FRONTEND_API_BASE": "https://test.clerk.app",
+    "GP_API_BASE_URL": "https://gp-api-dev.goodparty.org",
+    "AGENT_FLEET_CLERK_ID": "user_agent_fleet_test",
     "RESULTS_QUEUE_URL": "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
 }
 
@@ -36,6 +40,9 @@ class TestLoadSecrets:
         assert result.databricks_http_path == "/sql/1.0/warehouses/abc"
         assert result.databricks_api_key == "dapi-test"
         assert result.service_token_hash == "abc123hash"
+        assert result.clerk_secret_key == "sk_test_clerk"
+        assert result.clerk_frontend_api_base == "https://test.clerk.app"
+        assert result.agent_fleet_clerk_id == "user_agent_fleet_test"
         assert result.results_queue_url == "https://sqs.us-west-2.amazonaws.com/123/results.fifo"
 
     def test_missing_required_field_raises_valueerror(self):

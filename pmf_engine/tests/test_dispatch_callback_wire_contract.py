@@ -32,7 +32,7 @@ class TestSendErrorCallbackWireFormat:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_type": "voter_targeting",
+                    "experiment_type": "smoke_test",
                     "run_id": "run-err-1",
                     "organization_slug": "org-1",
                 },
@@ -45,7 +45,7 @@ class TestSendErrorCallbackWireFormat:
         assert body["type"] == "agentExperimentResult"
         # Data shape: camelCase, gp-api-compatible
         data = body["data"]
-        assert data["experimentId"] == "voter_targeting"
+        assert data["experimentId"] == "smoke_test"
         assert data["runId"] == "run-err-1"
         assert data["organizationSlug"] == "org-1"
         assert data["status"] == "failed"
@@ -59,7 +59,7 @@ class TestSendErrorCallbackWireFormat:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_type": "district_intel",
+                    "experiment_type": "smoke_test",
                     "run_id": "run-err-2",
                     "organization_slug": "org-2",
                 },
@@ -88,7 +88,7 @@ class TestSendErrorCallbackDedupKey:
         with patch.object(dh, "get_sqs_client", return_value=sqs):
             dh.send_error_callback(
                 message={
-                    "experiment_type": "voter_targeting",
+                    "experiment_type": "smoke_test",
                     "run_id": "run-xyz",
                     "organization_slug": "org-1",
                 },

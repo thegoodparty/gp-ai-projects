@@ -168,17 +168,18 @@ def handler(event: LambdaEvent, context=None) -> None:
 
 
 async def _generate(campaign_id: int, msg: SqsMessageBody) -> CampaignPlanResult:
-    from campaign_plan_lambda.event_generator import generate_event_tasks
+    from campaign_plan_lambda.event_generator import CampaignContext, generate_event_tasks
     from campaign_plan_lambda.output import write_result_to_s3, send_completion_message
 
-    event_tasks = await generate_event_tasks(
-        election_date=date.fromisoformat(msg.electionDate),
+    ctx = CampaignContext(
+        electionDate=msg.electionDate,
         state=msg.state,
         city=msg.city,
-        office_name=msg.officeName,
-        office_level=msg.officeLevel,
-        primary_election_date=msg.primaryElectionDate,
+        officeName=msg.officeName,
+        officeLevel=msg.officeLevel,
+        primaryElectionDate=msg.primaryElectionDate,
     )
+    event_tasks = await generate_event_tasks(ctx)
     logger.info(f"Generated {len(event_tasks)} event tasks")
 
     generation_timestamp = datetime.now(timezone.utc).isoformat()
