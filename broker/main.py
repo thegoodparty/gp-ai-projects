@@ -57,11 +57,6 @@ from broker.endpoints.delete_run_token import (
     get_ticket_store as delete_get_ticket_store,
     router as delete_router,
 )
-from broker.endpoints.pdf_fetch import (
-    get_browser_fetcher as pdf_get_browser_fetcher,
-    get_scope_ticket as pdf_get_scope_ticket,
-    router as pdf_router,
-)
 from broker.endpoints.http_fetch import (
     get_browser_fetcher as http_get_browser_fetcher,
     get_scope_ticket as http_get_scope_ticket,
@@ -131,7 +126,7 @@ async def lifespan(app: FastAPI):
     s3_client = boto3.client("s3")
     sqs_client = boto3.client("sqs")
     # Shared async client used by anthropic_proxy and agent_mcp_proxy. The
-    # pdf_fetch / http_fetch endpoints now route through PlaywrightBrowserFetcher
+    # unified /http/fetch endpoint routes through PlaywrightBrowserFetcher
     # below — plain httpx is 403'd by Cloudflare's JS challenge on muni sites.
     http_client = httpx.AsyncClient(timeout=30)
     browser_fetcher = PlaywrightBrowserFetcher()
@@ -213,9 +208,6 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[exp_get_s3_client] = lambda: s3_client
     app.dependency_overrides[exp_get_experiment_metadata_bucket] = lambda: experiment_metadata_bucket
 
-    app.dependency_overrides[pdf_get_scope_ticket] = _resolve_ticket_from_request
-    app.dependency_overrides[pdf_get_browser_fetcher] = lambda: browser_fetcher
-
     app.dependency_overrides[http_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[http_get_browser_fetcher] = lambda: browser_fetcher
 
@@ -251,7 +243,6 @@ app.include_router(read_router)
 app.include_router(status_router)
 app.include_router(databricks_router)
 app.include_router(upload_router)
-app.include_router(pdf_router)
 app.include_router(http_router)
 app.include_router(experiment_manifest_router)
 app.include_router(agent_mcp_router)

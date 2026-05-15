@@ -1,11 +1,10 @@
-"""Browser-rendered fetch with stealth. Drop-in replacement for the httpx
-fetch path that was previously used by `/http/fetch` and `/pdf/fetch`.
+"""Browser-rendered fetch with stealth. Backs the unified `/http/fetch` route.
 
 Why: plain httpx is 403'd by Cloudflare's JS challenge on many municipal
 agenda sites (e.g. CivicEngage, alvin.gov). A real Chromium + stealth
 fingerprint patches gets through, then captures the response — including
-PDFs that arrive as Content-Disposition: attachment downloads, not as the
-navigation response.
+PDFs/DOCX/anything that arrives as Content-Disposition: attachment downloads,
+not as the navigation response.
 
 DI shape: endpoints depend on the `BrowserFetcher` protocol so tests can
 inject an in-memory fake. Production wiring constructs a single
@@ -47,12 +46,7 @@ class BrowserFetchResult:
 
 
 class BrowserFetcher(Protocol):
-    async def fetch(
-        self,
-        url: str,
-        *,
-        capture_download: bool = False,
-    ) -> BrowserFetchResult: ...
+    async def fetch(self, url: str) -> BrowserFetchResult: ...
 
 
 class PlaywrightBrowserFetcher:
@@ -65,11 +59,10 @@ class PlaywrightBrowserFetcher:
     sub-resources, etc.) — the same posture the previous httpx path enforced
     via per-hop validation in `resolve_redirects`.
 
-    `capture_download=True` is for endpoints (like /pdf/fetch) that need to
-    grab the file when the upstream sends Content-Disposition: attachment.
-    page.goto() raises with "Download is starting" in that case and the bytes
-    arrive via the `download` event — see the working reference at
-    /tmp/fetch_alvin_stealth.py (Alvin TX agenda PDF).
+    fetch() handles both the page-response path (HTML / API JSON) and the
+    download path (PDFs/DOCX served as Content-Disposition: attachment) in
+    one call. Content-type for downloads comes from the response listener
+    that captured the upstream Content-Type header — NOT hardcoded.
     """
 
     def __init__(self, max_concurrent: int = 4) -> None:
@@ -94,21 +87,11 @@ class PlaywrightBrowserFetcher:
             await self._playwright.stop()
             self._playwright = None
 
-    async def fetch(
-        self,
-        url: str,
-        *,
-        capture_download: bool = False,
-    ) -> BrowserFetchResult:
+    async def fetch(self, url: str) -> BrowserFetchResult:
         async with self._semaphore:
-            return await self._fetch_impl(url, capture_download=capture_download)
+            return await self._fetch_impl(url)
 
-    async def _fetch_impl(
-        self,
-        url: str,
-        *,
-        capture_download: bool,
-    ) -> BrowserFetchResult:
+    async def _fetch_impl(self, url: str) -> BrowserFetchResult:
         from playwright.async_api import Download, Route
         from playwright.async_api import Error as PlaywrightError
         from playwright_stealth import stealth_async  # type: ignore[import-untyped]
@@ -135,6 +118,22 @@ class PlaywrightBrowserFetcher:
                 return
             await route.continue_()
 
+        # Capture every response Chromium sees so we can recover the real
+        # content-type for downloads (which fire via page.on("download")
+        # AFTER the response that triggered them has already been emitted).
+        # Key: response URL, value: (lowercased content-type, status).
+        captured_responses: dict[str, tuple[str, int]] = {}
+
+        def _response_listener(response: object) -> None:
+            try:
+                resp_url = response.url  # type: ignore[attr-defined]
+                headers = response.headers  # type: ignore[attr-defined]
+                status = response.status  # type: ignore[attr-defined]
+            except AttributeError:
+                return
+            ct = (headers.get("content-type") or "").split(";")[0].strip().lower()
+            captured_responses[resp_url] = (ct, status)
+
         context = await self._browser.new_context(
             user_agent=USER_AGENT,
             accept_downloads=True,
@@ -147,6 +146,7 @@ class PlaywrightBrowserFetcher:
 
             downloads: list[Download] = []
             page.on("download", lambda d: downloads.append(d))
+            page.on("response", _response_listener)
 
             response = None
             nav_error: Exception | None = None
@@ -157,48 +157,48 @@ class PlaywrightBrowserFetcher:
 
             _raise_if_violation()
 
-            if capture_download:
-                # The download path is normal here — page.goto raises when
-                # navigation becomes a download. Wait briefly for the event.
-                if not downloads:
-                    for _ in range(int(DOWNLOAD_WAIT_MS / 100)):
-                        if downloads:
-                            break
-                        await page.wait_for_timeout(100)
-                        _raise_if_violation()
-
-                if downloads:
-                    dl = downloads[0]
-                    final_url = dl.url
-                    await validate_url(final_url)
+            # Always wait briefly for a download event — page.goto either
+            # returns (page response path) or raises with "Download is
+            # starting" (download path); in both cases the download event
+            # may arrive slightly later.
+            if not downloads:
+                for _ in range(int(DOWNLOAD_WAIT_MS / 100)):
+                    if downloads:
+                        break
+                    await page.wait_for_timeout(100)
                     _raise_if_violation()
-                    body = await _read_download_bytes(dl)
-                    _raise_if_violation()
-                    return BrowserFetchResult(
-                        status=200,
-                        content_type="application/pdf",
-                        body=body,
-                        final_url=final_url,
-                    )
+                    # Short-circuit: if goto succeeded and no download fired
+                    # quickly, stop waiting and treat as page response.
+                    if response is not None and nav_error is None:
+                        break
 
-                # No download fired — fall through to treat as a regular page
-                # response. If nav_error is set, the upstream actually failed.
-                if nav_error is not None:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"upstream navigation failed: {nav_error}",
-                    )
+            if downloads:
+                dl = downloads[0]
+                final_url = dl.url
+                await validate_url(final_url)
+                _raise_if_violation()
+                body = await _read_download_bytes(dl)
+                _raise_if_violation()
+                captured = captured_responses.get(final_url)
+                content_type = captured[0] if captured and captured[0] else "application/octet-stream"
+                return BrowserFetchResult(
+                    status=200,
+                    content_type=content_type,
+                    body=body,
+                    final_url=final_url,
+                )
 
             if nav_error is not None:
+                logger.warning("playwright navigation error url=%s error=%s", url, nav_error)
                 raise HTTPException(
                     status_code=502,
-                    detail=f"upstream navigation failed: {nav_error}",
+                    detail="upstream navigation failed",
                 )
 
             if response is None:
                 raise HTTPException(
                     status_code=502,
-                    detail="upstream returned no response",
+                    detail="upstream navigation failed",
                 )
 
             await page.wait_for_timeout(POST_NAV_SETTLE_MS)
@@ -207,10 +207,12 @@ class PlaywrightBrowserFetcher:
             status = response.status
             content_type = (response.headers.get("content-type") or "").split(";")[
                 0
-            ].strip() or "application/octet-stream"
+            ].strip().lower() or "application/octet-stream"
             body = await response.body()
             _raise_if_violation()
             final_url = page.url
+            await validate_url(final_url)
+            _raise_if_violation()
 
             return BrowserFetchResult(
                 status=status,
