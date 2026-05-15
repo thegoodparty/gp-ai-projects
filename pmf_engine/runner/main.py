@@ -23,6 +23,26 @@ _shutdown_requested = False
 _current_task: "asyncio.Task | None" = None
 _terminal_callback_sent = False
 
+# Files the runner writes itself during workspace setup. An attachment that
+# matches one of these names would silently clobber the runner's own write.
+# The publisher rejects these at upload time; this set is the runtime
+# defense-in-depth guard.
+_RESERVED_WORKSPACE_FILES = frozenset({
+    "instruction.md",
+    "contract_schema.json",
+    "validate_output.py",
+})
+
+
+class AttachmentSafetyViolation(RuntimeError):
+    """Raised when an attachment write would clobber a reserved file, escape
+    the workspace, or otherwise violate the runner's path-safety guarantees.
+
+    Distinct subclass of RuntimeError so the outer error handler surfaces
+    reason_code='AttachmentSafetyViolation' to gp-api — operators get a
+    greppable, alertable error type instead of a generic 'RuntimeError'.
+    """
+
 _VALIDATOR_SCRIPT = '''#!/usr/bin/env python3
 """Validate output artifact against the contract schema.
 Usage: python3 /workspace/validate_output.py
@@ -658,6 +678,54 @@ async def main():
             with open(validator_path, "w") as f:
                 f.write(_VALIDATOR_SCRIPT)
             logger.info(f"Wrote contract validator to {validator_path}")
+
+        # Defense in depth: the publisher and broker both validate attachment
+        # names, but we double-check here because the workspace is a real
+        # filesystem and a malformed broker response could otherwise write
+        # outside /workspace/ or clobber files the runner just wrote.
+        workspace_real = os.path.realpath(workspace_dir)
+        for name, body in (config.attachments or {}).items():
+            if name in _RESERVED_WORKSPACE_FILES:
+                logger.error(
+                    "attachment_safety_violation errorType=%s "
+                    "run_id=%s experiment_id=%s basename=%r",
+                    "reserved_basename", config.run_id, config.experiment_id, name,
+                )
+                raise AttachmentSafetyViolation(
+                    f"attachment {name!r} collides with reserved basename"
+                )
+            if name != os.path.basename(name) or name.startswith("/") or ".." in name.split("/"):
+                logger.error(
+                    "attachment_safety_violation errorType=%s "
+                    "run_id=%s experiment_id=%s basename=%r",
+                    "unsafe_basename", config.run_id, config.experiment_id, name,
+                )
+                raise AttachmentSafetyViolation(
+                    f"attachment {name!r} has an unsafe basename"
+                )
+            attachment_path = os.path.realpath(os.path.join(workspace_dir, name))
+            # Realpath containment check: even after the basename guard, a
+            # symlinked workspace_dir or future validator drift could let
+            # the path leave /workspace/. Catch it before we open.
+            if not (
+                attachment_path == workspace_real
+                or attachment_path.startswith(workspace_real + os.sep)
+            ):
+                logger.error(
+                    "attachment_safety_violation errorType=%s "
+                    "run_id=%s experiment_id=%s basename=%r resolved=%r",
+                    "path_escape", config.run_id, config.experiment_id, name,
+                    attachment_path,
+                )
+                raise AttachmentSafetyViolation(
+                    f"attachment path {attachment_path!r} escapes workspace {workspace_real!r}"
+                )
+            # Exclusive-create + explicit utf-8: never silently clobber an
+            # existing file (FileExistsError), never trust the locale's
+            # default encoding (UnicodeEncodeError on locale-C with non-ASCII).
+            with open(attachment_path, "x", encoding="utf-8") as f:
+                f.write(body)
+            logger.info("Wrote attachment to %s (%d bytes)", attachment_path, len(body))
 
         _current_task = asyncio.ensure_future(run_experiment(config))
         await asyncio.wait_for(_current_task, timeout=timeout)

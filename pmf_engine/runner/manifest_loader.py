@@ -10,7 +10,7 @@ uses for everything else.
 from __future__ import annotations
 
 import logging
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import httpx
 
@@ -18,8 +18,27 @@ logger = logging.getLogger(__name__)
 
 
 class ManifestEnvelope(TypedDict):
+    """Envelope returned by POST /experiment/manifest.
+
+    `manifest` and `instruction` are always present after envelope validation
+    in `load_from_broker` — the previous `total=False` declaration was a
+    correctness regression: subscript access like `envelope["manifest"]` was
+    type-unsafe. Use `NotRequired` only for the truly optional fields the
+    broker may omit on older versions.
+    """
+
     manifest: dict
     instruction: str
+    # Sidecar files keyed by basename. Empty dict (not absent) when the
+    # experiment publishes no attachments — keeps downstream iteration
+    # unconditional in the runner. NotRequired only because older brokers
+    # (pre-attachment-feature) won't include the key at all.
+    attachments: NotRequired[dict[str, str]]
+    # VersionIds the broker actually resolved per attachment. Surfaced for
+    # audit-trail symmetry with manifest+instruction pinning so operators can
+    # cross-check what the runner saw against what dispatch HEADed at routing
+    # time. Older brokers (or experiments with no attachments) omit this key.
+    resolved_attachment_version_ids: NotRequired[dict[str, str]]
 
 
 class ManifestLoadError(RuntimeError):
@@ -32,6 +51,7 @@ def load_from_broker(
     broker_token: str,
     manifest_version_id: str | None = None,
     instruction_version_id: str | None = None,
+    attachment_version_ids: dict[str, str] | None = None,
     timeout_seconds: float = 30.0,
     client: httpx.Client | None = None,
 ) -> ManifestEnvelope:
@@ -65,6 +85,8 @@ def load_from_broker(
         request_body["manifest_version_id"] = manifest_version_id
     if instruction_version_id:
         request_body["instruction_version_id"] = instruction_version_id
+    if attachment_version_ids:
+        request_body["attachment_version_ids"] = attachment_version_ids
 
     try:
         try:
@@ -106,7 +128,60 @@ def load_from_broker(
             if required not in manifest:
                 raise ManifestLoadError(f"manifest missing required field '{required}'")
 
-        return ManifestEnvelope(manifest=manifest, instruction=instruction)
+        # Attachments are optional — older broker versions that haven't been
+        # redeployed yet don't include the field. Distinguish "key absent"
+        # (broker too old to ship attachments — emit operator-facing INFO so
+        # the discrepancy is visible) from "key present but {}" (broker is
+        # current, this experiment publishes no attachments — quiet).
+        has_attachments_key = "attachments" in envelope
+        if not has_attachments_key:
+            logger.info(
+                "broker did not return attachments key — running against older broker? "
+                "experiment_id=%s",
+                experiment_id,
+            )
+        raw_attachments = envelope.get("attachments", {})
+        if raw_attachments is None:
+            raw_attachments = {}
+        if not isinstance(raw_attachments, dict):
+            raise ManifestLoadError("envelope.attachments must be an object (basename → body)")
+        attachments: dict[str, str] = {}
+        for name, body in raw_attachments.items():
+            if not isinstance(name, str) or not isinstance(body, str):
+                raise ManifestLoadError(
+                    f"envelope.attachments['{name}'] must map a string basename to a string body"
+                )
+            attachments[name] = body
+
+        # Resolved attachment VersionIds — broker's audit-trail echo of what
+        # it actually fetched after the pinning request body was applied.
+        # Optional and only surfaced when present; legacy brokers (or
+        # experiments with no attachments) omit it entirely.
+        raw_resolved = envelope.get("resolved_attachment_version_ids")
+        resolved_attachment_version_ids: dict[str, str] | None = None
+        if raw_resolved is not None:
+            if not isinstance(raw_resolved, dict):
+                raise ManifestLoadError(
+                    "envelope.resolved_attachment_version_ids must be an object "
+                    "(basename → version_id)"
+                )
+            resolved_attachment_version_ids = {}
+            for name, vid in raw_resolved.items():
+                if not isinstance(name, str) or not isinstance(vid, str):
+                    raise ManifestLoadError(
+                        f"envelope.resolved_attachment_version_ids['{name}'] must map "
+                        f"a string basename to a string version_id"
+                    )
+                resolved_attachment_version_ids[name] = vid
+
+        result: ManifestEnvelope = {
+            "manifest": manifest,
+            "instruction": instruction,
+            "attachments": attachments,
+        }
+        if resolved_attachment_version_ids is not None:
+            result["resolved_attachment_version_ids"] = resolved_attachment_version_ids
+        return result
     finally:
         if owns_client and client is not None:
             client.close()

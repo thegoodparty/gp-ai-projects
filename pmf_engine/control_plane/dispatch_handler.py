@@ -397,6 +397,18 @@ def build_container_overrides(
         env.append({"name": "MANIFEST_VERSION_ID", "value": experiment["manifest_version_id"]})
     if experiment.get("instruction_version_id"):
         env.append({"name": "INSTRUCTION_VERSION_ID", "value": experiment["instruction_version_id"]})
+    # Attachment VersionIds are sidecar pins captured by the manifest loader's
+    # per-attachment HEADs. sort_keys keeps the env-var value byte-deterministic
+    # across dispatches so downstream caches / idempotency tests don't churn
+    # on dict iteration order. Skip when empty/absent — empty env vars are
+    # noise and the runner already special-cases empty/unset.
+    if experiment.get("attachment_version_ids"):
+        env.append(
+            {
+                "name": "ATTACHMENT_VERSION_IDS",
+                "value": json.dumps(experiment["attachment_version_ids"], sort_keys=True),
+            }
+        )
     # Write-action manifest fields (system_prompt, permission_mode,
     # allowed_external_tools — ENG-10128) are not forwarded as env vars on
     # purpose: the runner fetches the full manifest itself via

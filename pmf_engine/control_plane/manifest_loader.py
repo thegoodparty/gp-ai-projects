@@ -87,6 +87,10 @@ class ManifestRoutingLoader:
         # was upstream and brittle.
         self._manifest_cache: dict[str, tuple[tuple[dict, str | None], float]] = {}
         self._instruction_version_cache: dict[str, tuple[str | None, float]] = {}
+        # Per-experiment cache of {basename: version_id}. Single-source-of-
+        # truth for the runner's attachment pin so a publish during the
+        # dispatch→runner window can't swap bytes out under us.
+        self._attachment_version_cache: dict[str, tuple[dict[str, str], float]] = {}
 
     # ---------- public ----------
 
@@ -120,9 +124,14 @@ class ManifestRoutingLoader:
             experiment_id,
             entry.get("instruction_key", f"{experiment_id}/instruction.md"),
         )
+        attachment_keys = entry.get("attachment_keys") or []
+        attachment_version_ids = self._fetch_attachment_version_ids(
+            experiment_id, attachment_keys
+        )
         routing = _project_routing(manifest, experiment_id=experiment_id)
         routing["manifest_version_id"] = manifest_version_id
         routing["instruction_version_id"] = instruction_version_id
+        routing["attachment_version_ids"] = attachment_version_ids
         return routing
 
     def known_experiments(self) -> list[str]:
@@ -229,6 +238,84 @@ class ManifestRoutingLoader:
             self._instruction_version_cache.clear()
         self._instruction_version_cache[experiment_id] = (version_id, now)
         return version_id
+
+    def _fetch_attachment_version_ids(
+        self, experiment_id: str, attachment_keys: list[str]
+    ) -> dict[str, str]:
+        """HEAD each attachment key, return {basename: VersionId}.
+
+        Error-handling contract mirrors `_fetch_instruction_version_id`:
+        - `NoSuchKey` / `NoSuchVersion` / `"404"` on a single attachment:
+          WARN-log + skip that basename. Dispatch proceeds; the runner will
+          surface the missing attachment via the broker fetch when it tries
+          to materialize the workspace file.
+        - Any other ClientError (AccessDenied, ServiceUnavailable, SlowDown,
+          throttling, transient 5xx): raise ManifestLoaderTransientError.
+          Falling through to "latest" defeats the entire pinning system the
+          dispatch-time HEAD was designed to guarantee.
+        - Wrong-prefix attachment_key (doesn't start with
+          `{experiment_id}/attachments/`): WARN-log + skip. Defense in depth
+          against publish-pipeline bugs / manual S3 edits.
+
+        Cached under the same TTL as manifest+instruction so warm Lambdas
+        don't re-HEAD on every invocation.
+        """
+        now = time.monotonic()
+        cached = self._attachment_version_cache.get(experiment_id)
+        if cached and now - cached[1] < self._ttl:
+            return cached[0]
+
+        result: dict[str, str] = {}
+        expected_prefix = f"{experiment_id}/attachments/"
+        for ak in attachment_keys:
+            if not isinstance(ak, str) or not ak.startswith(expected_prefix):
+                logger.warning(
+                    "attachment_key has unexpected prefix — skipping: "
+                    "experiment_id=%s key=%r expected_prefix=%s",
+                    experiment_id,
+                    ak,
+                    expected_prefix,
+                )
+                continue
+            basename = ak.split("/attachments/", 1)[1]
+            try:
+                response = self._s3.head_object(Bucket=self._bucket, Key=ak)
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                request_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
+                if code in ("NoSuchKey", "NoSuchVersion", "404"):
+                    logger.warning(
+                        "attachment object absent — proceeding without version pin: "
+                        "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
+                        experiment_id,
+                        ak,
+                        self._bucket,
+                        code,
+                        request_id,
+                    )
+                    continue
+                logger.error(
+                    "S3 HeadObject failed for attachment (NOT swallowed — version pin lost): "
+                    "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
+                    experiment_id,
+                    ak,
+                    self._bucket,
+                    code,
+                    request_id,
+                    exc_info=True,
+                )
+                raise ManifestLoaderTransientError(
+                    f"failed to head attachment s3://{self._bucket}/{ak} "
+                    f"for '{experiment_id}': {code} (request_id={request_id})"
+                ) from e
+            version_id = response.get("VersionId")
+            if version_id is not None:
+                result[basename] = version_id
+
+        if len(self._attachment_version_cache) >= _MANIFEST_CACHE_MAX:
+            self._attachment_version_cache.clear()
+        self._attachment_version_cache[experiment_id] = (result, now)
+        return result
 
     def _get_object(self, key: str, label: str) -> tuple[bytes, str | None]:
         try:
