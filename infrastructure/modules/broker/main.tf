@@ -997,6 +997,30 @@ resource "aws_cloudwatch_metric_alarm" "classifier_exception" {
   }
 }
 
+resource "aws_cloudwatch_metric_alarm" "experiment_terminal_failure" {
+  count               = var.sns_topic_arn != "" ? 1 : 0
+  alarm_name          = "broker-experiment-terminal-failure-${var.environment}"
+  alarm_description   = "PMF experiment terminated with failed/contract_violation/timeout. Emitted by broker /internal/run-status — alarms on every occurrence so ops sees user-impacting failures in Slack within minutes (otherwise the only signal is a row in experiment_run.status=FAILED that nobody queries proactively)."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ExperimentTerminalFailure"
+  namespace           = "PMFEngine"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [var.sns_topic_arn]
+  ok_actions          = [var.sns_topic_arn]
+
+  dimensions = {
+    Environment = var.environment
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
 resource "aws_cloudwatch_metric_alarm" "broker_task_count" {
   count               = var.sns_topic_arn != "" ? 1 : 0
   alarm_name          = "broker-task-count-${var.environment}"

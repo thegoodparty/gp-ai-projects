@@ -363,3 +363,112 @@ class TestRunStatusClearsRunLock:
                 "run-lock row must also be gone — otherwise re-dispatching the "
                 "same run_id hits 409 against the stale lock until TTL expires"
             )
+
+
+class TestRunStatusTerminalFailureAlerting:
+    """Every terminal /run-status (failed | contract_violation | timeout) must
+    emit a structured log line AND a CloudWatch metric so ops gets a Slack
+    alert. Without this, failures land silently in gp-api's experiment_run
+    table and only surface when a user complains. The metric is alarmed in
+    infrastructure/modules/broker/main.tf -> SNS -> shared-slack-notifier.
+    """
+
+    def _post(self, status: str, reason_code: str | None = None, ticket=None):
+        import logging
+        from unittest.mock import patch
+        from broker.endpoints.run_status import _reset_cw_client_for_tests
+
+        _reset_cw_client_for_tests()
+        app, _, _, _ = _create_app(ticket=ticket)
+        body: dict = {"status": status, "duration_seconds": 12.5}
+        if reason_code:
+            body["reason_code"] = reason_code
+        with patch("broker.endpoints.run_status._get_cw_client") as mock_cw:
+            client = TestClient(app)
+            resp = client.post(
+                "/internal/run-status",
+                json=body,
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+            return resp, mock_cw
+
+    def test_failed_emits_structured_log_with_run_id_and_experiment(self, caplog):
+        caplog.set_level("WARNING", logger="broker.endpoints.run_status")
+        ticket = _make_ticket(
+            experiment_id="meeting_briefing", run_id="run-failed-001",
+            organization_slug="demo-org",
+        )
+        resp, _ = self._post("failed", reason_code="agent_crashed", ticket=ticket)
+        assert resp.status_code == 200
+        records = [r for r in caplog.records if "run_status terminal" in r.message]
+        assert records, "expected a 'run_status terminal' warning log"
+        msg = records[0].getMessage()
+        assert "status=failed" in msg
+        assert "reason_code=agent_crashed" in msg
+        assert "run_id=run-failed-001" in msg
+        assert "experiment_id=meeting_briefing" in msg
+
+    def test_contract_violation_emits_structured_log(self, caplog):
+        caplog.set_level("WARNING", logger="broker.endpoints.run_status")
+        ticket = _make_ticket(experiment_id="meeting_briefing", run_id="run-cv-001")
+        resp, _ = self._post("contract_violation", ticket=ticket)
+        assert resp.status_code == 200
+        assert any(
+            "run_status terminal" in r.message and "status=contract_violation" in r.message
+            for r in caplog.records
+        )
+
+    def test_timeout_emits_structured_log_with_status_timeout(self, caplog):
+        """The wire callback translates timeout -> failed, but the log must
+        record the original 'timeout' so ops can distinguish."""
+        caplog.set_level("WARNING", logger="broker.endpoints.run_status")
+        ticket = _make_ticket(run_id="run-timeout-001")
+        resp, _ = self._post("timeout", ticket=ticket)
+        assert resp.status_code == 200
+        assert any(
+            "run_status terminal" in r.message and "status=timeout" in r.message
+            for r in caplog.records
+        )
+
+    def test_failed_emits_cloudwatch_metric_with_dimensions(self):
+        ticket = _make_ticket(experiment_id="meeting_briefing", run_id="run-metric-001")
+        resp, mock_cw = self._post("failed", ticket=ticket)
+        assert resp.status_code == 200
+        mock_cw.return_value.put_metric_data.assert_called_once()
+        call = mock_cw.return_value.put_metric_data.call_args.kwargs
+        assert call["Namespace"] == "PMFEngine"
+        data = call["MetricData"][0]
+        assert data["MetricName"] == "ExperimentTerminalFailure"
+        assert data["Value"] == 1
+        dims = {d["Name"]: d["Value"] for d in data["Dimensions"]}
+        assert dims["ExperimentId"] == "meeting_briefing"
+        assert dims["Status"] == "failed"
+        assert "Environment" in dims
+
+    def test_contract_violation_metric_status_value(self):
+        ticket = _make_ticket(experiment_id="district_intel", run_id="run-cv-002")
+        resp, mock_cw = self._post("contract_violation", ticket=ticket)
+        assert resp.status_code == 200
+        data = mock_cw.return_value.put_metric_data.call_args.kwargs["MetricData"][0]
+        dims = {d["Name"]: d["Value"] for d in data["Dimensions"]}
+        assert dims["Status"] == "contract_violation"
+        assert dims["ExperimentId"] == "district_intel"
+
+    def test_metric_emission_failure_does_not_break_response(self):
+        """CloudWatch hiccup must never fail the broker response."""
+        from unittest.mock import patch
+        from broker.endpoints.run_status import _reset_cw_client_for_tests
+        _reset_cw_client_for_tests()
+        app, _, mock_sender, _ = _create_app()
+        with patch(
+            "broker.endpoints.run_status._get_cw_client",
+            side_effect=RuntimeError("cw outage"),
+        ):
+            client = TestClient(app)
+            resp = client.post(
+                "/internal/run-status",
+                json={"status": "failed", "reason_code": "test"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+        assert resp.status_code == 200
+        mock_sender.send_result.assert_called_once()
