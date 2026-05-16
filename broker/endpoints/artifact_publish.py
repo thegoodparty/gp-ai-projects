@@ -120,16 +120,34 @@ def artifact_publish(
     # list — broker stays consumer-domain-agnostic. Any new experiment that
     # adds allowed_tables automatically gets the safety check; web-only
     # experiments skip it.
+    #
+    # Carve-out for legitimate no-data outcomes: a manifest may declare
+    #   scope.data_required_unless = {"field": "<artifact_field>",
+    #                                  "values": ["<v1>", ...]}
+    # When the artifact's named field carries one of those values (e.g.
+    # meeting_briefing's `briefing_status=awaiting_agenda` placeholder when
+    # the next council meeting's agenda packet hasn't been published yet),
+    # the gate is skipped — no data query is appropriate for that branch.
+    # Broker stays domain-agnostic: it doesn't know what the values mean,
+    # only that the manifest declared them as exemptions.
     if ticket.scope.get("allowed_tables") and tracker.get(ticket.pk) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"NoDataQueriesSucceeded: experiment '{ticket.experiment_id}' "
-                f"declares scope.allowed_tables but no Databricks query succeeded "
-                f"during this run. Refusing to publish — this prevents synthetic "
-                f"artifacts from being accepted when data sources are unreachable."
-            ),
+        carve_out = ticket.scope.get("data_required_unless")
+        artifact_field_value = (
+            req.artifact.get(carve_out["field"]) if carve_out else None
         )
+        carve_applies = bool(
+            carve_out and artifact_field_value in carve_out.get("values", [])
+        )
+        if not carve_applies:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"NoDataQueriesSucceeded: experiment '{ticket.experiment_id}' "
+                    f"declares scope.allowed_tables but no Databricks query succeeded "
+                    f"during this run. Refusing to publish — this prevents synthetic "
+                    f"artifacts from being accepted when data sources are unreachable."
+                ),
+            )
 
     if os.environ.get("ENABLE_PII_SCANNER", "").strip().lower() in _PII_ENABLED_VALUES:
         pii_matches = scan_artifact(req.artifact)
