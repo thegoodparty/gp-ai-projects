@@ -48,7 +48,7 @@ def app_and_store(moto_env):
     app.include_router(router)
     fake_clerk = MagicMock(spec=ClerkClient)
     fake_clerk.create_actor_token = AsyncMock(
-        return_value={"url": "https://test.clerk.app/v1/client/sign_in_tokens/tok?token=jwt"}
+        return_value={"url": "https://test.clerk.app/v1/tickets/accept?ticket=jwt"}
     )
     fake_clerk.redeem_actor_token = AsyncMock(return_value={"session_id": "sess_test"})
     app.dependency_overrides[mint_get_ticket_store] = lambda: store

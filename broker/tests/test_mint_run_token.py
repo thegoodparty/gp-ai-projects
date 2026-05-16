@@ -26,7 +26,7 @@ from broker.endpoints.mint_run_token import (
 SERVICE_TOKEN = "test-dispatch-lambda-token"
 SERVICE_TOKEN_HASH = hash_service_token(SERVICE_TOKEN)
 DEFAULT_CLERK_USER_ID = "user_test_abc123"
-DEFAULT_ACTOR_TOKEN_URL = "https://test.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
+DEFAULT_ACTOR_TOKEN_URL = "https://test.clerk.app/v1/tickets/accept?ticket=jwt"
 
 
 def _make_fake_clerk(

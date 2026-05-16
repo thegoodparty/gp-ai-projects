@@ -95,60 +95,90 @@ class TestMintSessionJwt:
 
 
 class TestRedeemActorToken:
-    async def test_returns_session_id_from_response_created_session_id(self):
-        transport = httpx.MockTransport(
-            lambda req: httpx.Response(
+    async def test_posts_form_encoded_ticket_to_sign_ins_endpoint(self):
+        captured: dict = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            captured["method"] = req.method
+            captured["url"] = str(req.url)
+            captured["content_type"] = req.headers.get("content-type")
+            captured["body"] = req.content.decode()
+            return httpx.Response(
                 200,
-                json={"response": {"created_session_id": "sess_abc"}},
+                json={
+                    "response": {
+                        "status": "complete",
+                        "created_session_id": "sess_abc",
+                    }
+                },
             )
-        )
+
+        transport = httpx.MockTransport(handler)
         client = _make_client_with_http(transport)
 
         info = await client.redeem_actor_token(
-            "https://x.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
+            "https://x.clerk.app/v1/tickets/accept?ticket=jwt-value"
         )
 
         assert info == {"session_id": "sess_abc"}
-        await client.aclose()
-
-    async def test_falls_back_to_client_last_active_session_id(self):
-        transport = httpx.MockTransport(
-            lambda req: httpx.Response(
-                200,
-                json={"client": {"last_active_session_id": "sess_xyz"}},
-            )
-        )
-        client = _make_client_with_http(transport)
-
-        info = await client.redeem_actor_token(
-            "https://x.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
-        )
-
-        assert info == {"session_id": "sess_xyz"}
+        assert captured["method"] == "POST"
+        assert captured["url"] == "https://x.clerk.app/v1/client/sign_ins"
+        assert "application/x-www-form-urlencoded" in captured["content_type"]
+        assert "strategy=ticket" in captured["body"]
+        assert "ticket=jwt-value" in captured["body"]
         await client.aclose()
 
     async def test_raises_on_non_2xx(self):
         transport = httpx.MockTransport(
-            lambda req: httpx.Response(410, text="actor_token_already_used")
+            lambda req: httpx.Response(
+                400,
+                json={
+                    "errors": [{"code": "actor_token_already_used_code"}],
+                },
+            )
         )
         client = _make_client_with_http(transport)
 
         with pytest.raises(ClerkClientError, match="actor token redemption failed"):
             await client.redeem_actor_token(
-                "https://x.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
+                "https://x.clerk.app/v1/tickets/accept?ticket=jwt"
             )
         await client.aclose()
 
-    async def test_raises_when_no_session_id_present(self):
+    async def test_raises_when_status_not_complete(self):
         transport = httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"response": {}, "client": {}})
+            lambda req: httpx.Response(
+                200,
+                json={"response": {"status": "needs_identifier"}},
+            )
         )
         client = _make_client_with_http(transport)
 
-        with pytest.raises(ClerkClientError, match="missing session id"):
+        with pytest.raises(ClerkClientError, match="non-complete status"):
             await client.redeem_actor_token(
-                "https://x.clerk.app/v1/client/sign_in_tokens/tok_1?token=jwt"
+                "https://x.clerk.app/v1/tickets/accept?ticket=jwt"
             )
+        await client.aclose()
+
+    async def test_raises_when_created_session_id_missing(self):
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(
+                200,
+                json={"response": {"status": "complete"}},
+            )
+        )
+        client = _make_client_with_http(transport)
+
+        with pytest.raises(ClerkClientError, match="missing created_session_id"):
+            await client.redeem_actor_token(
+                "https://x.clerk.app/v1/tickets/accept?ticket=jwt"
+            )
+        await client.aclose()
+
+    async def test_raises_when_ticket_query_param_missing(self):
+        client = _make_client_with_http(httpx.MockTransport(lambda req: httpx.Response(200)))
+        with pytest.raises(ClerkClientError, match="missing ticket query parameter"):
+            await client.redeem_actor_token("https://x.clerk.app/v1/tickets/accept")
         await client.aclose()
 
     async def test_rejects_url_outside_frontend_api_base(self):
@@ -159,7 +189,7 @@ class TestRedeemActorToken:
         )
         with pytest.raises(ClerkClientError, match="not from the configured"):
             await client.redeem_actor_token(
-                "https://attacker.com/v1/sign_in_tokens/abc?token=xyz"
+                "https://attacker.com/v1/tickets/accept?ticket=xyz"
             )
         await client.aclose()
 
