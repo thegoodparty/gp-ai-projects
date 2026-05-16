@@ -116,7 +116,13 @@ def _is_textual_content_type(ct: str) -> bool:
 
 
 class PlaywrightBrowserFetcher:
-    def __init__(self, max_concurrent: int = 4) -> None:
+    # 8 concurrent contexts on a 4 vCPU / 8 GB Fargate task. At ~100-300 MB per
+    # Chromium context (worst case, JS-heavy pages), peak is ~2.4 GB out of 8 —
+    # leaves ~5 GB headroom. CPU is the binding constraint at this concurrency,
+    # not memory: most fetches are in network-wait at any given moment, so
+    # contexts overlap their JS-exec phases rather than colliding. If sustained
+    # load pushes CPU avg past 55%, the ECS service autoscales out.
+    def __init__(self, max_concurrent: int = 8) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._closing = False
