@@ -116,13 +116,20 @@ def _is_textual_content_type(ct: str) -> bool:
 
 
 class PlaywrightBrowserFetcher:
-    # 8 concurrent contexts on a 4 vCPU / 8 GB Fargate task. At ~100-300 MB per
-    # Chromium context (worst case, JS-heavy pages), peak is ~2.4 GB out of 8 —
-    # leaves ~5 GB headroom. CPU is the binding constraint at this concurrency,
-    # not memory: most fetches are in network-wait at any given moment, so
-    # contexts overlap their JS-exec phases rather than colliding. If sustained
-    # load pushes CPU avg past 55%, the ECS service autoscales out.
-    def __init__(self, max_concurrent: int = 8) -> None:
+    # 20 concurrent contexts on a 4 vCPU / 8 GB Fargate task. Stress-tested at
+    # 8 concurrent on 2026-05-16: 100 in-flight requests against a real
+    # Granicus page peaked at ~30% CPU and ~6% memory on a single task —
+    # ~3.75% CPU per active context, plenty of headroom on memory regardless.
+    # Bumping to 20 puts the expected peak at ~75% CPU under burst, which
+    # will reliably trigger the ECS service's 55% CPU autoscale target and
+    # add a second task. That's intentional: we'd rather scale out under real
+    # demand than leave throughput on the table. Memory at 20 concurrent is
+    # ~15% — still nowhere near the 70% target.
+    #
+    # If sustained load keeps the service scaled out at high cost, the next
+    # move is the path-based pool split described in broker/README.md
+    # (/http/fetch gets its own target group with a memory-tuned task size).
+    def __init__(self, max_concurrent: int = 20) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._closing = False
