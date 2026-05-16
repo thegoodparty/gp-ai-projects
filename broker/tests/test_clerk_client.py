@@ -193,6 +193,53 @@ class TestRedeemActorToken:
             )
         await client.aclose()
 
+    async def test_clears_cookies_between_redemptions(self):
+        # Dev Clerk instances (*.clerk.accounts.dev) 401 with
+        # dev_browser_unauthenticated when a second sign-in arrives carrying
+        # the __client / __session cookies set by the first. The httpx jar
+        # must be empty before each redemption.
+        call_count = 0
+        cookies_received_per_call: list[dict[str, str]] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            cookies_received_per_call.append(dict(req.headers))
+            return httpx.Response(
+                200,
+                json={
+                    "response": {
+                        "status": "complete",
+                        "created_session_id": f"sess_{call_count}",
+                    }
+                },
+                headers={
+                    "set-cookie": "__client=client_cookie_value; Path=/; HttpOnly",
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = _make_client_with_http(transport)
+
+        await client.redeem_actor_token(
+            "https://x.clerk.app/v1/tickets/accept?ticket=jwt-1"
+        )
+        # Cookies set by the first response would normally land in the jar.
+        # After clearing, the next call must not carry them.
+        await client.redeem_actor_token(
+            "https://x.clerk.app/v1/tickets/accept?ticket=jwt-2"
+        )
+
+        assert call_count == 2
+        first_cookies = cookies_received_per_call[0].get("cookie", "")
+        second_cookies = cookies_received_per_call[1].get("cookie", "")
+        assert first_cookies == ""
+        assert second_cookies == "", (
+            f"second call leaked cookies from the first: {second_cookies!r}"
+        )
+        assert dict(client._http.cookies) == {}
+        await client.aclose()
+
 
 class TestCreateActorToken:
     async def test_returns_body_with_url(self):

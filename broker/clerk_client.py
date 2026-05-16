@@ -74,6 +74,13 @@ class ClerkClient:
         # POST /v1/client/sign_ins with strategy=ticket, which is what
         # @clerk/clerk-js does internally via signIn.ticket({ ticket }). Response
         # is JSON: { response: { status: "complete", created_session_id, ... } }.
+        #
+        # The shared httpx client's cookie jar is cleared in the finally block
+        # below. Without that reset, Set-Cookie headers from prior sign-ins
+        # (Clerk's __client / __session) accumulate, and dev Clerk instances
+        # (*.clerk.accounts.dev) reject the next sign-in carrying an existing
+        # client cookie with `dev_browser_unauthenticated`. Clearing matches
+        # the wire semantics of a real first-time browser sign-in per call.
         if not actor_token_url.startswith(f"{self._frontend_api_base}/"):
             raise ClerkClientError(
                 f"actor token URL is not from the configured Clerk frontend API base "
@@ -84,10 +91,13 @@ class ClerkClient:
             raise ClerkClientError(
                 f"actor token URL missing ticket query parameter (url={actor_token_url[:80]}...)"
             )
-        resp = await self._http.post(
-            f"{self._frontend_api_base}/v1/client/sign_ins",
-            data={"strategy": "ticket", "ticket": ticket_values[0]},
-        )
+        try:
+            resp = await self._http.post(
+                f"{self._frontend_api_base}/v1/client/sign_ins",
+                data={"strategy": "ticket", "ticket": ticket_values[0]},
+            )
+        finally:
+            self._http.cookies.clear()
         if resp.status_code >= 400:
             raise ClerkClientError(
                 f"actor token redemption failed status={resp.status_code} body={resp.text[:500]}"
