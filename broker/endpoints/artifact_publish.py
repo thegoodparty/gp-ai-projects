@@ -131,12 +131,28 @@ def artifact_publish(
     # Broker stays domain-agnostic: it doesn't know what the values mean,
     # only that the manifest declared them as exemptions.
     if ticket.scope.get("allowed_tables") and tracker.get(ticket.pk) == 0:
+        # carve_out shape is validated by the manifest meta-schema at publish
+        # time in the runbooks repo, but the broker treats it as untrusted dict
+        # input — a malformed `data_required_unless` (missing 'field', missing
+        # 'values', wrong types) must not crash the publish path with a raw
+        # 500. Use .get() everywhere and fail safe: any malformed shape falls
+        # back to today's strict gate behavior.
         carve_out = ticket.scope.get("data_required_unless")
-        artifact_field_value = (
-            req.artifact.get(carve_out["field"]) if carve_out else None
+        carve_field = (
+            carve_out.get("field") if isinstance(carve_out, dict) else None
         )
-        carve_applies = bool(
-            carve_out and artifact_field_value in carve_out.get("values", [])
+        carve_values = (
+            carve_out.get("values") if isinstance(carve_out, dict) else None
+        )
+        artifact_field_value = (
+            req.artifact.get(carve_field)
+            if isinstance(carve_field, str) and isinstance(req.artifact, dict)
+            else None
+        )
+        carve_applies = (
+            isinstance(carve_values, list)
+            and artifact_field_value is not None
+            and artifact_field_value in carve_values
         )
         if not carve_applies:
             raise HTTPException(

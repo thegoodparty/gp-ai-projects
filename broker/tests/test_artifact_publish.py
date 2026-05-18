@@ -963,3 +963,58 @@ class TestArtifactPublishDataRequiredUnlessCarveOut:
         assert resp.status_code == 400
         assert "NoDataQueriesSucceeded" in resp.json()["detail"]
         mock_s3.put_object.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "malformed_carve_out",
+        [
+            pytest.param({"values": ["awaiting_agenda"]}, id="missing-field-key"),
+            pytest.param({"field": "briefing_status"}, id="missing-values-key"),
+            pytest.param({"field": None, "values": ["x"]}, id="null-field"),
+            pytest.param({"field": "briefing_status", "values": None}, id="null-values"),
+            pytest.param({"field": 42, "values": ["x"]}, id="non-string-field"),
+            pytest.param({"field": "x", "values": "not-a-list"}, id="non-list-values"),
+            pytest.param("not-a-dict", id="non-dict-carve-out"),
+        ],
+    )
+    def test_malformed_carve_out_does_not_crash_and_falls_back_to_strict_gate(
+        self, malformed_carve_out
+    ):
+        """The carve-out shape is meta-schema-validated upstream in the runbooks
+        repo, but the broker treats `ticket.scope` as untrusted dict input. A
+        malformed `data_required_unless` (missing keys, wrong types, etc.) must
+        not crash the publish path with a raw 500. Fail safe: behave as if no
+        carve-out existed and let the strict gate fire normally."""
+        now = int(time.time())
+        ticket = ScopeTicket(
+            pk=BROKER_TOKEN,
+            run_id="run-malformed-001",
+            organization_slug="org-malformed",
+            experiment_id="meeting_briefing",
+            scope={
+                "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
+                "max_rows": 50000,
+                "data_required_unless": malformed_carve_out,
+            },
+            params={},
+            exp=now + 3600,
+            issued_at=now,
+            issued_by="dispatch-lambda-dev",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket, tracker_count=0)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _awaiting_agenda_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Critical: NOT a 500 (raw KeyError / AttributeError leak).
+        # Critical: IS a 400 with the structured anti-fabrication reason,
+        # because the malformed carve-out is treated as absent.
+        assert resp.status_code == 400, (
+            f"malformed carve-out crashed the publish path: status={resp.status_code} "
+            f"body={resp.text}"
+        )
+        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
+        mock_s3.put_object.assert_not_called()
