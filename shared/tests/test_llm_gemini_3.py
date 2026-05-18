@@ -41,7 +41,7 @@ class TestGemini3ClientInit:
         client = Gemini3Client(api_key="test-key")
 
         assert client.default_model == GeminiModelType.FLASH_3
-        assert client.default_temperature == 0.7
+        assert client.default_temperature == 1.0
         assert client.thinking_level == ThinkingLevel.MINIMAL
         assert client.include_thoughts is False
         assert client.max_retries == 3
@@ -77,7 +77,7 @@ class TestBuildConfig:
         client = Gemini3Client(api_key="test-key")
         config = client._build_config(GeminiModelType.FLASH_3)
 
-        assert config.temperature == 0.7
+        assert config.temperature == 1.0
         assert "minimal" in str(config.thinking_config.thinking_level).lower()
         assert config.thinking_config.include_thoughts is False
 

@@ -53,7 +53,7 @@ class Gemini3Client:
         self,
         api_key: Optional[str] = None,
         default_model: GeminiModelType = GeminiModelType.FLASH_3,
-        default_temperature: float = 0.7,
+        default_temperature: float = 1.0,
         thinking_level: ThinkingLevel = ThinkingLevel.MINIMAL,
         include_thoughts: bool = False,
         max_connections: int = 100,

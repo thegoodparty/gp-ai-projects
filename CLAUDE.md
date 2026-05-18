@@ -37,6 +37,10 @@ CI workflows are mostly `build-*.yml` Docker→ECR builds per workspace member, 
 | AI rule-by-rule code review | `ai-rules/` (git submodule) |
 | Why a thing is the way it is | `docs/adr/` (not yet seeded) |
 
+## LLM defaults
+
+- **Gemini**: prefer Gemini 3 (`shared.llm_gemini_3.Gemini3Client`) over Gemini 2.5 for new work. Use the default temperature of `1.0` unless you have a specific reason to override it — this is the recommended setting for Gemini 3.
+
 ## Code style
 
 - **Python `3.13`** at runtime (`.python-version`). Subprojects declare `requires-python = ">=3.11"`. ruff targets `py311`. mypy `python_version = 3.11`. The 3.13 runtime can run anything ≤3.13; the 3.11 floor is the compatibility line. Don't use 3.12+ syntax features (e.g., PEP 695 type aliases) without checking that ruff and mypy agree.
