@@ -116,7 +116,22 @@ def _is_textual_content_type(ct: str) -> bool:
 
 
 class PlaywrightBrowserFetcher:
-    def __init__(self, max_concurrent: int = 4) -> None:
+    # 30 concurrent contexts on a 4 vCPU / 8 GB Fargate task. Stress-tested
+    # incrementally on 2026-05-16:
+    #   max_concurrent=8,  100 reqs burst:  CPU peak ~30%, mem peak ~8%
+    #   max_concurrent=20, 200 reqs burst:  CPU peak ~50%, mem peak ~8.5%
+    # Per-context CPU cost is ~2.5% (sub-linear vs. linear projection because
+    # network-wait dominates each fetch's lifecycle, so 30 contexts don't all
+    # hit JS-exec at the same instant). Predicted at 30 concurrent: ~75% peak
+    # CPU and ~12% memory — above the 55% CPU autoscale target, so sustained
+    # bursts will reliably trigger the ECS service to add a second task.
+    # Intentional: prefer scale-out under demand to leaving throughput on the
+    # table. Memory stays well clear of the 70% target.
+    #
+    # If sustained load keeps the service scaled out at high cost, the next
+    # move is the path-based pool split described in broker/README.md
+    # (/http/fetch gets its own target group with a memory-tuned task size).
+    def __init__(self, max_concurrent: int = 30) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._closing = False

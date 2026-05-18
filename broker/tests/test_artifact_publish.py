@@ -831,3 +831,190 @@ class TestArtifactPublishAntiFabricationGate:
         assert resp.status_code == 400
         assert "brand_new_experiment_42" in resp.json()["detail"]
         mock_s3.put_object.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Carve-out for legitimate no-data outcomes.
+#
+# The anti-fabrication gate above is correct when the agent SHOULD have queried
+# data and didn't — but some experiment playbooks have legitimate early-exit
+# branches where no data query is appropriate (e.g. meeting_briefing emits an
+# `awaiting_agenda` placeholder when the next council meeting's agenda packet
+# hasn't been published yet). The manifest opts in via:
+#
+#   "scope": {
+#     "allowed_tables": [...],
+#     "data_required_unless": {
+#       "field": "briefing_status",
+#       "values": ["awaiting_agenda", "no_meeting_found", "error"]
+#     }
+#   }
+#
+# When set, the broker checks the artifact's named field; if its value is in
+# the allowlist, the gate is skipped even with zero data queries. Otherwise
+# (full-data branches, or any unconfigured experiment), today's strict
+# behavior is preserved.
+# ---------------------------------------------------------------------------
+
+
+def _make_ticket_with_data_required_unless(
+    field: str = "briefing_status",
+    values: list[str] | None = None,
+    experiment_id: str = "meeting_briefing",
+) -> ScopeTicket:
+    """Ticket whose scope declares allowed_tables AND a data_required_unless
+    carve-out — the gate should skip when artifact[field] in values."""
+    now = int(time.time())
+    return ScopeTicket(
+        pk=BROKER_TOKEN,
+        run_id="run-carve-001",
+        organization_slug="org-carve",
+        experiment_id=experiment_id,
+        scope={
+            "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
+            "max_rows": 50000,
+            "data_required_unless": {
+                "field": field,
+                "values": values or ["awaiting_agenda", "no_meeting_found", "error"],
+            },
+        },
+        params={},
+        exp=now + 3600,
+        issued_at=now,
+        issued_by="dispatch-lambda-dev",
+    )
+
+
+def _awaiting_agenda_artifact() -> dict:
+    """Placeholder artifact the agent emits when the next meeting's agenda
+    packet hasn't been published yet — no Databricks query is appropriate."""
+    return {
+        "briefing_status": "awaiting_agenda",
+        "briefing_type": "city_council_meeting",
+        "summary": "Agenda not yet published for next meeting",
+    }
+
+
+class TestArtifactPublishDataRequiredUnlessCarveOut:
+    def test_carve_out_allows_publish_for_matching_status_with_zero_queries(self):
+        """Manifest declares data_required_unless={briefing_status:
+        [awaiting_agenda, ...]}. Artifact has briefing_status=awaiting_agenda
+        and zero data queries succeeded. The gate skips — this is a legitimate
+        no-data outcome, not a fabricated artifact."""
+        ticket = _make_ticket_with_data_required_unless()
+        app, mock_s3, mock_sender, _ = _create_app(
+            ticket=ticket, tracker_count=0
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _awaiting_agenda_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        assert mock_s3.put_object.call_count >= 1
+        mock_sender.send_result.assert_called_once()
+
+    def test_carve_out_does_not_apply_to_full_output_branch(self):
+        """The carve-out is value-scoped. A full-data artifact
+        (briefing_status=briefing_ready) on the same manifest still requires
+        a successful query — protecting against the original fabrication risk
+        when the agent emits a full briefing without real data backing it."""
+        ticket = _make_ticket_with_data_required_unless()
+        app, mock_s3, mock_sender, _ = _create_app(
+            ticket=ticket, tracker_count=0
+        )
+        client = TestClient(app)
+
+        full_artifact = {
+            "briefing_status": "briefing_ready",
+            "briefing_type": "city_council_meeting",
+            "summary": "Full briefing",
+        }
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": full_artifact},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 400
+        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
+        mock_s3.put_object.assert_not_called()
+        mock_sender.send_result.assert_not_called()
+
+    def test_no_carve_out_field_preserves_strict_gate(self):
+        """Existing manifests (no data_required_unless field) keep today's
+        behavior exactly — zero queries with allowed_tables set → 400. This
+        is the backward-compatibility guarantee for district_issue_pulse,
+        district_issue_snapshot, and any future strict-data experiment."""
+        ticket = _make_ticket_with_data_scope(experiment_id="meeting_briefing")
+        # _make_ticket_with_data_scope does NOT set data_required_unless.
+        app, mock_s3, _, _ = _create_app(ticket=ticket, tracker_count=0)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _awaiting_agenda_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 400
+        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
+        mock_s3.put_object.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "malformed_carve_out",
+        [
+            pytest.param({"values": ["awaiting_agenda"]}, id="missing-field-key"),
+            pytest.param({"field": "briefing_status"}, id="missing-values-key"),
+            pytest.param({"field": None, "values": ["x"]}, id="null-field"),
+            pytest.param({"field": "briefing_status", "values": None}, id="null-values"),
+            pytest.param({"field": 42, "values": ["x"]}, id="non-string-field"),
+            pytest.param({"field": "x", "values": "not-a-list"}, id="non-list-values"),
+            pytest.param("not-a-dict", id="non-dict-carve-out"),
+        ],
+    )
+    def test_malformed_carve_out_does_not_crash_and_falls_back_to_strict_gate(
+        self, malformed_carve_out
+    ):
+        """The carve-out shape is meta-schema-validated upstream in the runbooks
+        repo, but the broker treats `ticket.scope` as untrusted dict input. A
+        malformed `data_required_unless` (missing keys, wrong types, etc.) must
+        not crash the publish path with a raw 500. Fail safe: behave as if no
+        carve-out existed and let the strict gate fire normally."""
+        now = int(time.time())
+        ticket = ScopeTicket(
+            pk=BROKER_TOKEN,
+            run_id="run-malformed-001",
+            organization_slug="org-malformed",
+            experiment_id="meeting_briefing",
+            scope={
+                "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
+                "max_rows": 50000,
+                "data_required_unless": malformed_carve_out,
+            },
+            params={},
+            exp=now + 3600,
+            issued_at=now,
+            issued_by="dispatch-lambda-dev",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket, tracker_count=0)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _awaiting_agenda_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Critical: NOT a 500 (raw KeyError / AttributeError leak).
+        # Critical: IS a 400 with the structured anti-fabrication reason,
+        # because the malformed carve-out is treated as absent.
+        assert resp.status_code == 400, (
+            f"malformed carve-out crashed the publish path: status={resp.status_code} "
+            f"body={resp.text}"
+        )
+        assert "NoDataQueriesSucceeded" in resp.json()["detail"]
+        mock_s3.put_object.assert_not_called()
