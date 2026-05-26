@@ -369,6 +369,9 @@ async def run_experiment(
                     contract_schema=config.contract_schema,
                     parent_span=span,
                     experiment_id=config.experiment_id,
+                    system_prompt=config.system_prompt,
+                    permission_mode=config.permission_mode,
+                    allowed_external_tools=config.allowed_external_tools,
                 )
             except Exception as e:
                 duration = time.monotonic() - start_time
