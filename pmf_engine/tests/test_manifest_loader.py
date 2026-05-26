@@ -319,3 +319,198 @@ class TestManifestLoaderAttachmentVersionIds:
             load_from_broker(
                 "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
             )
+
+
+# ---------------------------------------------------------------------------
+# Write-action field validation (ENG-10234, runner-side mirror of
+# pmf_engine.control_plane.manifest_loader._validate_write_action_fields).
+#
+# Each test sends a single malformed write-action field through the real
+# load_from_broker + httpx.MockTransport path so the validator runs against
+# the actual envelope-parse code, not in isolation. If a future refactor
+# drops any of these branches, one of these tests must fail.
+# ---------------------------------------------------------------------------
+
+
+def _envelope_with_write_action(**overrides) -> dict:
+    """Build a baseline-valid envelope with the three write-action fields,
+    then apply overrides. Use `_MISSING` sentinel to delete a key entirely
+    (vs setting it to None / empty)."""
+    envelope = _good_envelope()
+    envelope["manifest"]["system_prompt"] = "You are a compliance setup agent."
+    envelope["manifest"]["permission_mode"] = "default"
+    envelope["manifest"]["allowed_external_tools"] = ["Read"]
+    for key, value in overrides.items():
+        if value is _MISSING:
+            envelope["manifest"].pop(key, None)
+        else:
+            envelope["manifest"][key] = value
+    return envelope
+
+
+_MISSING = object()
+
+
+class TestRunnerWriteActionValidation:
+    """Mirrors test_lambda_manifest_loader.py's parametrized coverage of
+    `_validate_write_action_fields`. The runner-side validator is the last
+    line of defense for hand-edited manifests in local-dev runs that bypass
+    dispatch; without these tests, a refactor that drops a branch would land
+    silently."""
+
+    def test_accepts_all_three_fields_well_formed(self):
+        envelope = _envelope_with_write_action()
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert result["manifest"]["system_prompt"] == "You are a compliance setup agent."
+        assert result["manifest"]["permission_mode"] == "default"
+        assert result["manifest"]["allowed_external_tools"] == ["Read"]
+
+    def test_accepts_when_all_write_action_fields_absent(self):
+        """Legacy read-action manifest (no write-action fields) must still
+        load — the runner's existing 1.6k tests rely on this."""
+        envelope = _envelope_with_write_action(
+            system_prompt=_MISSING,
+            permission_mode=_MISSING,
+            allowed_external_tools=_MISSING,
+        )
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert "system_prompt" not in result["manifest"]
+        assert "permission_mode" not in result["manifest"]
+        assert "allowed_external_tools" not in result["manifest"]
+
+    @pytest.mark.parametrize(
+        "permission_mode",
+        ["acceptEdits", "plan", "hax", "", "BypassPermissions"],
+    )
+    def test_rejects_unknown_permission_mode(self, permission_mode):
+        """Only `default` and `bypassPermissions` are allowlisted on both
+        sides. `acceptEdits` and `plan` are intentionally excluded until the
+        harness is audited for them; case-sensitive."""
+        envelope = _envelope_with_write_action(permission_mode=permission_mode)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="permission_mode"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_rejects_non_string_permission_mode(self):
+        envelope = _envelope_with_write_action(permission_mode=42)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="permission_mode"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_accepts_bypass_permissions_mode(self):
+        envelope = _envelope_with_write_action(permission_mode="bypassPermissions")
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert result["manifest"]["permission_mode"] == "bypassPermissions"
+
+    @pytest.mark.parametrize("bad_value", [42, 3.14, ["a", "list"], {"a": "dict"}, True])
+    def test_rejects_non_string_system_prompt(self, bad_value):
+        envelope = _envelope_with_write_action(system_prompt=bad_value)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="system_prompt"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    @pytest.mark.parametrize("empty_value", ["", "   ", "\n\t"])
+    def test_rejects_empty_system_prompt(self, empty_value):
+        """Whitespace-only is treated as empty — matches dispatch-side rule."""
+        envelope = _envelope_with_write_action(system_prompt=empty_value)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="system_prompt"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    @pytest.mark.parametrize("bad_value", ["WebFetch", 42, {"tool": "WebFetch"}])
+    def test_rejects_non_list_allowed_external_tools(self, bad_value):
+        envelope = _envelope_with_write_action(allowed_external_tools=bad_value)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="allowed_external_tools"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    @pytest.mark.parametrize(
+        "bad_entry",
+        [None, 42, ["nested"], "", "   "],
+    )
+    def test_rejects_invalid_external_tool_entry(self, bad_entry):
+        envelope = _envelope_with_write_action(
+            allowed_external_tools=["Read", bad_entry],
+        )
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="allowed_external_tools"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_empty_external_tools_list_is_valid(self):
+        """An empty list explicitly denies external tools — distinct from
+        the field being absent (runner default ALLOWED_TOOLS applies)."""
+        envelope = _envelope_with_write_action(allowed_external_tools=[])
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert result["manifest"]["allowed_external_tools"] == []
+
+    def test_permission_mode_validated_in_isolation(self):
+        """A malformed permission_mode is rejected even when it's the only
+        write-action field on the manifest (no system_prompt /
+        allowed_external_tools present)."""
+        envelope = _envelope_with_write_action(
+            system_prompt=_MISSING,
+            allowed_external_tools=_MISSING,
+            permission_mode="hax",
+        )
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="permission_mode"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )

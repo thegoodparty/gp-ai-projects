@@ -1854,9 +1854,6 @@ async def test_write_action_manifest_flows_through_to_claude_agent_options(
     side (ENG-10128) routes the SQS message; this test covers the runner side
     that consumes the resulting manifest and builds ClaudeAgentOptions for
     the Fargate task's Claude SDK session.
-
-    Anchor: see Architecture Note 5 + "Runner harness gap" in the Epic plan
-    (/Users/tomeralmog/.claude/plans/86ah2ezk6-plan.md).
     """
     from claude_agent_sdk import ResultMessage
 
