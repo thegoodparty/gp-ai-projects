@@ -25,4 +25,7 @@ class AgentHarness(Protocol):
         contract_schema: dict | None = None,
         parent_span=None,
         experiment_id: str | None = None,
+        system_prompt: str | None = None,
+        permission_mode: str | None = None,
+        allowed_external_tools: list[str] | None = None,
     ) -> HarnessResult: ...
