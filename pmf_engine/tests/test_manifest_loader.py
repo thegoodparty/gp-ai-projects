@@ -514,3 +514,28 @@ class TestRunnerWriteActionValidation:
             load_from_broker(
                 "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
             )
+
+
+def test_permission_mode_values_parity_with_control_plane():
+    """The runner-side `_PERMISSION_MODE_VALUES` is a deliberate copy of the
+    control-plane set (kept inline to avoid a control_plane → runner import
+    in the runner Docker image). This parity test catches drift the moment
+    a new mode is added on one side but not the other: without it, a future
+    addition like `acceptEdits` to control-plane would dispatch correctly
+    but every experiment using it would hard-fail in the runner with
+    `ManifestLoadError`.
+    """
+    from pmf_engine.control_plane.manifest_loader import (
+        _PERMISSION_MODE_VALUES as cp_vals,
+    )
+    from pmf_engine.runner.manifest_loader import (
+        _PERMISSION_MODE_VALUES as runner_vals,
+    )
+
+    assert runner_vals == cp_vals, (
+        f"runner and control_plane _PERMISSION_MODE_VALUES diverged: "
+        f"runner={sorted(runner_vals)!r} cp={sorted(cp_vals)!r}. "
+        f"Update whichever side is missing the value; both must allowlist "
+        f"the same set (the harness allowlists are reviewed alongside the "
+        f"validator rules)."
+    )

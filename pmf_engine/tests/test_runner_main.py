@@ -1953,3 +1953,81 @@ async def test_write_action_manifest_flows_through_to_claude_agent_options(
         "Authorization": "Bearer tok-end-to-end"
     }
 
+
+# ---------------------------------------------------------------------------
+# Bearer-token redaction (ENG-10234 hardening — delegate-review finding)
+#
+# The Claude SDK writes a session JSONL at ~/.claude/projects/**/*.jsonl that
+# the runner uploads to S3 via _upload_logs. Pre-ENG-10234 the runner only
+# ever passed env-derived secrets to the SDK; the new BROKER_TOKEN bearer
+# header inside ClaudeAgentOptions.mcp_servers is potentially serializable
+# into that JSONL by SDK internals. The existing _SECRET_PATTERNS only catch
+# `key=value`/`key:value` shapes — `Authorization: Bearer <token>` has a
+# space the char class doesn't include, so it passes through unredacted.
+# ---------------------------------------------------------------------------
+
+
+class TestBearerTokenRedaction:
+    def test_redacts_authorization_header_bearer_token(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # JSON-serialized header shape that the SDK could emit into session
+        # logs. This is the exact shape that escaped _SECRET_PATTERNS pre-fix.
+        line = '{"headers": {"Authorization": "Bearer tok-mcp-123-secret-stuff"}}\n'
+        redacted = _redact_line(line)
+
+        assert "tok-mcp-123-secret-stuff" not in redacted
+        assert "Bearer " in redacted, "Bearer prefix preserved for diagnostic value"
+        assert "REDACTED" in redacted
+
+    def test_redacts_bearer_in_curl_style_header(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # Whatever the SDK chooses to emit, the redaction must apply to any
+        # `Bearer <token>` shape — header lines, curl reproducers, etc.
+        line = "curl -H 'Authorization: Bearer broker-jwt-eyJhbGciOiJIUzI1NiJ9...'"
+        redacted = _redact_line(line)
+
+        assert "broker-jwt-eyJhbGciOiJIUzI1NiJ9" not in redacted
+        assert "Bearer " in redacted
+
+    def test_redacts_jwt_with_dots_and_dashes(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # JWTs contain `.` and `-` — verify the char class covers them.
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        line = f'"auth": "Bearer {jwt}"'
+        redacted = _redact_line(line)
+
+        assert jwt not in redacted
+        assert "Bearer " in redacted
+
+    def test_short_bearer_value_below_threshold_not_redacted(self):
+        """Threshold of 8 chars matches the existing _SECRET_PATTERNS
+        convention — tokens shorter than that aren't credentials worth
+        guarding against; this avoids redacting words like "Bearer hi"
+        in agent-authored prose."""
+        from pmf_engine.runner.main import _redact_line
+
+        line = "the Bearer hi was retrieved"
+        redacted = _redact_line(line)
+
+        assert redacted == line
+
+    def test_redaction_does_not_destroy_surrounding_json(self):
+        """The substitution must leave the surrounding JSON parseable so log
+        diffing / cwltail-style tools that consume the redacted file still
+        work."""
+        import json as _json
+        from pmf_engine.runner.main import _redact_line
+
+        original = '{"event": "session_start", "headers": {"Authorization": "Bearer tok-12345678"}}'
+        redacted = _redact_line(original)
+
+        # Both ends still parseable as JSON — the redacted portion is a
+        # string value, so the JSON structure stays intact.
+        parsed = _json.loads(redacted)
+        assert parsed["event"] == "session_start"
+        assert "tok-12345678" not in parsed["headers"]["Authorization"]
+        assert parsed["headers"]["Authorization"].startswith("Bearer ")
+
