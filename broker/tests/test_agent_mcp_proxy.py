@@ -359,6 +359,71 @@ class TestAgentMcpProxySseResponse:
         assert "text/event-stream" in resp.headers["content-type"]
         assert resp.content == sse_body
 
+    def test_upstream_send_failure_returns_502(self):
+        """gp-api unreachable (connection refused, DNS, timeout, etc.)
+        surfaces as a structured 502, not a generic 500. Mirrors
+        anthropic_proxy's handling of httpx.HTTPError on send."""
+        app, _, mock_http = _create_app()
+        mock_http.send = AsyncMock(
+            side_effect=httpx.ConnectError("connection refused")
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0"}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "gp_api_upstream_failed"
+        assert detail["err"] == "ConnectError"
+
+    def test_sse_mid_stream_truncation_yields_synthetic_error_event(self):
+        """Mid-stream network failure during SSE iteration: the proxy must
+        emit an `event: error` in-band so the downstream MCP client treats
+        the truncated response as a failure, not a complete tool result.
+        The 200 status was already on the wire when iteration started, so
+        an in-band event is the only failure signal available."""
+        app, _, mock_http = _create_app(
+            upstream_status=200,
+            upstream_body=b"event: message\ndata: {\"chunk\":1}\n\n",
+            upstream_content_type="text/event-stream",
+        )
+
+        # Replace the streamed response with one whose aiter_bytes() yields
+        # one chunk and then raises — simulating a connection drop after
+        # bytes have already left the wire.
+        async def truncating_iter():
+            yield b'event: message\ndata: {"chunk":1}\n\n'
+            raise httpx.ReadError("stream closed unexpectedly")
+
+        upstream = mock_http.send.return_value
+        upstream.aiter_bytes = MagicMock(return_value=truncating_iter())
+        upstream.aclose = AsyncMock()
+
+        client = TestClient(app)
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0","method":"tools/call","id":1}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200  # already on the wire
+        # First chunk passed through; then a synthetic SSE error event.
+        assert b'data: {"chunk":1}' in resp.content
+        assert b"event: error" in resp.content
+        assert b"upstream_stream_truncated" in resp.content
+        # Stream resource closed even on the error path.
+        upstream.aclose.assert_awaited()
+
     def test_json_upstream_still_returns_plain_response(self):
         # Regression guard for the non-SSE path: the branch must still
         # return a fully-buffered Response (not a stream) when upstream

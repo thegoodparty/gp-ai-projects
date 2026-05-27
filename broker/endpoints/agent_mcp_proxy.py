@@ -1,9 +1,13 @@
+import logging
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import ScopeTicket
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent/mcp", tags=["agent_mcp"])
 
@@ -68,7 +72,21 @@ async def proxy_mcp_root(
             "X-Organization-Slug": ticket.organization_slug,
         },
     )
-    upstream = await http.send(upstream_request, stream=True)
+    try:
+        upstream = await http.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "gp-api upstream send error run_id=%s org=%s exc_type=%s",
+            ticket.run_id, ticket.organization_slug, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "gp_api_upstream_failed",
+                "err": type(exc).__name__,
+            },
+        )
+
     upstream_content_type = upstream.headers.get("content-type", "application/json")
 
     if "text/event-stream" in upstream_content_type.lower():
@@ -76,6 +94,23 @@ async def proxy_mcp_root(
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "mcp upstream stream truncated run_id=%s org=%s exc_type=%s: %s",
+                    ticket.run_id, ticket.organization_slug,
+                    type(exc).__name__, exc,
+                    exc_info=True,
+                )
+                # 200 status is already on the wire. Without an in-band
+                # error event the downstream MCP client treats a
+                # truncated stream as a complete tool result. Yield a
+                # synthetic SSE error so failure is observable.
+                yield (
+                    b'event: error\n'
+                    b'data: {"type":"error","error":'
+                    b'{"type":"upstream_stream_truncated",'
+                    b'"message":"upstream stream ended unexpectedly"}}\n\n'
+                )
             finally:
                 await upstream.aclose()
 
