@@ -66,7 +66,18 @@ def _create_app(
         content=upstream_body,
         headers={"content-type": upstream_content_type},
     )
-    mock_http.request = AsyncMock(return_value=upstream_response)
+    # The proxy uses build_request + send(stream=True) so it can branch on
+    # the upstream content-type and preserve SSE framing for streaming
+    # responses (mirrors the anthropic_proxy pattern).
+    mock_http.build_request = MagicMock(
+        side_effect=lambda **kwargs: httpx.Request(
+            method=kwargs["method"],
+            url=kwargs["url"],
+            headers=kwargs.get("headers"),
+            content=kwargs.get("content"),
+        )
+    )
+    mock_http.send = AsyncMock(return_value=upstream_response)
     app.dependency_overrides[get_http_client] = lambda: mock_http
 
     return app, mock_clerk, mock_http
@@ -95,14 +106,18 @@ class TestAgentMcpProxyHappyPath:
 
         mock_clerk.get_session_jwt.assert_awaited_once_with("sess_abc123")
 
-        mock_http.request.assert_awaited_once()
-        call_kwargs = mock_http.request.call_args.kwargs
+        mock_http.build_request.assert_called_once()
+        call_kwargs = mock_http.build_request.call_args.kwargs
         assert call_kwargs["method"] == "POST"
         assert call_kwargs["url"] == f"{GP_API_BASE_URL}/v1/mcp"
         assert call_kwargs["content"] == request_body
         assert call_kwargs["headers"]["Authorization"] == f"Bearer {FAKE_JWT}"
         assert call_kwargs["headers"]["Content-Type"] == "application/json"
         assert call_kwargs["headers"]["X-Organization-Slug"] == "org-42"
+        # send() called with stream=True so the proxy can decide to stream
+        # SSE responses through without buffering.
+        mock_http.send.assert_awaited_once()
+        assert mock_http.send.call_args.kwargs.get("stream") is True
 
     def test_get_method_also_proxied(self):
         app, _, mock_http = _create_app()
@@ -114,7 +129,7 @@ class TestAgentMcpProxyHappyPath:
         )
 
         assert resp.status_code == 200
-        assert mock_http.request.call_args.kwargs["method"] == "GET"
+        assert mock_http.build_request.call_args.kwargs["method"] == "GET"
 
 
 class TestAgentMcpProxyMissingClerkSessionId:
@@ -135,7 +150,7 @@ class TestAgentMcpProxyMissingClerkSessionId:
         assert resp.status_code == 500
         assert resp.json()["detail"]["reason"] == "ticket_missing_clerk_session_id"
         mock_clerk.get_session_jwt.assert_not_awaited()
-        mock_http.request.assert_not_awaited()
+        mock_http.send.assert_not_awaited()
 
 
 class TestAgentMcpProxyClerkMintFailure:
@@ -158,7 +173,7 @@ class TestAgentMcpProxyClerkMintFailure:
         detail = resp.json()["detail"]
         assert detail["reason"] == "clerk_session_jwt_mint_failed"
         assert "upstream 500" in detail["err"]
-        mock_http.request.assert_not_awaited()
+        mock_http.send.assert_not_awaited()
 
 
 class TestAgentMcpProxyUpstreamErrorPassthrough:
@@ -220,7 +235,7 @@ class TestAgentMcpProxyHeaderHygiene:
         )
 
         assert resp.status_code == 200
-        outbound_headers = mock_http.request.call_args.kwargs["headers"]
+        outbound_headers = mock_http.build_request.call_args.kwargs["headers"]
         # Case-insensitive guard: no broker token under any casing.
         lowered = {k.lower(): v for k, v in outbound_headers.items()}
         assert "x-broker-token" not in lowered, (
@@ -258,7 +273,7 @@ class TestAgentMcpProxyAcceptHeader:
         )
 
         assert resp.status_code == 200
-        outbound = mock_http.request.call_args.kwargs["headers"]
+        outbound = mock_http.build_request.call_args.kwargs["headers"]
         assert outbound["Accept"] == "application/json, text/event-stream"
 
     def test_caller_supplied_accept_is_overridden(self):
@@ -278,5 +293,93 @@ class TestAgentMcpProxyAcceptHeader:
         )
 
         assert resp.status_code == 200
-        outbound = mock_http.request.call_args.kwargs["headers"]
+        outbound = mock_http.build_request.call_args.kwargs["headers"]
         assert outbound["Accept"] == "application/json, text/event-stream"
+
+
+class TestAgentMcpProxySseResponse:
+    """gp-api's MCP Streamable HTTP transport can respond with either
+    `application/json` (single envelope) or `text/event-stream` (SSE for
+    streamable tools). The proxy must preserve the streaming shape for SSE
+    so large/long-lived streams aren't buffered fully in memory and SSE
+    framing isn't lost. Mirrors the anthropic_proxy pattern."""
+
+    def test_sse_upstream_returns_streaming_response(self):
+        sse_body = (
+            b"event: message\n"
+            b'data: {"jsonrpc":"2.0","result":{"chunk":1}}\n\n'
+            b"event: message\n"
+            b'data: {"jsonrpc":"2.0","result":{"chunk":2}}\n\n'
+        )
+        app, _, mock_http = _create_app(
+            upstream_status=200,
+            upstream_body=sse_body,
+            upstream_content_type="text/event-stream",
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0","method":"tools/call","id":1}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        assert resp.content == sse_body
+        # send() invoked in streaming mode so the upstream body wasn't
+        # buffered into memory before the proxy decided what to return.
+        assert mock_http.send.call_args.kwargs.get("stream") is True
+
+    def test_sse_with_charset_in_content_type_still_streams(self):
+        # Some servers send `text/event-stream; charset=utf-8`. The branch
+        # check is `in upstream_content_type.lower()`, so the charset
+        # suffix must not break detection.
+        sse_body = b'event: message\ndata: {"chunk":1}\n\n'
+        app, _, _ = _create_app(
+            upstream_status=200,
+            upstream_body=sse_body,
+            upstream_content_type="text/event-stream; charset=utf-8",
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/agent/mcp",
+            content=b"{}",
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        assert resp.content == sse_body
+
+    def test_json_upstream_still_returns_plain_response(self):
+        # Regression guard for the non-SSE path: the branch must still
+        # return a fully-buffered Response (not a stream) when upstream
+        # is application/json.
+        json_body = b'{"jsonrpc":"2.0","result":{"tools":[]}}'
+        app, _, _ = _create_app(
+            upstream_status=200,
+            upstream_body=json_body,
+            upstream_content_type="application/json",
+        )
+        client = TestClient(app)
+
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0","method":"tools/list","id":1}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.content == json_body

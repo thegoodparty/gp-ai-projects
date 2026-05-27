@@ -1,5 +1,6 @@
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import ScopeTicket
@@ -50,7 +51,7 @@ async def proxy_mcp_root(
         )
 
     body = await request.body()
-    upstream = await http.request(
+    upstream_request = http.build_request(
         method=request.method,
         url=f"{base_url.rstrip('/')}/v1/mcp",
         content=body,
@@ -59,16 +60,38 @@ async def proxy_mcp_root(
             # gp-api's MCP Streamable HTTP transport returns 406 without this
             # exact Accept value (per MCP spec). Hardcoded rather than
             # forwarded because callers (incl. FastAPI TestClient) routinely
-            # send `*/*`, which gp-api would still reject.
+            # send `*/*`, which gp-api would still reject. Inviting SSE here
+            # means the upstream may respond with `text/event-stream`; the
+            # branch below preserves streaming end-to-end.
             "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {jwt}",
             "X-Organization-Slug": ticket.organization_slug,
         },
     )
+    upstream = await http.send(upstream_request, stream=True)
+    upstream_content_type = upstream.headers.get("content-type", "application/json")
+
+    if "text/event-stream" in upstream_content_type.lower():
+        async def stream_sse():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+
+        return StreamingResponse(
+            stream_sse(),
+            status_code=upstream.status_code,
+            media_type=upstream_content_type,
+        )
+
+    try:
+        content = await upstream.aread()
+    finally:
+        await upstream.aclose()
+
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
-        headers={
-            "content-type": upstream.headers.get("content-type", "application/json")
-        },
+        media_type=upstream_content_type,
     )
