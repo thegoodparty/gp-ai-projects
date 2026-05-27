@@ -98,7 +98,7 @@ class TestAgentMcpProxyHappyPath:
         mock_http.request.assert_awaited_once()
         call_kwargs = mock_http.request.call_args.kwargs
         assert call_kwargs["method"] == "POST"
-        assert call_kwargs["url"] == f"{GP_API_BASE_URL}/agent/mcp"
+        assert call_kwargs["url"] == f"{GP_API_BASE_URL}/v1/mcp"
         assert call_kwargs["content"] == request_body
         assert call_kwargs["headers"]["Authorization"] == f"Bearer {FAKE_JWT}"
         assert call_kwargs["headers"]["Content-Type"] == "application/json"

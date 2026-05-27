@@ -52,7 +52,7 @@ async def proxy_mcp_root(
     body = await request.body()
     upstream = await http.request(
         method=request.method,
-        url=f"{base_url.rstrip('/')}/agent/mcp",
+        url=f"{base_url.rstrip('/')}/v1/mcp",
         content=body,
         headers={
             "Content-Type": request.headers.get("content-type", "application/json"),
