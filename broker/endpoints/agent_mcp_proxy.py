@@ -122,6 +122,18 @@ async def proxy_mcp_root(
 
     try:
         content = await upstream.aread()
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "gp-api upstream read error run_id=%s org=%s exc_type=%s",
+            ticket.run_id, ticket.organization_slug, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "gp_api_upstream_failed",
+                "err": type(exc).__name__,
+            },
+        )
     finally:
         await upstream.aclose()
 

@@ -383,6 +383,36 @@ class TestAgentMcpProxySseResponse:
         assert detail["reason"] == "gp_api_upstream_failed"
         assert detail["err"] == "ConnectError"
 
+    def test_non_sse_aread_failure_returns_502(self):
+        """JSON-path body read fails mid-flight (connection drop after
+        headers are in, before body fully read). aread() raises — must
+        surface as a structured 502, not a generic 500. aclose() still
+        runs via the finally."""
+        app, _, mock_http = _create_app(
+            upstream_content_type="application/json",
+        )
+        upstream = mock_http.send.return_value
+        upstream.aread = AsyncMock(
+            side_effect=httpx.ReadError("connection reset by peer")
+        )
+        upstream.aclose = AsyncMock()
+
+        client = TestClient(app)
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0"}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "gp_api_upstream_failed"
+        assert detail["err"] == "ReadError"
+        upstream.aclose.assert_awaited()
+
     def test_sse_mid_stream_truncation_yields_synthetic_error_event(self):
         """Mid-stream network failure during SSE iteration: the proxy must
         emit an `event: error` in-band so the downstream MCP client treats
