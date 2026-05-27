@@ -66,6 +66,11 @@ def _create_app(
         content=upstream_body,
         headers={"content-type": upstream_content_type},
     )
+    # aclose is mocked on every upstream so tests can assert cleanup ran
+    # without per-test setup. The proxy's `finally: await _safe_aclose()`
+    # is the only thing keeping connections from leaking on every code
+    # path — the assertion is the regression guard for accidental removal.
+    upstream_response.aclose = AsyncMock()
     # The proxy uses build_request + send(stream=True) so it can branch on
     # the upstream content-type and preserve SSE framing for streaming
     # responses (mirrors the anthropic_proxy pattern).
@@ -118,6 +123,11 @@ class TestAgentMcpProxyHappyPath:
         # SSE responses through without buffering.
         mock_http.send.assert_awaited_once()
         assert mock_http.send.call_args.kwargs.get("stream") is True
+        # finally: aclose must run on the non-SSE happy path — without
+        # this assertion, deleting `finally: await _safe_aclose()` would
+        # leave every non-SSE connection leaking in production but tests
+        # green. Symmetric with the SSE happy path's aclose assertion.
+        mock_http.send.return_value.aclose.assert_awaited_once()
 
     def test_get_method_also_proxied(self):
         app, _, mock_http = _create_app()
@@ -401,7 +411,6 @@ class TestAgentMcpProxySseResponse:
         upstream.aread = AsyncMock(
             side_effect=httpx.ReadError("connection reset by peer")
         )
-        upstream.aclose = AsyncMock()
 
         client = TestClient(app)
         resp = client.post(
@@ -418,6 +427,107 @@ class TestAgentMcpProxySseResponse:
         assert detail["reason"] == "gp_api_upstream_failed"
         assert detail["err"] == "ReadError"
         upstream.aclose.assert_awaited()
+
+    def test_non_sse_aclose_failure_does_not_mask_upstream_error(self):
+        """If aread() raises (-> HTTPException 502) AND aclose() itself
+        also raises (realistic on a connection that just dropped mid-
+        read), the in-flight HTTPException must survive. `_safe_aclose`
+        swallows the aclose exception so FastAPI's HTTPException handler
+        produces the structured 502 instead of an unstructured 500."""
+        app, _, mock_http = _create_app(
+            upstream_content_type="application/json",
+        )
+        upstream = mock_http.send.return_value
+        upstream.aread = AsyncMock(
+            side_effect=httpx.ReadError("connection reset by peer")
+        )
+        upstream.aclose = AsyncMock(
+            side_effect=httpx.NetworkError("aclose also failed")
+        )
+
+        client = TestClient(app)
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0"}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        # The structured 502 from aread's HTTPError survives — aclose's
+        # NetworkError was swallowed by _safe_aclose.
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "gp_api_upstream_failed"
+        assert detail["err"] == "ReadError"
+        upstream.aclose.assert_awaited()
+
+    def test_non_sse_aclose_failure_on_happy_path_does_not_break_response(self):
+        """On the happy path: aread succeeds, response body is ready, but
+        aclose raises during cleanup. The successful response must still
+        reach the client. `_safe_aclose` swallows the exception so the
+        already-built Response is returned intact."""
+        json_body = b'{"jsonrpc":"2.0","result":{"ok":true}}'
+        app, _, mock_http = _create_app(
+            upstream_status=200,
+            upstream_body=json_body,
+            upstream_content_type="application/json",
+        )
+        upstream = mock_http.send.return_value
+        upstream.aclose = AsyncMock(
+            side_effect=httpx.NetworkError("aclose failed during cleanup")
+        )
+
+        client = TestClient(app)
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0"}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        # Happy 200 survives the aclose failure — body intact, status
+        # unchanged. aclose was still attempted.
+        assert resp.status_code == 200
+        assert resp.content == json_body
+        upstream.aclose.assert_awaited_once()
+
+    def test_sse_aclose_failure_does_not_break_streaming_response(self):
+        """SSE path: aclose raises in the generator's finally after the
+        stream content was successfully iterated. Without `_safe_aclose`,
+        the raise would propagate up through the StreamingResponse
+        generator and surface as a stream error (after the chunks already
+        reached the wire). With the swallow, the response completes
+        cleanly."""
+        sse_body = b'event: message\ndata: {"chunk":1}\n\n'
+        app, _, mock_http = _create_app(
+            upstream_status=200,
+            upstream_body=sse_body,
+            upstream_content_type="text/event-stream",
+        )
+        upstream = mock_http.send.return_value
+        upstream.aclose = AsyncMock(
+            side_effect=httpx.NetworkError("aclose failed during cleanup")
+        )
+
+        client = TestClient(app)
+        resp = client.post(
+            "/agent/mcp",
+            content=b"{}",
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        # Stream content delivered intact despite aclose failure.
+        assert resp.content == sse_body
+        upstream.aclose.assert_awaited_once()
 
     def test_sse_mid_stream_truncation_yields_synthetic_error_event(self):
         """Mid-stream network failure during SSE iteration: the proxy must
@@ -465,7 +575,7 @@ class TestAgentMcpProxySseResponse:
         # return a fully-buffered Response (not a stream) when upstream
         # is application/json.
         json_body = b'{"jsonrpc":"2.0","result":{"tools":[]}}'
-        app, _, _ = _create_app(
+        app, _, mock_http = _create_app(
             upstream_status=200,
             upstream_body=json_body,
             upstream_content_type="application/json",
@@ -484,3 +594,8 @@ class TestAgentMcpProxySseResponse:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("application/json")
         assert resp.content == json_body
+        # finally: aclose must close the upstream even on the happy path.
+        # Asserting here (in addition to the canonical happy-path test
+        # above) covers this branch specifically, so removing the finally
+        # block fails both tests rather than passing silently.
+        mock_http.send.return_value.aclose.assert_awaited_once()

@@ -89,6 +89,20 @@ async def proxy_mcp_root(
 
     upstream_content_type = upstream.headers.get("content-type", "application/json")
 
+    async def _safe_aclose():
+        # finally-block cleanup. A raise here would replace the in-flight
+        # HTTPException (or in the SSE path, propagate up the generator and
+        # be reported as a stream error after the response was already
+        # sent). The connection is being discarded either way; swallow and
+        # log so the caller's structured error survives.
+        try:
+            await upstream.aclose()
+        except Exception:
+            logger.debug(
+                "upstream aclose error (ignored) run_id=%s org=%s",
+                ticket.run_id, ticket.organization_slug,
+            )
+
     if "text/event-stream" in upstream_content_type.lower():
         async def stream_sse():
             try:
@@ -112,7 +126,7 @@ async def proxy_mcp_root(
                     b'"message":"upstream stream ended unexpectedly"}}\n\n'
                 )
             finally:
-                await upstream.aclose()
+                await _safe_aclose()
 
         return StreamingResponse(
             stream_sse(),
@@ -135,7 +149,7 @@ async def proxy_mcp_root(
             },
         )
     finally:
-        await upstream.aclose()
+        await _safe_aclose()
 
     return Response(
         content=content,
