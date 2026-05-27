@@ -56,6 +56,11 @@ async def proxy_mcp_root(
         content=body,
         headers={
             "Content-Type": request.headers.get("content-type", "application/json"),
+            # gp-api's MCP Streamable HTTP transport returns 406 without this
+            # exact Accept value (per MCP spec). Hardcoded rather than
+            # forwarded because callers (incl. FastAPI TestClient) routinely
+            # send `*/*`, which gp-api would still reject.
+            "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {jwt}",
             "X-Organization-Slug": ticket.organization_slug,
         },

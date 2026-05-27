@@ -203,8 +203,8 @@ class TestAgentMcpProxyUpstreamErrorPassthrough:
 
 class TestAgentMcpProxyHeaderHygiene:
     """X-Broker-Token is the broker's internal auth — it must never appear on
-    the outbound request to gp-api. Only Content-Type and Authorization should
-    be forwarded."""
+    the outbound request to gp-api. Outbound headers are limited to the set
+    gp-api needs (Content-Type, Accept, Authorization, X-Organization-Slug)."""
 
     def test_x_broker_token_is_not_forwarded_to_gp_api(self):
         app, _, mock_http = _create_app()
@@ -226,5 +226,57 @@ class TestAgentMcpProxyHeaderHygiene:
         assert "x-broker-token" not in lowered, (
             f"X-Broker-Token leaked to gp-api: {outbound_headers}"
         )
-        # Sanity: only the three expected headers should be present.
-        assert set(lowered.keys()) == {"content-type", "authorization", "x-organization-slug"}
+        # Sanity: only the four expected headers should be present.
+        assert set(lowered.keys()) == {
+            "content-type",
+            "accept",
+            "authorization",
+            "x-organization-slug",
+        }
+
+
+class TestAgentMcpProxyAcceptHeader:
+    """gp-api's MCP Streamable HTTP transport returns 406 Not Acceptable
+    without `Accept: application/json, text/event-stream`. The proxy
+    hardcodes this value (rather than forwarding the caller's) because
+    callers — including FastAPI TestClient and httpx — routinely send
+    `*/*`, which gp-api would still reject."""
+
+    def test_sends_mcp_required_accept_regardless_of_caller(self):
+        app, _, mock_http = _create_app()
+        client = TestClient(app)
+
+        # Caller sends */* (the TestClient default); proxy still emits the
+        # MCP-required value upstream.
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0","method":"tools/list","id":1}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+        assert resp.status_code == 200
+        outbound = mock_http.request.call_args.kwargs["headers"]
+        assert outbound["Accept"] == "application/json, text/event-stream"
+
+    def test_caller_supplied_accept_is_overridden(self):
+        app, _, mock_http = _create_app()
+        client = TestClient(app)
+
+        # Even if the caller explicitly sets a different Accept value, the
+        # proxy overrides — the upstream is MCP-specific.
+        resp = client.post(
+            "/agent/mcp",
+            content=b'{"jsonrpc":"2.0"}',
+            headers={
+                "X-Broker-Token": BROKER_TOKEN,
+                "Content-Type": "application/json",
+                "Accept": "text/html",
+            },
+        )
+
+        assert resp.status_code == 200
+        outbound = mock_http.request.call_args.kwargs["headers"]
+        assert outbound["Accept"] == "application/json, text/event-stream"
