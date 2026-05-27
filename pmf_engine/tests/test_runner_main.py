@@ -1950,7 +1950,7 @@ async def test_write_action_manifest_flows_through_to_claude_agent_options(
     assert options.mcp_servers["broker"]["type"] == "http"
     assert options.mcp_servers["broker"]["url"] == "https://broker-dev.test/agent/mcp"
     assert options.mcp_servers["broker"]["headers"] == {
-        "Authorization": "Bearer tok-end-to-end"
+        "X-Broker-Token": "tok-end-to-end"
     }
 
 
@@ -2030,4 +2030,77 @@ class TestBearerTokenRedaction:
         assert parsed["event"] == "session_start"
         assert "tok-12345678" not in parsed["headers"]["Authorization"]
         assert parsed["headers"]["Authorization"].startswith("Bearer ")
+
+
+class TestBrokerTokenRedaction:
+    """X-Broker-Token redaction. The runner now passes BROKER_TOKEN in this
+    header (claude_sdk._build_broker_mcp_servers); the SDK can serialize the
+    headers dict into session JSONL that _upload_logs ships to S3. The
+    JSON-quoted shape `"X-Broker-Token": "<token>"` is not caught by
+    _SECRET_PATTERNS because the `"` between the keyword and `:` breaks
+    `\\s*[=:]`. _BROKER_TOKEN_PATTERN handles it."""
+
+    def test_redacts_json_serialized_x_broker_token(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # The exact shape the SDK emits into session JSONL for the MCP
+        # server config — this is what was leaking pre-fix.
+        line = '{"headers": {"X-Broker-Token": "tok-broker-abc-12345"}}\n'
+        redacted = _redact_line(line)
+
+        assert "tok-broker-abc-12345" not in redacted
+        assert "X-Broker-Token" in redacted, "Header name preserved"
+        assert "REDACTED" in redacted
+
+    def test_redacts_curl_style_header(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = "curl -H 'X-Broker-Token: tok-broker-deadbeef0123'"
+        redacted = _redact_line(line)
+
+        assert "tok-broker-deadbeef0123" not in redacted
+        assert "X-Broker-Token" in redacted
+
+    def test_redacts_env_style_assignment(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = "X-Broker-Token=tok-broker-deadbeef0123"
+        redacted = _redact_line(line)
+
+        assert "tok-broker-deadbeef0123" not in redacted
+        assert "X-Broker-Token" in redacted
+
+    def test_case_insensitive(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = '"x-broker-token": "tok-broker-abc-12345"'
+        redacted = _redact_line(line)
+
+        assert "tok-broker-abc-12345" not in redacted
+
+    def test_short_value_below_threshold_not_redacted(self):
+        """Threshold of 8 chars matches the existing convention — short
+        strings aren't credentials worth guarding."""
+        from pmf_engine.runner.main import _redact_line
+
+        line = '"X-Broker-Token": "short"'
+        redacted = _redact_line(line)
+
+        assert redacted == line
+
+    def test_redaction_keeps_json_parseable(self):
+        """The substitution must leave surrounding JSON parseable — the
+        value's closing `"` is outside the captured token, so it stays."""
+        import json as _json
+        from pmf_engine.runner.main import _redact_line
+
+        original = (
+            '{"event": "session_start", '
+            '"headers": {"X-Broker-Token": "tok-broker-abc-12345"}}'
+        )
+        redacted = _redact_line(original)
+
+        parsed = _json.loads(redacted)
+        assert parsed["event"] == "session_start"
+        assert "tok-broker-abc-12345" not in parsed["headers"]["X-Broker-Token"]
 
