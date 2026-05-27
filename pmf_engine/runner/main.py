@@ -220,11 +220,23 @@ _SECRET_PATTERNS = [
 # the secret portion.
 _BEARER_TOKEN_PATTERN = re.compile(r'(?i)(Bearer\s+)([A-Za-z0-9_\-/.+=]{8,})')
 
+# X-Broker-Token redaction. The runner passes BROKER_TOKEN in this header on
+# the MCP server config (claude_sdk._build_broker_mcp_servers), and the SDK
+# can serialize that headers dict into session JSONL. The JSON-quoted shape
+# `"X-Broker-Token": "<token>"` puts a `"` between the keyword and `:`, so
+# _SECRET_PATTERNS' `\s*[=:]` doesn't catch it. Captured separately so the
+# substitution preserves the key + separator (parseable JSON structure)
+# while redacting only the value.
+_BROKER_TOKEN_PATTERN = re.compile(
+    r'(?i)(X-Broker-Token["\']?\s*[=:]\s*["\']?)([A-Za-z0-9_\-/.+=]{8,})'
+)
+
 
 def _redact_line(line: str) -> str:
     for pattern in _SECRET_PATTERNS:
         line = pattern.sub(lambda m: m.group(0)[:8] + "***REDACTED***", line)
     line = _BEARER_TOKEN_PATTERN.sub(lambda m: m.group(1) + "***REDACTED***", line)
+    line = _BROKER_TOKEN_PATTERN.sub(lambda m: m.group(1) + "***REDACTED***", line)
     return line
 
 
