@@ -79,7 +79,7 @@ def _build_broker_mcp_servers() -> dict:
         _BROKER_MCP_SERVER_NAME: {
             "type": "http",
             "url": broker_url.rstrip("/") + "/agent/mcp",
-            "headers": {"Authorization": f"Bearer {broker_token}"},
+            "headers": {"X-Broker-Token": broker_token},
         }
     }
 

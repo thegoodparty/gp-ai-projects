@@ -805,7 +805,9 @@ class TestWriteActionManifestFields:
     @pytest.mark.asyncio
     async def test_mcp_servers_configured_when_broker_url_set(self):
         """When BROKER_URL is set, the harness wires the broker's /agent/mcp
-        endpoint into options.mcp_servers with BROKER_TOKEN as bearer.
+        endpoint into options.mcp_servers with BROKER_TOKEN in the
+        X-Broker-Token header (the broker's scope-ticket auth — see
+        broker/main.py:_resolve_ticket_from_request).
         This is what gives a compliance_setup-style agent access to gp-api
         MCP tools."""
         options = await _run_harness_capture_options(
@@ -819,7 +821,7 @@ class TestWriteActionManifestFields:
         broker_cfg = options.mcp_servers["broker"]
         assert broker_cfg["type"] == "http"
         assert broker_cfg["url"] == "https://broker-dev.test/agent/mcp"
-        assert broker_cfg["headers"] == {"Authorization": "Bearer tok-mcp-123"}
+        assert broker_cfg["headers"] == {"X-Broker-Token": "tok-mcp-123"}
 
     @pytest.mark.asyncio
     async def test_mcp_servers_url_strips_trailing_slash(self):
@@ -847,9 +849,9 @@ class TestWriteActionManifestFields:
     @pytest.mark.asyncio
     async def test_mcp_servers_empty_when_broker_token_missing(self):
         """BROKER_URL without BROKER_TOKEN is an incoherent config — skip
-        MCP entirely rather than emit an unauthenticated `Authorization:
-        Bearer ` header the broker would 401 on first tool-use. Keeps the
-        failure mode symmetric with "no broker at all"."""
+        MCP entirely rather than emit an empty `X-Broker-Token` header the
+        broker would 401 on first tool-use. Keeps the failure mode
+        symmetric with "no broker at all"."""
         options = await _run_harness_capture_options(
             monkey_env={"BROKER_URL": "https://broker-dev.test", "BROKER_TOKEN": None},
         )
@@ -884,5 +886,5 @@ class TestWriteActionManifestFields:
         assert options.permission_mode == "default"
         assert options.allowed_tools == [*ALLOWED_TOOLS, "Read"]
         assert options.mcp_servers["broker"]["url"] == "https://broker-dev.test/agent/mcp"
-        assert options.mcp_servers["broker"]["headers"]["Authorization"] == "Bearer tok-all"
+        assert options.mcp_servers["broker"]["headers"]["X-Broker-Token"] == "tok-all"
 
