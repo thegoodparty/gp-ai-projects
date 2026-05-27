@@ -316,6 +316,8 @@ class TestAgentMcpProxySseResponse:
             upstream_body=sse_body,
             upstream_content_type="text/event-stream",
         )
+        upstream = mock_http.send.return_value
+        upstream.aclose = AsyncMock()
         client = TestClient(app)
 
         resp = client.post(
@@ -333,6 +335,10 @@ class TestAgentMcpProxySseResponse:
         # send() invoked in streaming mode so the upstream body wasn't
         # buffered into memory before the proxy decided what to return.
         assert mock_http.send.call_args.kwargs.get("stream") is True
+        # finally block must close the upstream even on the happy path —
+        # without this assertion, deleting `finally: await aclose()` would
+        # leave every SSE connection leaking in production but tests green.
+        upstream.aclose.assert_awaited_once()
 
     def test_sse_with_charset_in_content_type_still_streams(self):
         # Some servers send `text/event-stream; charset=utf-8`. The branch
