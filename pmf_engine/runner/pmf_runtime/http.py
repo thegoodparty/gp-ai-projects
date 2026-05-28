@@ -1,5 +1,28 @@
 from __future__ import annotations
 
+# Both `get()` and `download()` route through the broker's `/http/fetch`,
+# which is backed by a shared Playwright/Chromium pool (broker/browser_fetcher.py,
+# max_concurrent=30 per broker task, ~30-35 MB resident per browser context
+# under typical government-site workloads — measured 2026-05-16 in dev at
+# 300 concurrent requests against Granicus pages: 13% of 8 GB peak memory
+# across all 30 contexts plus baseline, so ~26-32 MB per context). Heavier
+# pages (JS-heavy SPAs, browser-rendered PDFs) can push per-context memory
+# 5-10× higher, so don't treat this number as a hard ceiling. When the pool
+# is degraded — Chromium crashed, target site is hammering Cloudflare's bot
+# wall, broker task scaling out from a cold start, page-load timeouts piling
+# up — the failure mode is 5xx / timeouts / repeated empty bodies, NOT a
+# clean error we can backoff on per-request.
+#
+# DO NOT retry tightly. Short retries make it worse: each retry occupies a
+# concurrency permit on the broker, blocks scale-out, and starves other
+# in-flight agents. If `/http/fetch` looks degraded (3+ consecutive failures
+# on different URLs, or 5xx with no clear per-URL cause), wait MINUTES — not
+# seconds — before retrying. 5-15 minutes is reasonable; the broker autoscaler
+# needs time to add a task and Chromium needs ~10s of warmup on the new pool.
+#
+# Better still: pivot the agent's plan to a deterministic-URL probe or a
+# WebSearch path that doesn't go through Playwright, and only return to
+# `/http/fetch` once you have a single high-value URL to fetch.
 import os
 import re
 import uuid

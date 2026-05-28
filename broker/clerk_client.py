@@ -3,6 +3,7 @@ import base64
 import json
 import time
 from typing import TypedDict
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -66,30 +67,54 @@ class ClerkClient:
         return body
 
     async def redeem_actor_token(self, actor_token_url: str) -> ClerkSessionInfo:
-        # The actor_token_url comes back from clerkClient.actorTokens.create,
-        # in the form https://<frontend-api>/v1/client/sign_in_tokens/<id>?token=<jwt>.
-        # Hitting it (POST, no body) creates a Client + Session and returns both;
-        # we only need the session id (we mint fresh JWTs per call via Backend API).
+        # actor_token_url comes back from POST /v1/actor_tokens as
+        # https://<frontend-api>/v1/tickets/accept?ticket=<jwt>. That URL is the
+        # browser-facing Account Portal flow (POST→405, GET→HTML), not a
+        # server-redeemable JSON endpoint. Extract the ticket and submit it to
+        # POST /v1/client/sign_ins with strategy=ticket, which is what
+        # @clerk/clerk-js does internally via signIn.ticket({ ticket }). Response
+        # is JSON: { response: { status: "complete", created_session_id, ... } }.
+        #
+        # The shared httpx client's cookie jar is cleared in the finally block
+        # below. Without that reset, Set-Cookie headers from prior sign-ins
+        # (Clerk's __client / __session) accumulate, and dev Clerk instances
+        # (*.clerk.accounts.dev) reject the next sign-in carrying an existing
+        # client cookie with `dev_browser_unauthenticated`. Clearing matches
+        # the wire semantics of a real first-time browser sign-in per call.
         if not actor_token_url.startswith(f"{self._frontend_api_base}/"):
             raise ClerkClientError(
                 f"actor token URL is not from the configured Clerk frontend API base "
                 f"(base={self._frontend_api_base}, got={actor_token_url[:64]}...)"
             )
-        resp = await self._http.post(actor_token_url)
+        ticket_values = parse_qs(urlsplit(actor_token_url).query).get("ticket")
+        if not ticket_values:
+            raise ClerkClientError(
+                f"actor token URL missing ticket query parameter (url={actor_token_url[:80]}...)"
+            )
+        try:
+            resp = await self._http.post(
+                f"{self._frontend_api_base}/v1/client/sign_ins",
+                data={"strategy": "ticket", "ticket": ticket_values[0]},
+            )
+        finally:
+            self._http.cookies.clear()
         if resp.status_code >= 400:
             raise ClerkClientError(
                 f"actor token redemption failed status={resp.status_code} body={resp.text[:500]}"
             )
         body = resp.json()
-        # The Clerk Frontend API response shape varies a bit across versions.
-        # Try the common keys; fail loudly if neither is present.
-        session_id = (
-            body.get("response", {}).get("created_session_id")
-            or body.get("client", {}).get("last_active_session_id")
-        )
+        response = body.get("response") or {}
+        status = response.get("status")
+        if status != "complete":
+            raise ClerkClientError(
+                f"actor token redemption returned non-complete status={status} "
+                f"errors={body.get('errors')}"
+            )
+        session_id = response.get("created_session_id")
         if not session_id:
             raise ClerkClientError(
-                f"actor token redemption response missing session id; keys={list(body.keys())}"
+                f"actor token redemption response missing created_session_id; "
+                f"response_keys={list(response.keys())}"
             )
         return {"session_id": session_id}
 

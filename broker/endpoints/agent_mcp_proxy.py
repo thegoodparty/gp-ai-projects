@@ -1,8 +1,13 @@
+import logging
+
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import ScopeTicket
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent/mcp", tags=["agent_mcp"])
 
@@ -50,20 +55,104 @@ async def proxy_mcp_root(
         )
 
     body = await request.body()
-    upstream = await http.request(
+    upstream_request = http.build_request(
         method=request.method,
-        url=f"{base_url.rstrip('/')}/agent/mcp",
+        url=f"{base_url.rstrip('/')}/v1/mcp",
         content=body,
         headers={
             "Content-Type": request.headers.get("content-type", "application/json"),
+            # gp-api's MCP Streamable HTTP transport returns 406 without this
+            # exact Accept value (per MCP spec). Hardcoded rather than
+            # forwarded because callers (incl. FastAPI TestClient) routinely
+            # send `*/*`, which gp-api would still reject. Inviting SSE here
+            # means the upstream may respond with `text/event-stream`; the
+            # branch below preserves streaming end-to-end.
+            "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {jwt}",
             "X-Organization-Slug": ticket.organization_slug,
         },
     )
+    try:
+        upstream = await http.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "gp-api upstream send error run_id=%s org=%s exc_type=%s",
+            ticket.run_id, ticket.organization_slug, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "gp_api_upstream_failed",
+                "err": type(exc).__name__,
+            },
+        )
+
+    upstream_content_type = upstream.headers.get("content-type", "application/json")
+
+    async def _safe_aclose():
+        # finally-block cleanup. A raise here would replace the in-flight
+        # HTTPException (or in the SSE path, propagate up the generator and
+        # be reported as a stream error after the response was already
+        # sent). The connection is being discarded either way; swallow and
+        # log so the caller's structured error survives.
+        try:
+            await upstream.aclose()
+        except Exception:
+            logger.debug(
+                "upstream aclose error (ignored) run_id=%s org=%s",
+                ticket.run_id, ticket.organization_slug,
+            )
+
+    if "text/event-stream" in upstream_content_type.lower():
+        async def stream_sse():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "mcp upstream stream truncated run_id=%s org=%s exc_type=%s: %s",
+                    ticket.run_id, ticket.organization_slug,
+                    type(exc).__name__, exc,
+                    exc_info=True,
+                )
+                # 200 status is already on the wire. Without an in-band
+                # error event the downstream MCP client treats a
+                # truncated stream as a complete tool result. Yield a
+                # synthetic SSE error so failure is observable.
+                yield (
+                    b'event: error\n'
+                    b'data: {"type":"error","error":'
+                    b'{"type":"upstream_stream_truncated",'
+                    b'"message":"upstream stream ended unexpectedly"}}\n\n'
+                )
+            finally:
+                await _safe_aclose()
+
+        return StreamingResponse(
+            stream_sse(),
+            status_code=upstream.status_code,
+            media_type=upstream_content_type,
+        )
+
+    try:
+        content = await upstream.aread()
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "gp-api upstream read error run_id=%s org=%s exc_type=%s",
+            ticket.run_id, ticket.organization_slug, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "reason": "gp_api_upstream_failed",
+                "err": type(exc).__name__,
+            },
+        )
+    finally:
+        await _safe_aclose()
+
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
-        headers={
-            "content-type": upstream.headers.get("content-type", "application/json")
-        },
+        media_type=upstream_content_type,
     )

@@ -389,6 +389,13 @@ def build_container_overrides(
         {"name": "ANTHROPIC_API_KEY", "value": broker_token},
         {"name": "PARAMS_JSON", "value": params_json},
         {"name": "TIMEOUT_SECONDS", "value": str(experiment.get("timeout_seconds", 600))},
+        # QA_JUDGES configures the runbooks qa-spine pluggable LLM judge registry
+        # (format: name:provider:model,...). Routes through the same broker proxy
+        # the runner already uses for the agent — no new Secrets Manager entries,
+        # no new egress. Same-family Phase 1/2 (Sonnet + Opus with adversarial
+        # system prompt) is the documented in-Fargate path; cross-family (e.g.
+        # Gemini Phase 2) is deferred until/if a broker route for Google exists.
+        {"name": "QA_JUDGES", "value": "claude:anthropic:claude-sonnet-4-6,opus:anthropic:claude-opus-4-7"},
     ]
     # Pin the runner to the exact S3 object versions Lambda fetched at routing
     # time. Without this, a publish during the dispatch→start window could

@@ -129,6 +129,13 @@ class RunnerConfig:
     # spawning the agent. Default-empty so legacy code paths (INSTRUCTION env
     # override for local-dev runs) work without explicit plumbing.
     attachments: dict[str, str] = field(default_factory=dict)
+    # Write-action manifest fields (ENG-10128). All optional — when absent the
+    # harness falls back to its legacy defaults (capability-prompt only,
+    # bypassPermissions, ALLOWED_TOOLS only). The runner-side manifest loader
+    # validates these before they reach here.
+    system_prompt: str | None = None
+    permission_mode: str | None = None
+    allowed_external_tools: list[str] | None = None
 
     @classmethod
     def from_env(cls) -> RunnerConfig:
@@ -170,6 +177,9 @@ class RunnerConfig:
 
         contract_schema = None
         attachments: dict[str, str] = {}
+        system_prompt: str | None = None
+        permission_mode: str | None = None
+        allowed_external_tools: list[str] | None = None
         if experiment_id:
             # The broker is the only source for manifest+instruction. The
             # broker reads s3://agent-experiment-metadata-{env}/<id>/* and
@@ -232,6 +242,13 @@ class RunnerConfig:
                     f"oneOf/anyOf/allOf with at least one well-formed branch; "
                     f"got {contract_schema!r}"
                 )
+            # Write-action fields (ENG-10128) flow through the manifest body.
+            # Already type-validated in manifest_loader._validate_write_action_fields;
+            # here we just project them onto RunnerConfig so the harness can read
+            # them as ordinary attributes.
+            system_prompt = manifest.get("system_prompt")
+            permission_mode = manifest.get("permission_mode")
+            allowed_external_tools = manifest.get("allowed_external_tools")
 
         ts_raw = os.environ.get("TIMEOUT_SECONDS", "").strip()
         if ts_raw:
@@ -257,4 +274,7 @@ class RunnerConfig:
             max_turns=max_turns,
             timeout_seconds=timeout_seconds,
             attachments=attachments,
+            system_prompt=system_prompt,
+            permission_mode=permission_mode,
+            allowed_external_tools=allowed_external_tools,
         )

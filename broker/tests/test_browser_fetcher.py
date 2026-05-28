@@ -250,10 +250,10 @@ class TestConcurrencyCap:
         assert peak == 4, f"expected peak == 4 to confirm cap was binding, got {peak}"
 
     @pytest.mark.asyncio
-    async def test_default_max_concurrent_is_four(self) -> None:
+    async def test_default_max_concurrent_is_thirty(self) -> None:
         fetcher = PlaywrightBrowserFetcher()
         assert hasattr(fetcher, "_semaphore"), "must expose a semaphore for concurrency cap"
-        assert fetcher._semaphore._value == 4
+        assert fetcher._semaphore._value == 30
 
 
 class TestUnifiedFetchSignature:

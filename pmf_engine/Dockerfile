@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     xz-utils \
     poppler-utils \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Claude CLI) — verify SHA256 against the
