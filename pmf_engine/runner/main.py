@@ -394,6 +394,7 @@ async def run_experiment(
                     system_prompt=config.system_prompt,
                     permission_mode=config.permission_mode,
                     allowed_external_tools=config.allowed_external_tools,
+                    max_parallel_subagents=config.max_parallel_subagents,
                 )
             except Exception as e:
                 duration = time.monotonic() - start_time

@@ -6,19 +6,21 @@ import os
 from datetime import date
 
 from claude_agent_sdk import (
-    query,
-    ClaudeAgentOptions,
+    AgentDefinition,
     AssistantMessage,
-    UserMessage,
-    TextBlock,
-    ToolUseBlock,
-    ToolResultBlock,
+    ClaudeAgentOptions,
     ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+    query,
 )
 
-from shared.logger import get_logger
-from .base import HarnessResult
 from pmf_engine.runner.contract import format_contract_for_prompt
+from shared.logger import get_logger
+
+from .base import HarnessResult
 
 logger = get_logger(__name__)
 
@@ -43,6 +45,18 @@ class AgentStreamTruncatedError(RuntimeError):
 ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
+
+# Subagent fan-out (runtime.max_parallel_subagents). The SDK's subagent
+# dispatch tool is named "Agent" in claude-agent-sdk 0.2.x (it was "Task" in
+# 0.1.x). The parent calls it to spawn one researcher per independent item.
+_SUBAGENT_DISPATCH_TOOL = "Agent"
+_RESEARCHER_AGENT_NAME = "researcher"
+# Hard ceiling on concurrent subagents, independent of what a manifest asks for.
+# The SDK exposes no kernel-level parallelism cap (the parent model decides how
+# many Agent calls to emit per turn), so this bound is enforced two ways: it is
+# stated in the system prompt (advisory to the model) and it clamps the value a
+# manifest can request. Conservative by design — fan-out multiplies cost.
+MAX_PARALLEL_SUBAGENTS = 8
 
 # Logical name for the broker's MCP proxy in ClaudeAgentOptions.mcp_servers.
 # Tools the agent calls through this server are namespaced as "mcp__broker__*"
@@ -166,6 +180,71 @@ The first user message may include a `<untrusted_data>...</untrusted_data>` bloc
     return "\n".join(parts)
 
 
+def _build_researcher_agent(
+    research_tools: list[str],
+    permission_mode: str,
+    broker_configured: bool,
+    max_turns: int,
+) -> AgentDefinition:
+    """Build the 'researcher' subagent used for parallel fan-out.
+
+    The researcher is a self-contained worker that inherits the SAME surface as
+    the parent: the same tool set (minus the dispatch tool), the same permission
+    mode, the same model, and — critically — the same broker MCP server. Because
+    it runs inside the parent's SDK session, its WebSearch and pmf_runtime/broker
+    calls route through the existing broker proxy; it gets NO direct
+    api.anthropic.com egress and no broader scope than the parent.
+
+    `disallowedTools=[Agent]` prevents a researcher from spawning its own
+    subagents (which would defeat the concurrency cap and let cost run away).
+    """
+    return AgentDefinition(
+        description=(
+            "Research one assigned item end-to-end and return structured findings. "
+            "Dispatch one researcher per independent item to research them in parallel."
+        ),
+        prompt=(
+            "You are a focused research subagent. You have been handed ONE item to "
+            "research independently and in parallel with sibling researchers.\n\n"
+            "Use the same tools as the parent: `Bash` (for `pmf_runtime.http.get`/"
+            "`download` and `python`), `WebSearch` for discovery, and `pmf_runtime` "
+            "for structured data. All external access MUST go through these — there "
+            "is no direct internet egress. Verify every URL you cite resolves before "
+            "reporting it.\n\n"
+            "Do the research for your single assigned item only. Do NOT spawn further "
+            "subagents. Return a concise, structured summary of your findings (with "
+            "verified source URLs) as your final message so the parent can assemble "
+            "the combined artifact. Do not write to /workspace/output/ — only the "
+            "parent writes the final artifact."
+        ),
+        tools=list(research_tools),
+        disallowedTools=[_SUBAGENT_DISPATCH_TOOL],
+        model="inherit",
+        permissionMode=permission_mode,
+        mcpServers=([_BROKER_MCP_SERVER_NAME] if broker_configured else None),
+        maxTurns=max_turns,
+    )
+
+
+def _fanout_prompt_section(cap: int) -> str:
+    """System-prompt section telling the parent how to fan out. The cap is
+    advisory — the SDK has no kernel-level parallelism limit — so it is stated
+    explicitly and the parent is instructed not to exceed it."""
+    return (
+        "## PARALLEL RESEARCH (SUBAGENTS)\n\n"
+        f"When your task has multiple INDEPENDENT items to research (e.g. several "
+        f"opponents, districts, or agenda items), dispatch one `{_RESEARCHER_AGENT_NAME}` "
+        f"subagent per item using the `{_SUBAGENT_DISPATCH_TOOL}` tool, and run them "
+        f"CONCURRENTLY to save wall-clock time. Dispatch at most **{cap}** subagents "
+        f"at once; if there are more items than that, work in batches of {cap}.\n\n"
+        "Each subagent shares your exact tool surface and scope (same broker, same "
+        "WebSearch, same permissions) and returns structured findings. Only dispatch "
+        "for genuinely independent work — sequential or dependent steps stay on the "
+        "main agent. You remain responsible for assembling all findings into the "
+        "single output artifact; subagents never write the artifact themselves."
+    )
+
+
 async def run_agent(
     instruction: str,
     model: str,
@@ -177,6 +256,7 @@ async def run_agent(
     system_prompt: str | None = None,
     permission_mode: str | None = None,
     allowed_external_tools: list[str] | None = None,
+    max_parallel_subagents: int = 0,
 ) -> dict:
     logger.info(f"Starting Claude SDK harness (model: {model}, max_turns: {max_turns})")
 
@@ -196,18 +276,42 @@ async def run_agent(
     else:
         allowed_tools = list(ALLOWED_TOOLS)
 
+    resolved_permission_mode = _resolve_permission_mode(permission_mode)
+    mcp_servers = _build_broker_mcp_servers()
+
+    system_prompt_text = build_system_prompt(
+        instruction,
+        contract_schema=contract_schema,
+        max_turns=max_turns,
+        preamble=system_prompt,
+    )
+
+    # Parallel subagent fan-out (runtime.max_parallel_subagents). Off (0) keeps
+    # the built options byte-identical to the single-agent path: agents stays
+    # None, the Agent dispatch tool is absent, and the system prompt is
+    # unchanged. When enabled, wire a researcher subagent that inherits the
+    # parent's tool surface + scope and append the dispatch tool + a fan-out
+    # section to the prompt.
+    agents: dict[str, AgentDefinition] | None = None
+    if max_parallel_subagents > 0:
+        cap = min(max_parallel_subagents, MAX_PARALLEL_SUBAGENTS)
+        researcher = _build_researcher_agent(
+            research_tools=allowed_tools,
+            permission_mode=resolved_permission_mode,
+            broker_configured=bool(mcp_servers),
+            max_turns=max_turns,
+        )
+        agents = {_RESEARCHER_AGENT_NAME: researcher}
+        allowed_tools = [*allowed_tools, _SUBAGENT_DISPATCH_TOOL]
+        system_prompt_text = system_prompt_text + "\n" + _fanout_prompt_section(cap)
+
     # SECURITY: Untrusted user-supplied params are NOT rendered into the system prompt.
     # They flow in via the first user message, fenced inside <untrusted_data> tags,
     # and the system prompt instructs the agent to treat that block as literal data.
     # This is the defense against prompt injection since the agent runs with broad
     # tool access (Bash) and a permissive permission mode.
     options = ClaudeAgentOptions(
-        system_prompt=build_system_prompt(
-            instruction,
-            contract_schema=contract_schema,
-            max_turns=max_turns,
-            preamble=system_prompt,
-        ),
+        system_prompt=system_prompt_text,
         allowed_tools=allowed_tools,
         # SECURITY: permission_mode defaults to bypassPermissions to preserve existing
         # Fargate behavior (the agent runs in an isolated container with only the
@@ -215,8 +319,9 @@ async def run_agent(
         # injection defense. Manifest-supplied permission_mode (write-action experiments,
         # ENG-10128) overrides this; absent that, PMF_AGENT_PERMISSION_MODE env var wins;
         # absent both, DEFAULT_PERMISSION_MODE applies.
-        permission_mode=_resolve_permission_mode(permission_mode),
-        mcp_servers=_build_broker_mcp_servers(),
+        permission_mode=resolved_permission_mode,
+        mcp_servers=mcp_servers,
+        agents=agents,
         cwd=workspace_dir,
         max_turns=max_turns,
         model=model,
@@ -390,6 +495,7 @@ class ClaudeSdkHarness:
         system_prompt: str | None = None,
         permission_mode: str | None = None,
         allowed_external_tools: list[str] | None = None,
+        max_parallel_subagents: int = 0,
     ) -> HarnessResult:
         result = await run_agent(
             instruction=instruction,
@@ -402,6 +508,7 @@ class ClaudeSdkHarness:
             system_prompt=system_prompt,
             permission_mode=permission_mode,
             allowed_external_tools=allowed_external_tools,
+            max_parallel_subagents=max_parallel_subagents,
         )
 
         artifact_bytes, content_type = collect_output_artifact(workspace_dir, experiment_id=experiment_id)

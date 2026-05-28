@@ -418,6 +418,17 @@ def _validate_write_action_fields(manifest: dict, experiment_id: str) -> None:
             if not isinstance(t, str) or not t.strip() or len(t) > _MAX_TOOL_NAME_LEN:
                 raise ManifestLoaderMalformedError(f"{experiment_id}: invalid allowed_external_tools entry: {t!r}")
 
+    # runtime.max_parallel_subagents — parallel research fan-out opt-in.
+    runtime = manifest.get("runtime")
+    if runtime is not None:
+        if not isinstance(runtime, dict):
+            raise ManifestLoaderMalformedError(f"{experiment_id}: runtime must be an object")
+        mps = runtime.get("max_parallel_subagents")
+        if mps is not None and (isinstance(mps, bool) or not isinstance(mps, int) or mps < 0):
+            raise ManifestLoaderMalformedError(
+                f"{experiment_id}: runtime.max_parallel_subagents must be a non-negative integer; got {mps!r}"
+            )
+
 
 def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
     """Project the full manifest down to the routing fields the Lambda needs.

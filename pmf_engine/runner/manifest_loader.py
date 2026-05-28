@@ -83,6 +83,23 @@ def _validate_write_action_fields(manifest: dict) -> None:
                     f"manifest.allowed_external_tools entry must be a non-empty string; got {t!r}"
                 )
 
+    # runtime.max_parallel_subagents — opt-in for parallel research fan-out.
+    # Optional nested block; when present it must be a dict and the field, if
+    # set, a non-negative int (bool excluded — it's an int subclass in Python
+    # but a boolean here is an authoring mistake). The harness clamps the value
+    # to its own ceiling; this only rejects ill-typed/negative input.
+    runtime = manifest.get("runtime")
+    if runtime is not None:
+        if not isinstance(runtime, dict):
+            raise ManifestLoadError(f"manifest.runtime must be an object; got {runtime!r}")
+        mps = runtime.get("max_parallel_subagents")
+        if mps is not None and (
+            isinstance(mps, bool) or not isinstance(mps, int) or mps < 0
+        ):
+            raise ManifestLoadError(
+                f"manifest.runtime.max_parallel_subagents must be a non-negative integer; got {mps!r}"
+            )
+
 
 def load_from_broker(
     experiment_id: str,
