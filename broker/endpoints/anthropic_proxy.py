@@ -63,9 +63,18 @@ async def proxy_messages(
 
     headers = {
         "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
         "content-type": "application/json",
     }
+    # Forward the client's anthropic-beta header verbatim. The bundled Claude
+    # CLI (Agent SDK >=0.2.x) gates request fields like context_management and
+    # output_config behind this header; dropping it makes api.anthropic.com
+    # reject those fields with 400 "Extra inputs are not permitted", killing
+    # every agent run on turn 1. Only forward when the client sent one — never
+    # invent a beta header, which could itself trigger a 400.
+    client_beta = request.headers.get("anthropic-beta")
+    if client_beta:
+        headers["anthropic-beta"] = client_beta
 
     try:
         parsed_body = json.loads(body)
