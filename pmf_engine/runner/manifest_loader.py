@@ -45,6 +45,45 @@ class ManifestLoadError(RuntimeError):
     """Raised when the broker fails to return a usable manifest envelope."""
 
 
+# Mirror of pmf_engine.control_plane.manifest_loader._PERMISSION_MODE_VALUES.
+# Kept inline (not imported) so the runner-side loader has no control-plane
+# import dependency; keep the two in sync if either side changes.
+_PERMISSION_MODE_VALUES = frozenset({"default", "bypassPermissions"})
+
+
+def _validate_write_action_fields(manifest: dict) -> None:
+    """Defense-in-depth validation for the optional write-action manifest
+    fields (system_prompt, permission_mode, allowed_external_tools).
+
+    These are validated at publish time (meta-schema) and again at dispatch
+    time (control_plane.manifest_loader._validate_write_action_fields — the
+    authoritative ruleset). This runner-side mirror catches hand-edited
+    manifests used in local-dev / debug runs that bypass dispatch.
+    """
+    permission_mode = manifest.get("permission_mode")
+    if permission_mode is not None:
+        if not isinstance(permission_mode, str) or permission_mode not in _PERMISSION_MODE_VALUES:
+            raise ManifestLoadError(
+                f"manifest.permission_mode must be one of {sorted(_PERMISSION_MODE_VALUES)}; "
+                f"got {permission_mode!r}"
+            )
+
+    system_prompt = manifest.get("system_prompt")
+    if system_prompt is not None:
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ManifestLoadError("manifest.system_prompt must be a non-empty string")
+
+    tools = manifest.get("allowed_external_tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise ManifestLoadError("manifest.allowed_external_tools must be a list")
+        for t in tools:
+            if not isinstance(t, str) or not t.strip():
+                raise ManifestLoadError(
+                    f"manifest.allowed_external_tools entry must be a non-empty string; got {t!r}"
+                )
+
+
 def load_from_broker(
     experiment_id: str,
     broker_url: str,
@@ -127,6 +166,11 @@ def load_from_broker(
         for required in ("output_schema", "model", "max_turns"):
             if required not in manifest:
                 raise ManifestLoadError(f"manifest missing required field '{required}'")
+
+        # Write-action fields (ENG-10128) are optional but, when present, must
+        # be well-formed before main.py reads them onto RunnerConfig and the
+        # harness wires them into ClaudeAgentOptions.
+        _validate_write_action_fields(manifest)
 
         # Attachments are optional — older broker versions that haven't been
         # redeployed yet don't include the field. Distinguish "key absent"

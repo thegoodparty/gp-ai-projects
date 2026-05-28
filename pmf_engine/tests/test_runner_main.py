@@ -1834,3 +1834,273 @@ class TestSigtermDuringInitExitsCleanly:
             f"shutdown; got calls: {mock_publish.report_status.call_args_list!r}"
         )
 
+
+# ---------------------------------------------------------------------------
+# Write-action manifest end-to-end (ENG-10234)
+#
+# Asserts the full chain: manifest_loader.load_from_broker returns a write-
+# action manifest → RunnerConfig.from_env extracts the three new fields →
+# run_experiment passes them to the harness → ClaudeAgentOptions reflects
+# them all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_action_manifest_flows_through_to_claude_agent_options(
+    monkeypatch, tmp_path
+):
+    """ENG-10234: a write-action manifest with system_prompt /
+    permission_mode / allowed_external_tools flows end-to-end. The dispatch
+    side (ENG-10128) routes the SQS message; this test covers the runner side
+    that consumes the resulting manifest and builds ClaudeAgentOptions for
+    the Fargate task's Claude SDK session.
+    """
+    from claude_agent_sdk import ResultMessage
+
+    from pmf_engine.runner.harness.claude_sdk import ALLOWED_TOOLS, ClaudeSdkHarness
+
+    synthetic_envelope = {
+        "manifest": {
+            "id": "compliance_setup",
+            "version": 1,
+            "mode": "win",
+            "model": "sonnet",
+            "max_turns": 60,
+            "timeout_seconds": 1200,
+            "input_schema": {"type": "object", "properties": {}},
+            "output_schema": {
+                "type": "object",
+                "properties": {"stage": {"type": "string"}},
+            },
+            "system_prompt": "You are setting up TCR compliance for a candidate.",
+            "permission_mode": "default",
+            "allowed_external_tools": ["Read"],
+        },
+        "instruction": "# Compliance setup\n\nDo the thing.",
+        "attachments": {},
+    }
+
+    monkeypatch.setattr(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        lambda **kwargs: synthetic_envelope,
+    )
+    monkeypatch.setenv("EXPERIMENT_ID", "compliance_setup")
+    monkeypatch.setenv("RUN_ID", "run-write-001")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-test")
+    monkeypatch.setenv("BROKER_URL", "https://broker-dev.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok-end-to-end")
+    # `local` is outside _AWS_DEPLOYMENT_ENVS so the https-only guard is a
+    # no-op — keeps the synthetic broker URL valid for the test boundary.
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.delenv("PMF_AGENT_PERMISSION_MODE", raising=False)
+    monkeypatch.delenv("INSTRUCTION", raising=False)
+
+    # Step 1: loader → from_env populates the three RunnerConfig fields.
+    config = RunnerConfig.from_env()
+    assert config.system_prompt == "You are setting up TCR compliance for a candidate."
+    assert config.permission_mode == "default"
+    assert config.allowed_external_tools == ["Read"]
+    assert config.instruction == "# Compliance setup\n\nDo the thing."
+
+    # Step 2: run_experiment + real ClaudeSdkHarness → ClaudeAgentOptions
+    # carries all three. Use the real harness with `query` patched at the
+    # SDK boundary; this is the lowest-mocking point that still proves the
+    # options shape without launching a real agent process.
+    captured: dict = {}
+
+    async def fake_query(prompt, options):
+        captured["options"] = options
+        yield ResultMessage(
+            subtype="result",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-e2e",
+            total_cost_usd=0.01,
+            result="Done",
+        )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "output").mkdir()
+    (workspace / "output" / "result.json").write_text(json.dumps({"stage": "done"}))
+
+    monkeypatch.setenv("WORKSPACE_DIR", str(workspace))
+
+    with patch(
+        "pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query
+    ), patch("pmf_engine.runner.main.publish"), patch(
+        "pmf_engine.runner.main._upload_logs"
+    ):
+        harness = ClaudeSdkHarness()
+        await run_experiment(config, harness=harness)
+
+    options = captured["options"]
+    # system_prompt prepended above the capability section.
+    assert options.system_prompt.startswith(
+        "You are setting up TCR compliance for a candidate.\n"
+    )
+    # permission_mode overrides the bypassPermissions default.
+    assert options.permission_mode == "default"
+    # allowed_external_tools extended onto ALLOWED_TOOLS, base set preserved.
+    assert options.allowed_tools == [*ALLOWED_TOOLS, "Read"]
+    # MCP server wired from BROKER_URL + BROKER_TOKEN env.
+    assert options.mcp_servers["broker"]["type"] == "http"
+    assert options.mcp_servers["broker"]["url"] == "https://broker-dev.test/agent/mcp"
+    assert options.mcp_servers["broker"]["headers"] == {
+        "X-Broker-Token": "tok-end-to-end"
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bearer-token redaction (ENG-10234 hardening — delegate-review finding)
+#
+# The Claude SDK writes a session JSONL at ~/.claude/projects/**/*.jsonl that
+# the runner uploads to S3 via _upload_logs. Pre-ENG-10234 the runner only
+# ever passed env-derived secrets to the SDK; the new BROKER_TOKEN bearer
+# header inside ClaudeAgentOptions.mcp_servers is potentially serializable
+# into that JSONL by SDK internals. The existing _SECRET_PATTERNS only catch
+# `key=value`/`key:value` shapes — `Authorization: Bearer <token>` has a
+# space the char class doesn't include, so it passes through unredacted.
+# ---------------------------------------------------------------------------
+
+
+class TestBearerTokenRedaction:
+    def test_redacts_authorization_header_bearer_token(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # JSON-serialized header shape that the SDK could emit into session
+        # logs. This is the exact shape that escaped _SECRET_PATTERNS pre-fix.
+        line = '{"headers": {"Authorization": "Bearer tok-mcp-123-secret-stuff"}}\n'
+        redacted = _redact_line(line)
+
+        assert "tok-mcp-123-secret-stuff" not in redacted
+        assert "Bearer " in redacted, "Bearer prefix preserved for diagnostic value"
+        assert "REDACTED" in redacted
+
+    def test_redacts_bearer_in_curl_style_header(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # Whatever the SDK chooses to emit, the redaction must apply to any
+        # `Bearer <token>` shape — header lines, curl reproducers, etc.
+        line = "curl -H 'Authorization: Bearer broker-jwt-eyJhbGciOiJIUzI1NiJ9...'"
+        redacted = _redact_line(line)
+
+        assert "broker-jwt-eyJhbGciOiJIUzI1NiJ9" not in redacted
+        assert "Bearer " in redacted
+
+    def test_redacts_jwt_with_dots_and_dashes(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # JWTs contain `.` and `-` — verify the char class covers them.
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        line = f'"auth": "Bearer {jwt}"'
+        redacted = _redact_line(line)
+
+        assert jwt not in redacted
+        assert "Bearer " in redacted
+
+    def test_short_bearer_value_below_threshold_not_redacted(self):
+        """Threshold of 8 chars matches the existing _SECRET_PATTERNS
+        convention — tokens shorter than that aren't credentials worth
+        guarding against; this avoids redacting words like "Bearer hi"
+        in agent-authored prose."""
+        from pmf_engine.runner.main import _redact_line
+
+        line = "the Bearer hi was retrieved"
+        redacted = _redact_line(line)
+
+        assert redacted == line
+
+    def test_redaction_does_not_destroy_surrounding_json(self):
+        """The substitution must leave the surrounding JSON parseable so log
+        diffing / cwltail-style tools that consume the redacted file still
+        work."""
+        import json as _json
+        from pmf_engine.runner.main import _redact_line
+
+        original = '{"event": "session_start", "headers": {"Authorization": "Bearer tok-12345678"}}'
+        redacted = _redact_line(original)
+
+        # Both ends still parseable as JSON — the redacted portion is a
+        # string value, so the JSON structure stays intact.
+        parsed = _json.loads(redacted)
+        assert parsed["event"] == "session_start"
+        assert "tok-12345678" not in parsed["headers"]["Authorization"]
+        assert parsed["headers"]["Authorization"].startswith("Bearer ")
+
+
+class TestBrokerTokenRedaction:
+    """X-Broker-Token redaction. The runner now passes BROKER_TOKEN in this
+    header (claude_sdk._build_broker_mcp_servers); the SDK can serialize the
+    headers dict into session JSONL that _upload_logs ships to S3. The
+    JSON-quoted shape `"X-Broker-Token": "<token>"` is not caught by
+    _SECRET_PATTERNS because the `"` between the keyword and `:` breaks
+    `\\s*[=:]`. _BROKER_TOKEN_PATTERN handles it."""
+
+    def test_redacts_json_serialized_x_broker_token(self):
+        from pmf_engine.runner.main import _redact_line
+
+        # The exact shape the SDK emits into session JSONL for the MCP
+        # server config — this is what was leaking pre-fix.
+        line = '{"headers": {"X-Broker-Token": "tok-broker-abc-12345"}}\n'
+        redacted = _redact_line(line)
+
+        assert "tok-broker-abc-12345" not in redacted
+        assert "X-Broker-Token" in redacted, "Header name preserved"
+        assert "REDACTED" in redacted
+
+    def test_redacts_curl_style_header(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = "curl -H 'X-Broker-Token: tok-broker-deadbeef0123'"
+        redacted = _redact_line(line)
+
+        assert "tok-broker-deadbeef0123" not in redacted
+        assert "X-Broker-Token" in redacted
+
+    def test_redacts_env_style_assignment(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = "X-Broker-Token=tok-broker-deadbeef0123"
+        redacted = _redact_line(line)
+
+        assert "tok-broker-deadbeef0123" not in redacted
+        assert "X-Broker-Token" in redacted
+
+    def test_case_insensitive(self):
+        from pmf_engine.runner.main import _redact_line
+
+        line = '"x-broker-token": "tok-broker-abc-12345"'
+        redacted = _redact_line(line)
+
+        assert "tok-broker-abc-12345" not in redacted
+
+    def test_short_value_below_threshold_not_redacted(self):
+        """Threshold of 8 chars matches the existing convention — short
+        strings aren't credentials worth guarding."""
+        from pmf_engine.runner.main import _redact_line
+
+        line = '"X-Broker-Token": "short"'
+        redacted = _redact_line(line)
+
+        assert redacted == line
+
+    def test_redaction_keeps_json_parseable(self):
+        """The substitution must leave surrounding JSON parseable — the
+        value's closing `"` is outside the captured token, so it stays."""
+        import json as _json
+        from pmf_engine.runner.main import _redact_line
+
+        original = (
+            '{"event": "session_start", '
+            '"headers": {"X-Broker-Token": "tok-broker-abc-12345"}}'
+        )
+        redacted = _redact_line(original)
+
+        parsed = _json.loads(redacted)
+        assert parsed["event"] == "session_start"
+        assert "tok-broker-abc-12345" not in parsed["headers"]["X-Broker-Token"]
+
