@@ -23,6 +23,7 @@ _LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1", None})
 _installed = False
 _orig_getaddrinfo = None
 _orig_connect = None
+_orig_connect_ex = None
 
 
 class SandboxEgressError(OSError):
@@ -34,7 +35,7 @@ def _is_loopback_ip(ip: str) -> bool:
 
 
 def install(broker_url: str | None = None) -> None:
-    global _installed, _orig_getaddrinfo, _orig_connect
+    global _installed, _orig_getaddrinfo, _orig_connect, _orig_connect_ex
 
     resolved_url = broker_url or os.environ.get("BROKER_URL")
     if not resolved_url:
@@ -46,6 +47,7 @@ def install(broker_url: str | None = None) -> None:
 
     _orig_getaddrinfo = socket.getaddrinfo
     _orig_connect = socket.socket.connect
+    _orig_connect_ex = socket.socket.connect_ex
 
     broker_ips: set[str] = set()
     if broker_host is not None:
@@ -67,23 +69,33 @@ def install(broker_url: str | None = None) -> None:
                 broker_ips.add(info[4][0])
         return results
 
-    def guarded_connect(self, address):
+    def _reject_if_blocked(address):
         ip = address[0] if isinstance(address, (tuple, list)) and address else None
         if isinstance(ip, str) and not _is_loopback_ip(ip) and ip not in broker_ips:
             raise SandboxEgressError(MESSAGE)
+
+    def guarded_connect(self, address):
+        _reject_if_blocked(address)
         return _orig_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        _reject_if_blocked(address)
+        return _orig_connect_ex(self, address)
 
     socket.getaddrinfo = guarded_getaddrinfo
     socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
     _installed = True
 
 
 def uninstall() -> None:
-    global _installed, _orig_getaddrinfo, _orig_connect
+    global _installed, _orig_getaddrinfo, _orig_connect, _orig_connect_ex
     if not _installed:
         return
     socket.getaddrinfo = _orig_getaddrinfo
     socket.socket.connect = _orig_connect
+    socket.socket.connect_ex = _orig_connect_ex
     _orig_getaddrinfo = None
     _orig_connect = None
+    _orig_connect_ex = None
     _installed = False

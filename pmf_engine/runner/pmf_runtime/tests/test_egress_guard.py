@@ -81,6 +81,26 @@ class TestConnectGuard:
             s.close()
         assert ("8.8.8.8", 53) not in connect_calls
 
+    def test_blocks_non_loopback_ip_literal_via_connect_ex(self, monkeypatch):
+        """connect_ex is a distinct C-level method — a caller using it with an IP
+        literal must be blocked too, not just connect()."""
+        def fake_getaddrinfo(host, *args, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.9.9", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        ex_calls = []
+        monkeypatch.setattr(socket.socket, "connect_ex", lambda self, address: ex_calls.append(address) or 0)
+
+        egress_guard.install("https://broker.example.com")
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(SandboxEgressError):
+                s.connect_ex(("8.8.8.8", 53))
+        finally:
+            s.close()
+        assert ("8.8.8.8", 53) not in ex_calls
+
     def test_allows_loopback_ip_literal(self, monkeypatch):
         def fake_getaddrinfo(host, *args, **kwargs):
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.9.9", 0))]
