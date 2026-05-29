@@ -741,9 +741,21 @@ resource "aws_ecs_service" "broker" {
 
 # --- Autoscaling ---
 
+variable "autoscale_min_capacity" {
+  description = "Minimum number of broker tasks held by application-autoscaling. Defaults to 1; prod overrides to keep warm capacity."
+  type        = number
+  default     = 1
+}
+
+variable "autoscale_max_capacity" {
+  description = "Maximum number of broker tasks application-autoscaling may scale to under load. Defaults to 10; prod overrides for more burst headroom."
+  type        = number
+  default     = 10
+}
+
 resource "aws_appautoscaling_target" "broker" {
-  min_capacity       = 1
-  max_capacity       = 10
+  min_capacity       = var.autoscale_min_capacity
+  max_capacity       = var.autoscale_max_capacity
   resource_id        = "service/${aws_ecs_cluster.broker.name}/${aws_ecs_service.broker.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"

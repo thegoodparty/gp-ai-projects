@@ -98,6 +98,9 @@ module "broker" {
   ecr_repository_url = "333022194791.dkr.ecr.us-west-2.amazonaws.com/gp-ai-projects"
   docker_image_tag   = "broker-prod"
 
+  autoscale_min_capacity = 5
+  autoscale_max_capacity = 30
+
   agent_security_group_id           = try(data.terraform_remote_state.fargate[0].outputs.security_group_id, "")
   dispatch_lambda_security_group_id = try(data.terraform_remote_state.control_plane[0].outputs.dispatch_lambda_sg_id, "")
 
