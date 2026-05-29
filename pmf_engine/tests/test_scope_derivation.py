@@ -2,7 +2,6 @@ import pytest
 
 from pmf_engine.control_plane.scope_derivation import derive_scope
 
-
 SYNTHETIC_MANIFEST_SCOPE = {
     "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
     "max_rows": 50000,
@@ -137,3 +136,35 @@ class TestInputValidation:
     def test_rejects_control_chars_or_excessive_length_district(self, bad_district):
         with pytest.raises(ValueError, match="district"):
             derive_scope("smoke_test", {"state": "NC", "district": bad_district})
+
+
+class TestDataRequiredUnlessForwarding:
+    """data_required_unless is a broker-domain carve-out field declared in the
+    manifest scope. derive_scope must carry it through unchanged so the broker's
+    anti-fabrication gate can exempt legitimate zero-query artifacts (e.g.
+    meeting_briefing with briefing_status=awaiting_agenda)."""
+
+    MEETING_BRIEFING_SCOPE = {
+        "allowed_tables": [],
+        "max_rows": 50000,
+        "data_required_unless": {
+            "field": "briefing_status",
+            "values": ["awaiting_agenda", "no_meeting_found", "error"],
+        },
+    }
+
+    def test_data_required_unless_is_forwarded_when_present(self):
+        scope = derive_scope("meeting_briefing", {"state": "CA"}, manifest_scope=self.MEETING_BRIEFING_SCOPE)
+        assert scope["data_required_unless"] == self.MEETING_BRIEFING_SCOPE["data_required_unless"]
+
+    def test_data_required_unless_absent_when_not_in_manifest(self):
+        scope = derive_scope(
+            "smoke_test",
+            {"state": "NC"},
+            manifest_scope={"allowed_tables": ["some_table"], "max_rows": 1000},
+        )
+        assert "data_required_unless" not in scope
+
+    def test_data_required_unless_absent_when_no_manifest_scope(self):
+        scope = derive_scope("smoke_test", {"state": "NC"})
+        assert "data_required_unless" not in scope

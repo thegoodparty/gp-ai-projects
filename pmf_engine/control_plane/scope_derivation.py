@@ -42,10 +42,18 @@ def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None =
     if district:
         _validate_scope_string("district", district)
 
-    return {
+    result: dict = {
         "state": state,
         "cities": [city] if city else [],
         "districts": [district] if district else [],
         "allowed_tables": config.get("allowed_tables", []),
         "max_rows": config.get("max_rows", 50000),
     }
+
+    # Carry broker-domain carve-out fields through verbatim so the anti-fabrication
+    # gate in artifact_publish.py can exempt zero-query artifacts (e.g. meeting_briefing
+    # with briefing_status=awaiting_agenda).
+    if "data_required_unless" in config:
+        result["data_required_unless"] = config["data_required_unless"]
+
+    return result
