@@ -249,6 +249,53 @@ async def test_main_writes_instruction_to_workspace():
             assert f.read() == "# Test Instruction\n\nDo the thing."
 
 
+@pytest.mark.asyncio
+async def test_main_writes_sandbox_doc_to_workspace():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(instruction="# Test Instruction")
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                            await main()
+
+        sandbox_path = os.path.join(tmpdir, "SANDBOX.md")
+        assert os.path.exists(sandbox_path)
+        with open(sandbox_path) as f:
+            content = f.read()
+        assert "no direct network egress" in content.lower()
+
+
+def test_sandbox_md_is_reserved_workspace_file():
+    from pmf_engine.runner.main import _RESERVED_WORKSPACE_FILES
+
+    assert "SANDBOX.md" in _RESERVED_WORKSPACE_FILES
+
+
+def test_sandbox_doc_embeds_egress_guard_message_as_single_source():
+    """The no-egress sandbox message must have ONE source of truth. The
+    SANDBOX.md doc the runner writes (`_SANDBOX_DOC`) and the runtime
+    SandboxEgressError text (`egress_guard.MESSAGE`) had drifted as two
+    hand-maintained near-copies. Pin that `_SANDBOX_DOC` is built by
+    embedding `egress_guard.MESSAGE` verbatim so the two cannot diverge.
+
+    `egress_guard.MESSAGE` ends with a self-referential "See /workspace/
+    SANDBOX.md." sentence that reads oddly inside SANDBOX.md itself, so the
+    runner is allowed to trim that trailing sentence when embedding. Assert
+    the core text (everything before that self-reference) is a substring.
+    """
+    from pmf_engine.runner.main import _SANDBOX_DOC
+    from pmf_engine.runner.pmf_runtime.egress_guard import MESSAGE
+
+    core = MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip()
+    assert core in _SANDBOX_DOC, (
+        "egress_guard.MESSAGE must be embedded verbatim in _SANDBOX_DOC so "
+        "the two no-egress messages share a single source and cannot drift"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Attachments — runner writes sidecar files to /workspace/ before agent spawn
 # ---------------------------------------------------------------------------
@@ -593,11 +640,12 @@ async def test_main_works_with_runner_config_default_attachments(tmp_path):
                         await main()
 
     mock_run.assert_called_once()
-    # Only instruction.md present — no spurious attachment files.
+    # Only runner-written sidecars present — no spurious attachment files.
     assert (tmp_path / "instruction.md").exists()
+    runner_sidecars = {"instruction.md", "SANDBOX.md"}
     extra_files = [
         p.name for p in tmp_path.iterdir()
-        if p.is_file() and p.name != "instruction.md"
+        if p.is_file() and p.name not in runner_sidecars
     ]
     assert extra_files == [], (
         f"default-attachments path must not create extra files; got: {extra_files!r}"

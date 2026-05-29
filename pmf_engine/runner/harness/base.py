@@ -28,4 +28,6 @@ class AgentHarness(Protocol):
         system_prompt: str | None = None,
         permission_mode: str | None = None,
         allowed_external_tools: list[str] | None = None,
+        max_parallel_subagents: int = 0,
+        max_thinking_tokens: int | None = None,
     ) -> HarnessResult: ...

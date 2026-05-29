@@ -16,6 +16,7 @@ from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
 from .pmf_runtime import publish
 from .pmf_runtime.config import init_config
+from .pmf_runtime.egress_guard import MESSAGE as EGRESS_MESSAGE
 
 logger = get_logger(__name__)
 
@@ -31,7 +32,28 @@ _RESERVED_WORKSPACE_FILES = frozenset({
     "instruction.md",
     "contract_schema.json",
     "validate_output.py",
+    "SANDBOX.md",
 })
+
+_SANDBOX_DOC = EGRESS_MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip() + """
+
+## Allowed tools
+
+- WebSearch — discover URLs and facts. Start here.
+- pmf_runtime.http.head(url) — cheap check that a URL exists / resolves before citing. Use first.
+- pmf_runtime.http.get(url) — fetch a web page (HTML/JSON/CSV/XML text). The browser; escalate to this only if head fails.
+- pmf_runtime.http.download(url) — download a binary file (PDF, docx, xlsx) to the workspace.
+
+## Web-access escalation ladder
+
+WebSearch -> pmf_runtime.http.head -> pmf_runtime.http.get (browser, only if head fails)
+
+## Never
+
+Never use urllib, requests, httpx, curl, wget, or raw socket directly — they fail here, and never \
+retry them or reverse-engineer the runtime. There is no route out of this container except the \
+broker-proxied tools above.
+"""
 
 
 class AttachmentSafetyViolation(RuntimeError):
@@ -394,6 +416,8 @@ async def run_experiment(
                     system_prompt=config.system_prompt,
                     permission_mode=config.permission_mode,
                     allowed_external_tools=config.allowed_external_tools,
+                    max_parallel_subagents=config.max_parallel_subagents,
+                    max_thinking_tokens=config.max_thinking_tokens,
                 )
             except Exception as e:
                 duration = time.monotonic() - start_time
@@ -693,6 +717,11 @@ async def main():
         with open(instruction_path, "w") as f:
             f.write(config.instruction)
         logger.info(f"Wrote instruction to {instruction_path}")
+
+        sandbox_path = os.path.join(workspace_dir, "SANDBOX.md")
+        with open(sandbox_path, "w") as f:
+            f.write(_SANDBOX_DOC)
+        logger.info(f"Wrote sandbox doc to {sandbox_path}")
 
         if config.contract_schema:
             schema_path = os.path.join(workspace_dir, "contract_schema.json")

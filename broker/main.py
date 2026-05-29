@@ -58,6 +58,7 @@ from broker.endpoints.delete_run_token import (
 )
 from broker.endpoints.http_fetch import (
     get_browser_fetcher as http_get_browser_fetcher,
+    get_http_client as http_get_http_client,
     get_scope_ticket as http_get_scope_ticket,
     router as http_router,
 )
@@ -208,6 +209,7 @@ async def lifespan(app: FastAPI):
 
     app.dependency_overrides[http_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[http_get_browser_fetcher] = lambda: browser_fetcher
+    app.dependency_overrides[http_get_http_client] = lambda: http_client
 
     app.dependency_overrides[agent_mcp_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[agent_mcp_get_agent_mcp_secret] = lambda: secrets.agent_mcp_token_secret
