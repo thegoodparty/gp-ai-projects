@@ -244,6 +244,7 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
           "dynamodb:Query"
         ]

@@ -85,9 +85,25 @@ def _create_app(
     # Tracker default: simulate one successful Databricks query (count=1) so
     # the anti-fabrication gate doesn't trip on tickets whose scope has
     # allowed_tables. Override to 0 in tests that exercise the gate.
-    from broker.data_query_tracker import DataQueryTracker
+    # These tests verify the gate, not the tracker's storage — the real
+    # DynamoDB-backed tracker is covered in test_data_query_tracker.py — so use
+    # an in-memory double with the same increment/get/clear interface.
     from broker.endpoints.artifact_publish import get_data_query_tracker
-    tracker = DataQueryTracker()
+
+    class _FakeTracker:
+        def __init__(self) -> None:
+            self._counts: dict[str, int] = {}
+
+        def increment(self, pk: str) -> None:
+            self._counts[pk] = self._counts.get(pk, 0) + 1
+
+        def get(self, pk: str) -> int:
+            return self._counts.get(pk, 0)
+
+        def clear(self, pk: str) -> None:
+            self._counts.pop(pk, None)
+
+    tracker = _FakeTracker()
     for _ in range(tracker_count):
         tracker.increment(_ticket.pk)
     app.dependency_overrides[get_data_query_tracker] = lambda: tracker
