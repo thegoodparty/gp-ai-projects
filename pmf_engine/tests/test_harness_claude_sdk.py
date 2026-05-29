@@ -714,6 +714,7 @@ async def _run_harness_capture_options(
     allowed_external_tools: list[str] | None = None,
     max_parallel_subagents: int = 0,
     max_thinking_tokens: int | None = None,
+    max_turns: int = 5,
     monkey_env: dict[str, str] | None = None,
 ):
     captured, fake_query = _make_options_capture()
@@ -729,7 +730,7 @@ async def _run_harness_capture_options(
                 await harness.run(
                     instruction="Do analysis",
                     model="sonnet",
-                    max_turns=5,
+                    max_turns=max_turns,
                     workspace_dir=tmpdir,
                     params={},
                     system_prompt=system_prompt,
@@ -1027,13 +1028,25 @@ class TestSubagentFanout:
         assert not researcher.mcpServers
 
     @pytest.mark.asyncio
-    async def test_subagent_has_per_subagent_turn_budget(self):
-        """Each subagent gets a bounded maxTurns so a single runaway researcher
-        can't burn the whole budget."""
-        options = await _run_harness_capture_options(max_parallel_subagents=4)
+    async def test_subagent_maxturns_capped_below_parent_budget(self):
+        """Each subagent gets a maxTurns CAPPED well below the parent's full budget
+        so N runaway researchers can't multiply cost (with the parent budget at 50
+        and cap 20 subagents, an uncapped researcher would allow 50 + 20*50 = 1050
+        turns). A researcher does ONE item, so it's bounded at _RESEARCHER_MAX_TURNS."""
+        from pmf_engine.runner.harness.claude_sdk import _RESEARCHER_MAX_TURNS
+
+        options = await _run_harness_capture_options(max_parallel_subagents=4, max_turns=50)
         researcher = options.agents["researcher"]
 
-        assert researcher.maxTurns == 5
+        assert researcher.maxTurns == _RESEARCHER_MAX_TURNS
+        assert researcher.maxTurns < 50
+
+    @pytest.mark.asyncio
+    async def test_subagent_maxturns_never_exceeds_parent(self):
+        """If the parent's budget is below the cap, the researcher inherits the
+        (smaller) parent budget — never more than the parent."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4, max_turns=3)
+        assert options.agents["researcher"].maxTurns == 3
 
     @pytest.mark.asyncio
     async def test_concurrency_cap_clamped_and_surfaced_in_prompt(self):

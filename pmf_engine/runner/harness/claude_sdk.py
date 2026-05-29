@@ -58,6 +58,12 @@ _RESEARCHER_AGENT_NAME = "researcher"
 # manifest can request. Conservative by design — fan-out multiplies cost.
 MAX_PARALLEL_SUBAGENTS = 20
 
+# Per-researcher turn ceiling. A researcher handles ONE item (read brief, 1-2
+# searches, verify URLs, write its fragment) — it never needs the parent's full
+# budget. Capping it well below the parent bounds the fan-out cost multiplier:
+# without it, parent + N*parent turns are possible (N up to MAX_PARALLEL_SUBAGENTS).
+_RESEARCHER_MAX_TURNS = 20
+
 # Logical name for the broker's MCP proxy in ClaudeAgentOptions.mcp_servers.
 # Tools the agent calls through this server are namespaced as "mcp__broker__*"
 # by the SDK at session start (per the SDK's slugified-tool-name convention).
@@ -318,7 +324,7 @@ async def run_agent(
             research_tools=allowed_tools,
             permission_mode=resolved_permission_mode,
             broker_configured=bool(mcp_servers),
-            max_turns=max_turns,
+            max_turns=min(max_turns, _RESEARCHER_MAX_TURNS),
         )
         agents = {_RESEARCHER_AGENT_NAME: researcher}
         allowed_tools = [*allowed_tools, _SUBAGENT_DISPATCH_TOOL]
