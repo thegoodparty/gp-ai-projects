@@ -24,6 +24,12 @@ from broker.endpoints.anthropic_proxy import (
     get_upstream_client,
     router as anthropic_router,
 )
+from broker.endpoints.braintrust_proxy import (
+    get_braintrust_api_key,
+    get_broker_auth as braintrust_get_broker_auth,
+    get_upstream_client as braintrust_get_upstream_client,
+    router as braintrust_router,
+)
 from broker.endpoints.artifact_publish import (
     get_artifact_bucket as publish_get_artifact_bucket,
     get_broker_token_raw as publish_get_broker_token_raw,
@@ -164,6 +170,10 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[get_upstream_client] = lambda: upstream_client
     app.dependency_overrides[get_anthropic_api_key] = lambda: secrets.anthropic_api_key
 
+    app.dependency_overrides[braintrust_get_broker_auth] = lambda: broker_auth
+    app.dependency_overrides[braintrust_get_upstream_client] = lambda: http_client
+    app.dependency_overrides[get_braintrust_api_key] = lambda: secrets.braintrust_api_key
+
     app.dependency_overrides[publish_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[publish_get_s3_client] = lambda: s3_client
     app.dependency_overrides[publish_get_callback_sender] = lambda: callback_sender
@@ -239,6 +249,7 @@ async def auth_error_handler(request: Request, exc: AuthError):
 app.include_router(mint_router)
 app.include_router(delete_router)
 app.include_router(anthropic_router)
+app.include_router(braintrust_router)
 app.include_router(publish_router)
 app.include_router(read_router)
 app.include_router(status_router)
