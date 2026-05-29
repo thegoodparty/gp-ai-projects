@@ -41,7 +41,7 @@ def get_http_client() -> httpx.AsyncClient:  # pragma: no cover
 
 
 _HEAD_MAX_REDIRECTS = 5
-_HEAD_TIMEOUT_S = 15.0
+_HEAD_TIMEOUT_S = 5.0
 
 
 class _HeaderInjectingClient:
