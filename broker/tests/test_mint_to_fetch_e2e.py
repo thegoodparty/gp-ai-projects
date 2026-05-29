@@ -13,15 +13,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from broker.auth import AuthError, hash_service_token
 from broker.browser_fetcher import BrowserFetchResult
-from broker.clerk_client import ClerkClient
 from broker.dynamodb_client import ScopeTicket, TicketAlreadyExistsError
 from broker.endpoints.http_fetch import (
     get_browser_fetcher as http_get_browser_fetcher,
@@ -33,7 +30,6 @@ from broker.endpoints.http_fetch import (
     router as http_router,
 )
 from broker.endpoints.mint_run_token import (
-    get_clerk_client,
     get_service_token_hash,
     get_ticket_store,
 )
@@ -92,13 +88,6 @@ class _FakeFetcher:
         return self.result
 
 
-def _make_fake_clerk() -> MagicMock:
-    fake = MagicMock(spec=ClerkClient)
-    fake.create_actor_token = AsyncMock(return_value={"url": "https://fake.clerk.app/sign_in_tokens/tok_1?token=jwt"})
-    fake.redeem_actor_token = AsyncMock(return_value={"session_id": "sess_fake"})
-    return fake
-
-
 def _make_app(
     store: _InMemoryTicketStore,
     fetcher_result: BrowserFetchResult,
@@ -128,7 +117,6 @@ def _make_app(
 
     app.dependency_overrides[get_ticket_store] = lambda: store
     app.dependency_overrides[get_service_token_hash] = lambda: SERVICE_TOKEN_HASH
-    app.dependency_overrides[get_clerk_client] = lambda: _make_fake_clerk()
     app.dependency_overrides[http_get_scope_ticket] = _resolve_scope_ticket
     app.dependency_overrides[http_get_browser_fetcher] = lambda: fetcher
 

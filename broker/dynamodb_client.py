@@ -28,7 +28,7 @@ class ScopeTicket(BaseModel):
     issued_at: int
     issued_by: str
     prior_artifact_versions: dict[str, str] | None = None
-    clerk_session_id: str | None = None
+    clerk_user_id: str | None = None
 
 
 class ScopeTicketStore:
@@ -50,8 +50,8 @@ class ScopeTicketStore:
         }
         if ticket.prior_artifact_versions is not None:
             item["prior_artifact_versions"] = {"S": json.dumps(ticket.prior_artifact_versions)}
-        if ticket.clerk_session_id is not None:
-            item["clerk_session_id"] = {"S": ticket.clerk_session_id}
+        if ticket.clerk_user_id is not None:
+            item["clerk_user_id"] = {"S": ticket.clerk_user_id}
 
         run_lock_item = {
             "pk": {"S": _run_lock_pk(ticket.run_id)},
@@ -109,9 +109,9 @@ class ScopeTicketStore:
         if "prior_artifact_versions" in item:
             prior = json.loads(item["prior_artifact_versions"]["S"])
 
-        clerk_session_id = None
-        if "clerk_session_id" in item:
-            clerk_session_id = item["clerk_session_id"]["S"]
+        clerk_user_id = None
+        if "clerk_user_id" in item:
+            clerk_user_id = item["clerk_user_id"]["S"]
 
         return ScopeTicket(
             pk=item["pk"]["S"],
@@ -124,7 +124,7 @@ class ScopeTicketStore:
             issued_at=int(item["issued_at"]["N"]),
             issued_by=item["issued_by"]["S"],
             prior_artifact_versions=prior,
-            clerk_session_id=clerk_session_id,
+            clerk_user_id=clerk_user_id,
         )
 
     def delete_ticket(self, broker_token: str) -> None:
