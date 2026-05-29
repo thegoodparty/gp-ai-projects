@@ -30,13 +30,17 @@ from broker.browser_fetcher import (
 
 
 class _FakeRequest:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, is_navigation: bool = True) -> None:
         self.url = url
+        self._is_navigation = is_navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._is_navigation
 
 
 class _FakeRoute:
-    def __init__(self, url: str) -> None:
-        self.request = _FakeRequest(url)
+    def __init__(self, url: str, is_navigation: bool = True) -> None:
+        self.request = _FakeRequest(url, is_navigation)
         self.aborted = False
         self.continued = False
 
@@ -1190,4 +1194,70 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         leaked = captured_paths[0]
         assert not os.path.exists(leaked), (
             f"late-download temp file leaked after post-save SSRF violation: {leaked}"
+        )
+
+
+class TestSubResourceSSRFTolerance:
+    """A blocked third-party sub-resource (tracker/ad/analytics on a dead or
+    non-allowlisted domain) must NOT fail the whole page fetch — it's aborted
+    for safety, but a legitimate main page should still resolve. Only an SSRF
+    violation on the MAIN navigation/document request is fatal. Real news pages
+    are tracker-soup, so failing on any sub-resource violation made URL
+    verification spuriously fail ('SSRF blocked mid-fetch: atrk.js')."""
+
+    def test_subresource_violation_is_not_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("https://d31qbv1cthcecs.cloudfront.net/atrk.js", "DNS resolution failed", is_navigation=False)
+        assert t.fatal() is None
+
+    def test_navigation_violation_is_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("http://169.254.169.254/latest/meta-data/", "blocked private IP", is_navigation=True)
+        fatal = t.fatal()
+        assert fatal is not None
+        assert "169.254.169.254" in fatal
+
+    def test_mixed_returns_navigation_violation_only(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("https://tracker.example/ads.js", "non-allowlisted", is_navigation=False)
+        t.record("http://10.0.0.5/internal", "blocked private IP", is_navigation=True)
+        t.record("https://analytics.example/p.gif", "non-allowlisted", is_navigation=False)
+        fatal = t.fatal()
+        assert fatal is not None
+        assert "10.0.0.5" in fatal
+
+    def test_no_violations_is_not_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        assert _ViolationTracker().fatal() is None
+
+    # Real third-party resources that spuriously failed legitimate news pages in
+    # the opposition_research fan-out run (RUN_ID fc3c4651). Each is embedded in
+    # a WNEP article the agent was trying to verify as a citation:
+    #   https://www.wnep.com/article/.../projected-winner-jeff-cusat.../523-31e120df-...
+    #   https://www.wnep.com/article/.../yannuzzi-calls-to-congratulate-cusat.../523-e531aa5e-...
+    # Both articles 200 fine; they failed only because these embedded sub-
+    # resources trip the SSRF guard (dead/non-allowlisted domains). They must
+    # NOT fail their host page — that broke verification and caused the timeout.
+    @pytest.mark.parametrize(
+        "subresource_url",
+        [
+            "https://d31qbv1cthcecs.cloudfront.net/atrk.js",       # comScore/Alexa tracker
+            "https://launch.newsinc.com/js/embed.js",               # NewsInc video widget
+        ],
+    )
+    def test_real_world_embedded_trackers_are_not_fatal(self, subresource_url):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record(subresource_url, "DNS resolution failed: [Errno -5]", is_navigation=False)
+        assert t.fatal() is None, (
+            f"{subresource_url} is an embedded third-party resource; blocking it must "
+            f"not fail the host news article it was cited from"
         )
