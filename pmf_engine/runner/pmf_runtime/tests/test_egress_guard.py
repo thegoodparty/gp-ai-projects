@@ -99,6 +99,47 @@ class TestConnectGuard:
             s.close()
         assert ("127.0.0.1", 4001) in connect_calls
 
+    def test_allows_broker_resolved_ip_on_connect(self, monkeypatch):
+        def fake_getaddrinfo(host, *args, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.9.9", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+        connect_calls = []
+        monkeypatch.setattr(socket.socket, "connect", lambda self, address: connect_calls.append(address))
+
+        egress_guard.install("https://broker.example.com")
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect(("10.9.9.9", 443))
+        finally:
+            s.close()
+        assert ("10.9.9.9", 443) in connect_calls
+
+    def test_allows_rotated_broker_ip(self, monkeypatch):
+        current_ip = ["10.9.9.9"]
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (current_ip[0], 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+        connect_calls = []
+        monkeypatch.setattr(socket.socket, "connect", lambda self, address: connect_calls.append(address))
+
+        egress_guard.install("https://broker.example.com")
+
+        current_ip[0] = "10.8.8.8"
+        socket.getaddrinfo("broker.example.com", 443)
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect(("10.8.8.8", 443))
+        finally:
+            s.close()
+        assert ("10.8.8.8", 443) in connect_calls
+
 
 class TestNoOp:
     def test_no_broker_url_is_noop(self, monkeypatch):

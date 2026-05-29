@@ -42,6 +42,7 @@ def get_http_client() -> httpx.AsyncClient:  # pragma: no cover
 
 _HEAD_MAX_REDIRECTS = 5
 _HEAD_TIMEOUT_S = 15.0
+_HEAD_TOTAL_TIMEOUT_S = 25.0
 
 
 class _HeaderInjectingClient:
@@ -73,32 +74,41 @@ async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
     missing-Location -> 502, hop bound) is delegated to the canonical
     `resolve_redirects` loop in `ssrf_guard` — never re-implemented here.
     """
-    head_client = _HeaderInjectingClient(client, {"user-agent": USER_AGENT})
-    try:
-        resp, final_url = await resolve_redirects(
-            head_client, "HEAD", url, timeout=_HEAD_TIMEOUT_S, max_redirects=_HEAD_MAX_REDIRECTS
-        )
-        if resp.status_code in (403, 405, 501):
-            get_client = _HeaderInjectingClient(
-                client, {"user-agent": USER_AGENT, "range": "bytes=0-0"}
-            )
+    async def _run() -> tuple[int, str]:
+        head_client = _HeaderInjectingClient(client, {"user-agent": USER_AGENT})
+        try:
             resp, final_url = await resolve_redirects(
-                get_client,
-                "GET",
-                final_url,
-                timeout=_HEAD_TIMEOUT_S,
-                max_redirects=_HEAD_MAX_REDIRECTS,
+                head_client, "HEAD", url, timeout=_HEAD_TIMEOUT_S, max_redirects=_HEAD_MAX_REDIRECTS
             )
-        return resp.status_code, final_url
-    except HTTPException:
-        raise
-    except httpx.TimeoutException as e:
+            if resp.status_code in (403, 405, 501):
+                get_client = _HeaderInjectingClient(
+                    client, {"user-agent": USER_AGENT, "range": "bytes=0-0"}
+                )
+                resp, final_url = await resolve_redirects(
+                    get_client,
+                    "GET",
+                    final_url,
+                    timeout=_HEAD_TIMEOUT_S,
+                    max_redirects=_HEAD_MAX_REDIRECTS,
+                )
+            return resp.status_code, final_url
+        except HTTPException:
+            raise
+        except httpx.TimeoutException as e:
+            raise HTTPException(
+                status_code=504, detail=f"timeout after {_HEAD_TIMEOUT_S}s: {url}"
+            ) from e
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=502, detail=f"connection failed: {type(e).__name__}: {e}"
+            ) from e
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=_HEAD_TOTAL_TIMEOUT_S)
+    except asyncio.TimeoutError as e:
         raise HTTPException(
-            status_code=504, detail=f"timeout after {_HEAD_TIMEOUT_S}s: {url}"
-        ) from e
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=502, detail=f"connection failed: {type(e).__name__}: {e}"
+            status_code=504,
+            detail=f"head check exceeded {_HEAD_TOTAL_TIMEOUT_S}s total: {url}",
         ) from e
 
 

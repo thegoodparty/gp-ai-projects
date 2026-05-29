@@ -1,5 +1,6 @@
 import os
 import socket
+import sys
 from urllib.parse import urlparse
 
 MESSAGE = (
@@ -51,8 +52,8 @@ def install(broker_url: str | None = None) -> None:
         try:
             for info in _orig_getaddrinfo(broker_host, None):
                 broker_ips.add(info[4][0])
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f"egress_guard: broker host pre-resolve failed for {broker_host!r}: {exc}", file=sys.stderr)
 
     allowed_hosts = set(_LOOPBACK)
     allowed_hosts.add(broker_host)
@@ -60,7 +61,11 @@ def install(broker_url: str | None = None) -> None:
     def guarded_getaddrinfo(host, *args, **kwargs):
         if host not in allowed_hosts:
             raise SandboxEgressError(MESSAGE)
-        return _orig_getaddrinfo(host, *args, **kwargs)
+        results = _orig_getaddrinfo(host, *args, **kwargs)
+        if host == broker_host:
+            for info in results:
+                broker_ips.add(info[4][0])
+        return results
 
     def guarded_connect(self, address):
         ip = address[0] if isinstance(address, (tuple, list)) and address else None

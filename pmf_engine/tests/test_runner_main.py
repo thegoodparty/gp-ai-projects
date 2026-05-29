@@ -274,6 +274,28 @@ def test_sandbox_md_is_reserved_workspace_file():
     assert "SANDBOX.md" in _RESERVED_WORKSPACE_FILES
 
 
+def test_sandbox_doc_embeds_egress_guard_message_as_single_source():
+    """The no-egress sandbox message must have ONE source of truth. The
+    SANDBOX.md doc the runner writes (`_SANDBOX_DOC`) and the runtime
+    SandboxEgressError text (`egress_guard.MESSAGE`) had drifted as two
+    hand-maintained near-copies. Pin that `_SANDBOX_DOC` is built by
+    embedding `egress_guard.MESSAGE` verbatim so the two cannot diverge.
+
+    `egress_guard.MESSAGE` ends with a self-referential "See /workspace/
+    SANDBOX.md." sentence that reads oddly inside SANDBOX.md itself, so the
+    runner is allowed to trim that trailing sentence when embedding. Assert
+    the core text (everything before that self-reference) is a substring.
+    """
+    from pmf_engine.runner.main import _SANDBOX_DOC
+    from pmf_engine.runner.pmf_runtime.egress_guard import MESSAGE
+
+    core = MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip()
+    assert core in _SANDBOX_DOC, (
+        "egress_guard.MESSAGE must be embedded verbatim in _SANDBOX_DOC so "
+        "the two no-egress messages share a single source and cannot drift"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Attachments — runner writes sidecar files to /workspace/ before agent spawn
 # ---------------------------------------------------------------------------

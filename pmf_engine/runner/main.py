@@ -16,6 +16,7 @@ from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
 from .pmf_runtime import publish
 from .pmf_runtime.config import init_config
+from .pmf_runtime.egress_guard import MESSAGE as EGRESS_MESSAGE
 
 logger = get_logger(__name__)
 
@@ -34,20 +35,7 @@ _RESERVED_WORKSPACE_FILES = frozenset({
     "SANDBOX.md",
 })
 
-_SANDBOX_DOC = """Sandboxed environment: this container has NO direct network egress. \
-Direct network calls (urllib, requests, httpx, curl, wget, raw socket) cannot reach the internet \
-and ALWAYS fail here.
-
-STOP — do NOT waste turns inspecting, importing, or reverse-engineering the runtime to figure out \
-how to make a request. Use this exact, ready-to-run path:
-
-    from pmf_runtime import http
-    r = http.head(url)   # -> {'status': int, 'final_url': str}; cite the URL only if status == 200
-
-Verify URLs with pmf_runtime.http.head FIRST. ONLY if http.head fails for a URL you believe is real \
-(e.g. 403/405 from a bot-walled site, or you need the page body) escalate to the browser:
-
-    r = http.get(url)    # -> {'status': int, 'body': str, 'source_url': str}
+_SANDBOX_DOC = EGRESS_MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip() + """
 
 ## Allowed tools
 

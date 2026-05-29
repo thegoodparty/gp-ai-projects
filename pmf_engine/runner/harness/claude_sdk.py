@@ -114,7 +114,7 @@ You have **{max_turns} tool-use turns** to complete this task. Each tool call (B
 
 ## TOOLS AVAILABLE
 
-**CLI**: python, aws, pdftotext (poppler-utils). You can `pip install` additional Python packages if needed.
+**CLI**: python, pdftotext (poppler-utils). You can `pip install` additional Python packages if needed.
 
 **Network egress**: The container has NO direct internet access — it is network-quarantined. Any direct outbound request from your code or shell will NOT fail fast; it **HANGS until it times out (~30s+ each), silently burning your time budget**, then errors. This includes `curl`, `wget`, `requests`, `httpx`, `urllib`/`urllib.request.urlopen`, `urllib3`, `aiohttp`, raw `socket`, and any other direct HTTP/DNS call. **NEVER write Python or shell that fetches a URL directly** — if you catch yourself importing `urllib`/`requests` or running `curl`, STOP: it will only hang. The ONLY ways to reach the outside world are the broker-backed helpers below. Every external fetch goes through one of:
 - `WebSearch(query)` (Claude SDK) — for discovering URLs and topical results. Returns search hits.

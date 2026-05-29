@@ -57,6 +57,20 @@ def test_build_system_prompt_includes_capability_header():
     assert "TOOLS AVAILABLE" in prompt
 
 
+def test_build_system_prompt_does_not_advertise_aws_cli():
+    """The runtime Docker image dropped the AWS CLI (boto3 via broker; egress
+    guard blocks direct AWS access). An agent that runs `aws ...` gets
+    command-not-found, so the prompt must NOT list `aws` in its CLI list.
+    Match the actual CLI-list phrasing to avoid false-matching unrelated
+    substrings like "AWS Secrets".
+    """
+    prompt = build_system_prompt("Do something.")
+    cli_line = next(line for line in prompt.splitlines() if line.startswith("**CLI**:"))
+    assert "aws" not in cli_line
+    assert "python" in cli_line
+    assert "pdftotext" in cli_line
+
+
 def test_build_system_prompt_includes_output_contract():
     """The prompt MUST point the agent at /workspace/output/ (the real writable
     path), not bare /root-level /output/. Agents on 2026-04-20 wasted ~22 turns

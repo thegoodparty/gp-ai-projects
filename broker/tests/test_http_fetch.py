@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import tempfile
@@ -543,3 +544,23 @@ class TestHttpHead:
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/slow"})
         assert r.status_code == 504
         assert "timeout after" in r.json()["detail"]
+
+    def test_total_deadline_bounds_redirect_loop(self, monkeypatch):
+        monkeypatch.setattr("broker.endpoints.http_fetch._HEAD_TOTAL_TIMEOUT_S", 0.2)
+        hops = {"count": 0}
+
+        async def handler(req: httpx.Request) -> httpx.Response:
+            hops["count"] += 1
+            await asyncio.sleep(0.15)
+            n = hops["count"]
+            return httpx.Response(302, headers={"location": f"https://example.gov/hop{n}"})
+
+        app = _head_app(handler, monkeypatch)
+        started = time.monotonic()
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/start"})
+        elapsed = time.monotonic() - started
+
+        assert r.status_code == 504
+        assert "exceeded" in r.json()["detail"]
+        assert "0.2" in r.json()["detail"]
+        assert elapsed < 1.0, f"total deadline did not bound the loop; took {elapsed:.2f}s"
