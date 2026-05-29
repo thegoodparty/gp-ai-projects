@@ -132,10 +132,10 @@ async def lifespan(app: FastAPI):
     await browser_fetcher.start()
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
     # Per-ticket counter feeding the artifact_publish anti-fabrication gate.
-    # Process-local; broker restart mid-run rejects publish (strictly safer
-    # than accepting a synthetic artifact from an agent whose data calls
-    # all failed).
-    data_query_tracker = DataQueryTracker()
+    # DynamoDB-backed (stamped on the scope-ticket item) so the count is shared
+    # across all broker instances — a run's query and its publish can land on
+    # different tasks behind the ALB.
+    data_query_tracker = DataQueryTracker(table_name=_resolve_table_name())
     artifact_bucket = os.environ.get("ARTIFACT_BUCKET", "gp-agent-artifacts-dev")
     env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
     experiment_metadata_bucket = os.environ.get(

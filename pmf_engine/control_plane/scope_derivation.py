@@ -18,7 +18,12 @@ def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None =
     """Build the broker scope ticket fields.
 
     `manifest_scope` is the `scope` block from the experiment manifest in S3.
-    When present, its `allowed_tables` and `max_rows` are passed through verbatim.
+    When present, its `allowed_tables`, `max_rows`, and `data_required_unless`
+    are passed through verbatim. `data_required_unless` MUST be carried through:
+    the broker's NoDataQueriesSucceeded publish guard reads it from the ticket
+    scope to exempt legitimate no-data placeholder runs (e.g. meeting_briefing's
+    `briefing_status=awaiting_agenda`). Dropping it here causes those runs to be
+    rejected at publish even though no Databricks query is appropriate.
 
     Permissive defaults are intentional: when `manifest_scope` is None or empty
     (e.g. web-research-only experiments with no Databricks access), we default
@@ -42,10 +47,13 @@ def derive_scope(experiment_id: str, params: dict, manifest_scope: dict | None =
     if district:
         _validate_scope_string("district", district)
 
-    return {
+    scope = {
         "state": state,
         "cities": [city] if city else [],
         "districts": [district] if district else [],
         "allowed_tables": config.get("allowed_tables", []),
         "max_rows": config.get("max_rows", 50000),
     }
+    if "data_required_unless" in config:
+        scope["data_required_unless"] = config["data_required_unless"]
+    return scope
