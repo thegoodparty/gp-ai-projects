@@ -4,12 +4,13 @@ import asyncio
 import logging
 import os
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from broker.browser_fetcher import MAX_BYTES, BrowserFetcher
+from broker.browser_fetcher import MAX_BYTES, USER_AGENT, BrowserFetcher
 from broker.dynamodb_client import ScopeTicket
 from broker.ssrf_guard import validate_url
 
@@ -33,6 +34,51 @@ def get_scope_ticket() -> ScopeTicket:  # pragma: no cover
 
 def get_browser_fetcher() -> BrowserFetcher:  # pragma: no cover
     raise NotImplementedError("Must be overridden via dependency_overrides")
+
+
+def get_http_client() -> httpx.AsyncClient:  # pragma: no cover
+    raise NotImplementedError("Must be overridden via dependency_overrides")
+
+
+_HEAD_MAX_REDIRECTS = 5
+_HEAD_TIMEOUT_S = 15.0
+
+
+async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
+    """Lightweight SSRF-guarded liveness check — NO browser render.
+
+    Verification only needs a status code, so this does a plain HEAD (falling
+    back to a body-less GET when a server rejects HEAD with 403/405/501) instead
+    of a full Chromium render. It never loads sub-resources, so it can't trip
+    the embedded-tracker SSRF red herrings, and it's ~100x cheaper than
+    `fetch`. The browser fetcher stays for when you actually need page content.
+
+    Every hop (initial URL + each redirect target) is run through `validate_url`
+    so a redirect can't smuggle the check to a private/blocked target.
+    """
+    current = url
+    for _ in range(_HEAD_MAX_REDIRECTS + 1):
+        await validate_url(current)
+        headers = {"user-agent": USER_AGENT}
+        resp = await client.head(
+            current, headers=headers, follow_redirects=False, timeout=_HEAD_TIMEOUT_S
+        )
+        location = resp.headers.get("location")
+        if resp.is_redirect and location:
+            current = str(httpx.URL(current).join(location))
+            continue
+        if resp.status_code in (403, 405, 501):
+            # Server dislikes HEAD — confirm with a GET, but don't read the body.
+            async with client.stream(
+                "GET", current, headers=headers, follow_redirects=False, timeout=_HEAD_TIMEOUT_S
+            ) as get_resp:
+                get_location = get_resp.headers.get("location")
+                if get_resp.is_redirect and get_location:
+                    current = str(httpx.URL(current).join(get_location))
+                    continue
+                return get_resp.status_code, current
+        return resp.status_code, current
+    raise HTTPException(status_code=400, detail="too many redirects")
 
 
 def _read_chunk(path: str, offset: int, size: int) -> bytes:
@@ -127,6 +173,31 @@ async def http_fetch(
             e.detail,
         )
         raise
+
+
+@router.post("/head")
+async def http_head(
+    req: HttpFetchRequest,
+    ticket: ScopeTicket = Depends(get_scope_ticket),
+    client: httpx.AsyncClient = Depends(get_http_client),
+):
+    """Fast, non-browser liveness check (rung 2 of WebSearch -> http/head ->
+    http/fetch). Returns the status code without rendering the page. Callers
+    escalate to /fetch (browser) only when this is blocked (e.g. 403 from a
+    Cloudflare-protected site that a bare request can't pass)."""
+    try:
+        status, final_url = await _status_check(client, req.url)
+    except HTTPException as e:
+        logger.warning(
+            "http_head failed run_id=%s status=%d purpose=%s url=%s detail=%s",
+            ticket.run_id, e.status_code, req.purpose or "", req.url, e.detail,
+        )
+        raise
+    logger.info(
+        "http_head ok run_id=%s status=%d purpose=%s url=%s",
+        ticket.run_id, status, req.purpose or "", req.url,
+    )
+    return {"status": status, "final_url": final_url}
 
 
 def _unlink_quietly(path: str) -> None:

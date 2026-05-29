@@ -4,6 +4,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -11,6 +12,7 @@ from broker.browser_fetcher import BrowserFetchResult
 from broker.dynamodb_client import ScopeTicket
 from broker.endpoints.http_fetch import (
     get_browser_fetcher,
+    get_http_client,
     get_scope_ticket,
     router,
 )
@@ -451,3 +453,62 @@ class TestDownloadStreaming:
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# /http/head — fast non-browser liveness check (rung 2: WebSearch -> head -> fetch)
+# ---------------------------------------------------------------------------
+def _head_app(handler, monkeypatch, *, allow=lambda u: True):
+    async def _validate(url: str) -> None:
+        if not allow(url):
+            raise HTTPException(status_code=400, detail="SSRF blocked")
+    monkeypatch.setattr("broker.endpoints.http_fetch.validate_url", _validate)
+    app = FastAPI()
+    app.include_router(router)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app.dependency_overrides[get_scope_ticket] = _make_ticket
+    app.dependency_overrides[get_http_client] = lambda: client
+    return app
+
+
+class TestHttpHead:
+    def test_returns_status_via_plain_head(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.method == "HEAD"  # no browser, no GET body
+            return httpx.Response(200)
+        app = _head_app(handler, monkeypatch)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/page"})
+        assert r.status_code == 200
+        assert r.json()["status"] == 200
+
+    def test_falls_back_to_get_when_head_405(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(405) if req.method == "HEAD" else httpx.Response(200)
+        app = _head_app(handler, monkeypatch)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/p"})
+        assert r.json()["status"] == 200
+
+    def test_follows_redirect_and_validates_each_hop(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == "/old":
+                return httpx.Response(301, headers={"location": "https://example.gov/new"})
+            return httpx.Response(200)
+        app = _head_app(handler, monkeypatch)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/old"})
+        assert r.json()["status"] == 200
+        assert r.json()["final_url"].endswith("/new")
+
+    def test_blocks_ssrf_on_redirect_target(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(302, headers={"location": "http://10.0.0.5/internal"})
+        # allow the public origin, block the private redirect target
+        app = _head_app(handler, monkeypatch, allow=lambda u: "10.0.0.5" not in u)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/start"})
+        assert r.status_code == 400
+
+    def test_blocks_ssrf_on_initial_url(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+        app = _head_app(handler, monkeypatch, allow=lambda u: False)
+        r = TestClient(app).post("/http/head", json={"url": "http://169.254.169.254/"})
+        assert r.status_code == 400
