@@ -699,6 +699,7 @@ async def _run_harness_capture_options(
     permission_mode: str | None = None,
     allowed_external_tools: list[str] | None = None,
     max_parallel_subagents: int = 0,
+    max_thinking_tokens: int | None = None,
     monkey_env: dict[str, str] | None = None,
 ):
     captured, fake_query = _make_options_capture()
@@ -721,8 +722,28 @@ async def _run_harness_capture_options(
                     permission_mode=permission_mode,
                     allowed_external_tools=allowed_external_tools,
                     max_parallel_subagents=max_parallel_subagents,
+                    max_thinking_tokens=max_thinking_tokens,
                 )
     return captured["options"]
+
+
+class TestThinkingControl:
+    @pytest.mark.asyncio
+    async def test_thinking_untouched_by_default(self):
+        """Absent runtime.max_thinking_tokens (None) ⇒ options.thinking stays
+        None so the CLI default is preserved (regression-safe)."""
+        options = await _run_harness_capture_options()
+        assert options.thinking is None
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_thinking(self):
+        options = await _run_harness_capture_options(max_thinking_tokens=0)
+        assert options.thinking == {"type": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_positive_enables_with_budget(self):
+        options = await _run_harness_capture_options(max_thinking_tokens=2048)
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
 
 
 class TestWriteActionManifestFields:

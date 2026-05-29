@@ -428,6 +428,11 @@ def _validate_write_action_fields(manifest: dict, experiment_id: str) -> None:
             raise ManifestLoaderMalformedError(
                 f"{experiment_id}: runtime.max_parallel_subagents must be a non-negative integer; got {mps!r}"
             )
+        mtt = runtime.get("max_thinking_tokens")
+        if mtt is not None and (isinstance(mtt, bool) or not isinstance(mtt, int) or mtt < 0):
+            raise ManifestLoaderMalformedError(
+                f"{experiment_id}: runtime.max_thinking_tokens must be a non-negative integer; got {mtt!r}"
+            )
 
 
 def _project_routing(manifest: dict, experiment_id: str = "") -> dict:

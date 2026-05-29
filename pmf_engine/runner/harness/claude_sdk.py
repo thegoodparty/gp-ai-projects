@@ -257,6 +257,7 @@ async def run_agent(
     permission_mode: str | None = None,
     allowed_external_tools: list[str] | None = None,
     max_parallel_subagents: int = 0,
+    max_thinking_tokens: int | None = None,
 ) -> dict:
     logger.info(f"Starting Claude SDK harness (model: {model}, max_turns: {max_turns})")
 
@@ -278,6 +279,19 @@ async def run_agent(
 
     resolved_permission_mode = _resolve_permission_mode(permission_mode)
     mcp_servers = _build_broker_mcp_servers()
+
+    # Extended-thinking control (manifest runtime.max_thinking_tokens). The
+    # bundled CLI enables thinking by default, which generates reasoning tokens
+    # on EVERY turn — the dominant wall-clock cost on long research+assemble
+    # runs (measured: ~10 of 18 min in per-turn inference, not tools). None =
+    # leave the CLI default untouched (byte-identical to pre-feature options).
+    # 0 = disable thinking entirely. >0 = enable with that token budget.
+    thinking_config: dict | None = None
+    if max_thinking_tokens is not None:
+        if max_thinking_tokens <= 0:
+            thinking_config = {"type": "disabled"}
+        else:
+            thinking_config = {"type": "enabled", "budget_tokens": max_thinking_tokens}
 
     system_prompt_text = build_system_prompt(
         instruction,
@@ -325,6 +339,7 @@ async def run_agent(
         cwd=workspace_dir,
         max_turns=max_turns,
         model=model,
+        thinking=thinking_config,
         max_buffer_size=100 * 1024 * 1024,  # 100MB
     )
 
@@ -496,6 +511,7 @@ class ClaudeSdkHarness:
         permission_mode: str | None = None,
         allowed_external_tools: list[str] | None = None,
         max_parallel_subagents: int = 0,
+        max_thinking_tokens: int | None = None,
     ) -> HarnessResult:
         result = await run_agent(
             instruction=instruction,
@@ -509,6 +525,7 @@ class ClaudeSdkHarness:
             permission_mode=permission_mode,
             allowed_external_tools=allowed_external_tools,
             max_parallel_subagents=max_parallel_subagents,
+            max_thinking_tokens=max_thinking_tokens,
         )
 
         artifact_bytes, content_type = collect_output_artifact(workspace_dir, experiment_id=experiment_id)
