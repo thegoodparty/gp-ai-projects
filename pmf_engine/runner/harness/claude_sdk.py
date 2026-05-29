@@ -56,7 +56,7 @@ _RESEARCHER_AGENT_NAME = "researcher"
 # many Agent calls to emit per turn), so this bound is enforced two ways: it is
 # stated in the system prompt (advisory to the model) and it clamps the value a
 # manifest can request. Conservative by design — fan-out multiplies cost.
-MAX_PARALLEL_SUBAGENTS = 8
+MAX_PARALLEL_SUBAGENTS = 20
 
 # Logical name for the broker's MCP proxy in ClaudeAgentOptions.mcp_servers.
 # Tools the agent calls through this server are namespaced as "mcp__broker__*"

@@ -60,16 +60,9 @@ RUN ARCH=$(uname -m) && \
 # silently land in production.
 RUN npm install -g @anthropic-ai/claude-code@2.1.109
 
-# Install AWS CLI (for S3 artifact uploads if needed by agent)
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; \
-    elif [ "$ARCH" = "aarch64" ]; then \
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"; \
-    fi && \
-    unzip awscliv2.zip && \
-    ./aws/install && \
-    rm -rf awscliv2.zip aws
+# (AWS CLI removed — the runner uploads via the broker using boto3, and the
+# egress guard blocks the agent from reaching AWS endpoints directly anyway.
+# Dropping the ~150 MB CLI shrinks the image and speeds Fargate cold-start pulls.)
 
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
