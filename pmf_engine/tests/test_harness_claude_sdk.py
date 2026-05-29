@@ -976,6 +976,18 @@ class TestSubagentFanout:
         assert "Agent" in (researcher.disallowedTools or [])
 
     @pytest.mark.asyncio
+    async def test_subagent_prompt_hands_over_the_url_verification_tool(self):
+        """The researcher's base prompt tells it to verify URLs, so it MUST hand
+        over the verification tool (`http.head`) — otherwise 'verify the URL' +
+        'write python' leaves a gap the urllib reflex fills. It must also not
+        frame Bash as a general 'python' tool, which invites that reflex."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4)
+        prompt = options.agents["researcher"].prompt
+
+        assert "http.head" in prompt
+        assert "for `pmf_runtime.http.get`/`download` and `python`" not in prompt
+
+    @pytest.mark.asyncio
     async def test_subagent_pinned_to_broker_mcp_when_broker_set(self):
         """Subagents must route external access through the broker exactly like
         the parent — pin the subagent's mcpServers to the broker server so it
