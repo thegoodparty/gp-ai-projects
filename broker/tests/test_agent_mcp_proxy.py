@@ -2,14 +2,14 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
-import pytest
+import jwt
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from broker.clerk_client import ClerkClient, ClerkClientError
 from broker.dynamodb_client import ScopeTicket
 from broker.endpoints.agent_mcp_proxy import (
-    get_clerk_client,
+    get_agent_fleet_id,
+    get_agent_mcp_secret,
     get_gp_api_base_url,
     get_http_client,
     get_scope_ticket,
@@ -18,10 +18,11 @@ from broker.endpoints.agent_mcp_proxy import (
 
 BROKER_TOKEN = "broker-token-test-mcp"
 GP_API_BASE_URL = "https://gp-api-dev.goodparty.org"
-FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.fake.jwt"
+TEST_SECRET = "test-agent-mcp-secret"
+TEST_FLEET_ID = "user_agent_fleet_test"
 
 
-def _make_ticket(clerk_session_id: str | None = "sess_abc123") -> ScopeTicket:
+def _make_ticket(clerk_user_id: str | None = "user_test_abc123") -> ScopeTicket:
     now = int(time.time())
     return ScopeTicket(
         pk=BROKER_TOKEN,
@@ -33,7 +34,7 @@ def _make_ticket(clerk_session_id: str | None = "sess_abc123") -> ScopeTicket:
         exp=now + 3600,
         issued_at=now,
         issued_by="dispatch-lambda-dev",
-        clerk_session_id=clerk_session_id,
+        clerk_user_id=clerk_user_id,
     )
 
 
@@ -42,22 +43,16 @@ def _create_app(
     upstream_status: int = 200,
     upstream_body: bytes = b'{"jsonrpc":"2.0","result":{"ok":true}}',
     upstream_content_type: str = "application/json",
-    mint_jwt_error: Exception | None = None,
-    mint_jwt_value: str = FAKE_JWT,
-) -> tuple[FastAPI, MagicMock, MagicMock]:
+    secret: str = TEST_SECRET,
+    fleet_id: str = TEST_FLEET_ID,
+) -> tuple[FastAPI, MagicMock]:
     app = FastAPI()
     app.include_router(router)
 
     _ticket = ticket if ticket is not None else _make_ticket()
     app.dependency_overrides[get_scope_ticket] = lambda: _ticket
-
-    mock_clerk = MagicMock(spec=ClerkClient)
-    if mint_jwt_error is not None:
-        mock_clerk.get_session_jwt = AsyncMock(side_effect=mint_jwt_error)
-    else:
-        mock_clerk.get_session_jwt = AsyncMock(return_value=mint_jwt_value)
-    app.dependency_overrides[get_clerk_client] = lambda: mock_clerk
-
+    app.dependency_overrides[get_agent_mcp_secret] = lambda: secret
+    app.dependency_overrides[get_agent_fleet_id] = lambda: fleet_id
     app.dependency_overrides[get_gp_api_base_url] = lambda: GP_API_BASE_URL
 
     mock_http = MagicMock(spec=httpx.AsyncClient)
@@ -85,12 +80,12 @@ def _create_app(
     mock_http.send = AsyncMock(return_value=upstream_response)
     app.dependency_overrides[get_http_client] = lambda: mock_http
 
-    return app, mock_clerk, mock_http
+    return app, mock_http
 
 
 class TestAgentMcpProxyHappyPath:
-    def test_forwards_body_with_bearer_jwt_and_returns_upstream_response(self):
-        app, mock_clerk, mock_http = _create_app(
+    def test_forwards_body_with_broker_signed_jwt_and_returns_upstream_response(self):
+        app, mock_http = _create_app(
             upstream_status=200,
             upstream_body=b'{"jsonrpc":"2.0","result":{"tools":[]}}',
         )
@@ -109,15 +104,24 @@ class TestAgentMcpProxyHappyPath:
         assert resp.status_code == 200
         assert resp.content == b'{"jsonrpc":"2.0","result":{"tools":[]}}'
 
-        mock_clerk.get_session_jwt.assert_awaited_once_with("sess_abc123")
-
         mock_http.build_request.assert_called_once()
         call_kwargs = mock_http.build_request.call_args.kwargs
         assert call_kwargs["method"] == "POST"
         assert call_kwargs["url"] == f"{GP_API_BASE_URL}/v1/mcp"
         assert call_kwargs["content"] == request_body
-        assert call_kwargs["headers"]["Authorization"] == f"Bearer {FAKE_JWT}"
-        assert call_kwargs["headers"]["Content-Type"] == "application/json"
+
+        # Verify JWT is a valid HS256 broker-signed token with correct claims.
+        auth_header = call_kwargs["headers"]["Authorization"]
+        assert auth_header.startswith("Bearer ")
+        raw_token = auth_header.removeprefix("Bearer ")
+        decoded = jwt.decode(raw_token, TEST_SECRET, algorithms=["HS256"], audience="gp-api")
+        assert decoded["iss"] == "gp-broker"
+        assert decoded["aud"] == "gp-api"
+        assert decoded["sub"] == "user_test_abc123"
+        assert decoded["act"] == {"sub": TEST_FLEET_ID}
+        assert decoded["run_id"] == "run-mcp-001"
+        assert decoded["exp"] - decoded["iat"] == 120
+
         assert call_kwargs["headers"]["X-Organization-Slug"] == "org-42"
         # send() called with stream=True so the proxy can decide to stream
         # SSE responses through without buffering.
@@ -130,7 +134,7 @@ class TestAgentMcpProxyHappyPath:
         mock_http.send.return_value.aclose.assert_awaited_once()
 
     def test_get_method_also_proxied(self):
-        app, _, mock_http = _create_app()
+        app, mock_http = _create_app()
         client = TestClient(app)
 
         resp = client.get(
@@ -142,10 +146,10 @@ class TestAgentMcpProxyHappyPath:
         assert mock_http.build_request.call_args.kwargs["method"] == "GET"
 
 
-class TestAgentMcpProxyMissingClerkSessionId:
-    def test_returns_500_when_ticket_lacks_clerk_session_id(self):
-        ticket = _make_ticket(clerk_session_id=None)
-        app, mock_clerk, mock_http = _create_app(ticket=ticket)
+class TestAgentMcpProxyMissingClerkUserId:
+    def test_returns_500_when_ticket_lacks_clerk_user_id(self):
+        ticket = _make_ticket(clerk_user_id=None)
+        app, mock_http = _create_app(ticket=ticket)
         client = TestClient(app)
 
         resp = client.post(
@@ -158,37 +162,13 @@ class TestAgentMcpProxyMissingClerkSessionId:
         )
 
         assert resp.status_code == 500
-        assert resp.json()["detail"]["reason"] == "ticket_missing_clerk_session_id"
-        mock_clerk.get_session_jwt.assert_not_awaited()
-        mock_http.send.assert_not_awaited()
-
-
-class TestAgentMcpProxyClerkMintFailure:
-    def test_returns_502_when_clerk_mint_raises(self):
-        app, _, mock_http = _create_app(
-            mint_jwt_error=ClerkClientError("upstream 500"),
-        )
-        client = TestClient(app)
-
-        resp = client.post(
-            "/agent/mcp",
-            content=b"{}",
-            headers={
-                "X-Broker-Token": BROKER_TOKEN,
-                "Content-Type": "application/json",
-            },
-        )
-
-        assert resp.status_code == 502
-        detail = resp.json()["detail"]
-        assert detail["reason"] == "clerk_session_jwt_mint_failed"
-        assert "upstream 500" in detail["err"]
+        assert resp.json()["detail"]["reason"] == "ticket_missing_clerk_user_id"
         mock_http.send.assert_not_awaited()
 
 
 class TestAgentMcpProxyUpstreamErrorPassthrough:
     def test_upstream_401_passes_through(self):
-        app, _, _ = _create_app(
+        app, _ = _create_app(
             upstream_status=401,
             upstream_body=b'{"error":"unauthorized"}',
         )
@@ -207,7 +187,7 @@ class TestAgentMcpProxyUpstreamErrorPassthrough:
         assert resp.content == b'{"error":"unauthorized"}'
 
     def test_upstream_500_passes_through(self):
-        app, _, _ = _create_app(
+        app, _ = _create_app(
             upstream_status=500,
             upstream_body=b'{"error":"internal"}',
         )
@@ -232,7 +212,7 @@ class TestAgentMcpProxyHeaderHygiene:
     gp-api needs (Content-Type, Accept, Authorization, X-Organization-Slug)."""
 
     def test_x_broker_token_is_not_forwarded_to_gp_api(self):
-        app, _, mock_http = _create_app()
+        app, mock_http = _create_app()
         client = TestClient(app)
 
         resp = client.post(
@@ -248,9 +228,7 @@ class TestAgentMcpProxyHeaderHygiene:
         outbound_headers = mock_http.build_request.call_args.kwargs["headers"]
         # Case-insensitive guard: no broker token under any casing.
         lowered = {k.lower(): v for k, v in outbound_headers.items()}
-        assert "x-broker-token" not in lowered, (
-            f"X-Broker-Token leaked to gp-api: {outbound_headers}"
-        )
+        assert "x-broker-token" not in lowered, f"X-Broker-Token leaked to gp-api: {outbound_headers}"
         # Sanity: only the four expected headers should be present.
         assert set(lowered.keys()) == {
             "content-type",
@@ -268,7 +246,7 @@ class TestAgentMcpProxyAcceptHeader:
     `*/*`, which gp-api would still reject."""
 
     def test_sends_mcp_required_accept_regardless_of_caller(self):
-        app, _, mock_http = _create_app()
+        app, mock_http = _create_app()
         client = TestClient(app)
 
         # Caller sends */* (the TestClient default); proxy still emits the
@@ -287,7 +265,7 @@ class TestAgentMcpProxyAcceptHeader:
         assert outbound["Accept"] == "application/json, text/event-stream"
 
     def test_caller_supplied_accept_is_overridden(self):
-        app, _, mock_http = _create_app()
+        app, mock_http = _create_app()
         client = TestClient(app)
 
         # Even if the caller explicitly sets a different Accept value, the
@@ -321,7 +299,7 @@ class TestAgentMcpProxySseResponse:
             b"event: message\n"
             b'data: {"jsonrpc":"2.0","result":{"chunk":2}}\n\n'
         )
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_status=200,
             upstream_body=sse_body,
             upstream_content_type="text/event-stream",
@@ -355,7 +333,7 @@ class TestAgentMcpProxySseResponse:
         # check is `in upstream_content_type.lower()`, so the charset
         # suffix must not break detection.
         sse_body = b'event: message\ndata: {"chunk":1}\n\n'
-        app, _, _ = _create_app(
+        app, _ = _create_app(
             upstream_status=200,
             upstream_body=sse_body,
             upstream_content_type="text/event-stream; charset=utf-8",
@@ -379,10 +357,8 @@ class TestAgentMcpProxySseResponse:
         """gp-api unreachable (connection refused, DNS, timeout, etc.)
         surfaces as a structured 502, not a generic 500. Mirrors
         anthropic_proxy's handling of httpx.HTTPError on send."""
-        app, _, mock_http = _create_app()
-        mock_http.send = AsyncMock(
-            side_effect=httpx.ConnectError("connection refused")
-        )
+        app, mock_http = _create_app()
+        mock_http.send = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
         client = TestClient(app)
 
         resp = client.post(
@@ -404,13 +380,11 @@ class TestAgentMcpProxySseResponse:
         headers are in, before body fully read). aread() raises — must
         surface as a structured 502, not a generic 500. aclose() still
         runs via the finally."""
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_content_type="application/json",
         )
         upstream = mock_http.send.return_value
-        upstream.aread = AsyncMock(
-            side_effect=httpx.ReadError("connection reset by peer")
-        )
+        upstream.aread = AsyncMock(side_effect=httpx.ReadError("connection reset by peer"))
 
         client = TestClient(app)
         resp = client.post(
@@ -434,16 +408,12 @@ class TestAgentMcpProxySseResponse:
         read), the in-flight HTTPException must survive. `_safe_aclose`
         swallows the aclose exception so FastAPI's HTTPException handler
         produces the structured 502 instead of an unstructured 500."""
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_content_type="application/json",
         )
         upstream = mock_http.send.return_value
-        upstream.aread = AsyncMock(
-            side_effect=httpx.ReadError("connection reset by peer")
-        )
-        upstream.aclose = AsyncMock(
-            side_effect=httpx.NetworkError("aclose also failed")
-        )
+        upstream.aread = AsyncMock(side_effect=httpx.ReadError("connection reset by peer"))
+        upstream.aclose = AsyncMock(side_effect=httpx.NetworkError("aclose also failed"))
 
         client = TestClient(app)
         resp = client.post(
@@ -469,15 +439,13 @@ class TestAgentMcpProxySseResponse:
         reach the client. `_safe_aclose` swallows the exception so the
         already-built Response is returned intact."""
         json_body = b'{"jsonrpc":"2.0","result":{"ok":true}}'
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_status=200,
             upstream_body=json_body,
             upstream_content_type="application/json",
         )
         upstream = mock_http.send.return_value
-        upstream.aclose = AsyncMock(
-            side_effect=httpx.NetworkError("aclose failed during cleanup")
-        )
+        upstream.aclose = AsyncMock(side_effect=httpx.NetworkError("aclose failed during cleanup"))
 
         client = TestClient(app)
         resp = client.post(
@@ -503,15 +471,13 @@ class TestAgentMcpProxySseResponse:
         reached the wire). With the swallow, the response completes
         cleanly."""
         sse_body = b'event: message\ndata: {"chunk":1}\n\n'
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_status=200,
             upstream_body=sse_body,
             upstream_content_type="text/event-stream",
         )
         upstream = mock_http.send.return_value
-        upstream.aclose = AsyncMock(
-            side_effect=httpx.NetworkError("aclose failed during cleanup")
-        )
+        upstream.aclose = AsyncMock(side_effect=httpx.NetworkError("aclose failed during cleanup"))
 
         client = TestClient(app)
         resp = client.post(
@@ -535,9 +501,9 @@ class TestAgentMcpProxySseResponse:
         the truncated response as a failure, not a complete tool result.
         The 200 status was already on the wire when iteration started, so
         an in-band event is the only failure signal available."""
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_status=200,
-            upstream_body=b"event: message\ndata: {\"chunk\":1}\n\n",
+            upstream_body=b'event: message\ndata: {"chunk":1}\n\n',
             upstream_content_type="text/event-stream",
         )
 
@@ -575,7 +541,7 @@ class TestAgentMcpProxySseResponse:
         # return a fully-buffered Response (not a stream) when upstream
         # is application/json.
         json_body = b'{"jsonrpc":"2.0","result":{"tools":[]}}'
-        app, _, mock_http = _create_app(
+        app, mock_http = _create_app(
             upstream_status=200,
             upstream_body=json_body,
             upstream_content_type="application/json",

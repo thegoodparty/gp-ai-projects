@@ -125,6 +125,62 @@ class TestAnthropicProxyNonStreaming:
 
         assert resp.status_code == 200
 
+    def test_forwards_anthropic_beta_header(self):
+        """The bundled Claude CLI (Agent SDK >=0.2.x) gates fields like
+        context_management / output_config behind an `anthropic-beta` header.
+        If the proxy drops that header, api.anthropic.com rejects the field with
+        400 'context_management: Extra inputs are not permitted' and every agent
+        run dies on turn 1. Verified live: same request 400s without the header,
+        200s with it. The proxy MUST forward the client's anthropic-beta verbatim."""
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["anthropic-beta"] = request.headers.get("anthropic-beta")
+            return httpx.Response(
+                200,
+                json={"id": "m", "type": "message", "role": "assistant",
+                      "content": [{"type": "text", "text": "ok"}]},
+            )
+
+        app = _create_test_app(upstream_transport=httpx.MockTransport(handler))
+        client = TestClient(app)
+        beta = "context-management-2025-06-27,effort-2025-11-24"
+
+        resp = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "Hi"}],
+                  "max_tokens": 16, "context_management": {"edits": []}},
+            headers={"x-api-key": VALID_BROKER_TOKEN, "anthropic-beta": beta},
+        )
+
+        assert resp.status_code == 200
+        assert captured["anthropic-beta"] == beta
+
+    def test_no_anthropic_beta_header_when_client_sends_none(self):
+        """When the client sends no anthropic-beta, the proxy must not invent one
+        — forwarding an empty/garbage beta header could itself trigger a 400."""
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["has_beta"] = "anthropic-beta" in request.headers
+            return httpx.Response(
+                200,
+                json={"id": "m", "type": "message", "role": "assistant",
+                      "content": [{"type": "text", "text": "ok"}]},
+            )
+
+        app = _create_test_app(upstream_transport=httpx.MockTransport(handler))
+        client = TestClient(app)
+
+        resp = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 16},
+            headers={"x-api-key": VALID_BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        assert captured["has_beta"] is False
+
 
 class TestSdkTelemetryNoOps:
     def test_event_logging_batch_returns_204(self):

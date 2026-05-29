@@ -82,7 +82,11 @@ class TestPutAndGetRoundTrip:
                 "run_id": {"S": ticket.run_id},
                 "organization_slug": {"S": ticket.organization_slug},
                 "experiment_id": {"S": ticket.experiment_id},
-                "scope": {"S": ticket.scope.model_dump_json() if hasattr(ticket.scope, "model_dump_json") else __import__("json").dumps(ticket.scope)},
+                "scope": {
+                    "S": ticket.scope.model_dump_json()
+                    if hasattr(ticket.scope, "model_dump_json")
+                    else __import__("json").dumps(ticket.scope)
+                },
                 "params": {"S": __import__("json").dumps(ticket.params)},
                 "exp": {"N": str(ticket.exp)},
                 "issued_at": {"N": str(ticket.issued_at)},

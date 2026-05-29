@@ -5,7 +5,7 @@ description = "Claude Agent SDK powered engineer for analyzing and fixing produc
 requires-python = ">=3.11"
 dependencies = [
     "gp-shared",
-    "claude-agent-sdk>=0.1.19",
+    "claude-agent-sdk==0.2.87",
     "boto3>=1.40.50",
 ]
 

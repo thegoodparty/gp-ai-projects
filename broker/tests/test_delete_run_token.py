@@ -1,5 +1,3 @@
-from unittest.mock import AsyncMock, MagicMock
-
 import boto3
 import pytest
 from fastapi import FastAPI
@@ -7,7 +5,6 @@ from fastapi.testclient import TestClient
 from moto import mock_aws
 
 from broker.auth import hash_service_token
-from broker.clerk_client import ClerkClient
 from broker.dynamodb_client import ScopeTicketStore
 from broker.endpoints.delete_run_token import (
     get_service_token_hash,
@@ -15,7 +12,6 @@ from broker.endpoints.delete_run_token import (
     router,
 )
 from broker.endpoints.mint_run_token import (
-    get_clerk_client as mint_get_clerk_client,
     get_service_token_hash as mint_get_service_token_hash,
     get_ticket_store as mint_get_ticket_store,
     router as mint_router,
@@ -46,14 +42,8 @@ def app_and_store(moto_env):
     app = FastAPI()
     app.include_router(mint_router)
     app.include_router(router)
-    fake_clerk = MagicMock(spec=ClerkClient)
-    fake_clerk.create_actor_token = AsyncMock(
-        return_value={"url": "https://test.clerk.app/v1/tickets/accept?ticket=jwt"}
-    )
-    fake_clerk.redeem_actor_token = AsyncMock(return_value={"session_id": "sess_test"})
     app.dependency_overrides[mint_get_ticket_store] = lambda: store
     app.dependency_overrides[mint_get_service_token_hash] = lambda: SERVICE_TOKEN_HASH
-    app.dependency_overrides[mint_get_clerk_client] = lambda: fake_clerk
     app.dependency_overrides[get_ticket_store] = lambda: store
     app.dependency_overrides[get_service_token_hash] = lambda: SERVICE_TOKEN_HASH
     return app, store, moto_env
