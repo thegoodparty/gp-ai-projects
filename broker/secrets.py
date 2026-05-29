@@ -12,6 +12,7 @@ _REQUIRED_FIELDS = {
     "CLERK_FRONTEND_API_BASE": "clerk_frontend_api_base",
     "GP_API_BASE_URL": "gp_api_base_url",
     "AGENT_FLEET_CLERK_ID": "agent_fleet_clerk_id",
+    "AGENT_MCP_TOKEN_SECRET": "agent_mcp_token_secret",
 }
 
 _OPTIONAL_FIELDS = {
@@ -33,6 +34,7 @@ class BrokerSecrets:
     clerk_frontend_api_base: str
     gp_api_base_url: str
     agent_fleet_clerk_id: str
+    agent_mcp_token_secret: str
     tavily_api_key: str = ""
     databricks_server_hostname: str = ""
     databricks_http_path: str = ""
