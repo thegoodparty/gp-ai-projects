@@ -249,6 +249,31 @@ async def test_main_writes_instruction_to_workspace():
             assert f.read() == "# Test Instruction\n\nDo the thing."
 
 
+@pytest.mark.asyncio
+async def test_main_writes_sandbox_doc_to_workspace():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(instruction="# Test Instruction")
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                            await main()
+
+        sandbox_path = os.path.join(tmpdir, "SANDBOX.md")
+        assert os.path.exists(sandbox_path)
+        with open(sandbox_path) as f:
+            content = f.read()
+        assert "no direct network egress" in content.lower()
+
+
+def test_sandbox_md_is_reserved_workspace_file():
+    from pmf_engine.runner.main import _RESERVED_WORKSPACE_FILES
+
+    assert "SANDBOX.md" in _RESERVED_WORKSPACE_FILES
+
+
 # ---------------------------------------------------------------------------
 # Attachments — runner writes sidecar files to /workspace/ before agent spawn
 # ---------------------------------------------------------------------------
@@ -593,11 +618,12 @@ async def test_main_works_with_runner_config_default_attachments(tmp_path):
                         await main()
 
     mock_run.assert_called_once()
-    # Only instruction.md present — no spurious attachment files.
+    # Only runner-written sidecars present — no spurious attachment files.
     assert (tmp_path / "instruction.md").exists()
+    runner_sidecars = {"instruction.md", "SANDBOX.md"}
     extra_files = [
         p.name for p in tmp_path.iterdir()
-        if p.is_file() and p.name != "instruction.md"
+        if p.is_file() and p.name not in runner_sidecars
     ]
     assert extra_files == [], (
         f"default-attachments path must not create extra files; got: {extra_files!r}"

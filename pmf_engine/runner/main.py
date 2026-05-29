@@ -31,7 +31,31 @@ _RESERVED_WORKSPACE_FILES = frozenset({
     "instruction.md",
     "contract_schema.json",
     "validate_output.py",
+    "SANDBOX.md",
 })
+
+_SANDBOX_DOC = """Sandboxed environment: this container has NO direct network egress. \
+Direct network calls (urllib, requests, httpx, curl, wget, raw socket) cannot reach the internet \
+and will fail. The ONLY way to reach a URL is the broker-proxied tools you were given: \
+pmf_runtime.http.head(url) / pmf_runtime.http.get(url) / pmf_runtime.http.download(url) for web pages, \
+and the WebSearch tool for discovery. Use those instead. See /workspace/SANDBOX.md.
+
+## Allowed tools
+
+- WebSearch — discover URLs and facts. Start here.
+- pmf_runtime.http.head(url) — cheap check that a URL exists / resolves before fetching.
+- pmf_runtime.http.get(url) — fetch a web page (HTML/JSON/CSV/XML text). This is the browser; last resort.
+- pmf_runtime.http.download(url) — download a binary file (PDF, docx, xlsx) to the workspace.
+
+## Web-access escalation ladder
+
+WebSearch -> pmf_runtime.http.head -> pmf_runtime.http.get (browser, last resort)
+
+## Never
+
+Never use urllib, requests, httpx, curl, wget, or raw socket directly — they fail here. \
+There is no route out of this container except the broker-proxied tools above.
+"""
 
 
 class AttachmentSafetyViolation(RuntimeError):
@@ -695,6 +719,11 @@ async def main():
         with open(instruction_path, "w") as f:
             f.write(config.instruction)
         logger.info(f"Wrote instruction to {instruction_path}")
+
+        sandbox_path = os.path.join(workspace_dir, "SANDBOX.md")
+        with open(sandbox_path, "w") as f:
+            f.write(_SANDBOX_DOC)
+        logger.info(f"Wrote sandbox doc to {sandbox_path}")
 
         if config.contract_schema:
             schema_path = os.path.join(workspace_dir, "contract_schema.json")
