@@ -36,25 +36,35 @@ _RESERVED_WORKSPACE_FILES = frozenset({
 
 _SANDBOX_DOC = """Sandboxed environment: this container has NO direct network egress. \
 Direct network calls (urllib, requests, httpx, curl, wget, raw socket) cannot reach the internet \
-and will fail. The ONLY way to reach a URL is the broker-proxied tools you were given: \
-pmf_runtime.http.head(url) / pmf_runtime.http.get(url) / pmf_runtime.http.download(url) for web pages, \
-and the WebSearch tool for discovery. Use those instead. See /workspace/SANDBOX.md.
+and ALWAYS fail here.
+
+STOP — do NOT waste turns inspecting, importing, or reverse-engineering the runtime to figure out \
+how to make a request. Use this exact, ready-to-run path:
+
+    from pmf_runtime import http
+    r = http.head(url)   # -> {'status': int, 'final_url': str}; cite the URL only if status == 200
+
+Verify URLs with pmf_runtime.http.head FIRST. ONLY if http.head fails for a URL you believe is real \
+(e.g. 403/405 from a bot-walled site, or you need the page body) escalate to the browser:
+
+    r = http.get(url)    # -> {'status': int, 'body': str, 'source_url': str}
 
 ## Allowed tools
 
 - WebSearch — discover URLs and facts. Start here.
-- pmf_runtime.http.head(url) — cheap check that a URL exists / resolves before fetching.
-- pmf_runtime.http.get(url) — fetch a web page (HTML/JSON/CSV/XML text). This is the browser; last resort.
+- pmf_runtime.http.head(url) — cheap check that a URL exists / resolves before citing. Use first.
+- pmf_runtime.http.get(url) — fetch a web page (HTML/JSON/CSV/XML text). The browser; escalate to this only if head fails.
 - pmf_runtime.http.download(url) — download a binary file (PDF, docx, xlsx) to the workspace.
 
 ## Web-access escalation ladder
 
-WebSearch -> pmf_runtime.http.head -> pmf_runtime.http.get (browser, last resort)
+WebSearch -> pmf_runtime.http.head -> pmf_runtime.http.get (browser, only if head fails)
 
 ## Never
 
-Never use urllib, requests, httpx, curl, wget, or raw socket directly — they fail here. \
-There is no route out of this container except the broker-proxied tools above.
+Never use urllib, requests, httpx, curl, wget, or raw socket directly — they fail here, and never \
+retry them or reverse-engineer the runtime. There is no route out of this container except the \
+broker-proxied tools above.
 """
 
 

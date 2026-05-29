@@ -5,10 +5,15 @@ from urllib.parse import urlparse
 MESSAGE = (
     "Sandboxed environment: this container has NO direct network egress. "
     "Direct network calls (urllib, requests, httpx, curl, wget, raw socket) "
-    "cannot reach the internet and will fail. The ONLY way to reach a URL is "
-    "the broker-proxied tools you were given: pmf_runtime.http.head(url) / "
-    "pmf_runtime.http.get(url) / pmf_runtime.http.download(url) for web pages, "
-    "and the WebSearch tool for discovery. Use those instead. "
+    "cannot reach the internet and ALWAYS fail here. "
+    "STOP. Do NOT waste turns inspecting, importing, or reverse-engineering the "
+    "runtime to figure out how to make a request. Use this exact, ready-to-run path:\n"
+    "  from pmf_runtime import http\n"
+    "  r = http.head(url)   # -> {'status': int, 'final_url': str}; cite the URL only if status == 200\n"
+    "Verify URLs with pmf_runtime.http.head FIRST. ONLY if http.head fails for a URL you believe is real "
+    "(e.g. 403/405 from a bot-walled site, or you need the page body) escalate to the browser:\n"
+    "  r = http.get(url)    # -> {'status': int, 'body': str, 'source_url': str}\n"
+    "For discovering candidates/URLs use the WebSearch tool. Never retry urllib/curl. "
     "See /workspace/SANDBOX.md."
 )
 
