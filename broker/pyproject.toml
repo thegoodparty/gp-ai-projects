@@ -14,4 +14,5 @@ dependencies = [
     "databricks-sql-connector>=4.0.5",
     "playwright>=1.59.0,<1.60.0",
     "tf-playwright-stealth>=1.2.0,<2.0.0",
+    "pyjwt>=2.10.1",
 ]

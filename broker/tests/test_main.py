@@ -30,6 +30,7 @@ def _fake_secrets() -> BrokerSecrets:
         clerk_frontend_api_base="https://fake.clerk.app",
         gp_api_base_url="https://gp-api-dev.goodparty.org",
         agent_fleet_clerk_id="user_agent_fleet_test",
+        agent_mcp_token_secret="test-agent-mcp-secret",
         results_queue_url="https://sqs.us-west-2.amazonaws.com/123/queue.fifo",
     )
 
@@ -58,12 +59,14 @@ class TestTableNameResolution:
         monkeypatch.setenv("ENVIRONMENT", "prod")
         monkeypatch.setenv("DYNAMO_TABLE_NAME", "broker-scope-tickets-prod")
         from broker.main import _resolve_table_name
+
         assert _resolve_table_name() == "broker-scope-tickets-prod"
 
     def test_fails_closed_when_unset_in_aws_env(self, monkeypatch):
         monkeypatch.setenv("ENVIRONMENT", "prod")
         monkeypatch.delenv("DYNAMO_TABLE_NAME", raising=False)
         from broker.main import _resolve_table_name
+
         with pytest.raises(RuntimeError, match="DYNAMO_TABLE_NAME"):
             _resolve_table_name()
 
@@ -72,6 +75,7 @@ class TestTableNameResolution:
         monkeypatch.setenv("ENVIRONMENT", env)
         monkeypatch.delenv("DYNAMO_TABLE_NAME", raising=False)
         from broker.main import _resolve_table_name
+
         assert _resolve_table_name() == "broker-scope-tickets-local"
 
 

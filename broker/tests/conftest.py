@@ -35,5 +35,6 @@ def fake_secrets() -> BrokerSecrets:
         clerk_frontend_api_base="https://fake.clerk.app",
         gp_api_base_url="https://gp-api-dev.goodparty.org",
         agent_fleet_clerk_id="user_agent_fleet_test",
+        agent_mcp_token_secret="test-agent-mcp-secret",
         results_queue_url="https://sqs.us-west-2.amazonaws.com/333022194791/agent-results-dev.fifo",
     )

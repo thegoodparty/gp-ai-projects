@@ -17,6 +17,7 @@ FULL_SECRET = {
     "CLERK_FRONTEND_API_BASE": "https://test.clerk.app",
     "GP_API_BASE_URL": "https://gp-api-dev.goodparty.org",
     "AGENT_FLEET_CLERK_ID": "user_agent_fleet_test",
+    "AGENT_MCP_TOKEN_SECRET": "test-agent-mcp-secret",
     "RESULTS_QUEUE_URL": "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
 }
 
@@ -43,6 +44,7 @@ class TestLoadSecrets:
         assert result.clerk_secret_key == "sk_test_clerk"
         assert result.clerk_frontend_api_base == "https://test.clerk.app"
         assert result.agent_fleet_clerk_id == "user_agent_fleet_test"
+        assert result.agent_mcp_token_secret == "test-agent-mcp-secret"
         assert result.results_queue_url == "https://sqs.us-west-2.amazonaws.com/123/results.fifo"
 
     def test_missing_required_field_raises_valueerror(self):
