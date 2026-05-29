@@ -12,7 +12,7 @@ from starlette.background import BackgroundTask
 
 from broker.browser_fetcher import MAX_BYTES, USER_AGENT, BrowserFetcher
 from broker.dynamodb_client import ScopeTicket
-from broker.ssrf_guard import validate_url
+from broker.ssrf_guard import resolve_redirects, validate_url
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,22 @@ _HEAD_MAX_REDIRECTS = 5
 _HEAD_TIMEOUT_S = 15.0
 
 
+class _HeaderInjectingClient:
+    def __init__(self, client: httpx.AsyncClient, headers: dict[str, str]) -> None:
+        self._client = client
+        self._headers = headers
+
+    def _wrap(self, method: str):
+        async def call(url: str, **kwargs):
+            merged = {**self._headers, **kwargs.pop("headers", {})}
+            return await getattr(self._client, method)(url, headers=merged, **kwargs)
+
+        return call
+
+    def __getattr__(self, name: str):
+        return self._wrap(name)
+
+
 async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
     """Lightweight SSRF-guarded liveness check — NO browser render.
 
@@ -53,32 +69,37 @@ async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
     the embedded-tracker SSRF red herrings, and it's ~100x cheaper than
     `fetch`. The browser fetcher stays for when you actually need page content.
 
-    Every hop (initial URL + each redirect target) is run through `validate_url`
-    so a redirect can't smuggle the check to a private/blocked target.
+    Redirect resolution (per-hop `validate_url`, `urljoin` Location handling,
+    missing-Location -> 502, hop bound) is delegated to the canonical
+    `resolve_redirects` loop in `ssrf_guard` — never re-implemented here.
     """
-    current = url
-    for _ in range(_HEAD_MAX_REDIRECTS + 1):
-        await validate_url(current)
-        headers = {"user-agent": USER_AGENT}
-        resp = await client.head(
-            current, headers=headers, follow_redirects=False, timeout=_HEAD_TIMEOUT_S
+    head_client = _HeaderInjectingClient(client, {"user-agent": USER_AGENT})
+    try:
+        resp, final_url = await resolve_redirects(
+            head_client, "HEAD", url, timeout=_HEAD_TIMEOUT_S, max_redirects=_HEAD_MAX_REDIRECTS
         )
-        location = resp.headers.get("location")
-        if resp.is_redirect and location:
-            current = str(httpx.URL(current).join(location))
-            continue
         if resp.status_code in (403, 405, 501):
-            # Server dislikes HEAD — confirm with a GET, but don't read the body.
-            async with client.stream(
-                "GET", current, headers=headers, follow_redirects=False, timeout=_HEAD_TIMEOUT_S
-            ) as get_resp:
-                get_location = get_resp.headers.get("location")
-                if get_resp.is_redirect and get_location:
-                    current = str(httpx.URL(current).join(get_location))
-                    continue
-                return get_resp.status_code, current
-        return resp.status_code, current
-    raise HTTPException(status_code=400, detail="too many redirects")
+            get_client = _HeaderInjectingClient(
+                client, {"user-agent": USER_AGENT, "range": "bytes=0-0"}
+            )
+            resp, final_url = await resolve_redirects(
+                get_client,
+                "GET",
+                final_url,
+                timeout=_HEAD_TIMEOUT_S,
+                max_redirects=_HEAD_MAX_REDIRECTS,
+            )
+        return resp.status_code, final_url
+    except HTTPException:
+        raise
+    except httpx.TimeoutException as e:
+        raise HTTPException(
+            status_code=504, detail=f"timeout after {_HEAD_TIMEOUT_S}s: {url}"
+        ) from e
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502, detail=f"connection failed: {type(e).__name__}: {e}"
+        ) from e
 
 
 def _read_chunk(path: str, offset: int, size: int) -> bytes:

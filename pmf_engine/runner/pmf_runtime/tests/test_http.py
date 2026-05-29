@@ -612,3 +612,11 @@ class TestHead:
         _inject_client(handler)
         with pytest.raises(ValueError, match="http.head failed: SSRF blocked"):
             head("http://10.0.0.5/internal")
+
+    def test_raises_value_error_on_malformed_200_body_missing_status(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"final_url": "https://example.gov/p"})
+
+        _inject_client(handler)
+        with pytest.raises(ValueError, match="malformed"):
+            head("https://example.gov/p")

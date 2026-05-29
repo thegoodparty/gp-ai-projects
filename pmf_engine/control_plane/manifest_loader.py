@@ -418,21 +418,23 @@ def _validate_write_action_fields(manifest: dict, experiment_id: str) -> None:
             if not isinstance(t, str) or not t.strip() or len(t) > _MAX_TOOL_NAME_LEN:
                 raise ManifestLoaderMalformedError(f"{experiment_id}: invalid allowed_external_tools entry: {t!r}")
 
-    # runtime.max_parallel_subagents — parallel research fan-out opt-in.
+
+def _validate_runtime_fields(manifest: dict, experiment_id: str) -> None:
     runtime = manifest.get("runtime")
-    if runtime is not None:
-        if not isinstance(runtime, dict):
-            raise ManifestLoaderMalformedError(f"{experiment_id}: runtime must be an object")
-        mps = runtime.get("max_parallel_subagents")
-        if mps is not None and (isinstance(mps, bool) or not isinstance(mps, int) or mps < 0):
-            raise ManifestLoaderMalformedError(
-                f"{experiment_id}: runtime.max_parallel_subagents must be a non-negative integer; got {mps!r}"
-            )
-        mtt = runtime.get("max_thinking_tokens")
-        if mtt is not None and (isinstance(mtt, bool) or not isinstance(mtt, int) or mtt < 0):
-            raise ManifestLoaderMalformedError(
-                f"{experiment_id}: runtime.max_thinking_tokens must be a non-negative integer; got {mtt!r}"
-            )
+    if runtime is None:
+        return
+    if not isinstance(runtime, dict):
+        raise ManifestLoaderMalformedError(f"{experiment_id}: runtime must be an object")
+    mps = runtime.get("max_parallel_subagents")
+    if mps is not None and (isinstance(mps, bool) or not isinstance(mps, int) or mps < 0):
+        raise ManifestLoaderMalformedError(
+            f"{experiment_id}: runtime.max_parallel_subagents must be a non-negative integer; got {mps!r}"
+        )
+    mtt = runtime.get("max_thinking_tokens")
+    if mtt is not None and (isinstance(mtt, bool) or not isinstance(mtt, int) or mtt < 0):
+        raise ManifestLoaderMalformedError(
+            f"{experiment_id}: runtime.max_thinking_tokens must be a non-negative integer; got {mtt!r}"
+        )
 
 
 def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
@@ -460,11 +462,16 @@ def _project_routing(manifest: dict, experiment_id: str = "") -> dict:
         "scope": scope,
     }
 
+    eid = experiment_id or manifest.get("id", "<unknown>")
+
+    if manifest.get("runtime") is not None:
+        _validate_runtime_fields(manifest, eid)
+
     # Write-action experiment fields (ENG-10128). Validated and projected only
     # when at least one is present, so legacy Databricks/web-only manifests
     # produce a routing dict with the same keys they did before.
     if any(manifest.get(f) is not None for f in _WRITE_ACTION_FIELDS):
-        _validate_write_action_fields(manifest, experiment_id or manifest.get("id", "<unknown>"))
+        _validate_write_action_fields(manifest, eid)
         for field in _WRITE_ACTION_FIELDS:
             value = manifest.get(field)
             if value is not None:

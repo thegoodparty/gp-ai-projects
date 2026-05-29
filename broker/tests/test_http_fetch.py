@@ -8,7 +8,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from broker.browser_fetcher import BrowserFetchResult
+from broker.browser_fetcher import USER_AGENT, BrowserFetchResult
 from broker.dynamodb_client import ScopeTicket
 from broker.endpoints.http_fetch import (
     get_browser_fetcher,
@@ -463,6 +463,7 @@ def _head_app(handler, monkeypatch, *, allow=lambda u: True):
         if not allow(url):
             raise HTTPException(status_code=400, detail="SSRF blocked")
     monkeypatch.setattr("broker.endpoints.http_fetch.validate_url", _validate)
+    monkeypatch.setattr("broker.ssrf_guard.validate_url", _validate)
     app = FastAPI()
     app.include_router(router)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -480,13 +481,19 @@ class TestHttpHead:
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/page"})
         assert r.status_code == 200
         assert r.json()["status"] == 200
+        assert r.json()["final_url"] == "https://example.gov/page"
 
     def test_falls_back_to_get_when_head_405(self, monkeypatch):
+        seen: dict[str, httpx.Headers] = {}
+
         def handler(req: httpx.Request) -> httpx.Response:
+            seen[req.method] = req.headers
             return httpx.Response(405) if req.method == "HEAD" else httpx.Response(200)
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/p"})
         assert r.json()["status"] == 200
+        assert seen["GET"]["range"] == "bytes=0-0"
+        assert USER_AGENT in seen["GET"]["user-agent"]
 
     def test_follows_redirect_and_validates_each_hop(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
@@ -500,11 +507,17 @@ class TestHttpHead:
 
     def test_blocks_ssrf_on_redirect_target(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
+            if "10.0.0.5" in str(req.url):
+                return httpx.Response(200)
             return httpx.Response(302, headers={"location": "http://10.0.0.5/internal"})
-        # allow the public origin, block the private redirect target
+        # allow the public origin, block the private redirect target. If per-hop
+        # validation were dropped, the 10.0.0.5 hop would return a clean 200
+        # instead of a 400 — so a passing 400 here proves the guard fired on the
+        # redirect target, not merely on the initial URL.
         app = _head_app(handler, monkeypatch, allow=lambda u: "10.0.0.5" not in u)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/start"})
         assert r.status_code == 400
+        assert "SSRF blocked" in r.json()["detail"]
 
     def test_blocks_ssrf_on_initial_url(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
@@ -512,3 +525,21 @@ class TestHttpHead:
         app = _head_app(handler, monkeypatch, allow=lambda u: False)
         r = TestClient(app).post("/http/head", json={"url": "http://169.254.169.254/"})
         assert r.status_code == 400
+        assert "SSRF blocked" in r.json()["detail"]
+
+    def test_transport_connect_error_maps_to_502(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("boom")
+        app = _head_app(handler, monkeypatch)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/down"})
+        assert r.status_code == 502
+        assert "connection failed" in r.json()["detail"]
+        assert "ConnectError" in r.json()["detail"]
+
+    def test_transport_timeout_maps_to_504(self, monkeypatch):
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectTimeout("slow")
+        app = _head_app(handler, monkeypatch)
+        r = TestClient(app).post("/http/head", json={"url": "https://example.gov/slow"})
+        assert r.status_code == 504
+        assert "timeout after" in r.json()["detail"]

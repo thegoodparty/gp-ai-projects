@@ -1007,8 +1007,7 @@ class TestSubagentFanout:
         options = await _run_harness_capture_options(max_parallel_subagents=4)
         researcher = options.agents["researcher"]
 
-        assert isinstance(researcher.maxTurns, int)
-        assert researcher.maxTurns > 0
+        assert researcher.maxTurns == 5
 
     @pytest.mark.asyncio
     async def test_concurrency_cap_clamped_and_surfaced_in_prompt(self):
@@ -1017,9 +1016,10 @@ class TestSubagentFanout:
         more than that many subagents concurrently."""
         from pmf_engine.runner.harness.claude_sdk import MAX_PARALLEL_SUBAGENTS
 
-        options = await _run_harness_capture_options(
-            max_parallel_subagents=MAX_PARALLEL_SUBAGENTS + 50
-        )
+        requested = MAX_PARALLEL_SUBAGENTS + 51
+        options = await _run_harness_capture_options(max_parallel_subagents=requested)
 
-        assert str(MAX_PARALLEL_SUBAGENTS) in options.system_prompt
+        assert f"at most **{MAX_PARALLEL_SUBAGENTS}**" in options.system_prompt
+        assert f"batches of {MAX_PARALLEL_SUBAGENTS}" in options.system_prompt
+        assert str(requested) not in options.system_prompt
         assert "subagent" in options.system_prompt.lower()

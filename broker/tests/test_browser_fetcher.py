@@ -1197,6 +1197,109 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         )
 
 
+def _patch_playwright_async_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This sandbox has no real `playwright` package, so `_fetch_impl`'s
+    `from playwright.async_api import ...` raises ModuleNotFoundError before any
+    fake page logic runs. Install a minimal stub exposing the three symbols the
+    fetcher imports: a `Download` / `Route` marker (only used for typing) and a
+    real `Error` exception class (caught by `except PlaywrightError`)."""
+    import sys
+    import types
+
+    if "playwright" not in sys.modules:
+        sys.modules["playwright"] = types.ModuleType("playwright")
+    if "playwright.async_api" not in sys.modules:
+        async_api = types.ModuleType("playwright.async_api")
+
+        class _Error(Exception):
+            pass
+
+        async_api.Error = _Error  # type: ignore[attr-defined]
+        async_api.Download = object  # type: ignore[attr-defined]
+        async_api.Route = object  # type: ignore[attr-defined]
+        sys.modules["playwright.async_api"] = async_api
+        sys.modules["playwright"].async_api = async_api  # type: ignore[attr-defined]
+
+
+class TestSubResourceSSRFNonFatalDuringSettle:
+    """Non-fatal twin of test_subresource_ssrf_during_settle_raises_400.
+
+    A sub-resource (non-navigation) request that fails the SSRF check during the
+    post-nav settle is aborted by the route handler but must NOT fail the page —
+    the main document still resolves to a BrowserFetchResult. This drives the
+    real wiring (`_route_handler` reading `is_navigation_request()` and feeding
+    `tracker.record(...)`), which the _ViolationTracker-only tests bypass."""
+
+    @pytest.mark.asyncio
+    async def test_subresource_ssrf_during_settle_resolves_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_playwright_types(monkeypatch)
+        _patch_playwright_async_api(monkeypatch)
+
+        async def validate_url(url: str) -> None:
+            if "169.254.169.254" in url:
+                raise HTTPException(status_code=400, detail="metadata IP blocked")
+
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", validate_url)
+
+        browser_holder: list[_FakeBrowser] = []
+
+        async def on_settle() -> None:
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            route = _FakeRoute(
+                "https://169.254.169.254/latest/meta-data/",
+                is_navigation=False,
+            )
+            await handler(route)
+
+        body = b"<html><body>main page</body></html>"
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://example.com/landed",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=body,
+            ),
+            url="https://example.com/landed",
+        )
+
+        page._on_settle = None
+        sub_route_holder: list[_FakeRoute] = []
+
+        async def on_settle_capture() -> None:
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            route = _FakeRoute(
+                "https://169.254.169.254/latest/meta-data/",
+                is_navigation=False,
+            )
+            await handler(route)
+            sub_route_holder.append(route)
+
+        async def wait_for_load_state(state: str, *, timeout: int) -> None:
+            page._load_state_calls += 1
+            await on_settle_capture()
+
+        page.wait_for_load_state = wait_for_load_state  # type: ignore[method-assign]
+
+        browser = _FakeBrowser(lambda: page)
+        browser_holder.append(browser)
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = browser  # type: ignore[assignment]
+
+        result = await fetcher.fetch("https://example.com/")
+
+        assert isinstance(result, BrowserFetchResult)
+        assert result.status == 200
+        assert result.content_type == "text/html"
+        assert result.final_url == "https://example.com/landed"
+        assert result.body == body
+        assert result.body_path is None
+        assert result.byte_size == len(body)
+        assert sub_route_holder[0].aborted is True
+        assert sub_route_holder[0].continued is False
+
+
 class TestSubResourceSSRFTolerance:
     """A blocked third-party sub-resource (tracker/ad/analytics on a dead or
     non-allowlisted domain) must NOT fail the whole page fetch — it's aborted

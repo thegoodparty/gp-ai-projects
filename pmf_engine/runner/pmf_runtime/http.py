@@ -146,6 +146,8 @@ def head(url: str, purpose: str = "") -> dict:
     if resp.status_code >= 400:
         _raise_from_error(resp, "http.head")
     data = resp.json()
+    if "status" not in data:
+        raise ValueError("http.head: malformed broker response")
     return {"status": int(data["status"]), "final_url": data.get("final_url", url)}
 
 
