@@ -423,13 +423,18 @@ async def run_experiment(
                 duration = time.monotonic() - start_time
                 logger.exception(f"Harness failed for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush the span BEFORE report_status: a terminal status deletes
+                # this run's broker scope ticket, which invalidates the token the
+                # Braintrust proxy authenticates with. Logging/flushing after it
+                # drops the rollup batch with a 401.
+                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
                     detail=str(e),
                     duration_seconds=duration,
                 )
-                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
 
@@ -463,6 +468,16 @@ async def run_experiment(
                     # None / empty bytes case — preserve the empty marker
                     # for downstream tooling that branches on truncation.
                     rejected = {"_raw_bytes": "", "_truncated": False}
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={
+                    "status": "contract_violation",
+                    "error": str(e),
+                    "cost_usd": result.cost_usd,
+                    "num_turns": result.num_turns,
+                    "duration_seconds": duration,
+                })
+                bt.flush()
                 publish.report_status(
                     "contract_violation",
                     rejected_artifact=rejected,
@@ -471,18 +486,15 @@ async def run_experiment(
                     cost_usd=result.cost_usd,
                 )
                 _mark_callback_sent()
-                span.log(output={
-                    "status": "contract_violation",
-                    "error": str(e),
-                    "cost_usd": result.cost_usd,
-                    "num_turns": result.num_turns,
-                    "duration_seconds": duration,
-                })
                 return
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Validator error for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
@@ -490,7 +502,6 @@ async def run_experiment(
                     duration_seconds=duration,
                     cost_usd=result.cost_usd,
                 )
-                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
 
@@ -500,6 +511,16 @@ async def run_experiment(
                 duration = time.monotonic() - start_time
                 logger.exception(f"Artifact not valid JSON for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={
+                    "status": "failed",
+                    "error": str(e),
+                    "cost_usd": result.cost_usd,
+                    "num_turns": result.num_turns,
+                    "duration_seconds": duration,
+                })
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code="InvalidJSON",
@@ -513,6 +534,17 @@ async def run_experiment(
             _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
 
             duration = time.monotonic() - start_time
+            # Log + flush the root span BEFORE publish: publish deletes this
+            # run's broker scope ticket (anti-replay), which invalidates the
+            # token the Braintrust proxy authenticates with. Flushing after
+            # publish drops the run-level rollup with a 401.
+            span.log(output={
+                "status": "success",
+                "cost_usd": result.cost_usd,
+                "num_turns": result.num_turns,
+                "duration_seconds": duration,
+            })
+            bt.flush()
             try:
                 publish.publish(
                     artifact,
@@ -544,14 +576,9 @@ async def run_experiment(
                         f"for run {config.run_id}: {report_err}"
                     )
                 raise
-
-            span.log(output={
-                "status": "success",
-                "cost_usd": result.cost_usd,
-                "num_turns": result.num_turns,
-                "duration_seconds": duration,
-            })
     finally:
+        # Safety net for unexpected exits; terminal branches already flush the
+        # root span before the broker call that deletes the scope ticket.
         bt.flush()
 
 

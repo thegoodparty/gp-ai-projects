@@ -964,7 +964,9 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
     assert log_kwargs["output"]["num_turns"] == 3
     assert log_kwargs["output"]["duration_seconds"] > 0
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
 
 
 @pytest.mark.asyncio
@@ -985,7 +987,9 @@ async def test_run_experiment_traces_failure_to_braintrust(mock_publish, _mock_l
     assert log_kwargs["output"]["status"] == "failed"
     assert "Agent crashed" in log_kwargs["output"]["error"]
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1015,72 @@ async def test_run_experiment_traces_contract_violation_to_braintrust(mock_publi
     assert log_kwargs["output"]["status"] == "contract_violation"
     assert "greeting" in log_kwargs["output"]["error"]
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_braintrust_flushes_before_publish_deletes_scope_ticket(mock_publish, _mock_logs):
+    """The broker deletes this run's scope ticket on publish (anti-replay),
+    which invalidates the token the Braintrust proxy authenticates with. So the
+    root span output must be logged AND flushed BEFORE publish — otherwise the
+    run-level rollup batch is dropped with a 401. Lock the ordering."""
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+        session_id="sess-abc",
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    manager = MagicMock()
+    manager.attach_mock(mock_span.log, "span_log")
+    manager.attach_mock(mock_bt.flush, "flush")
+    manager.attach_mock(mock_publish.publish, "publish")
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        await run_experiment(config, harness=mock_harness)
+
+    order = [c[0] for c in manager.mock_calls]
+    assert "publish" in order and "span_log" in order and "flush" in order
+    assert order.index("span_log") < order.index("publish"), (
+        "root span output must be logged before publish deletes the scope ticket"
+    )
+    assert order.index("flush") < order.index("publish"), (
+        "Braintrust must flush before publish deletes the scope ticket"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_braintrust_flushes_before_report_status_on_failure(mock_publish, _mock_logs):
+    """Terminal report_status also deletes the scope ticket. The failure-path
+    span output + flush must precede it for the same reason."""
+    config = _make_config()
+    mock_harness = AsyncMock()
+    mock_harness.run.side_effect = RuntimeError("Agent crashed")
+    mock_bt, mock_span = _make_mock_bt()
+
+    manager = MagicMock()
+    manager.attach_mock(mock_span.log, "span_log")
+    manager.attach_mock(mock_bt.flush, "flush")
+    manager.attach_mock(mock_publish.report_status, "report_status")
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        with pytest.raises(RuntimeError, match="Agent crashed"):
+            await run_experiment(config, harness=mock_harness)
+
+    order = [c[0] for c in manager.mock_calls]
+    assert order.index("span_log") < order.index("report_status")
+    assert order.index("flush") < order.index("report_status")
 
 
 class TestMainErrorPaths:
