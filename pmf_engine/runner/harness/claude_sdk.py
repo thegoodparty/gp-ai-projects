@@ -257,7 +257,16 @@ def _fanout_prompt_section(cap: int) -> str:
         "WebSearch, same permissions) and returns structured findings. Only dispatch "
         "for genuinely independent work — sequential or dependent steps stay on the "
         "main agent. You remain responsible for assembling all findings into the "
-        "single output artifact; subagents never write the artifact themselves."
+        "single output artifact; subagents never write the artifact themselves.\n\n"
+        "WAITING FOR SUBAGENTS — do NOT sleep. Collect each subagent's findings as "
+        "the dispatch tool returns them. Never run a `Bash sleep`, idle a turn, or "
+        "otherwise block to 'wait for them to finish', and never wait on a completion "
+        "signal unbounded: a subagent that finishes in the gap before you start "
+        "waiting can be missed, hanging the whole run until its turn budget is spent. "
+        "If you genuinely must wait, poll every ~5 seconds for completed work (e.g. "
+        "list the result files the subagents write) until all expected items are "
+        "present, and bound any single wait to ~30 seconds (signal-or-30s, whichever "
+        "is first) then re-check — never an unbounded wait."
     )
 
 
