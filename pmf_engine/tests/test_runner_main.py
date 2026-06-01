@@ -963,6 +963,9 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
     assert log_kwargs["output"]["cost_usd"] == 0.05
     assert log_kwargs["output"]["num_turns"] == 3
     assert log_kwargs["output"]["duration_seconds"] > 0
+    # The final artifact JSON is pushed into the trace output so Braintrust
+    # shows input(params)→output(artifact), not just rollup metadata.
+    assert log_kwargs["output"]["artifact"] == {"greeting": "hello"}
 
     # flushed twice now: once in the terminal branch (before the broker call
     # that deletes the scope ticket) + once in the finally safety net.

@@ -540,6 +540,7 @@ async def run_experiment(
             # publish drops the run-level rollup with a 401.
             span.log(output={
                 "status": "success",
+                "artifact": artifact,
                 "cost_usd": result.cost_usd,
                 "num_turns": result.num_turns,
                 "duration_seconds": duration,
