@@ -430,6 +430,56 @@ class TestRunnerWriteActionValidation:
         )
         assert result["manifest"]["permission_mode"] == "bypassPermissions"
 
+    def test_accepts_valid_runtime_max_parallel_subagents(self):
+        """runtime.max_parallel_subagents is the fan-out opt-in. A well-formed
+        non-negative int loads."""
+        envelope = _envelope_with_write_action(runtime={"max_parallel_subagents": 4})
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert result["manifest"]["runtime"]["max_parallel_subagents"] == 4
+
+    def test_accepts_when_runtime_absent(self):
+        """No runtime block ⇒ fan-out off; legacy manifests load unchanged."""
+        envelope = _envelope_with_write_action(runtime=_MISSING)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+        assert "runtime" not in result["manifest"]
+
+    @pytest.mark.parametrize("bad_value", ["4", 3.14, True, -1, [4], {"n": 4}])
+    def test_rejects_bad_max_parallel_subagents(self, bad_value):
+        """Must be a non-negative int (bool excluded). Anything else is a
+        manifest authoring error and must fail loud at the runner boundary."""
+        envelope = _envelope_with_write_action(runtime={"max_parallel_subagents": bad_value})
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="max_parallel_subagents"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_rejects_non_dict_runtime(self):
+        envelope = _envelope_with_write_action(runtime=42)
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="runtime"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
     @pytest.mark.parametrize("bad_value", [42, 3.14, ["a", "list"], {"a": "dict"}, True])
     def test_rejects_non_string_system_prompt(self, bad_value):
         envelope = _envelope_with_write_action(system_prompt=bad_value)

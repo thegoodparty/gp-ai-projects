@@ -57,6 +57,20 @@ def test_build_system_prompt_includes_capability_header():
     assert "TOOLS AVAILABLE" in prompt
 
 
+def test_build_system_prompt_does_not_advertise_aws_cli():
+    """The runtime Docker image dropped the AWS CLI (boto3 via broker; egress
+    guard blocks direct AWS access). An agent that runs `aws ...` gets
+    command-not-found, so the prompt must NOT list `aws` in its CLI list.
+    Match the actual CLI-list phrasing to avoid false-matching unrelated
+    substrings like "AWS Secrets".
+    """
+    prompt = build_system_prompt("Do something.")
+    cli_line = next(line for line in prompt.splitlines() if line.startswith("**CLI**:"))
+    assert "aws" not in cli_line
+    assert "python" in cli_line
+    assert "pdftotext" in cli_line
+
+
 def test_build_system_prompt_includes_output_contract():
     """The prompt MUST point the agent at /workspace/output/ (the real writable
     path), not bare /root-level /output/. Agents on 2026-04-20 wasted ~22 turns
@@ -698,6 +712,9 @@ async def _run_harness_capture_options(
     system_prompt: str | None = None,
     permission_mode: str | None = None,
     allowed_external_tools: list[str] | None = None,
+    max_parallel_subagents: int = 0,
+    max_thinking_tokens: int | None = None,
+    max_turns: int = 5,
     monkey_env: dict[str, str] | None = None,
 ):
     captured, fake_query = _make_options_capture()
@@ -713,14 +730,35 @@ async def _run_harness_capture_options(
                 await harness.run(
                     instruction="Do analysis",
                     model="sonnet",
-                    max_turns=5,
+                    max_turns=max_turns,
                     workspace_dir=tmpdir,
                     params={},
                     system_prompt=system_prompt,
                     permission_mode=permission_mode,
                     allowed_external_tools=allowed_external_tools,
+                    max_parallel_subagents=max_parallel_subagents,
+                    max_thinking_tokens=max_thinking_tokens,
                 )
     return captured["options"]
+
+
+class TestThinkingControl:
+    @pytest.mark.asyncio
+    async def test_thinking_untouched_by_default(self):
+        """Absent runtime.max_thinking_tokens (None) ⇒ options.thinking stays
+        None so the CLI default is preserved (regression-safe)."""
+        options = await _run_harness_capture_options()
+        assert options.thinking is None
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_thinking(self):
+        options = await _run_harness_capture_options(max_thinking_tokens=0)
+        assert options.thinking == {"type": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_positive_enables_with_budget(self):
+        options = await _run_harness_capture_options(max_thinking_tokens=2048)
+        assert options.thinking == {"type": "enabled", "budget_tokens": 2048}
 
 
 class TestWriteActionManifestFields:
@@ -888,3 +926,150 @@ class TestWriteActionManifestFields:
         assert options.mcp_servers["broker"]["url"] == "https://broker-dev.test/agent/mcp"
         assert options.mcp_servers["broker"]["headers"]["X-Broker-Token"] == "tok-all"
 
+
+# ---------------------------------------------------------------------------
+# Parallel subagent fan-out (runtime.max_parallel_subagents)
+#
+# When an experiment opts in, the harness wires native SDK subagents so the
+# parent can fan out N independent research items concurrently. The subagent
+# inherits the SAME tool surface + scope as the parent (it runs in-session, so
+# it shares the broker MCP server and routes all egress through the broker —
+# never api.anthropic.com directly). When the field is absent/0, the built
+# ClaudeAgentOptions must be byte-identical to the pre-feature single-agent
+# path (regression lock).
+# ---------------------------------------------------------------------------
+
+
+class TestSubagentFanout:
+    @pytest.mark.asyncio
+    async def test_disabled_by_default_no_agents_no_dispatch_tool(self):
+        """max_parallel_subagents=0 (the default) ⇒ no agents wired, no Agent
+        dispatch tool, and the system prompt carries no fan-out section. This is
+        the regression lock: every existing experiment keeps today's options."""
+        options = await _run_harness_capture_options(max_parallel_subagents=0)
+
+        assert options.agents is None
+        assert "Agent" not in options.allowed_tools
+        assert options.allowed_tools == ALLOWED_TOOLS
+        assert "subagent" not in options.system_prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_enabled_wires_researcher_agent_and_dispatch_tool(self):
+        """max_parallel_subagents>0 ⇒ a 'researcher' agent definition is wired
+        and the Agent dispatch tool is appended to allowed_tools so the parent
+        can spawn subagents."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4)
+
+        assert options.agents is not None
+        assert "researcher" in options.agents
+        assert "Agent" in options.allowed_tools
+        # base tools still reachable (Agent appended, not replacing)
+        for legacy in ALLOWED_TOOLS:
+            assert legacy in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_subagent_inherits_model_and_permission_mode(self):
+        """The researcher subagent must run with the SAME model and permission
+        posture as the parent — model='inherit', and permissionMode matching the
+        parent's resolved mode (not a broader one)."""
+        options = await _run_harness_capture_options(
+            max_parallel_subagents=4, permission_mode="bypassPermissions"
+        )
+        researcher = options.agents["researcher"]
+
+        assert researcher.model == "inherit"
+        assert researcher.permissionMode == "bypassPermissions"
+
+    @pytest.mark.asyncio
+    async def test_subagent_cannot_recursively_fan_out(self):
+        """The researcher must NOT be able to spawn its own subagents — that
+        would defeat the concurrency cap and let cost/wall-clock run away.
+        Enforced mechanically via disallowedTools (SDK 0.2.x)."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4)
+        researcher = options.agents["researcher"]
+
+        assert "Agent" in (researcher.disallowedTools or [])
+
+    @pytest.mark.asyncio
+    async def test_subagent_prompt_hands_over_the_url_verification_tool(self):
+        """The researcher's base prompt tells it to verify URLs, so it MUST hand
+        over the verification tool (`http.head`) — otherwise 'verify the URL' +
+        'write python' leaves a gap the urllib reflex fills. It must also not
+        frame Bash as a general 'python' tool, which invites that reflex."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4)
+        prompt = options.agents["researcher"].prompt
+
+        assert "http.head" in prompt
+        assert "for `pmf_runtime.http.get`/`download` and `python`" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_subagent_prompt_has_untrusted_input_handling(self):
+        """The researcher has Bash and processes untrusted web content (WebSearch /
+        http.get results), so its prompt MUST carry the same injection defense the
+        parent has — treat fetched content as data, never as instructions."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4)
+        prompt = options.agents["researcher"].prompt
+
+        assert "UNTRUSTED INPUT" in prompt
+        assert "never as instructions" in prompt
+
+    @pytest.mark.asyncio
+    async def test_subagent_pinned_to_broker_mcp_when_broker_set(self):
+        """Subagents must route external access through the broker exactly like
+        the parent — pin the subagent's mcpServers to the broker server so it
+        can't reach anything the parent can't."""
+        options = await _run_harness_capture_options(
+            max_parallel_subagents=4,
+            monkey_env={"BROKER_URL": "https://broker-dev.test", "BROKER_TOKEN": "tok"},
+        )
+        researcher = options.agents["researcher"]
+
+        assert researcher.mcpServers == ["broker"]
+
+    @pytest.mark.asyncio
+    async def test_subagent_no_mcp_pin_when_broker_unset(self):
+        """Without a broker (local-dev), the subagent gets no mcpServers pin —
+        symmetric with the parent's empty mcp_servers."""
+        options = await _run_harness_capture_options(
+            max_parallel_subagents=4,
+            monkey_env={"BROKER_URL": None, "BROKER_TOKEN": None},
+        )
+        researcher = options.agents["researcher"]
+
+        assert not researcher.mcpServers
+
+    @pytest.mark.asyncio
+    async def test_subagent_maxturns_capped_below_parent_budget(self):
+        """Each subagent gets a maxTurns CAPPED well below the parent's full budget
+        so N runaway researchers can't multiply cost (with the parent budget at 50
+        and cap 20 subagents, an uncapped researcher would allow 50 + 20*50 = 1050
+        turns). A researcher does ONE item, so it's bounded at _RESEARCHER_MAX_TURNS."""
+        from pmf_engine.runner.harness.claude_sdk import _RESEARCHER_MAX_TURNS
+
+        options = await _run_harness_capture_options(max_parallel_subagents=4, max_turns=50)
+        researcher = options.agents["researcher"]
+
+        assert researcher.maxTurns == _RESEARCHER_MAX_TURNS
+        assert researcher.maxTurns < 50
+
+    @pytest.mark.asyncio
+    async def test_subagent_maxturns_never_exceeds_parent(self):
+        """If the parent's budget is below the cap, the researcher inherits the
+        (smaller) parent budget — never more than the parent."""
+        options = await _run_harness_capture_options(max_parallel_subagents=4, max_turns=3)
+        assert options.agents["researcher"].maxTurns == 3
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_clamped_and_surfaced_in_prompt(self):
+        """A manifest asking for more than the hard cap is clamped, and the
+        effective cap is stated in the system prompt so the parent dispatches no
+        more than that many subagents concurrently."""
+        from pmf_engine.runner.harness.claude_sdk import MAX_PARALLEL_SUBAGENTS
+
+        requested = MAX_PARALLEL_SUBAGENTS + 51
+        options = await _run_harness_capture_options(max_parallel_subagents=requested)
+
+        assert f"at most **{MAX_PARALLEL_SUBAGENTS}**" in options.system_prompt
+        assert f"batches of {MAX_PARALLEL_SUBAGENTS}" in options.system_prompt
+        assert str(requested) not in options.system_prompt
+        assert "subagent" in options.system_prompt.lower()

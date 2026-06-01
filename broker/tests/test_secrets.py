@@ -19,6 +19,7 @@ FULL_SECRET = {
     "AGENT_FLEET_CLERK_ID": "user_agent_fleet_test",
     "AGENT_MCP_TOKEN_SECRET": "test-agent-mcp-secret",
     "RESULTS_QUEUE_URL": "https://sqs.us-west-2.amazonaws.com/123/results.fifo",
+    "BRAINTRUST_API_KEY": "sk-bt-test",
 }
 
 
@@ -46,6 +47,18 @@ class TestLoadSecrets:
         assert result.agent_fleet_clerk_id == "user_agent_fleet_test"
         assert result.agent_mcp_token_secret == "test-agent-mcp-secret"
         assert result.results_queue_url == "https://sqs.us-west-2.amazonaws.com/123/results.fifo"
+        assert result.braintrust_api_key == "sk-bt-test"
+
+    def test_braintrust_api_key_is_optional(self):
+        without_bt = {k: v for k, v in FULL_SECRET.items() if k != "BRAINTRUST_API_KEY"}
+        mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": json.dumps(without_bt)}
+
+        with patch("broker.secrets.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_client
+            result = load_secrets("AI_SECRETS_DEV")
+
+        assert result.braintrust_api_key == ""
 
     def test_missing_required_field_raises_valueerror(self):
         incomplete = {k: v for k, v in FULL_SECRET.items() if k != "ANTHROPIC_API_KEY"}

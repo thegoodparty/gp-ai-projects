@@ -136,6 +136,12 @@ class RunnerConfig:
     system_prompt: str | None = None
     permission_mode: str | None = None
     allowed_external_tools: list[str] | None = None
+    # Parallel research fan-out opt-in (manifest.runtime.max_parallel_subagents).
+    # 0 = disabled (default); the harness clamps to its own ceiling.
+    max_parallel_subagents: int = 0
+    # Extended-thinking control (manifest.runtime.max_thinking_tokens). None =
+    # CLI default (thinking on); 0 = disabled; >0 = enabled with that budget.
+    max_thinking_tokens: int | None = None
 
     @classmethod
     def from_env(cls) -> RunnerConfig:
@@ -180,6 +186,8 @@ class RunnerConfig:
         system_prompt: str | None = None
         permission_mode: str | None = None
         allowed_external_tools: list[str] | None = None
+        max_parallel_subagents: int = 0
+        max_thinking_tokens: int | None = None
         if experiment_id:
             # The broker is the only source for manifest+instruction. The
             # broker reads s3://agent-experiment-metadata-{env}/<id>/* and
@@ -249,6 +257,13 @@ class RunnerConfig:
             system_prompt = manifest.get("system_prompt")
             permission_mode = manifest.get("permission_mode")
             allowed_external_tools = manifest.get("allowed_external_tools")
+            # Nested fan-out opt-in. Validated in manifest_loader; project the
+            # int onto the flat RunnerConfig field the harness reads (0 if the
+            # runtime block or field is absent).
+            runtime_block = manifest.get("runtime") or {}
+            max_parallel_subagents = runtime_block.get("max_parallel_subagents", 0) or 0
+            # None when absent (harness leaves CLI default); int (incl. 0) when set.
+            max_thinking_tokens = runtime_block.get("max_thinking_tokens")
 
         ts_raw = os.environ.get("TIMEOUT_SECONDS", "").strip()
         if ts_raw:
@@ -277,4 +292,6 @@ class RunnerConfig:
             system_prompt=system_prompt,
             permission_mode=permission_mode,
             allowed_external_tools=allowed_external_tools,
+            max_parallel_subagents=max_parallel_subagents,
+            max_thinking_tokens=max_thinking_tokens,
         )

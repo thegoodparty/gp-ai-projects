@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from pmf_engine.runner.pmf_runtime.config import init_config
-from pmf_engine.runner.pmf_runtime.http import download, get
+from pmf_engine.runner.pmf_runtime.http import download, get, head
 
 
 def _inject_client(handler):
@@ -580,3 +580,43 @@ class TestDownload:
         _inject_client(handler)
         result = download("https://city.gov/x.pdf", dest=str(tmp_path / "x.pdf"))
         assert result["byte_size"] == 9999
+
+
+class TestHead:
+    def setup_method(self):
+        _reset_config()
+
+    def test_returns_status_and_final_url(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/http/head"
+            assert json.loads(request.content)["url"] == "https://example.gov/p"
+            return httpx.Response(200, json={"status": 200, "final_url": "https://example.gov/p"})
+
+        _inject_client(handler)
+        result = head("https://example.gov/p")
+        assert result["status"] == 200
+        assert result["final_url"] == "https://example.gov/p"
+
+    def test_passes_through_non_200_status(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": 404, "final_url": "https://example.gov/missing"})
+
+        _inject_client(handler)
+        result = head("https://example.gov/missing")
+        assert result["status"] == 404
+
+    def test_raises_value_error_on_broker_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"detail": "SSRF blocked"})
+
+        _inject_client(handler)
+        with pytest.raises(ValueError, match="http.head failed: SSRF blocked"):
+            head("http://10.0.0.5/internal")
+
+    def test_raises_value_error_on_malformed_200_body_missing_status(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"final_url": "https://example.gov/p"})
+
+        _inject_client(handler)
+        with pytest.raises(ValueError, match="malformed"):
+            head("https://example.gov/p")

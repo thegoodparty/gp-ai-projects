@@ -156,6 +156,36 @@ class TestAnthropicProxyNonStreaming:
         assert resp.status_code == 200
         assert captured["anthropic-beta"] == beta
 
+    def test_forwards_client_supplied_anthropic_version(self):
+        """A client-supplied `anthropic-version` must be forwarded verbatim, not
+        silently overridden by the proxy's hardcoded default. The default
+        `_upstream_handler` only exercises the fallback (2023-06-01) branch, so the
+        passthrough was untested — a regression that pinned every request to the
+        default would go undetected."""
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["anthropic-version"] = request.headers.get("anthropic-version")
+            return httpx.Response(
+                200,
+                json={"id": "m", "type": "message", "role": "assistant",
+                      "content": [{"type": "text", "text": "ok"}]},
+            )
+
+        app = _create_test_app(upstream_transport=httpx.MockTransport(handler))
+        client = TestClient(app)
+
+        resp = client.post(
+            "/anthropic/v1/messages",
+            json={"model": "claude-sonnet-4-6",
+                  "messages": [{"role": "user", "content": "Hi"}],
+                  "max_tokens": 16},
+            headers={"x-api-key": VALID_BROKER_TOKEN, "anthropic-version": "2024-11-01"},
+        )
+
+        assert resp.status_code == 200
+        assert captured["anthropic-version"] == "2024-11-01"
+
     def test_no_anthropic_beta_header_when_client_sends_none(self):
         """When the client sends no anthropic-beta, the proxy must not invent one
         — forwarding an empty/garbage beta header could itself trigger a 400."""

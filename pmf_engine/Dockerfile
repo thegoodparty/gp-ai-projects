@@ -60,16 +60,9 @@ RUN ARCH=$(uname -m) && \
 # silently land in production.
 RUN npm install -g @anthropic-ai/claude-code@2.1.109
 
-# Install AWS CLI (for S3 artifact uploads if needed by agent)
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "x86_64" ]; then \
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; \
-    elif [ "$ARCH" = "aarch64" ]; then \
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"; \
-    fi && \
-    unzip awscliv2.zip && \
-    ./aws/install && \
-    rm -rf awscliv2.zip aws
+# (AWS CLI removed — the runner uploads via the broker using boto3, and the
+# egress guard blocks the agent from reaching AWS endpoints directly anyway.
+# Dropping the ~150 MB CLI shrinks the image and speeds Fargate cold-start pulls.)
 
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
@@ -77,6 +70,22 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source code
 COPY --from=builder /app/shared /app/shared
 COPY --from=builder /app/pmf_engine /app/pmf_engine
+
+# Sandbox egress guard: PYTHONPATH=/app is set below, so every python3 the
+# agent spawns auto-imports this and installs the socket-level guard when
+# BROKER_URL is present.
+COPY pmf_engine/sitecustomize.py /app/sitecustomize.py
+
+# Sandbox egress guard: shadow curl/wget with fast-fail shims so direct
+# network calls fail in <1s with an instructive message instead of hanging
+# ~30s against the network-quarantined container. /usr/local/bin precedes
+# /usr/bin in PATH; the real binaries remain at /usr/bin and nothing at
+# runtime needs them. Must come AFTER all build-time curl uses above.
+RUN SANDBOX_MSG="Sandboxed environment: this container has NO direct network egress. Direct network calls (urllib, requests, httpx, curl, wget, raw socket) cannot reach the internet and will fail. The ONLY way to reach a URL is the broker-proxied tools you were given: pmf_runtime.http.head(url) / pmf_runtime.http.get(url) / pmf_runtime.http.download(url) for web pages, and the WebSearch tool for discovery. Use those instead. See /workspace/SANDBOX.md." && \
+    for bin in curl wget; do \
+        printf '#!/bin/sh\necho "%s" >&2\nexit 1\n' "$SANDBOX_MSG" > "/usr/local/bin/$bin" && \
+        chmod +x "/usr/local/bin/$bin"; \
+    done
 
 # Copy entrypoint
 COPY pmf_engine/entrypoint.sh /app/entrypoint.sh

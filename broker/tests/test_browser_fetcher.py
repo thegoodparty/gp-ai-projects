@@ -30,13 +30,17 @@ from broker.browser_fetcher import (
 
 
 class _FakeRequest:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, is_navigation: bool = True) -> None:
         self.url = url
+        self._is_navigation = is_navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._is_navigation
 
 
 class _FakeRoute:
-    def __init__(self, url: str) -> None:
-        self.request = _FakeRequest(url)
+    def __init__(self, url: str, is_navigation: bool = True) -> None:
+        self.request = _FakeRequest(url, is_navigation)
         self.aborted = False
         self.continued = False
 
@@ -1190,4 +1194,173 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         leaked = captured_paths[0]
         assert not os.path.exists(leaked), (
             f"late-download temp file leaked after post-save SSRF violation: {leaked}"
+        )
+
+
+def _patch_playwright_async_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This sandbox has no real `playwright` package, so `_fetch_impl`'s
+    `from playwright.async_api import ...` raises ModuleNotFoundError before any
+    fake page logic runs. Install a minimal stub exposing the three symbols the
+    fetcher imports: a `Download` / `Route` marker (only used for typing) and a
+    real `Error` exception class (caught by `except PlaywrightError`)."""
+    import sys
+    import types
+
+    if "playwright" not in sys.modules:
+        sys.modules["playwright"] = types.ModuleType("playwright")
+    if "playwright.async_api" not in sys.modules:
+        async_api = types.ModuleType("playwright.async_api")
+
+        class _Error(Exception):
+            pass
+
+        async_api.Error = _Error  # type: ignore[attr-defined]
+        async_api.Download = object  # type: ignore[attr-defined]
+        async_api.Route = object  # type: ignore[attr-defined]
+        sys.modules["playwright.async_api"] = async_api
+        sys.modules["playwright"].async_api = async_api  # type: ignore[attr-defined]
+
+
+class TestSubResourceSSRFNonFatalDuringSettle:
+    """Non-fatal twin of test_subresource_ssrf_during_settle_raises_400.
+
+    A sub-resource (non-navigation) request that fails the SSRF check during the
+    post-nav settle is aborted by the route handler but must NOT fail the page —
+    the main document still resolves to a BrowserFetchResult. This drives the
+    real wiring (`_route_handler` reading `is_navigation_request()` and feeding
+    `tracker.record(...)`), which the _ViolationTracker-only tests bypass."""
+
+    @pytest.mark.asyncio
+    async def test_subresource_ssrf_during_settle_resolves_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_playwright_types(monkeypatch)
+        _patch_playwright_async_api(monkeypatch)
+
+        async def validate_url(url: str) -> None:
+            if "169.254.169.254" in url:
+                raise HTTPException(status_code=400, detail="metadata IP blocked")
+
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", validate_url)
+
+        browser_holder: list[_FakeBrowser] = []
+
+        async def on_settle() -> None:
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            route = _FakeRoute(
+                "https://169.254.169.254/latest/meta-data/",
+                is_navigation=False,
+            )
+            await handler(route)
+
+        body = b"<html><body>main page</body></html>"
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://example.com/landed",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=body,
+            ),
+            url="https://example.com/landed",
+        )
+
+        page._on_settle = None
+        sub_route_holder: list[_FakeRoute] = []
+
+        async def on_settle_capture() -> None:
+            handler = browser_holder[0].route_handler_holders[-1][0]
+            route = _FakeRoute(
+                "https://169.254.169.254/latest/meta-data/",
+                is_navigation=False,
+            )
+            await handler(route)
+            sub_route_holder.append(route)
+
+        async def wait_for_load_state(state: str, *, timeout: int) -> None:
+            page._load_state_calls += 1
+            await on_settle_capture()
+
+        page.wait_for_load_state = wait_for_load_state  # type: ignore[method-assign]
+
+        browser = _FakeBrowser(lambda: page)
+        browser_holder.append(browser)
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = browser  # type: ignore[assignment]
+
+        result = await fetcher.fetch("https://example.com/")
+
+        assert isinstance(result, BrowserFetchResult)
+        assert result.status == 200
+        assert result.content_type == "text/html"
+        assert result.final_url == "https://example.com/landed"
+        assert result.body == body
+        assert result.body_path is None
+        assert result.byte_size == len(body)
+        assert sub_route_holder[0].aborted is True
+        assert sub_route_holder[0].continued is False
+
+
+class TestSubResourceSSRFTolerance:
+    """A blocked third-party sub-resource (tracker/ad/analytics on a dead or
+    non-allowlisted domain) must NOT fail the whole page fetch — it's aborted
+    for safety, but a legitimate main page should still resolve. Only an SSRF
+    violation on the MAIN navigation/document request is fatal. Real news pages
+    are tracker-soup, so failing on any sub-resource violation made URL
+    verification spuriously fail ('SSRF blocked mid-fetch: atrk.js')."""
+
+    def test_subresource_violation_is_not_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("https://d31qbv1cthcecs.cloudfront.net/atrk.js", "DNS resolution failed", is_navigation=False)
+        assert t.fatal() is None
+
+    def test_navigation_violation_is_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("http://169.254.169.254/latest/meta-data/", "blocked private IP", is_navigation=True)
+        fatal = t.fatal()
+        assert fatal is not None
+        assert "169.254.169.254" in fatal
+
+    def test_mixed_returns_navigation_violation_only(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record("https://tracker.example/ads.js", "non-allowlisted", is_navigation=False)
+        t.record("http://10.0.0.5/internal", "blocked private IP", is_navigation=True)
+        t.record("https://analytics.example/p.gif", "non-allowlisted", is_navigation=False)
+        fatal = t.fatal()
+        assert fatal is not None
+        assert "10.0.0.5" in fatal
+
+    def test_no_violations_is_not_fatal(self):
+        from broker.browser_fetcher import _ViolationTracker
+
+        assert _ViolationTracker().fatal() is None
+
+    # Real third-party resources that spuriously failed legitimate news pages in
+    # the opposition_research fan-out run (RUN_ID fc3c4651). Each is embedded in
+    # a WNEP article the agent was trying to verify as a citation:
+    #   https://www.wnep.com/article/.../projected-winner-jeff-cusat.../523-31e120df-...
+    #   https://www.wnep.com/article/.../yannuzzi-calls-to-congratulate-cusat.../523-e531aa5e-...
+    # Both articles 200 fine; they failed only because these embedded sub-
+    # resources trip the SSRF guard (dead/non-allowlisted domains). They must
+    # NOT fail their host page — that broke verification and caused the timeout.
+    @pytest.mark.parametrize(
+        "subresource_url",
+        [
+            "https://d31qbv1cthcecs.cloudfront.net/atrk.js",       # comScore/Alexa tracker
+            "https://launch.newsinc.com/js/embed.js",               # NewsInc video widget
+        ],
+    )
+    def test_real_world_embedded_trackers_are_not_fatal(self, subresource_url):
+        from broker.browser_fetcher import _ViolationTracker
+
+        t = _ViolationTracker()
+        t.record(subresource_url, "DNS resolution failed: [Errno -5]", is_navigation=False)
+        assert t.fatal() is None, (
+            f"{subresource_url} is an embedded third-party resource; blocking it must "
+            f"not fail the host news article it was cited from"
         )
