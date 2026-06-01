@@ -123,7 +123,7 @@ resource "aws_cloudwatch_log_group" "broker" {
 
 resource "aws_secretsmanager_secret" "broker" {
   name        = "broker-${var.environment}"
-  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET"
+  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET, BRAINTRUST_API_KEY"
 
   tags = {
     Environment = var.environment
@@ -695,6 +695,10 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name      = "AGENT_MCP_TOKEN_SECRET"
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:AGENT_MCP_TOKEN_SECRET::"
+        },
+        {
+          name      = "BRAINTRUST_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:BRAINTRUST_API_KEY::"
         }
       ]
     }
