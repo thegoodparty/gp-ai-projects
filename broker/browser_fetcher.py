@@ -34,6 +34,34 @@ from fastapi import HTTPException
 
 from broker.ssrf_guard import validate_url
 
+
+class _ViolationTracker:
+    """Tracks SSRF policy violations seen while a page renders.
+
+    A violation on the MAIN navigation/document request is fatal — the caller
+    asked to fetch an SSRF target directly, so the whole fetch must fail. A
+    violation on a SUB-RESOURCE (third-party tracker, ad, analytics script) is
+    aborted by the route handler for safety but is NOT fatal: real pages embed
+    dozens of third-party resources, many on dead or non-allowlisted domains,
+    and failing the whole fetch on a benign embedded tracker turned legitimate
+    public pages into 'SSRF blocked mid-fetch' red herrings. Blocking the
+    sub-resource request (via route.abort) already provides the protection;
+    discarding the legitimately-fetched main page on top of that adds none.
+    """
+
+    def __init__(self) -> None:
+        self._fatal: str | None = None
+
+    def record(self, url: str, detail: str, is_navigation: bool) -> None:
+        # Keep only the first navigation (main-document) violation — that's the
+        # one that makes the fetch fatal. Sub-resource violations are aborted by
+        # the caller but intentionally not recorded as fatal.
+        if is_navigation and self._fatal is None:
+            self._fatal = f"{url}: {detail}"
+
+    def fatal(self) -> str | None:
+        return self._fatal
+
 logger = logging.getLogger(__name__)
 
 USER_AGENT = (
@@ -199,13 +227,14 @@ class PlaywrightBrowserFetcher:
                 "PlaywrightBrowserFetcher.start() must be awaited before fetch()"
             )
 
-        violations: list[str] = []
+        tracker = _ViolationTracker()
 
         def _raise_if_violation() -> None:
-            if violations:
+            fatal = tracker.fatal()
+            if fatal is not None:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"SSRF blocked mid-fetch: {violations[0]}",
+                    detail=f"SSRF blocked mid-fetch: {fatal}",
                 )
 
         async def _route_handler(route: Route) -> None:
@@ -213,7 +242,13 @@ class PlaywrightBrowserFetcher:
             try:
                 await validate_url(req_url)
             except HTTPException as e:
-                violations.append(f"{req_url}: {e.detail}")
+                # Block the request either way (safety). Only a violation on the
+                # main navigation/document request is fatal; a blocked third-party
+                # sub-resource (tracker/ad) must not fail the whole page fetch.
+                is_navigation = route.request.is_navigation_request()
+                tracker.record(req_url, str(e.detail), is_navigation)
+                if not is_navigation:
+                    logger.debug("aborted SSRF sub-resource (non-fatal): %s", req_url)
                 await route.abort()
                 return
             await route.continue_()
@@ -297,7 +332,7 @@ class PlaywrightBrowserFetcher:
                 # violations[] during that window; the file is already on
                 # disk. Unlink before raising — the endpoint never sees the
                 # result so its BackgroundTask cleanup won't run.
-                if violations:
+                if tracker.fatal():
                     try:
                         await asyncio.to_thread(os.unlink, body_path)
                     except OSError:
@@ -366,7 +401,7 @@ class PlaywrightBrowserFetcher:
                     # See the early-download path: temp file is already on disk
                     # if a sub-resource SSRF fired during the asyncio.to_thread
                     # yield. Unlink before raising so the file doesn't leak.
-                    if violations:
+                    if tracker.fatal():
                         try:
                             await asyncio.to_thread(os.unlink, body_path)
                         except OSError:

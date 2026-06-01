@@ -899,3 +899,75 @@ class TestWriteActionFieldValidation:
         )
         with pytest.raises(ManifestLoaderMalformedError, match="permission_mode"):
             self._publish(manifest).routing_for("compliance_smoke_test")
+
+
+class TestRuntimeFieldValidation:
+    """`runtime.*` validation must run at dispatch whenever a `runtime` block
+    is present, INDEPENDENT of the write-action fields. Previously it only ran
+    when at least one write-action field was set, so a manifest with a
+    malformed `runtime` block and no write-action fields slipped past dispatch
+    and was only rejected at the runner boundary — after a Fargate task had
+    already launched (wasted launch)."""
+
+    def _index(self):
+        return _index_payload(
+            [
+                {
+                    "id": "fanout_smoke_test",
+                    "version": 1,
+                    "mode": "serve",
+                    "manifest_key": "fanout_smoke_test/manifest.json",
+                },
+            ]
+        )
+
+    def _publish(self, manifest):
+        s3 = _fake_s3_with_index(self._index())
+        s3.set_json(BUCKET, "fanout_smoke_test/manifest.json", manifest)
+        return ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+    @pytest.mark.parametrize("bad_value", [-5, True, "4", 3.14])
+    def test_rejects_bad_max_parallel_subagents_without_write_action_fields(self, bad_value):
+        """A runtime block with no write-action fields present must still be
+        validated at dispatch. Each bad value names the offending field."""
+        manifest = _manifest_payload(
+            "fanout_smoke_test",
+            runtime={"max_parallel_subagents": bad_value},
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="max_parallel_subagents"):
+            self._publish(manifest).routing_for("fanout_smoke_test")
+
+    @pytest.mark.parametrize("bad_value", [-1, True, "8", 2.5])
+    def test_rejects_bad_max_thinking_tokens_without_write_action_fields(self, bad_value):
+        manifest = _manifest_payload(
+            "fanout_smoke_test",
+            runtime={"max_thinking_tokens": bad_value},
+        )
+        with pytest.raises(ManifestLoaderMalformedError, match="max_thinking_tokens"):
+            self._publish(manifest).routing_for("fanout_smoke_test")
+
+    def test_rejects_non_dict_runtime_without_write_action_fields(self):
+        manifest = _manifest_payload("fanout_smoke_test", runtime=42)
+        with pytest.raises(ManifestLoaderMalformedError, match="runtime"):
+            self._publish(manifest).routing_for("fanout_smoke_test")
+
+    def test_accepts_valid_runtime_without_write_action_fields(self):
+        """A well-formed runtime block (and no write-action fields) loads
+        cleanly — and the runtime block is NOT projected into routing, mirroring
+        the write-action gate which only projects the three write-action keys."""
+        manifest = _manifest_payload(
+            "fanout_smoke_test",
+            runtime={"max_parallel_subagents": 4, "max_thinking_tokens": 8000},
+        )
+        routing = self._publish(manifest).routing_for("fanout_smoke_test")
+        assert routing["model"] == "sonnet"
+        for field in ("system_prompt", "permission_mode", "allowed_external_tools"):
+            assert field not in routing
+
+    def test_zero_is_a_valid_non_negative_int(self):
+        manifest = _manifest_payload(
+            "fanout_smoke_test",
+            runtime={"max_parallel_subagents": 0},
+        )
+        routing = self._publish(manifest).routing_for("fanout_smoke_test")
+        assert routing["model"] == "sonnet"

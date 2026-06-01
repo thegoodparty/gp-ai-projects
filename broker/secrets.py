@@ -21,6 +21,7 @@ _OPTIONAL_FIELDS = {
     "DATABRICKS_HTTP_PATH": "databricks_http_path",
     "DATABRICKS_API_KEY": "databricks_api_key",
     "RESULTS_QUEUE_URL": "results_queue_url",
+    "BRAINTRUST_API_KEY": "braintrust_api_key",
 }
 
 _FIELD_MAP = {**_REQUIRED_FIELDS, **_OPTIONAL_FIELDS}
@@ -40,6 +41,7 @@ class BrokerSecrets:
     databricks_http_path: str = ""
     databricks_api_key: str = ""
     results_queue_url: str = ""
+    braintrust_api_key: str = ""
 
 
 def _parse_secrets(raw: dict[str, str]) -> BrokerSecrets:

@@ -129,6 +129,28 @@ def get(url: str, purpose: str = "") -> dict:
         }
 
 
+def head(url: str, purpose: str = "") -> dict:
+    """Fast, non-browser liveness check — returns {"status": int, "final_url": str}
+    WITHOUT rendering the page. Use this to VERIFY a URL is live (status 200)
+    before citing it: it's far cheaper than `get` (no Chromium render, no
+    sub-resources). Escalation ladder for the web: WebSearch (discover) ->
+    http.head (verify) -> http.get (render, last resort). If `head` returns a
+    bot-block status (403/405) on a site you believe is real, escalate to
+    `get(url)` — the browser defeats Cloudflare-style challenges a bare request
+    cannot.
+    """
+    from .config import get_config
+
+    client = get_config().client
+    resp = client.post("/http/head", json={"url": url, "purpose": purpose})
+    if resp.status_code >= 400:
+        _raise_from_error(resp, "http.head")
+    data = resp.json()
+    if "status" not in data:
+        raise ValueError("http.head: malformed broker response")
+    return {"status": int(data["status"]), "final_url": data.get("final_url", url)}
+
+
 def download(url: str, dest: str | None = None, purpose: str = "") -> dict:
     from .config import get_config
 
