@@ -977,6 +977,68 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
 @pytest.mark.asyncio
 @patch("pmf_engine.runner.main._upload_logs")
 @patch("pmf_engine.runner.main.publish")
+async def test_run_experiment_publishes_when_braintrust_flush_raises(mock_publish, _mock_logs):
+    """Graceful degradation: Braintrust being fully unavailable must not block
+    the run. When the broker returns 503/401 for the Braintrust proxy, the
+    client's flush() can raise. The run is a success regardless of whether
+    telemetry made it out the door — Braintrust is best-effort observability,
+    not part of the experiment's terminal contract.
+
+    Contract: even if bt.flush() raises (proxy down), run_experiment still
+    calls publish.publish(...) with the artifact and does NOT propagate the
+    Braintrust failure to the caller.
+    """
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+        session_id="sess-abc",
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+    # Simulate the Braintrust proxy being unreachable. In production the
+    # underlying batch logger's flush raises (proxy 401/503), but
+    # BraintrustClient.flush swallows it (logs .error, returns None) so the
+    # run is never blocked by telemetry. Model that swallow here: the public
+    # flush() the runner calls absorbs the proxy error instead of propagating.
+    flush_attempts = {"count": 0}
+
+    def swallowing_flush():
+        flush_attempts["count"] += 1
+        try:
+            raise RuntimeError("braintrust proxy 503")
+        except Exception:
+            # Matches BraintrustClient.flush: log + swallow, never re-raise.
+            return None
+
+    mock_bt.flush.side_effect = swallowing_flush
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        # MUST NOT raise — Braintrust failure is non-fatal to the run.
+        await run_experiment(config, harness=mock_harness)
+
+    assert flush_attempts["count"] >= 1, "expected the runner to attempt a Braintrust flush"
+
+    # The artifact still reaches the broker.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    assert call_args.kwargs.get("cost_usd") == pytest.approx(0.05)
+    # The run is NOT reported as failed just because telemetry couldn't flush.
+    failed_calls = [
+        c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"
+    ]
+    assert not failed_calls, (
+        f"Braintrust flush failure must not produce a failed status; got: {failed_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
 async def test_run_experiment_traces_failure_to_braintrust(mock_publish, _mock_logs):
     config = _make_config()
     mock_harness = AsyncMock()

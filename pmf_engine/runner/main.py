@@ -534,6 +534,12 @@ async def run_experiment(
             _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
 
             duration = time.monotonic() - start_time
+            # Intentional trace/status divergence: the trace records "success"
+            # and flushes HERE, before publish runs. Because publish deletes the
+            # scope ticket that authenticates the Braintrust proxy, if publish
+            # then fails and gp-api gets a "failed" status, this run's Braintrust
+            # trace will still read "success". That stale trace is a deliberate
+            # tradeoff of flush-before-delete, not a bug.
             # Log + flush the root span BEFORE publish: publish deletes this
             # run's broker scope ticket (anti-replay), which invalidates the
             # token the Braintrust proxy authenticates with. Flushing after

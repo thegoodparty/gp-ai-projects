@@ -75,7 +75,11 @@ async def proxy_braintrust(
         # Fail closed when the broker has no Braintrust key configured. The SDK
         # treats a failed login/ingest as non-fatal (logging just disables), so
         # the agent run continues — we just don't capture traces.
-        logger.warning("braintrust proxy hit but BRAINTRUST_API_KEY not configured; refusing")
+        logger.warning(
+            "braintrust proxy hit but BRAINTRUST_API_KEY not configured; refusing run_id=%s leg=%s",
+            ticket.run_id,
+            leg,
+        )
         raise HTTPException(status_code=503, detail="braintrust_not_configured")
 
     body = await request.body()
@@ -100,6 +104,7 @@ async def proxy_braintrust(
             leg,
             path,
             type(e).__name__,
+            exc_info=True,
         )
         raise HTTPException(
             status_code=502,

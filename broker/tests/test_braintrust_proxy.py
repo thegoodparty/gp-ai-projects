@@ -1,3 +1,4 @@
+import logging
 import time
 from unittest.mock import MagicMock
 
@@ -18,7 +19,7 @@ FAKE_BT_KEY = "sk-bt-real-braintrust-key"
 VALID_BROKER_TOKEN = "valid-broker-token-abc"
 
 
-def _make_ticket(expired: bool = False) -> ScopeTicket:
+def _make_ticket() -> ScopeTicket:
     now = int(time.time())
     return ScopeTicket(
         pk=VALID_BROKER_TOKEN,
@@ -27,7 +28,7 @@ def _make_ticket(expired: bool = False) -> ScopeTicket:
         experiment_id="voter_targeting",
         scope={"databricks": ["SELECT"]},
         params={"state": "CA"},
-        exp=now + (-3600 if expired else 3600),
+        exp=now + 3600,
         issued_at=now,
         issued_by="dispatch_lambda",
     )
@@ -172,3 +173,54 @@ class TestBraintrustProxyAuth:
 
         assert resp.status_code == 503
         assert calls == []
+
+    def test_unconfigured_key_warning_includes_run_id_correlation(self, caplog):
+        app = _create_test_app(api_key="")
+        client = TestClient(app)
+
+        with caplog.at_level(logging.WARNING, logger="broker.endpoints.braintrust_proxy"):
+            resp = client.post(
+                "/braintrust/api/logs3",
+                content=b"{}",
+                headers={"authorization": f"Bearer {VALID_BROKER_TOKEN}"},
+            )
+
+        assert resp.status_code == 503
+        warnings = [r for r in caplog.records if "not configured" in r.getMessage()]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "run-001" in message
+        assert "leg=api" in message
+
+
+class TestBraintrustProxyRouting:
+    def test_unknown_leg_returns_404_and_skips_upstream(self):
+        calls: list[httpx.Request] = []
+        app = _create_test_app(calls=calls)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/braintrust/bogus/x",
+            content=b"{}",
+            headers={"authorization": f"Bearer {VALID_BROKER_TOKEN}"},
+        )
+
+        assert resp.status_code == 404
+        assert calls == []
+
+
+class TestBraintrustProxyUpstreamErrors:
+    def test_upstream_error_returns_502(self):
+        def failing_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("boom")
+
+        app = _create_test_app(upstream_transport=httpx.MockTransport(failing_handler))
+        client = TestClient(app)
+
+        resp = client.post(
+            "/braintrust/api/logs3",
+            content=b"{}",
+            headers={"authorization": f"Bearer {VALID_BROKER_TOKEN}"},
+        )
+
+        assert resp.status_code == 502
