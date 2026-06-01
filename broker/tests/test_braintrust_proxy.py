@@ -132,6 +132,30 @@ class TestBraintrustProxyForwarding:
         assert calls[0].url.host == "www.braintrust.dev"
         assert calls[0].url.path == "/api/project"
 
+    def test_strips_transfer_encoding_so_no_framing_contradiction(self):
+        # We read the body and forward it as bytes, so httpx sets content-length.
+        # A forwarded request carrying both transfer-encoding and content-length
+        # is an RFC 7230 framing contradiction upstreams reject — so the proxy
+        # must drop a client-supplied transfer-encoding.
+        calls: list[httpx.Request] = []
+        app = _create_test_app(calls=calls)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/braintrust/api/logs3",
+            content=b'{"rows":[]}',
+            headers={
+                "authorization": f"Bearer {VALID_BROKER_TOKEN}",
+                "transfer-encoding": "chunked",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert len(calls) == 1
+        fwd = {k.lower() for k in calls[0].headers.keys()}
+        assert "transfer-encoding" not in fwd
+        assert "content-length" in fwd
+
 
 class TestBraintrustProxyAuth:
     def test_invalid_broker_token_returns_401_and_skips_upstream(self):

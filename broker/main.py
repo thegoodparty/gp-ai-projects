@@ -131,10 +131,15 @@ async def lifespan(app: FastAPI):
     upstream_client = httpx.AsyncClient(base_url="https://api.anthropic.com", timeout=300)
     s3_client = boto3.client("s3")
     sqs_client = boto3.client("sqs")
-    # Shared async client used by anthropic_proxy and agent_mcp_proxy. The
-    # unified /http/fetch endpoint routes through PlaywrightBrowserFetcher
-    # below — plain httpx is 403'd by Cloudflare's JS challenge on muni sites.
+    # Shared async client used by agent_mcp_proxy and the /http/fetch endpoint's
+    # non-browser paths. 30s suits short gp-api/MCP calls; the /http/fetch
+    # endpoint routes through PlaywrightBrowserFetcher below — plain httpx is
+    # 403'd by Cloudflare's JS challenge on muni sites.
     http_client = httpx.AsyncClient(timeout=30)
+    # Dedicated client for the Braintrust proxy. A 30s cap is too tight for the
+    # end-of-run /logs3 trace flush (batched spans); a timeout there 502s and
+    # silently loses telemetry with no retry. 300s matches the anthropic client.
+    braintrust_client = httpx.AsyncClient(timeout=300)
     browser_fetcher = PlaywrightBrowserFetcher()
     await browser_fetcher.start()
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
@@ -171,7 +176,7 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[get_anthropic_api_key] = lambda: secrets.anthropic_api_key
 
     app.dependency_overrides[braintrust_get_broker_auth] = lambda: broker_auth
-    app.dependency_overrides[braintrust_get_upstream_client] = lambda: http_client
+    app.dependency_overrides[braintrust_get_upstream_client] = lambda: braintrust_client
     app.dependency_overrides[get_braintrust_api_key] = lambda: secrets.braintrust_api_key
 
     app.dependency_overrides[publish_get_scope_ticket] = _resolve_ticket_from_request
@@ -232,6 +237,7 @@ async def lifespan(app: FastAPI):
     finally:
         await upstream_client.aclose()
         await http_client.aclose()
+        await braintrust_client.aclose()
         await browser_fetcher.aclose()
 
 

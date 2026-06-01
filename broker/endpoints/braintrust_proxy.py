@@ -21,7 +21,11 @@ _UPSTREAM_HOSTS = {
 
 # Hop-by-hop and host-scoped headers that must not be forwarded verbatim — the
 # upstream host/length/auth are all set by the proxy, not the client.
-_STRIP_REQUEST_HEADERS = {"host", "authorization", "content-length", "connection"}
+# transfer-encoding is stripped because we read the full body and forward it as
+# bytes; httpx then sets content-length, and a request carrying both
+# transfer-encoding and content-length is a framing contradiction (RFC 7230
+# §3.3.3) that upstreams reject with 400.
+_STRIP_REQUEST_HEADERS = {"host", "authorization", "content-length", "connection", "transfer-encoding"}
 
 
 def get_broker_auth() -> BrokerTokenAuth:
