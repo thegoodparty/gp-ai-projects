@@ -232,6 +232,35 @@ async def test_publish_failure_then_report_status_failure_leaves_callback_unsent
 
 
 @pytest.mark.asyncio
+async def test_main_falls_back_to_sqs_when_outer_report_status_fails():
+    """Broker fully down: run_experiment raises (no callback marked), then main()'s
+    outer handler calls report_status which ALSO raises. Without an SQS fallback
+    the exception escapes main() and the gp-api run row hangs PENDING forever.
+    main() must fall back to _send_failed_to_sqs_directly, matching the config-load
+    failure path."""
+    from pmf_engine.runner.main import _reset_callback_marker
+
+    _reset_callback_marker()
+    config = _make_config(instruction="Do stuff", timeout_seconds=30)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with patch("pmf_engine.runner.main._send_failed_to_sqs_directly") as mock_sqs:
+                                mock_run.side_effect = RuntimeError("kaboom")
+                                mock_publish.report_status.side_effect = Exception("broker down")
+                                with pytest.raises(Exception):
+                                    await main()
+
+    mock_sqs.assert_called_once()
+    assert mock_sqs.call_args.kwargs["run_id"] == config.run_id
+    assert mock_sqs.call_args.kwargs["experiment_id"] == config.experiment_id
+
+
+@pytest.mark.asyncio
 async def test_main_writes_instruction_to_workspace():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = _make_config(instruction="# Test Instruction\n\nDo the thing.")

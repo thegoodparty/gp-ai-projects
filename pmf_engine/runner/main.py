@@ -178,6 +178,39 @@ def _send_failed_to_sqs_directly(
         return False
 
 
+def _report_failed_or_fallback(
+    *,
+    run_id: str,
+    experiment_id: str,
+    reason_code: str,
+    detail: str,
+    duration_seconds: float,
+) -> None:
+    """Send a terminal "failed" status via the broker; if the broker is
+    unreachable (report_status raises), fall back to a direct SQS failed
+    envelope so the gp-api run row flips PENDING → FAILED instead of hanging
+    forever. Mirrors the config-load failure path so every terminal handler
+    in main() is broker-down-safe."""
+    try:
+        publish.report_status(
+            "failed",
+            reason_code=reason_code,
+            detail=detail,
+            duration_seconds=duration_seconds,
+        )
+    except Exception as report_err:
+        logger.exception(
+            "failed_callback_send_failed errorType=ReportStatusError "
+            f"run_id={run_id} error={report_err}"
+        )
+        _send_failed_to_sqs_directly(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            reason_code=reason_code,
+            detail=detail,
+        )
+
+
 def _exit_on_pre_task_shutdown(
     *,
     run_id: str,
@@ -833,8 +866,9 @@ async def main():
                     exc_info=True,
                 )
         _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
-        publish.report_status(
-            "failed",
+        _report_failed_or_fallback(
+            run_id=config.run_id,
+            experiment_id=config.experiment_id,
             reason_code="Timeout",
             detail=f"Experiment timed out after {config.timeout_seconds}s",
             duration_seconds=time.monotonic() - main_start_time,
@@ -844,8 +878,9 @@ async def main():
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
         _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
-        publish.report_status(
-            "failed",
+        _report_failed_or_fallback(
+            run_id=config.run_id,
+            experiment_id=config.experiment_id,
             reason_code="Signal",
             detail="Task terminated by signal",
             duration_seconds=time.monotonic() - main_start_time,
@@ -858,8 +893,9 @@ async def main():
     except Exception as e:
         if _shutdown_requested:
             logger.warning(f"Task terminated by signal for run {config.run_id}")
-            publish.report_status(
-                "failed",
+            _report_failed_or_fallback(
+                run_id=config.run_id,
+                experiment_id=config.experiment_id,
                 reason_code="Signal",
                 detail="Task terminated by signal",
                 duration_seconds=time.monotonic() - main_start_time,
@@ -868,8 +904,9 @@ async def main():
 
         logger.exception(f"Unhandled error in main for run {config.run_id}: {e}")
         if not _is_callback_already_sent():
-            publish.report_status(
-                "failed",
+            _report_failed_or_fallback(
+                run_id=config.run_id,
+                experiment_id=config.experiment_id,
                 reason_code=type(e).__name__,
                 detail=f"Unhandled error: {e}",
                 duration_seconds=time.monotonic() - main_start_time,
