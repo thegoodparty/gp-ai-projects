@@ -385,7 +385,7 @@ async def run_experiment(
         harness = get_harness(config.harness)
 
     bt = BraintrustClient.get_instance()
-    bt.init("pmf-engine")
+    bt.init(f"pmf-engine-{config.environment}")
 
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")
     start_time = time.monotonic()

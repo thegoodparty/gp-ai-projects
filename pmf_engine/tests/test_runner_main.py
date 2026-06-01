@@ -946,7 +946,9 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
     with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
         await run_experiment(config, harness=mock_harness)
 
-    mock_bt.init.assert_called_once_with("pmf-engine")
+    # Per-environment Braintrust project keeps prod a clean eval corpus,
+    # separate from dev/qa smoke noise. config.environment is "dev" here.
+    mock_bt.init.assert_called_once_with("pmf-engine-dev")
 
     call_kwargs = mock_bt.traced_span.call_args[1]
     assert call_kwargs["name"] == "experiment:hello_world"
