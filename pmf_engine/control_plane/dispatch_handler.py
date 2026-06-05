@@ -339,6 +339,60 @@ def _validate_prior_artifact_versions(versions) -> None:
             )
 
 
+# Mirrored in broker InputFileRef.dest and runner input_files._DEST_RE —
+# three-gate defense since `dest` becomes a basename under /workspace/input/.
+# `{0,254}` after the leading char bounds total length at 255 to match the
+# broker's Pydantic Field max_length.
+_INPUT_FILE_DEST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,254}$")
+# Path-traversal guard, not S3 DNS validation — S3 enforces real bucket rules.
+_INPUT_FILE_BUCKET_RE = re.compile(r"^[A-Za-z0-9.\-_]{1,255}$")
+_INPUT_FILE_REQUIRED_KEYS = {"bucket", "key", "dest"}
+# Mirrors prior_artifact_versions cap.
+_MAX_INPUT_FILES = 10
+
+
+def _validate_input_files(value) -> None:
+    """Validate the shape of `_input_files` before it reaches mint / Fargate.
+
+    Parallels `_validate_prior_artifact_versions`. Each entry must carry
+    {bucket, key, dest} where `dest` is a safe basename (the runner writes
+    `/workspace/input/<dest>`, so a slash or `..` here would escape the
+    workspace despite broker + runner re-checks).
+    """
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise ValueError(f"_input_files must be an array, got {type(value).__name__}")
+    if len(value) > _MAX_INPUT_FILES:
+        raise ValueError(f"_input_files too large: {len(value)} entries (max {_MAX_INPUT_FILES})")
+    for i, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ValueError(f"_input_files[{i}] must be an object, got {type(entry).__name__}")
+        missing = _INPUT_FILE_REQUIRED_KEYS - set(entry.keys())
+        if missing:
+            raise ValueError(f"_input_files[{i}] missing required keys: {sorted(missing)}")
+        bucket, key, dest = entry["bucket"], entry["key"], entry["dest"]
+        if not isinstance(bucket, str) or not _INPUT_FILE_BUCKET_RE.fullmatch(bucket):
+            raise ValueError(
+                f"_input_files[{i}].bucket must match [A-Za-z0-9.\\-_]{{1,255}}: got {bucket!r}"
+            )
+        if not isinstance(key, str) or not (0 < len(key) <= 1024):
+            raise ValueError(f"_input_files[{i}].key must be a 1-1024 char string: got {key!r}")
+        if not isinstance(dest, str) or not _INPUT_FILE_DEST_RE.fullmatch(dest):
+            raise ValueError(
+                f"_input_files[{i}].dest must be a simple filename "
+                f"matching [A-Za-z0-9_][A-Za-z0-9._-]*: got {dest!r}"
+            )
+
+
+# Dispatch-envelope metadata that ships inside params. The `_` prefix marks
+# a key as runner-orchestration, not agent input: stripped from params before
+# input_schema validation and before PARAMS_JSON is built, then re-attached
+# to the top-level message for downstream code. Unknown `_`-prefixed keys
+# raise so typos don't silently vanish.
+_RESERVED_ENVELOPE_KEYS = {"_input_files"}
+
+
 def parse_dispatch_message(body: str) -> dict:
     try:
         data = json.loads(body)
@@ -363,6 +417,32 @@ def parse_dispatch_message(body: str) -> dict:
 
     if data.get("params") is None:
         data["params"] = {}
+
+    # Envelope-strip pass. Must happen BEFORE input_schema validation
+    # (otherwise the manifest would need to list `_input_files` in its
+    # schema) and BEFORE building PARAMS_JSON (otherwise the agent's env
+    # would carry runner-orchestration data). Non-dict params is handled
+    # later in the handler loop with an InvalidParamsType error callback,
+    # so we just skip stripping when params isn't a dict.
+    if isinstance(data["params"], dict):
+        unknown_envelope_keys = [
+            k for k in data["params"]
+            if isinstance(k, str)
+            and k.startswith("_")
+            and k not in _RESERVED_ENVELOPE_KEYS
+        ]
+        if unknown_envelope_keys:
+            raise ValueError(
+                f"params contains unknown _-prefixed key(s) "
+                f"{sorted(unknown_envelope_keys)}; reserved for dispatch envelope only"
+            )
+        input_files = data["params"].pop("_input_files", None)
+        if input_files is not None:
+            _validate_input_files(input_files)
+            # Re-attach on the top-level dispatch dict so downstream code
+            # (mint call, INPUT_FILES_JSON env builder) reads it like any
+            # other dispatch field — symmetric with prior_artifact_versions.
+            data["_input_files"] = input_files
 
     _validate_prior_artifact_versions(data.get("prior_artifact_versions"))
     return data
@@ -422,6 +502,17 @@ def build_container_overrides(
             {
                 "name": "ATTACHMENT_VERSION_IDS",
                 "value": json.dumps(experiment["attachment_version_ids"], sort_keys=True),
+            }
+        )
+    # When the dispatch carries enumerated input-file refs (e.g. user-uploaded
+    # agenda PDFs), the runner pre-fetches each via the broker's /inputs/read
+    # endpoint before invoking the agent. Refs travel as a JSON-encoded env var
+    # — refs are small (a few hundred bytes each, capped at 10 entries).
+    if message.get("_input_files"):
+        env.append(
+            {
+                "name": "INPUT_FILES_JSON",
+                "value": json.dumps(message["_input_files"]),
             }
         )
     # Write-action manifest fields (system_prompt, permission_mode,
@@ -627,6 +718,10 @@ def handler(event: dict, context) -> dict:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
         prior_artifact_versions = message.get("prior_artifact_versions")
+        # Reads the envelope key parse_dispatch_message extracted out of
+        # params; renamed to `input_files` here to match the broker's
+        # MintRequest field name (no leading underscore at the API boundary).
+        input_files = message.get("_input_files")
         try:
             broker = get_broker_client()
             mint_result = broker.mint_run_token(
@@ -638,6 +733,7 @@ def handler(event: dict, context) -> dict:
                 clerk_user_id=message.get("clerk_user_id"),
                 exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
                 prior_artifact_versions=prior_artifact_versions,
+                input_files=input_files,
             )
         except BrokerError as e:
             logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")

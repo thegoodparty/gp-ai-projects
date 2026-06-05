@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from broker.auth import get_service_token, verify_service_token
 from broker.dynamodb_client import (
+    InputFileRef,
     ScopeTicket,
     ScopeTicketStore,
     TicketAlreadyExistsError,
@@ -49,6 +50,13 @@ class MintRequest(BaseModel):
     # dispatched against, preserving the STALE invariant for any experiment
     # with downstream dependencies.
     prior_artifact_versions: dict[str, str] | None = None
+    # Optional — enumerated S3 refs the runner is authorized to pre-fetch on
+    # behalf of the agent (e.g. user-uploaded agenda PDFs). Each entry is a
+    # {bucket, key, dest} ref; /inputs/read enforces exact (bucket, key) match
+    # against this list. Refs travel through gp-api's dispatch and dispatch
+    # handler strips the `_input_files` envelope key from params before
+    # validating against the manifest input_schema.
+    input_files: list[InputFileRef] | None = None
 
 
 class MintResponse(BaseModel):
@@ -137,6 +145,7 @@ async def mint_run_token(
         issued_by="dispatch_lambda",
         prior_artifact_versions=request.prior_artifact_versions,
         clerk_user_id=request.clerk_user_id,
+        input_files=request.input_files,
     )
 
     try:
