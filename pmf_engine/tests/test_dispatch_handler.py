@@ -68,6 +68,10 @@ def _default_dispatch_env(monkeypatch):
     monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com", raising=False)
     monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token-xyz", raising=False)
     monkeypatch.setenv("EXPERIMENT_METADATA_BUCKET", "agent-experiment-metadata-test")
+    # Drives _input_files bucket validation in dispatch_handler (expected bucket
+    # is gp-agent-run-inputs-{ENVIRONMENT}). Test fixtures already use the
+    # `-dev` suffix in _VALID_INPUT_FILE, so we set ENVIRONMENT=dev.
+    monkeypatch.setenv("ENVIRONMENT", "dev")
     fake_loader = _build_synthetic_loader()
     monkeypatch.setattr(dh, "_manifest_loader", fake_loader, raising=False)
     monkeypatch.setattr(dh, "get_manifest_loader", lambda: fake_loader)
@@ -2187,7 +2191,7 @@ class TestInputFilesEnvelopeStripping:
             "params": {
                 "state": "WI",
                 "_input_files": [
-                    {"bucket": "b", "key": "k", "dest": "../etc/passwd"}
+                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "../etc/passwd"}
                 ],
             },
         }
@@ -2203,7 +2207,7 @@ class TestInputFilesEnvelopeStripping:
             "params": {
                 "state": "WI",
                 "_input_files": [
-                    {"bucket": "b", "key": "k", "dest": "sub/file.pdf"}
+                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "sub/file.pdf"}
                 ],
             },
         }
@@ -2226,6 +2230,45 @@ class TestInputFilesEnvelopeStripping:
         with pytest.raises(ValueError, match="bucket"):
             parse_dispatch_message(json.dumps(body))
 
+    def test_rejects_wrong_environment_bucket(self, monkeypatch):
+        # Closes the bot-flagged hole where any caller controlling the SQS
+        # message could craft a bucket name and rely solely on broker IAM for
+        # defense. Dev dispatch must NOT authorize reads from the prod bucket.
+        monkeypatch.setenv("ENVIRONMENT", "dev")
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [
+                    {
+                        "bucket": "gp-agent-run-inputs-prod",
+                        "key": "k",
+                        "dest": "f.pdf",
+                    }
+                ],
+            },
+        }
+        with pytest.raises(ValueError, match="gp-agent-run-inputs-dev"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_when_environment_env_var_missing(self, monkeypatch):
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [_VALID_INPUT_FILE],
+            },
+        }
+        with pytest.raises(ValueError, match="ENVIRONMENT"):
+            parse_dispatch_message(json.dumps(body))
+
     def test_rejects_dest_over_255_chars(self):
         body = {
             "experiment_type": "smoke_test",
@@ -2236,7 +2279,7 @@ class TestInputFilesEnvelopeStripping:
                 "state": "WI",
                 "_input_files": [
                     {
-                        "bucket": "b",
+                        "bucket": "gp-agent-run-inputs-dev",
                         "key": "k",
                         # 256 chars — one past the broker's Pydantic max_length=255
                         "dest": "a" * 256,
@@ -2256,7 +2299,7 @@ class TestInputFilesEnvelopeStripping:
             "params": {
                 "state": "WI",
                 "_input_files": [
-                    {"bucket": "b", "key": "k", "dest": "a" * 255},
+                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "a" * 255},
                 ],
             },
         }

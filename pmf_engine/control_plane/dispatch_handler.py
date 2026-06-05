@@ -344,11 +344,20 @@ def _validate_prior_artifact_versions(versions) -> None:
 # `{0,254}` after the leading char bounds total length at 255 to match the
 # broker's Pydantic Field max_length.
 _INPUT_FILE_DEST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,254}$")
-# Path-traversal guard, not S3 DNS validation — S3 enforces real bucket rules.
-_INPUT_FILE_BUCKET_RE = re.compile(r"^[A-Za-z0-9.\-_]{1,255}$")
 _INPUT_FILE_REQUIRED_KEYS = {"bucket", "key", "dest"}
 # Mirrors prior_artifact_versions cap.
 _MAX_INPUT_FILES = 10
+
+
+def _expected_inputs_bucket() -> str:
+    """The single bucket dispatch is allowed to authorize for /inputs/read in
+    this environment. Derived from the ENVIRONMENT env var (`dev`/`qa`/`prod`),
+    matching what gp-ai-projects Terraform creates and what the broker IAM
+    grants GetObject on. Any other bucket name in `_input_files[i].bucket` is
+    rejected — defense in depth atop the broker's ScopeTicket allowlist.
+    """
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    return f"gp-agent-run-inputs-{env}" if env else ""
 
 
 def _validate_input_files(value) -> None:
@@ -357,7 +366,9 @@ def _validate_input_files(value) -> None:
     Parallels `_validate_prior_artifact_versions`. Each entry must carry
     {bucket, key, dest} where `dest` is a safe basename (the runner writes
     `/workspace/input/<dest>`, so a slash or `..` here would escape the
-    workspace despite broker + runner re-checks).
+    workspace despite broker + runner re-checks). `bucket` must equal the
+    single expected inputs bucket for this environment — no caller is
+    legitimately authorized to reference any other bucket.
     """
     if value is None:
         return
@@ -365,6 +376,12 @@ def _validate_input_files(value) -> None:
         raise ValueError(f"_input_files must be an array, got {type(value).__name__}")
     if len(value) > _MAX_INPUT_FILES:
         raise ValueError(f"_input_files too large: {len(value)} entries (max {_MAX_INPUT_FILES})")
+    expected_bucket = _expected_inputs_bucket()
+    if not expected_bucket:
+        raise ValueError(
+            "_input_files cannot be validated: ENVIRONMENT env var missing on dispatch lambda; "
+            "set ENVIRONMENT to one of dev/qa/prod (see modules/pmf-engine-control-plane/main.tf)"
+        )
     for i, entry in enumerate(value):
         if not isinstance(entry, dict):
             raise ValueError(f"_input_files[{i}] must be an object, got {type(entry).__name__}")
@@ -372,9 +389,9 @@ def _validate_input_files(value) -> None:
         if missing:
             raise ValueError(f"_input_files[{i}] missing required keys: {sorted(missing)}")
         bucket, key, dest = entry["bucket"], entry["key"], entry["dest"]
-        if not isinstance(bucket, str) or not _INPUT_FILE_BUCKET_RE.fullmatch(bucket):
+        if not isinstance(bucket, str) or bucket != expected_bucket:
             raise ValueError(
-                f"_input_files[{i}].bucket must match [A-Za-z0-9.\\-_]{{1,255}}: got {bucket!r}"
+                f"_input_files[{i}].bucket must be {expected_bucket!r}: got {bucket!r}"
             )
         if not isinstance(key, str) or not (0 < len(key) <= 1024):
             raise ValueError(f"_input_files[{i}].key must be a 1-1024 char string: got {key!r}")

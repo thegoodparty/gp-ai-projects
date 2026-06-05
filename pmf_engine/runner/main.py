@@ -344,7 +344,14 @@ def _collect_workspace_files(
     total_size = 0
     if not os.path.isdir(root_dir):
         return collected
-    for dirpath, _dirnames, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # User-uploaded inputs (e.g. agenda PDFs pre-fetched by the runner
+        # into /workspace/input/) may contain PII. Don't bundle them into
+        # the log capture that ships to gp-api after a failure — the agent
+        # already has them as part of its run inputs; logs are for the
+        # agent's WORK product, not its input data.
+        if dirpath == root_dir and "input" in dirnames:
+            dirnames.remove("input")
         for filename in filenames:
             if _is_sensitive_file(filename):
                 continue

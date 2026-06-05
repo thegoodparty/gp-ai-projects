@@ -1798,6 +1798,56 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
         )
 
 
+class TestCollectWorkspaceFilesSkipsUserInputs:
+    """User-uploaded inputs (e.g. agenda PDFs pre-fetched to
+    /workspace/input/) may contain PII. They must never end up in the log
+    bundle that ships to gp-api on failure — the agent's WORK product is what
+    we log, not its input data.
+    """
+
+    def test_input_subdirectory_pruned_from_log_capture(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
+
+        (tmp_path / "output").mkdir()
+        (tmp_path / "output" / "result.json").write_text('{"ok": true}')
+        (tmp_path / "instruction.md").write_text("agent instructions")
+
+        # The user-input subdir the prefetch helper creates.
+        (tmp_path / "input").mkdir()
+        (tmp_path / "input" / "agenda.pdf").write_bytes(b"%PDF-1.4 user data")
+
+        collected = _collect_workspace_files(str(tmp_path))
+        keys = set(collected.keys())
+
+        assert "workspace/output/result.json" in keys, (
+            f"output/result.json should be collected, got keys: {keys}"
+        )
+        assert "workspace/instruction.md" in keys, (
+            f"instruction.md should be collected, got keys: {keys}"
+        )
+        assert "workspace/input/agenda.pdf" not in keys, (
+            f"input/agenda.pdf must NOT be collected (user-uploaded), got keys: {keys}"
+        )
+
+    def test_nested_input_directory_below_top_level_is_collected(self, tmp_path):
+        # The prune-on-walk targets only the TOP-LEVEL `input` next to the
+        # workspace root. A non-top-level `input` directory created by an
+        # agent's own work (e.g. `output/components/input/foo.md`) is NOT
+        # user-uploaded and should still be captured.
+        from pmf_engine.runner.main import _collect_workspace_files
+
+        nested = tmp_path / "output" / "subtree" / "input"
+        nested.mkdir(parents=True)
+        (nested / "agent-note.md").write_text("agent wrote this")
+
+        collected = _collect_workspace_files(str(tmp_path))
+        keys = set(collected.keys())
+
+        assert "workspace/output/subtree/input/agent-note.md" in keys, (
+            f"nested input/ files should still be collected, got keys: {keys}"
+        )
+
+
 class TestBrokerInitLastResortSqsFallback:
     """C2: When BOTH init_config AND the subsequent RunnerConfig.from_env
     broker fetch fail, the runner has no broker channel to send a failed
