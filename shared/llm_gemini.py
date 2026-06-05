@@ -224,51 +224,52 @@ class GeminiClient:
         
         return types.GenerateContentConfig(**config_params)
     
-    def _calculate_cost(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
-        """Calculate cost for API usage based on model and token counts."""
+    def _calculate_cost(self, model_name: str, prompt_tokens: int, completion_tokens: int, thinking_tokens: int = 0) -> float:
+        """Calculate cost for API usage based on model and token counts.
+        Thinking tokens are billed at the same output rate as completion tokens."""
         model_key = model_name.lower()
         if model_key not in GEMINI_PRICING:
             # Default to flash pricing if model not found
             model_key = 'gemini-2.5-flash'
-            
+
         pricing = GEMINI_PRICING[model_key]
         input_cost = (prompt_tokens / 1_000_000) * pricing['input']
-        output_cost = (completion_tokens / 1_000_000) * pricing['output']
+        output_cost = ((completion_tokens + thinking_tokens) / 1_000_000) * pricing['output']
         total_cost = input_cost + output_cost
-        
-        self.logger.debug(f"Cost calculated for {model_name}: ${total_cost:.6f} (input: ${input_cost:.6f}, output: ${output_cost:.6f})")
+
+        self.logger.debug(f"Cost calculated for {model_name}: ${total_cost:.6f} (input: ${input_cost:.6f}, output: ${output_cost:.6f}, thinking_tokens: {thinking_tokens})")
         return total_cost
-    
+
     def _track_usage(self, response, model_name: str = None):
         if hasattr(response, 'usage_metadata') and response.usage_metadata:
             usage = response.usage_metadata
             total_tokens = getattr(usage, 'total_token_count', 0) or 0
             thinking_tokens = getattr(usage, 'thoughts_token_count', 0) or 0
             search_tokens = getattr(usage, 'tool_use_prompt_token_count', 0) or 0
-            
+
             # Extract prompt and completion tokens for cost calculation
             prompt_tokens = getattr(usage, 'prompt_token_count', 0) or 0
             completion_tokens = getattr(usage, 'candidates_token_count', 0) or 0
-            
+
             # If we don't have detailed breakdown, estimate from total
             if prompt_tokens == 0 and completion_tokens == 0 and total_tokens > 0:
                 # Estimate: roughly 70% prompt, 30% completion for typical interactions
                 prompt_tokens = int(total_tokens * 0.7)
                 completion_tokens = total_tokens - prompt_tokens
-            
+
             self.total_tokens += total_tokens
             self.total_thinking_tokens += thinking_tokens
             self.total_search_tokens += search_tokens
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
             self.api_call_count += 1
-            
-            # Calculate and track cost
+
+            # Calculate and track cost — thinking tokens billed at output rate
             if model_name:
-                cost = self._calculate_cost(model_name, prompt_tokens, completion_tokens)
+                cost = self._calculate_cost(model_name, prompt_tokens, completion_tokens, thinking_tokens)
                 self.total_cost += cost
-                
-                self.logger.debug(f"Token usage - Total: {total_tokens}, Prompt: {prompt_tokens}, Completion: {completion_tokens}, Cost: ${cost:.6f}")
+
+                self.logger.debug(f"Token usage - Total: {total_tokens}, Prompt: {prompt_tokens}, Completion: {completion_tokens}, Thinking: {thinking_tokens}, Cost: ${cost:.6f}")
             else:
                 self.logger.debug(f"Token usage - Total: {total_tokens}, Thinking: {thinking_tokens}, Search: {search_tokens}")
             
