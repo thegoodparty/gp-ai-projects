@@ -70,6 +70,12 @@ def prefetch_input_files(
             timeout=30.0,
         )
 
+    # Track files we've written so we can roll back on partial failure.
+    # If iteration N fails after iterations 1..N-1 succeeded, the already-
+    # written files would otherwise linger under /workspace/input/ — they're
+    # user-uploaded PDFs that may contain PII, and the agent would see a
+    # partial set of inputs which is worse than seeing none.
+    written: list[Path] = []
     try:
         for entry in entries:
             bucket = entry["bucket"]
@@ -91,10 +97,25 @@ def prefetch_input_files(
             # it loudly here rather than racing on bytes.
             with open(target, "xb") as f:
                 f.write(response.content)
+            written.append(target)
             logger.info(
                 "prefetched_input_file dest=%r bucket=%r key=%r bytes=%d",
                 dest, bucket, key, len(response.content),
             )
+    except BaseException:
+        # On ANY failure (broker error, unsafe dest, FileExistsError on
+        # duplicate dest, KeyError on malformed entry, KeyboardInterrupt),
+        # remove the files we already wrote so the agent never starts up
+        # against a partial input set. Use BaseException so SystemExit /
+        # KeyboardInterrupt also trigger cleanup. Unlink errors are
+        # swallowed — we're already on a failure path; raising here would
+        # mask the original exception.
+        for path in written:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
     finally:
         if owns_client:
             client.close()

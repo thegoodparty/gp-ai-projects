@@ -78,13 +78,19 @@ def inputs_read(
             ),
         )
 
-    body = s3_response["Body"].read()
+    # Bound the in-memory load even when the ContentLength header is missing
+    # — boto3's StreamingBody.read(amt) reads at most amt bytes. We read
+    # MAX_INPUT_BYTES + 1 so that any object exceeding the cap by even one
+    # byte produces a body longer than the cap and we can reject without
+    # loading the rest. Defends against an OOM via an oversized object that
+    # somehow slipped past the upload-time cap and lacks Content-Length.
+    body = s3_response["Body"].read(MAX_INPUT_BYTES + 1)
     if len(body) > MAX_INPUT_BYTES:
         raise HTTPException(
             status_code=413,
             detail=(
                 f"Input file exceeds {MAX_INPUT_BYTES}-byte cap "
-                f"(size={len(body)})"
+                f"(size>={len(body)})"
             ),
         )
 

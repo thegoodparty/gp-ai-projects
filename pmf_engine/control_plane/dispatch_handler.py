@@ -310,6 +310,13 @@ def _missing_critical_config() -> list[str]:
         missing.append("SERVICE_TOKEN")
     if not os.environ.get("EXPERIMENT_METADATA_BUCKET", "").strip():
         missing.append("EXPERIMENT_METADATA_BUCKET")
+    # ENVIRONMENT drives the expected `_input_files` bucket name. Without it,
+    # _validate_input_files raises ValueError on any dispatch carrying user
+    # uploads — surface the misconfig via the standard
+    # "dispatch-misconfig" error-callback path instead of letting the message
+    # dead-letter on an uncaught parse error.
+    if not os.environ.get("ENVIRONMENT", "").strip():
+        missing.append("ENVIRONMENT")
     return missing
 
 

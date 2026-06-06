@@ -266,3 +266,65 @@ class TestPrefetchDuplicateDestRejected:
                 BROKER_TOKEN,
                 client=_client_returning(handler),
             )
+
+
+class TestPrefetchCleansUpOnPartialFailure:
+    """User-uploaded PDFs may contain PII. If the second of N inputs fails to
+    fetch, the agent must NOT start up against a partial input set — both
+    because the first file would leak PII via log capture / error reports,
+    and because briefing against a partial input is incorrect.
+    """
+
+    def test_partial_fetch_failure_removes_already_written_files(
+        self, tmp_path, monkeypatch
+    ):
+        _set_input_files_env(
+            monkeypatch,
+            [
+                {"bucket": "b", "key": "k1", "dest": "agenda.pdf"},
+                {"bucket": "b", "key": "k2", "dest": "appendix.pdf"},
+            ],
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            if body["key"] == "k1":
+                return httpx.Response(200, content=b"agenda bytes")
+            # Second entry: broker 403 (e.g. ScopeTicket allowlist mismatch).
+            return httpx.Response(403, json={"detail": "not authorized"})
+
+        with pytest.raises(httpx.HTTPStatusError):
+            prefetch_input_files(
+                str(tmp_path),
+                BROKER_URL,
+                BROKER_TOKEN,
+                client=_client_returning(handler),
+            )
+
+        # Both files must be absent — the first one was rolled back.
+        assert not (tmp_path / "input" / "agenda.pdf").exists()
+        assert not (tmp_path / "input" / "appendix.pdf").exists()
+
+    def test_unsafe_dest_in_later_entry_rolls_back_earlier_writes(
+        self, tmp_path, monkeypatch
+    ):
+        _set_input_files_env(
+            monkeypatch,
+            [
+                {"bucket": "b", "key": "k1", "dest": "agenda.pdf"},
+                {"bucket": "b", "key": "k2", "dest": "../escape.pdf"},
+            ],
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"first file content")
+
+        with pytest.raises(ValueError, match="unsafe input_files dest"):
+            prefetch_input_files(
+                str(tmp_path),
+                BROKER_URL,
+                BROKER_TOKEN,
+                client=_client_returning(handler),
+            )
+
+        assert not (tmp_path / "input" / "agenda.pdf").exists()
