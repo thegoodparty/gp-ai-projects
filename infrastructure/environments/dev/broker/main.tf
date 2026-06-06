@@ -21,6 +21,17 @@ provider "aws" {
   region = "us-west-2"
 }
 
+# Bootstrap toggle for the agent_run_inputs cross-stack lookup. Lets a fresh
+# dev environment plan/apply this stack before agent-run-inputs/dev exists,
+# matching the pattern qa and prod use. Other cross-stack lookups in this
+# file (fargate, control_plane, agent_experiment_metadata) predate this
+# variable; tightening them similarly is out of scope here.
+variable "bootstrap_agent_run_inputs" {
+  type        = bool
+  default     = false
+  description = "Skip the agent_run_inputs remote_state lookup so plan succeeds before that stack exists. The broker module's count-guarded attachment leaves the IAM grant unset until the variable flips back to false on the second apply."
+}
+
 data "terraform_remote_state" "fargate" {
   backend = "s3"
   config = {
@@ -57,6 +68,8 @@ data "terraform_remote_state" "agent_experiment_metadata" {
 }
 
 data "terraform_remote_state" "agent_run_inputs" {
+  count = var.bootstrap_agent_run_inputs ? 0 : 1
+
   backend = "s3"
   config = {
     bucket = "goodparty-terraform-state-us-west-2"
@@ -111,7 +124,7 @@ module "broker" {
 
   sns_topic_arn = try(data.terraform_remote_state.fargate.outputs.sns_topic_arn, "")
 
-  agent_run_inputs_read_policy_arn = data.terraform_remote_state.agent_run_inputs.outputs.read_policy_arn
+  agent_run_inputs_read_policy_arn = try(data.terraform_remote_state.agent_run_inputs[0].outputs.read_policy_arn, "")
 }
 
 output "security_group_id" {
