@@ -1013,6 +1013,44 @@ class TestMissingCriticalEnvVars:
         assert "EXPERIMENT_METADATA_BUCKET" in error_msg
         assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_missing_environment_routes_to_misconfig_callback_not_invalid_payload(
+        self, mock_get_ecs, mock_send_error_callback, monkeypatch
+    ):
+        """Bot-flagged regression: when ENVIRONMENT is unset, a dispatch
+        carrying `_input_files` made _validate_input_files raise ValueError,
+        which the previous handler caught as InvalidDispatchPayload (retry-
+        forever-to-DLQ) instead of surfacing the dispatch-misconfig callback
+        the operator needs to see. Verify the misconfig path now fires
+        BEFORE parse, regardless of whether the dispatch carries envelope keys.
+        """
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+        event = _make_sqs_event(
+            {
+                "experiment_type": "meeting_briefing",
+                "organization_slug": "org-123",
+                "run_id": "run-env-missing",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {
+                    "state": "WI",
+                    "_input_files": [_VALID_INPUT_FILE],
+                },
+            }
+        )
+
+        result = handler(event, None)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        error_msg = mock_send_error_callback.call_args[0][1]
+        assert "ENVIRONMENT" in error_msg
+        assert (
+            mock_send_error_callback.call_args.kwargs["dedup_id"]
+            == "dispatch-misconfig-run-env-missing"
+        )
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+
 
 class TestParamsSizeLimit:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -1068,6 +1106,51 @@ class TestParamsSizeLimit:
         result = handler(event, None)
         assert result["batchItemFailures"] == []
         mock_ecs.run_task.assert_called_once()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_oversized_input_files_rejected_before_ecs(
+        self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
+    ):
+        # Worst-case-shaped entries: bucket-name max + key-max + dest-max
+        # serialize to ~1.3 KB each. 10 entries → ~13 KB, well past the
+        # ECS RunTask containerOverrides budget. Verify the cap fires before
+        # ECS is called and gets a clean dispatch-side error callback rather
+        # than RunTask silently truncating / failing.
+        bucket = "gp-agent-run-inputs-dev"
+        oversized_entries = [
+            {
+                "bucket": bucket,
+                "key": "k" * 1024,
+                "dest": "f" * 200 + str(i),
+            }
+            for i in range(10)
+        ]
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-big-inputs",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {
+                    **VALID_PARAMS,
+                    "_input_files": oversized_entries,
+                },
+            }
+        )
+
+        result = handler(event, None)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        error_msg = mock_send_error_callback.call_args[0][1]
+        assert "_input_files" in error_msg
+        assert "exceeds limit" in error_msg
+        assert (
+            mock_send_error_callback.call_args.kwargs["dedup_id"]
+            == "input-files-too-large-run-big-inputs"
+        )
+        assert result["batchItemFailures"] == []
 
 
 class TestRequiredParamsValidation:

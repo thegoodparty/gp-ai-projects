@@ -322,6 +322,16 @@ def _missing_critical_config() -> list[str]:
 
 MAX_PARAMS_JSON_BYTES = 6000
 
+# Cap on the serialized INPUT_FILES_JSON env var the dispatch sets on the
+# Fargate task. AWS ECS RunTask limits the total `containerOverrides[]`
+# environment payload, and our other env vars (PARAMS_JSON, ANTHROPIC_BASE_URL,
+# etc.) already consume budget. With realistic agenda-upload entries
+# (~150–300 bytes each), 4000 bytes covers 10+ entries; with worst-case
+# max-length entries (~1.3 KB each) it covers ~3. Reject larger payloads at
+# dispatch with a clean error callback rather than letting RunTask fail
+# silently on oversize overrides.
+MAX_INPUT_FILES_JSON_BYTES = 4000
+
 _PRIOR_ARTIFACT_VALUE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_-]{1,64}/artifact\.json$")
 
 
@@ -556,26 +566,41 @@ def handler(event: dict, context) -> dict:
         message_id = record.get("messageId", "unknown")
         body = record.get("body", "")
 
+        # When the Lambda is misconfigured (e.g. ENVIRONMENT unset), the strict
+        # parse below will raise on dispatches that exercise envelope validation
+        # — and that ValueError would otherwise be caught as InvalidDispatchPayload,
+        # masking the underlying misconfig. Check config FIRST and route through
+        # the dispatch-misconfig callback path. A minimal lenient parse extracts
+        # just enough message identity to make the callback useful; the strict
+        # parse below validates the envelope only after config is healthy.
+        if missing_config:
+            try:
+                partial = json.loads(body) if body else {}
+                shallow: dict = partial if isinstance(partial, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                shallow = {}
+            shallow.setdefault("run_id", "unknown")
+            shallow.setdefault("experiment_type", "_unknown")
+            shallow.setdefault("organization_slug", "unknown")
+            logger.error(
+                f"Dispatch Lambda misconfigured: missing required env vars "
+                f"{missing_config} (run: {shallow['run_id']}). "
+                f"Message will be retried via SQS until operator fixes config."
+            )
+            send_error_callback(
+                shallow,
+                f"Dispatch Lambda misconfigured: missing required env vars {missing_config}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"dispatch-misconfig-{shallow['run_id']}",
+            )
+            batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+
         try:
             message = parse_dispatch_message(body)
         except ValueError as e:
             logger.error(f"Invalid message {message_id}: {e}")
             emit_dispatch_metric("InvalidDispatchPayload", "_unknown")
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-
-        if missing_config:
-            logger.error(
-                f"Dispatch Lambda misconfigured: missing required env vars "
-                f"{missing_config} (run: {message['run_id']}). "
-                f"Message will be retried via SQS until operator fixes config."
-            )
-            send_error_callback(
-                message,
-                f"Dispatch Lambda misconfigured: missing required env vars {missing_config}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"dispatch-misconfig-{message['run_id']}",
-            )
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
@@ -653,6 +678,27 @@ def handler(event: dict, context) -> dict:
             if not sent:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
+
+        if message.get("_input_files"):
+            input_files_json = json.dumps(message["_input_files"])
+            input_files_bytes = len(input_files_json.encode("utf-8"))
+            if input_files_bytes > MAX_INPUT_FILES_JSON_BYTES:
+                logger.error(
+                    f"_input_files too large for {experiment_id} "
+                    f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
+                    f"{input_files_bytes} bytes > {MAX_INPUT_FILES_JSON_BYTES}"
+                )
+                emit_dispatch_metric("InputFilesJsonTooLarge", experiment_id)
+                sent = send_error_callback(
+                    message,
+                    f"_input_files serialized size exceeds limit "
+                    f"({input_files_bytes} > {MAX_INPUT_FILES_JSON_BYTES} bytes)",
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"input-files-too-large-{message['run_id']}",
+                )
+                if not sent:
+                    batch_item_failures.append({"itemIdentifier": message_id})
+                continue
 
         # Validate the dispatch message's params against the manifest's
         # input_schema (JSON Schema Draft-07). The meta-schema makes
