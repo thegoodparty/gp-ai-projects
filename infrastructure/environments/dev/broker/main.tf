@@ -21,15 +21,17 @@ provider "aws" {
   region = "us-west-2"
 }
 
-# Bootstrap toggle for the agent_run_inputs cross-stack lookup. Lets a fresh
-# dev environment plan/apply this stack before agent-run-inputs/dev exists,
-# matching the pattern qa and prod use. Other cross-stack lookups in this
-# file (fargate, control_plane, agent_experiment_metadata) predate this
-# variable; tightening them similarly is out of scope here.
-variable "bootstrap_agent_run_inputs" {
+# Bootstrap toggle, named to match qa/prod so operators use one procedure
+# (`-var bootstrap=true` on first apply, then false) across every environment.
+# On qa/prod `bootstrap` guards the whole stack because a fresh env has nothing
+# yet; on dev everything else already exists, so the only thing left to guard
+# is the agent_run_inputs cross-stack lookup. Same flag, same intent — it just
+# has less to guard here. Other dev lookups (fargate, control_plane,
+# agent_experiment_metadata) predate this and aren't bootstrap-gated.
+variable "bootstrap" {
   type        = bool
   default     = false
-  description = "Skip the agent_run_inputs remote_state lookup so plan succeeds before that stack exists. The broker module's count-guarded attachment leaves the IAM grant unset until the variable flips back to false on the second apply."
+  description = "Skip the agent_run_inputs remote_state lookup so plan succeeds before that stack exists. Mirrors the qa/prod bootstrap flag; on dev it gates only this lookup (the rest of the stack is already applied). The broker module's count-guarded attachment leaves the IAM grant unset until the variable flips back to false on the second apply."
 }
 
 data "terraform_remote_state" "fargate" {
@@ -68,7 +70,7 @@ data "terraform_remote_state" "agent_experiment_metadata" {
 }
 
 data "terraform_remote_state" "agent_run_inputs" {
-  count = var.bootstrap_agent_run_inputs ? 0 : 1
+  count = var.bootstrap ? 0 : 1
 
   backend = "s3"
   config = {

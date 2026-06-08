@@ -39,6 +39,7 @@ locals {
     ]
     prod = [
       "https://goodparty.org",
+      "https://www.goodparty.org",
     ]
   }
 }
