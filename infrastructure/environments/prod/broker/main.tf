@@ -124,8 +124,6 @@ module "broker" {
   results_queue_arn = data.aws_sqs_queue.results[0].arn
   results_queue_url = data.aws_sqs_queue.results[0].url
 
-  gp_api_sqs_queue_arn = data.aws_sqs_queue.results[0].arn
-
   sns_topic_arn = try(data.terraform_remote_state.fargate[0].outputs.sns_topic_arn, "")
 
   agent_run_inputs_read_policy_arn = try(data.terraform_remote_state.agent_run_inputs[0].outputs.read_policy_arn, "")
