@@ -58,7 +58,7 @@ from shared.braintrust import (
     init_braintrust,
     trace_pipeline,
 )
-from shared.llm_gemini_3 import Gemini3Client
+from shared.llm_gemini_3 import Gemini3Client, GeminiModelType, ThinkingLevel
 
 PROJECT = "braintrust-eval-sandbox"
 DATASET_NAME = "braintrust-eval-sandbox"
@@ -270,7 +270,10 @@ def pipeline_task(input: dict, hooks: Any) -> dict:
     main_prompt_built = params["main_prompt"].build(**input)
     main_prompt_text = flatten_prompt_messages(main_prompt_built)
 
-    llm_client = Gemini3Client()
+    llm_client = Gemini3Client(
+        default_model=GeminiModelType.FLASH_3_5,
+        thinking_level=ThinkingLevel.HIGH,
+    )
 
     with trace_pipeline(
         "pipeline_task",
@@ -377,7 +380,7 @@ EVAL_PARAMETERS: dict[str, Any] = {
                 "type": "chat",
                 "messages": [{"role": "system", "content": ""}],
             },
-            "options": {"model": "gemini-3-flash-preview"},
+            "options": {"model": "gemini-3.5-flash"},
         },
     },
     "structured_output_prompt": {
@@ -401,7 +404,7 @@ EVAL_PARAMETERS: dict[str, Any] = {
                     }
                 ],
             },
-            "options": {"model": "gemini-3-flash-preview"},
+            "options": {"model": "gemini-3.5-flash"},
         },
     },
     "structured_output_schema": _StructuredOutputSchemaParam,
