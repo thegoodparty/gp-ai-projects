@@ -21,6 +21,19 @@ provider "aws" {
   region = "us-west-2"
 }
 
+# Bootstrap toggle, named to match qa/prod so operators use one procedure
+# (`-var bootstrap=true` on first apply, then false) across every environment.
+# On qa/prod `bootstrap` guards the whole stack because a fresh env has nothing
+# yet; on dev everything else already exists, so the only thing left to guard
+# is the agent_run_inputs cross-stack lookup. Same flag, same intent — it just
+# has less to guard here. Other dev lookups (fargate, control_plane,
+# agent_experiment_metadata) predate this and aren't bootstrap-gated.
+variable "bootstrap" {
+  type        = bool
+  default     = false
+  description = "Skip the agent_run_inputs remote_state lookup so plan succeeds before that stack exists. Mirrors the qa/prod bootstrap flag; on dev it gates only this lookup (the rest of the stack is already applied). The broker module's count-guarded attachment leaves the IAM grant unset until the variable flips back to false on the second apply."
+}
+
 data "terraform_remote_state" "fargate" {
   backend = "s3"
   config = {
@@ -52,6 +65,17 @@ data "terraform_remote_state" "agent_experiment_metadata" {
   config = {
     bucket = "goodparty-terraform-state-us-west-2"
     key    = "agent-experiment-metadata/dev/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
+data "terraform_remote_state" "agent_run_inputs" {
+  count = var.bootstrap ? 0 : 1
+
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "agent-run-inputs/dev/terraform.tfstate"
     region = "us-west-2"
   }
 }
@@ -101,6 +125,8 @@ module "broker" {
   gp_api_sqs_queue_arn = data.aws_sqs_queue.results.arn
 
   sns_topic_arn = try(data.terraform_remote_state.fargate.outputs.sns_topic_arn, "")
+
+  agent_run_inputs_read_policy_arn = try(data.terraform_remote_state.agent_run_inputs[0].outputs.read_policy_arn, "")
 }
 
 output "security_group_id" {

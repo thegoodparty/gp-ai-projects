@@ -310,10 +310,27 @@ def _missing_critical_config() -> list[str]:
         missing.append("SERVICE_TOKEN")
     if not os.environ.get("EXPERIMENT_METADATA_BUCKET", "").strip():
         missing.append("EXPERIMENT_METADATA_BUCKET")
+    # ENVIRONMENT drives the expected `_input_files` bucket name. Without it,
+    # _validate_input_files raises ValueError on any dispatch carrying user
+    # uploads — surface the misconfig via the standard
+    # "dispatch-misconfig" error-callback path instead of letting the message
+    # dead-letter on an uncaught parse error.
+    if not os.environ.get("ENVIRONMENT", "").strip():
+        missing.append("ENVIRONMENT")
     return missing
 
 
 MAX_PARAMS_JSON_BYTES = 6000
+
+# Cap on the serialized INPUT_FILES_JSON env var the dispatch sets on the
+# Fargate task. AWS ECS RunTask limits the total `containerOverrides[]`
+# environment payload, and our other env vars (PARAMS_JSON, ANTHROPIC_BASE_URL,
+# etc.) already consume budget. With realistic agenda-upload entries
+# (~150–300 bytes each), 4000 bytes covers 10+ entries; with worst-case
+# max-length entries (~1.3 KB each) it covers ~3. Reject larger payloads at
+# dispatch with a clean error callback rather than letting RunTask fail
+# silently on oversize overrides.
+MAX_INPUT_FILES_JSON_BYTES = 4000
 
 _PRIOR_ARTIFACT_VALUE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}/[A-Za-z0-9_-]{1,64}/artifact\.json$")
 
@@ -337,6 +354,77 @@ def _validate_prior_artifact_versions(versions) -> None:
                 f"'<experiment_id>/<run_id>/artifact.json' pattern "
                 f"(segments [A-Za-z0-9_-]{{1,64}}): got {value!r}"
             )
+
+
+# Mirrored in broker InputFileRef.dest and runner input_files._DEST_RE —
+# three-gate defense since `dest` becomes a basename under /workspace/input/.
+# `{0,254}` after the leading char bounds total length at 255 to match the
+# broker's Pydantic Field max_length.
+_INPUT_FILE_DEST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,254}$")
+_INPUT_FILE_REQUIRED_KEYS = {"bucket", "key", "dest"}
+# Mirrors prior_artifact_versions cap.
+_MAX_INPUT_FILES = 10
+
+
+def _expected_inputs_bucket() -> str:
+    """The single bucket dispatch is allowed to authorize for /inputs/read in
+    this environment. Derived from the ENVIRONMENT env var (`dev`/`qa`/`prod`),
+    matching what gp-ai-projects Terraform creates and what the broker IAM
+    grants GetObject on. Any other bucket name in `_input_files[i].bucket` is
+    rejected — defense in depth atop the broker's ScopeTicket allowlist.
+    """
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    return f"gp-agent-run-inputs-{env}" if env else ""
+
+
+def _validate_input_files(value) -> None:
+    """Validate the shape of `_input_files` before it reaches mint / Fargate.
+
+    Parallels `_validate_prior_artifact_versions`. Each entry must carry
+    {bucket, key, dest} where `dest` is a safe basename (the runner writes
+    `/workspace/input/<dest>`, so a slash or `..` here would escape the
+    workspace despite broker + runner re-checks). `bucket` must equal the
+    single expected inputs bucket for this environment — no caller is
+    legitimately authorized to reference any other bucket.
+    """
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise ValueError(f"_input_files must be an array, got {type(value).__name__}")
+    if len(value) > _MAX_INPUT_FILES:
+        raise ValueError(f"_input_files too large: {len(value)} entries (max {_MAX_INPUT_FILES})")
+    expected_bucket = _expected_inputs_bucket()
+    if not expected_bucket:
+        raise ValueError(
+            "_input_files cannot be validated: ENVIRONMENT env var missing on dispatch lambda; "
+            "set ENVIRONMENT to one of dev/qa/prod (see modules/pmf-engine-control-plane/main.tf)"
+        )
+    for i, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ValueError(f"_input_files[{i}] must be an object, got {type(entry).__name__}")
+        missing = _INPUT_FILE_REQUIRED_KEYS - set(entry.keys())
+        if missing:
+            raise ValueError(f"_input_files[{i}] missing required keys: {sorted(missing)}")
+        bucket, key, dest = entry["bucket"], entry["key"], entry["dest"]
+        if not isinstance(bucket, str) or bucket != expected_bucket:
+            raise ValueError(
+                f"_input_files[{i}].bucket must be {expected_bucket!r}: got {bucket!r}"
+            )
+        if not isinstance(key, str) or not (0 < len(key) <= 1024):
+            raise ValueError(f"_input_files[{i}].key must be a 1-1024 char string: got {key!r}")
+        if not isinstance(dest, str) or not _INPUT_FILE_DEST_RE.fullmatch(dest):
+            raise ValueError(
+                f"_input_files[{i}].dest must be a simple filename "
+                f"matching [A-Za-z0-9_][A-Za-z0-9._-]*: got {dest!r}"
+            )
+
+
+# Dispatch-envelope metadata that ships inside params. The `_` prefix marks
+# a key as runner-orchestration, not agent input: stripped from params before
+# input_schema validation and before PARAMS_JSON is built, then re-attached
+# to the top-level message for downstream code. Unknown `_`-prefixed keys
+# raise so typos don't silently vanish.
+_RESERVED_ENVELOPE_KEYS = {"_input_files"}
 
 
 def parse_dispatch_message(body: str) -> dict:
@@ -363,6 +451,32 @@ def parse_dispatch_message(body: str) -> dict:
 
     if data.get("params") is None:
         data["params"] = {}
+
+    # Envelope-strip pass. Must happen BEFORE input_schema validation
+    # (otherwise the manifest would need to list `_input_files` in its
+    # schema) and BEFORE building PARAMS_JSON (otherwise the agent's env
+    # would carry runner-orchestration data). Non-dict params is handled
+    # later in the handler loop with an InvalidParamsType error callback,
+    # so we just skip stripping when params isn't a dict.
+    if isinstance(data["params"], dict):
+        unknown_envelope_keys = [
+            k for k in data["params"]
+            if isinstance(k, str)
+            and k.startswith("_")
+            and k not in _RESERVED_ENVELOPE_KEYS
+        ]
+        if unknown_envelope_keys:
+            raise ValueError(
+                f"params contains unknown _-prefixed key(s) "
+                f"{sorted(unknown_envelope_keys)}; reserved for dispatch envelope only"
+            )
+        input_files = data["params"].pop("_input_files", None)
+        if input_files is not None:
+            _validate_input_files(input_files)
+            # Re-attach on the top-level dispatch dict so downstream code
+            # (mint call, INPUT_FILES_JSON env builder) reads it like any
+            # other dispatch field — symmetric with prior_artifact_versions.
+            data["_input_files"] = input_files
 
     _validate_prior_artifact_versions(data.get("prior_artifact_versions"))
     return data
@@ -424,6 +538,17 @@ def build_container_overrides(
                 "value": json.dumps(experiment["attachment_version_ids"], sort_keys=True),
             }
         )
+    # When the dispatch carries enumerated input-file refs (e.g. user-uploaded
+    # agenda PDFs), the runner pre-fetches each via the broker's /inputs/read
+    # endpoint before invoking the agent. Refs travel as a JSON-encoded env var
+    # — refs are small (a few hundred bytes each, capped at 10 entries).
+    if message.get("_input_files"):
+        env.append(
+            {
+                "name": "INPUT_FILES_JSON",
+                "value": json.dumps(message["_input_files"]),
+            }
+        )
     # Write-action manifest fields (system_prompt, permission_mode,
     # allowed_external_tools — ENG-10128) are not forwarded as env vars on
     # purpose: the runner fetches the full manifest itself via
@@ -441,26 +566,41 @@ def handler(event: dict, context) -> dict:
         message_id = record.get("messageId", "unknown")
         body = record.get("body", "")
 
+        # When the Lambda is misconfigured (e.g. ENVIRONMENT unset), the strict
+        # parse below will raise on dispatches that exercise envelope validation
+        # — and that ValueError would otherwise be caught as InvalidDispatchPayload,
+        # masking the underlying misconfig. Check config FIRST and route through
+        # the dispatch-misconfig callback path. A minimal lenient parse extracts
+        # just enough message identity to make the callback useful; the strict
+        # parse below validates the envelope only after config is healthy.
+        if missing_config:
+            try:
+                partial = json.loads(body) if body else {}
+                shallow: dict = partial if isinstance(partial, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                shallow = {}
+            shallow.setdefault("run_id", "unknown")
+            shallow.setdefault("experiment_type", "_unknown")
+            shallow.setdefault("organization_slug", "unknown")
+            logger.error(
+                f"Dispatch Lambda misconfigured: missing required env vars "
+                f"{missing_config} (run: {shallow['run_id']}). "
+                f"Message will be retried via SQS until operator fixes config."
+            )
+            send_error_callback(
+                shallow,
+                f"Dispatch Lambda misconfigured: missing required env vars {missing_config}",
+                RESULTS_QUEUE_URL,
+                dedup_id=f"dispatch-misconfig-{shallow['run_id']}",
+            )
+            batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+
         try:
             message = parse_dispatch_message(body)
         except ValueError as e:
             logger.error(f"Invalid message {message_id}: {e}")
             emit_dispatch_metric("InvalidDispatchPayload", "_unknown")
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-
-        if missing_config:
-            logger.error(
-                f"Dispatch Lambda misconfigured: missing required env vars "
-                f"{missing_config} (run: {message['run_id']}). "
-                f"Message will be retried via SQS until operator fixes config."
-            )
-            send_error_callback(
-                message,
-                f"Dispatch Lambda misconfigured: missing required env vars {missing_config}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"dispatch-misconfig-{message['run_id']}",
-            )
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
@@ -538,6 +678,27 @@ def handler(event: dict, context) -> dict:
             if not sent:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
+
+        if message.get("_input_files"):
+            input_files_json = json.dumps(message["_input_files"])
+            input_files_bytes = len(input_files_json.encode("utf-8"))
+            if input_files_bytes > MAX_INPUT_FILES_JSON_BYTES:
+                logger.error(
+                    f"_input_files too large for {experiment_id} "
+                    f"(run: {message['run_id']}, organization: {message['organization_slug']}): "
+                    f"{input_files_bytes} bytes > {MAX_INPUT_FILES_JSON_BYTES}"
+                )
+                emit_dispatch_metric("InputFilesJsonTooLarge", experiment_id)
+                sent = send_error_callback(
+                    message,
+                    f"_input_files serialized size exceeds limit "
+                    f"({input_files_bytes} > {MAX_INPUT_FILES_JSON_BYTES} bytes)",
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"input-files-too-large-{message['run_id']}",
+                )
+                if not sent:
+                    batch_item_failures.append({"itemIdentifier": message_id})
+                continue
 
         # Validate the dispatch message's params against the manifest's
         # input_schema (JSON Schema Draft-07). The meta-schema makes
@@ -627,6 +788,10 @@ def handler(event: dict, context) -> dict:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
         prior_artifact_versions = message.get("prior_artifact_versions")
+        # Reads the envelope key parse_dispatch_message extracted out of
+        # params; renamed to `input_files` here to match the broker's
+        # MintRequest field name (no leading underscore at the API boundary).
+        input_files = message.get("_input_files")
         try:
             broker = get_broker_client()
             mint_result = broker.mint_run_token(
@@ -638,6 +803,7 @@ def handler(event: dict, context) -> dict:
                 clerk_user_id=message.get("clerk_user_id"),
                 exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
                 prior_artifact_versions=prior_artifact_versions,
+                input_files=input_files,
             )
         except BrokerError as e:
             logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")

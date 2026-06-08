@@ -26,6 +26,7 @@ class BrokerClient:
         clerk_user_id: str | None,
         exp_ttl_seconds: int = 3600,
         prior_artifact_versions: dict[str, str] | None = None,
+        input_files: list[dict] | None = None,
     ) -> dict:
         body = {
             "run_id": run_id,
@@ -36,6 +37,7 @@ class BrokerClient:
             "clerk_user_id": clerk_user_id,
             "exp_ttl_seconds": exp_ttl_seconds,
             "prior_artifact_versions": prior_artifact_versions,
+            "input_files": input_files,
         }
         response = httpx.post(
             f"{self.broker_url}/internal/mint-run-token",
