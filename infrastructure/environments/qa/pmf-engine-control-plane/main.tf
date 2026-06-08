@@ -27,14 +27,11 @@ variable "bootstrap" {
   description = "First-pass apply: skip the broker cross-stack remote_state lookup so control-plane can be applied before broker. Fargate state must already exist (apply order: fargate -> control-plane(bootstrap=true) -> broker -> control-plane re-apply)."
 }
 
-variable "gp_api_sqs_queue_url" {
-  type        = string
-  description = "URL of the gp-api SQS results queue that receives forwarded callbacks. Set per environment via terraform.tfvars; no default so dev values do not leak into qa/prod."
-}
-
-variable "gp_api_sqs_queue_arn" {
-  type        = string
-  description = "ARN of the gp-api SQS results queue. Set per environment via terraform.tfvars."
+# gp-api's results queue — the same queue the broker sends success results to
+# and gp-api's consumer polls. Looked up by name (not an unversioned tfvar) so
+# the dispatch Lambda's error callbacks land on the exact queue gp-api reads.
+data "aws_sqs_queue" "gp_api_results" {
+  name = "qa-Queue.fifo"
 }
 
 data "terraform_remote_state" "fargate" {
@@ -89,8 +86,8 @@ module "pmf_engine_control_plane" {
 
   lambda_package_dir = "${path.module}/../../../../pmf_engine/.lambda_build"
 
-  gp_api_sqs_queue_url = var.gp_api_sqs_queue_url
-  gp_api_sqs_queue_arn = var.gp_api_sqs_queue_arn
+  gp_api_sqs_queue_url = data.aws_sqs_queue.gp_api_results.url
+  gp_api_sqs_queue_arn = data.aws_sqs_queue.gp_api_results.arn
 
   broker_url                = var.bootstrap ? "https://broker-bootstrap.placeholder" : try(data.terraform_remote_state.broker[0].outputs.broker_url, "https://broker-bootstrap.placeholder")
   service_tokens_secret_arn = data.aws_secretsmanager_secret.service_tokens.arn

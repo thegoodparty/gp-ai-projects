@@ -60,7 +60,7 @@ resource "aws_s3_bucket" "inputs" {
     Name        = local.bucket_name
     Environment = var.environment
     ManagedBy   = "terraform"
-    Purpose     = "User-uploaded files consumed by agent runs (e.g. meeting-briefing agenda PDFs)"
+    Purpose     = "User-uploaded files consumed by agent runs such as meeting-briefing agenda PDFs"
   }
 }
 

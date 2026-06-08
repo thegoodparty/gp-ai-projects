@@ -68,13 +68,8 @@ variable "sns_topic_arn" {
   default     = ""
 }
 
-variable "gp_api_sqs_queue_arn" {
-  description = "ARN of the gp-api results queue (for reference only; broker sends to its own results queue)"
-  type        = string
-}
-
 variable "results_queue_arn" {
-  description = "ARN of the external SQS FIFO queue the broker sends results to (owned by the control-plane stack)"
+  description = "ARN of the external SQS FIFO queue the broker sends results to (the gp-api results queue, {branch}-Queue.fifo)"
   type        = string
 }
 
@@ -172,10 +167,11 @@ resource "aws_dynamodb_table" "scope_tickets" {
 }
 
 # --- SQS: Results Queue ---
-# The results queue itself is owned by the control-plane stack (agent-results-{env}.fifo).
-# Broker's access is granted via the broker task role's IAM policy (task_sqs_results below).
+# The broker sends run results to the gp-api results queue ({branch}-Queue.fifo), passed in
+# as var.results_queue_arn and looked up by the env config. The broker does not own the queue;
+# access is granted via the broker task role's IAM policy (task_sqs_results below).
 # No aws_sqs_queue_policy here — IAM role policy is sufficient and avoids conflicting with
-# any resource policy the control-plane owner may add later.
+# any resource policy the queue owner may add later.
 
 # --- IAM: Task Execution Role ---
 
