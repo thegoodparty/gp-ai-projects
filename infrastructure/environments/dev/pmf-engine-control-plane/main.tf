@@ -21,14 +21,11 @@ provider "aws" {
   region = "us-west-2"
 }
 
-variable "gp_api_sqs_queue_url" {
-  type        = string
-  description = "URL of the gp-api SQS results queue that receives forwarded callbacks. Set per environment via terraform.tfvars; no default so dev values do not leak into qa/prod."
-}
-
-variable "gp_api_sqs_queue_arn" {
-  type        = string
-  description = "ARN of the gp-api SQS results queue. Set per environment via terraform.tfvars."
+# gp-api's results queue — the same queue the broker sends success results to
+# and gp-api's consumer polls. Looked up by name (not an unversioned tfvar) so
+# the dispatch Lambda's error callbacks land on the exact queue gp-api reads.
+data "aws_sqs_queue" "gp_api_results" {
+  name = "develop-Queue.fifo"
 }
 
 data "terraform_remote_state" "fargate" {
@@ -63,17 +60,17 @@ module "pmf_engine_control_plane" {
 
   environment = "dev"
 
-  ecs_cluster_arn            = data.terraform_remote_state.fargate.outputs.cluster_arn
-  ecs_task_definition_family = data.terraform_remote_state.fargate.outputs.task_definition_family
-  ecs_subnet_ids             = ["subnet-053357b931f0524d4", "subnet-0bb591861f72dcb7f"]
-  ecs_security_group_id      = data.terraform_remote_state.fargate.outputs.security_group_id
+  ecs_cluster_arn             = data.terraform_remote_state.fargate.outputs.cluster_arn
+  ecs_task_definition_family  = data.terraform_remote_state.fargate.outputs.task_definition_family
+  ecs_subnet_ids              = ["subnet-053357b931f0524d4", "subnet-0bb591861f72dcb7f"]
+  ecs_security_group_id       = data.terraform_remote_state.fargate.outputs.security_group_id
   ecs_task_execution_role_arn = data.terraform_remote_state.fargate.outputs.task_execution_role_arn
-  ecs_task_role_arn          = data.terraform_remote_state.fargate.outputs.task_role_arn
+  ecs_task_role_arn           = data.terraform_remote_state.fargate.outputs.task_role_arn
 
   lambda_package_dir = "${path.module}/../../../../pmf_engine/.lambda_build"
 
-  gp_api_sqs_queue_url = var.gp_api_sqs_queue_url
-  gp_api_sqs_queue_arn = var.gp_api_sqs_queue_arn
+  gp_api_sqs_queue_url = data.aws_sqs_queue.gp_api_results.url
+  gp_api_sqs_queue_arn = data.aws_sqs_queue.gp_api_results.arn
 
   broker_url                = data.terraform_remote_state.broker.outputs.broker_url
   service_tokens_secret_arn = data.terraform_remote_state.broker.outputs.service_tokens_secret_arn
