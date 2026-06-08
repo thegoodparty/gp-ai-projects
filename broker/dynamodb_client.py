@@ -3,7 +3,7 @@ import time
 
 import boto3
 from botocore.exceptions import ClientError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 RUN_LOCK_PK_PREFIX = "run:"
@@ -15,6 +15,16 @@ def _run_lock_pk(run_id: str) -> str:
 
 class TicketAlreadyExistsError(Exception):
     pass
+
+
+class InputFileRef(BaseModel):
+    bucket: str = Field(..., min_length=1, max_length=255)
+    key: str = Field(..., min_length=1, max_length=1024)
+    # Path-traversal defense: dest is written under /workspace/input/<dest>,
+    # so it must be a simple filename — no separators, no parent refs, no
+    # leading dot (which would mark a hidden file the agent's directory
+    # walks could miss).
+    dest: str = Field(..., pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$", max_length=255)
 
 
 class ScopeTicket(BaseModel):
@@ -29,6 +39,7 @@ class ScopeTicket(BaseModel):
     issued_by: str
     prior_artifact_versions: dict[str, str] | None = None
     clerk_user_id: str | None = None
+    input_files: list[InputFileRef] | None = None
 
 
 class ScopeTicketStore:
@@ -52,6 +63,10 @@ class ScopeTicketStore:
             item["prior_artifact_versions"] = {"S": json.dumps(ticket.prior_artifact_versions)}
         if ticket.clerk_user_id is not None:
             item["clerk_user_id"] = {"S": ticket.clerk_user_id}
+        if ticket.input_files is not None:
+            item["input_files"] = {
+                "S": json.dumps([f.model_dump() for f in ticket.input_files])
+            }
 
         run_lock_item = {
             "pk": {"S": _run_lock_pk(ticket.run_id)},
@@ -113,6 +128,12 @@ class ScopeTicketStore:
         if "clerk_user_id" in item:
             clerk_user_id = item["clerk_user_id"]["S"]
 
+        input_files = None
+        if "input_files" in item:
+            input_files = [
+                InputFileRef(**f) for f in json.loads(item["input_files"]["S"])
+            ]
+
         return ScopeTicket(
             pk=item["pk"]["S"],
             run_id=item["run_id"]["S"],
@@ -125,6 +146,7 @@ class ScopeTicketStore:
             issued_by=item["issued_by"]["S"],
             prior_artifact_versions=prior,
             clerk_user_id=clerk_user_id,
+            input_files=input_files,
         )
 
     def delete_ticket(self, broker_token: str) -> None:

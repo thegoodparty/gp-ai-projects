@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import uuid
 
@@ -7,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from broker.auth import get_service_token, verify_service_token
 from broker.dynamodb_client import (
+    InputFileRef,
     ScopeTicket,
     ScopeTicketStore,
     TicketAlreadyExistsError,
@@ -49,12 +51,56 @@ class MintRequest(BaseModel):
     # dispatched against, preserving the STALE invariant for any experiment
     # with downstream dependencies.
     prior_artifact_versions: dict[str, str] | None = None
+    # Optional — enumerated S3 refs the runner is authorized to pre-fetch on
+    # behalf of the agent (e.g. user-uploaded agenda PDFs). Each entry is a
+    # {bucket, key, dest} ref; /inputs/read enforces exact (bucket, key) match
+    # against this list. Refs travel through gp-api's dispatch and dispatch
+    # handler strips the `_input_files` envelope key from params before
+    # validating against the manifest input_schema.
+    input_files: list[InputFileRef] | None = None
 
 
 class MintResponse(BaseModel):
     broker_token: str
     exp: int
     params_clean: dict
+
+
+def _expected_inputs_bucket() -> str:
+    """The only S3 bucket `input_files` refs may name in this environment.
+
+    The broker task role also holds GetObject on the artifact and
+    experiment-metadata buckets, so without this gate a caller with a valid
+    SERVICE_TOKEN could mint a ticket whose input_files point /inputs/read at
+    those buckets and read another run's data. Mirrors the dispatch handler's
+    `_expected_inputs_bucket` and the agent-run-inputs Terraform bucket name.
+    Defaults to `dev` when ENVIRONMENT is unset, matching the broker's other
+    env-derived bucket names (see main.py); a wrong default only ever rejects
+    a mismatched ref, never widens access.
+    """
+    env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
+    return f"gp-agent-run-inputs-{env}"
+
+
+def _validate_input_files_bucket(request_input_files, run_id: str) -> None:
+    if not request_input_files:
+        return
+    expected_bucket = _expected_inputs_bucket()
+    for ref in request_input_files:
+        if ref.bucket != expected_bucket:
+            logger.warning(
+                "mint_run_token input_file_bucket_rejected run_id=%s bucket=%r expected=%r",
+                run_id,
+                ref.bucket,
+                expected_bucket,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"input_files bucket {ref.bucket!r} not allowed; "
+                    f"only {expected_bucket!r} may be referenced for this run"
+                ),
+            )
 
 
 def get_ticket_store():
@@ -79,6 +125,8 @@ async def mint_run_token(
             getattr(request, "experiment_id", "unknown"),
         )
         raise HTTPException(status_code=401, detail="Invalid service token")
+
+    _validate_input_files_bucket(request.input_files, request.run_id)
 
     broker_token = str(uuid.uuid4())
     now = int(time.time())
@@ -137,6 +185,7 @@ async def mint_run_token(
         issued_by="dispatch_lambda",
         prior_artifact_versions=request.prior_artifact_versions,
         clerk_user_id=request.clerk_user_id,
+        input_files=request.input_files,
     )
 
     try:

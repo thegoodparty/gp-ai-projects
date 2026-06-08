@@ -95,6 +95,12 @@ variable "hostname" {
   default     = ""
 }
 
+variable "agent_run_inputs_read_policy_arn" {
+  description = "ARN of the managed IAM policy granting GetObject on the agent-run-inputs bucket (sourced from the agent-run-inputs Terraform stack's read_policy_arn output). Attached to the broker task role so /inputs/read can fetch user-uploaded files on the runner's behalf. Empty string skips the attachment entirely (local-dev / pre-bucket bootstrap)."
+  type        = string
+  default     = ""
+}
+
 locals {
   broker_hostname = var.hostname != "" ? var.hostname : (
     var.environment == "prod" ? "broker.ai.goodparty.org" : "broker-${var.environment}.ai.goodparty.org"
@@ -271,6 +277,17 @@ resource "aws_iam_role_policy" "task_s3" {
       }
     ]
   })
+}
+
+# Read-only access to the agent-run-inputs bucket (one per environment). The
+# managed policy is owned by the agent-run-inputs Terraform stack; we attach
+# it here so the broker task role gains GetObject on the bucket. /inputs/read
+# enforces per-request authorization against the ScopeTicket's enumerated
+# input_files list — this attachment is just the underlying AWS grant.
+resource "aws_iam_role_policy_attachment" "task_agent_run_inputs_read" {
+  count      = var.agent_run_inputs_read_policy_arn != "" ? 1 : 0
+  role       = aws_iam_role.task_role.name
+  policy_arn = var.agent_run_inputs_read_policy_arn
 }
 
 resource "aws_iam_role_policy_attachment" "task_experiment_metadata_read" {

@@ -186,3 +186,51 @@ class TestMintRunTokenPriorArtifactVersions:
 
         body = mock_post.call_args.kwargs["json"]
         assert body.get("prior_artifact_versions") is None
+
+
+class TestMintRunTokenInputFiles:
+    def test_mint_run_token_forwards_input_files(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"broker_token": "tok-xyz"}
+
+        refs = [
+            {
+                "bucket": "gp-agent-run-inputs-dev",
+                "key": "uploads/org-1/run-001/agenda.pdf",
+                "dest": "agenda.pdf",
+            }
+        ]
+        with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response) as mock_post:
+            client = BrokerClient("https://broker.example.com", "svc-token")
+            client.mint_run_token(
+                run_id="run-001",
+                organization_slug="org-1",
+                experiment_id="meeting_briefing",
+                scope={},
+                params={"state": "WI"},
+                clerk_user_id="user_test",
+                input_files=refs,
+            )
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body["input_files"] == refs
+
+    def test_mint_run_token_omits_input_files_when_none(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"broker_token": "tok-xyz"}
+
+        with patch("pmf_engine.control_plane.broker_client.httpx.post", return_value=mock_response) as mock_post:
+            client = BrokerClient("https://broker.example.com", "svc-token")
+            client.mint_run_token(
+                run_id="run-001",
+                organization_slug="org-1",
+                experiment_id="smoke_test",
+                scope={"state": "NC"},
+                params={"city": "Hendersonville"},
+                clerk_user_id="user_test",
+            )
+
+        body = mock_post.call_args.kwargs["json"]
+        assert body.get("input_files") is None
