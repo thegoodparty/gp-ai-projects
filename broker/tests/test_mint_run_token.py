@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from broker.auth import hash_service_token
 from broker.dynamodb_client import (
+    InputFileRef,
     ScopeTicket,
     ScopeTicketStore,
     TicketAlreadyExistsError,
@@ -364,6 +365,125 @@ class TestMintRunTokenPriorArtifactVersions:
         assert resp.status_code == 200
         ticket: ScopeTicket = store.put_ticket.call_args[0][0]
         assert ticket.prior_artifact_versions is None
+
+
+class TestMintRunTokenInputFiles:
+    """User-uploaded inputs (e.g. agenda PDFs) flow as enumerated S3 refs:
+    dispatch supplies `input_files` on mint; the ticket persists the list so
+    /inputs/read can enforce that the runner only fetches refs gp-api
+    authorized for this run.
+    """
+
+    def test_input_files_roundtrips_to_ticket(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        refs = [
+            {
+                "bucket": "gp-agent-run-inputs-dev",
+                "key": "uploads/org/abc/agenda.pdf",
+                "dest": "agenda.pdf",
+            }
+        ]
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(input_files=refs),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 200
+        store.put_ticket.assert_called_once()
+        ticket: ScopeTicket = store.put_ticket.call_args[0][0]
+        assert ticket.input_files == [
+            InputFileRef(
+                bucket="gp-agent-run-inputs-dev",
+                key="uploads/org/abc/agenda.pdf",
+                dest="agenda.pdf",
+            )
+        ]
+
+    def test_input_files_optional(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 200
+        ticket: ScopeTicket = store.put_ticket.call_args[0][0]
+        assert ticket.input_files is None
+
+    def test_input_files_rejects_unsafe_dest(self):
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(input_files=[{"bucket": "b", "key": "k", "dest": "../etc/passwd"}]),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 422
+        store.put_ticket.assert_not_called()
+
+    def test_input_files_rejects_foreign_bucket(self, monkeypatch):
+        """The broker task role can GetObject on the artifact and metadata
+        buckets too, so a ticket must only ever authorize the env's own inputs
+        bucket. A ref naming any other bucket is rejected at mint so it can
+        never reach /inputs/read.
+        """
+        monkeypatch.setenv("ENVIRONMENT", "dev")
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(
+                input_files=[
+                    {
+                        "bucket": "gp-agent-artifacts-dev",
+                        "key": "other-org/run-9/artifact.json",
+                        "dest": "agenda.pdf",
+                    }
+                ]
+            ),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 400
+        assert "bucket" in resp.json()["detail"].lower()
+        store.put_ticket.assert_not_called()
+
+    def test_input_files_honors_environment_bucket(self, monkeypatch):
+        """A ref naming the env's own inputs bucket passes the gate."""
+        monkeypatch.setenv("ENVIRONMENT", "qa")
+        store = MagicMock(spec=ScopeTicketStore)
+        app = _create_test_app(store=store)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/mint-run-token",
+            json=_mint_payload(
+                input_files=[
+                    {
+                        "bucket": "gp-agent-run-inputs-qa",
+                        "key": "uploads/org/abc/agenda.pdf",
+                        "dest": "agenda.pdf",
+                    }
+                ]
+            ),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
+
+        assert resp.status_code == 200
+        store.put_ticket.assert_called_once()
 
 
 class TestMintRunTokenClerkUserIdOnTicket:

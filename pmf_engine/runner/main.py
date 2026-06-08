@@ -14,6 +14,7 @@ from shared.logger import get_logger
 from .config import RunnerConfig, BrokerUrlSchemeError, validate_broker_url_scheme
 from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
+from .input_files import prefetch_input_files
 from .pmf_runtime import publish
 from .pmf_runtime.config import init_config
 from .pmf_runtime.egress_guard import MESSAGE as EGRESS_MESSAGE
@@ -343,7 +344,14 @@ def _collect_workspace_files(
     total_size = 0
     if not os.path.isdir(root_dir):
         return collected
-    for dirpath, _dirnames, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # User-uploaded inputs (e.g. agenda PDFs pre-fetched by the runner
+        # into /workspace/input/) may contain PII. Don't bundle them into
+        # the log capture that ships to gp-api after a failure — the agent
+        # already has them as part of its run inputs; logs are for the
+        # agent's WORK product, not its input data.
+        if dirpath == root_dir and "input" in dirnames:
+            dirnames.remove("input")
         for filename in filenames:
             if _is_sensitive_file(filename):
                 continue
@@ -779,6 +787,8 @@ async def main():
 
         os.makedirs(workspace_dir, exist_ok=True)
         os.makedirs(os.path.join(workspace_dir, "output"), exist_ok=True)
+
+        prefetch_input_files(workspace_dir, config.broker_url, config.broker_token)
 
         instruction_path = os.path.join(workspace_dir, "instruction.md")
         with open(instruction_path, "w") as f:

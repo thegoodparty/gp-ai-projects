@@ -6,6 +6,7 @@ import pytest
 from moto import mock_aws
 
 from broker.dynamodb_client import (
+    InputFileRef,
     ScopeTicket,
     ScopeTicketStore,
     TicketAlreadyExistsError,
@@ -58,6 +59,37 @@ class TestScopeTicketModel:
     def test_prior_artifact_versions_set(self):
         ticket = _make_ticket(prior_artifact_versions={"district_intel": "v2"})
         assert ticket.prior_artifact_versions == {"district_intel": "v2"}
+
+    def test_input_files_optional(self):
+        ticket = _make_ticket()
+        assert ticket.input_files is None
+
+    def test_input_files_set(self):
+        refs = [InputFileRef(bucket="gp-agent-run-inputs-dev", key="u/abc", dest="agenda.pdf")]
+        ticket = _make_ticket(input_files=refs)
+        assert ticket.input_files == refs
+
+
+class TestInputFileRefValidation:
+    def test_dest_rejects_separator(self):
+        with pytest.raises(ValueError):
+            InputFileRef(bucket="b", key="k", dest="sub/file.pdf")
+
+    def test_dest_rejects_parent_ref(self):
+        with pytest.raises(ValueError):
+            InputFileRef(bucket="b", key="k", dest="..")
+
+    def test_dest_rejects_leading_dot(self):
+        with pytest.raises(ValueError):
+            InputFileRef(bucket="b", key="k", dest=".hidden")
+
+    def test_dest_rejects_empty(self):
+        with pytest.raises(ValueError):
+            InputFileRef(bucket="b", key="k", dest="")
+
+    def test_dest_accepts_typical_filename(self):
+        ref = InputFileRef(bucket="b", key="k", dest="agenda.pdf")
+        assert ref.dest == "agenda.pdf"
 
 
 class TestPutAndGetRoundTrip:
@@ -263,3 +295,37 @@ class TestRunIdIdempotency:
             Key={"pk": {"S": "run:run-RETRY"}},
         )
         assert run_lock["Item"]["broker_token"]["S"] == "token-2"
+
+
+class TestInputFilesRoundTrip:
+    def test_input_files_roundtrip_through_dynamodb(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        refs = [
+            InputFileRef(
+                bucket="gp-agent-run-inputs-dev",
+                key="uploads/org/abc/agenda.pdf",
+                dest="agenda.pdf",
+            ),
+            InputFileRef(
+                bucket="gp-agent-run-inputs-dev",
+                key="uploads/org/abc/appendix.pdf",
+                dest="appendix.pdf",
+            ),
+        ]
+        ticket = _make_ticket(pk="token-if", run_id="run-IF", input_files=refs)
+
+        store.put_ticket(ticket)
+
+        result = store.get_ticket("token-if")
+        assert result is not None
+        assert result.input_files == refs
+
+    def test_input_files_absent_roundtrip(self, moto_ddb):
+        store = ScopeTicketStore("scope-tickets", dynamodb_client=moto_ddb)
+        ticket = _make_ticket(pk="token-noif", run_id="run-NOIF")
+
+        store.put_ticket(ticket)
+
+        result = store.get_ticket("token-noif")
+        assert result is not None
+        assert result.input_files is None
