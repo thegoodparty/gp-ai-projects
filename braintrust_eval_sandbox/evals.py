@@ -272,6 +272,7 @@ def pipeline_task(input: dict, hooks: Any) -> dict:
 
     llm_client = Gemini3Client(
         default_model=GeminiModelType.FLASH_3_5,
+        default_temperature=1.0,
         thinking_level=ThinkingLevel.HIGH,
     )
 
@@ -321,7 +322,7 @@ def pipeline_task(input: dict, hooks: Any) -> dict:
             structured = llm_client.generate_structured_content(
                 prompt=struct_text,
                 response_schema=gemini_schema,
-                temperature=0.0,
+                temperature=1.0,
             )
             struct_span.log(output={"structured": structured})
 
