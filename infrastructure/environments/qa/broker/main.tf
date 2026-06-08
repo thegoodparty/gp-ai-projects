@@ -110,8 +110,6 @@ module "broker" {
   results_queue_arn = data.aws_sqs_queue.results[0].arn
   results_queue_url = data.aws_sqs_queue.results[0].url
 
-  gp_api_sqs_queue_arn = data.aws_sqs_queue.results[0].arn
-
   sns_topic_arn = try(data.terraform_remote_state.fargate[0].outputs.sns_topic_arn, "")
 }
 

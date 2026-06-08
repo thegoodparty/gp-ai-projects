@@ -97,9 +97,6 @@ module "broker" {
   results_queue_arn = data.aws_sqs_queue.results.arn
   results_queue_url = data.aws_sqs_queue.results.url
 
-  # gp_api_sqs_queue_arn is reference-only in the module; pass a real value for documentation
-  gp_api_sqs_queue_arn = data.aws_sqs_queue.results.arn
-
   sns_topic_arn = try(data.terraform_remote_state.fargate.outputs.sns_topic_arn, "")
 }
 
