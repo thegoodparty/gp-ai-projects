@@ -95,7 +95,7 @@ In the `braintrust-eval-sandbox` Braintrust project, Project Settings → Enviro
 
 ## Limitations
 
-- Model hardcoded to `gemini-3-flash-preview`. Per-prompt model picking via the prompt parameter's `options.model` isn't honored — the Gemini client uses its default model. If we need per-eval model selection later, expose a 5th parameter.
+- Model hardcoded to `gemini-3.5-flash`. Per-prompt model picking via the prompt parameter's `options.model` isn't honored — the Gemini client uses its default model. If we need per-eval model selection later, expose a 5th parameter.
 - No derived variables (`today`, `days_remaining`, etc). Whatever the prompt needs has to be in the dataset row.
 - Stage 1 → stage 2 wiring is one direction: `main_prompt_output` only. If stage 2 needs the original row vars too, it gets them — every row key is available in both stages.
 - No scorers shipped. Write them in the Braintrust UI for each use case.

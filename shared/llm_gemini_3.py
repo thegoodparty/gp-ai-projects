@@ -18,12 +18,14 @@ load_dotenv()
 GEMINI_3_PRICING = {
     'gemini-3-flash-preview': {'input': 0.50, 'output': 3.00},
     'gemini-3-pro-preview': {'input': 2.50, 'output': 15.00},
+    'gemini-3.5-flash': {'input': 1.50, 'output': 9.00},
 }
 
 
 class GeminiModelType(Enum):
     FLASH_3 = "gemini-3-flash-preview"
     PRO_3 = "gemini-3-pro-preview"
+    FLASH_3_5 = "gemini-3.5-flash"
 
 
 class ThinkingLevel(Enum):
