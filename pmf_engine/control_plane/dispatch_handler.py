@@ -23,24 +23,24 @@ except (ImportError, OSError):
 
 try:
     from .broker_client import BrokerClient, BrokerError
-    from .scope_derivation import derive_scope
     from .jsonschema_errors import format_validation_errors
     from .manifest_loader import (
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from .scope_derivation import derive_scope
 except ImportError:
     from broker_client import BrokerClient, BrokerError
-    from scope_derivation import derive_scope  # type: ignore[no-redef]
     from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from scope_derivation import derive_scope  # type: ignore[no-redef]
 
 _ecs_client = None
 _sqs_client = None
@@ -282,6 +282,13 @@ def send_error_callback(
         return False
 
 
+# Maximum number of concurrently RUNNING agent Fargate tasks. 0 (or unset)
+# disables the cap. At-cap messages are deferred — returned to the queue with
+# an extended visibility timeout so each SQS receive buys a long wait instead
+# of burning maxReceiveCount every 120s.
+MAX_CONCURRENT_AGENTS = int(os.environ.get("MAX_CONCURRENT_AGENTS", "0") or 0)
+CAP_DEFERRAL_VISIBILITY_SECONDS = 600
+
 ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 ECS_TASK_DEFINITION = os.environ.get("ECS_TASK_DEFINITION", "")
 ECS_SUBNET_IDS = [s for s in os.environ.get("ECS_SUBNET_IDS", "").split(",") if s]
@@ -343,7 +350,7 @@ def parse_dispatch_message(body: str) -> dict:
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, TypeError) as e:
-        raise ValueError(f"Invalid message body: {e}")
+        raise ValueError(f"Invalid message body: {e}") from e
 
     for field in ("experiment_type", "organization_slug", "run_id"):
         if not data.get(field):
@@ -425,6 +432,54 @@ def build_container_overrides(
     return {"containerOverrides": [{"name": container_name, "environment": env}]}
 
 
+def _count_active_agent_tasks() -> int:
+    """Live RUNNING task count on the agent cluster — the source of truth for
+    "concurrent active agents". desiredStatus=RUNNING includes tasks still
+    PROVISIONING/PENDING, so just-launched tasks count immediately.
+    list_tasks returns at most 100 ARNs per page; paginate or caps >= 100
+    silently never bind.
+    """
+    paginator = get_ecs_client().get_paginator("list_tasks")
+    count = 0
+    for page in paginator.paginate(cluster=ECS_CLUSTER_ARN, desiredStatus="RUNNING"):
+        count += len(page.get("taskArns", []))
+    return count
+
+
+def _queue_url_from_arn(queue_arn: str) -> str:
+    _, _, _, region, account, name = queue_arn.split(":")
+    return f"https://sqs.{region}.amazonaws.com/{account}/{name}"
+
+
+def _defer_for_concurrency_cap(record: dict, message: dict, active: int) -> None:
+    """Return an at-cap message to the queue for a later retry.
+
+    Extends the message's visibility timeout so the retry comes in
+    CAP_DEFERRAL_VISIBILITY_SECONDS instead of the queue's 120s default —
+    each receive consumes one of maxReceiveCount, so longer waits mean a
+    cap-blocked message survives longer saturation before dead-lettering.
+    No error callback: deferral is not a failure; gp-api's run row stays
+    RUNNING until the agent actually executes.
+    """
+    logger.info(
+        f"Concurrency cap reached ({active}/{MAX_CONCURRENT_AGENTS}); deferring run {message['run_id']} "
+        f"(experiment={message['experiment_type']}, organization={message['organization_slug']})"
+    )
+    emit_dispatch_metric("ConcurrencyCapDeferred", message["experiment_type"])
+    try:
+        get_sqs_client().change_message_visibility(
+            QueueUrl=_queue_url_from_arn(record["eventSourceARN"]),
+            ReceiptHandle=record["receiptHandle"],
+            VisibilityTimeout=CAP_DEFERRAL_VISIBILITY_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            f"change_message_visibility failed for deferred run {message['run_id']}; "
+            f"message will retry after the queue's default visibility timeout",
+            exc_info=True,
+        )
+
+
 def handler(event: dict, context) -> dict:
     batch_item_failures = []
     missing_config = _missing_critical_config()
@@ -455,6 +510,23 @@ def handler(event: dict, context) -> dict:
             )
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
+
+        # Concurrency cap gate — before routing/mint so a deferred message
+        # does no work and leaks no broker token. Fail open on count errors:
+        # an ECS API hiccup or IAM regression must not wedge all dispatch.
+        if MAX_CONCURRENT_AGENTS > 0:
+            try:
+                active = _count_active_agent_tasks()
+            except Exception as e:
+                logger.warning(
+                    f"Concurrency cap check failed ({type(e).__name__}: {e}); "
+                    f"dispatching run {message['run_id']} without cap enforcement"
+                )
+                active = -1
+            if active >= MAX_CONCURRENT_AGENTS:
+                _defer_for_concurrency_cap(record, message, active)
+                batch_item_failures.append({"itemIdentifier": message_id})
+                continue
 
         experiment_id = message["experiment_type"]
         try:

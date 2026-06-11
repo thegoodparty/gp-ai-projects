@@ -7,11 +7,10 @@ import httpx
 import pytest
 
 from pmf_engine.control_plane.dispatch_handler import (
+    build_container_overrides,
     handler,
     parse_dispatch_message,
-    build_container_overrides,
 )
-
 
 SYNTHETIC_MANIFEST_VERSION_ID = "test-manifest-v-abc123"
 SYNTHETIC_INSTRUCTION_VERSION_ID = "test-instruction-v-def456"
@@ -223,7 +222,7 @@ class TestParseDispatchMessage:
             "organization_slug": "org-123",
             "run_id": "run-001",
             "clerk_user_id": "user_test_dispatch",
-            "prior_artifact_versions": {f"k{i}": f"e/r/artifact.json" for i in range(11)},
+            "prior_artifact_versions": {f"k{i}": "e/r/artifact.json" for i in range(11)},
         }
         with pytest.raises(ValueError, match="too large"):
             parse_dispatch_message(json.dumps(body))
@@ -323,9 +322,7 @@ class TestBuildContainerOverrides:
         # sort_keys=True: env-var bytes must be deterministic across dispatches
         # so idempotency checks / cache keys downstream don't churn on dict
         # iteration order.
-        assert env_map["ATTACHMENT_VERSION_IDS"] == json.dumps(
-            {"lookup.csv": "Vlk", "notes.md": "Vnt"}, sort_keys=True
-        )
+        assert env_map["ATTACHMENT_VERSION_IDS"] == json.dumps({"lookup.csv": "Vlk", "notes.md": "Vnt"}, sort_keys=True)
 
     def test_attachment_version_ids_omitted_when_empty(self):
         """Empty attachment_version_ids dict must NOT produce an env var
@@ -435,7 +432,7 @@ class TestHandler:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
         mock_ecs.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
         call_args = mock_send_error_callback.call_args
@@ -499,13 +496,13 @@ class TestHandler:
         )
 
         warning_records = [r for r in records if r.levelno == logging.WARNING and "nonexistent" in r.getMessage()]
-        assert warning_records == [], (
-            f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
-        )
+        assert (
+            warning_records == []
+        ), f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
 
-        assert any("smoke_test" in r.getMessage() for r in error_records), (
-            "Expected error log to include known experiment IDs for operator triage"
-        )
+        assert any(
+            "smoke_test" in r.getMessage() for r in error_records
+        ), "Expected error log to include known experiment IDs for operator triage"
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -813,7 +810,7 @@ class TestNonDictParamsGuard:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
 
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
@@ -975,7 +972,7 @@ class TestMissingCriticalEnvVars:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
         error_msg = mock_send_error_callback.call_args[0][1]
@@ -1027,7 +1024,7 @@ class TestParamsSizeLimit:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
 
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
@@ -1491,9 +1488,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         mock_send_error_callback.assert_called_once()
         error_str = mock_send_error_callback.call_args[0][1]
         assert "arn:aws:iam" not in error_str, f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
-        assert "333022194791" not in error_str, (
-            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
-        )
+        assert (
+            "333022194791" not in error_str
+        ), f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
         assert "ECS RunTask failed" in error_str
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -1533,9 +1530,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         mock_send_error_callback.assert_called_once()
         error_str = mock_send_error_callback.call_args[0][1]
         assert "arn:aws:iam" not in error_str, f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
-        assert "333022194791" not in error_str, (
-            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
-        )
+        assert (
+            "333022194791" not in error_str
+        ), f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
         assert "ClientError" in error_str, f"Expected exception type name in sanitized message, got: {error_str!r}"
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -1579,9 +1576,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             dh.logger.setLevel(original_level)
 
         combined = " ".join(r.getMessage() for r in records if r.levelno >= logging.ERROR)
-        assert "arn:aws:iam::333022194791" in combined, (
-            f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
-        )
+        assert (
+            "arn:aws:iam::333022194791" in combined
+        ), f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
 
 
 class TestRunTaskFailureCleansUpMintedTicket:
@@ -1769,7 +1766,7 @@ class TestInputSchemaSortKeyMixedTypes:
         )
 
         # If the sort key blows up, this raises TypeError uncaught.
-        result = handler(event, None)
+        handler(event, None)
 
         # Validation should have caught the issues and emitted a callback,
         # NOT crashed.
@@ -1871,9 +1868,9 @@ class TestResolveRoutingFailures:
         assert routing["model"] == "sonnet"
         # known is only populated on the unknown-experiment branch (routing is None).
         assert known == []
-        assert not any(call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list), (
-            "happy path must not emit fallback metric"
-        )
+        assert not any(
+            call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list
+        ), "happy path must not emit fallback metric"
 
     def test_loader_transient_error_raises_and_emits_metric(self, monkeypatch):
         """S3 outage / IAM throttle → re-raise ManifestLoaderTransientError so
@@ -2126,3 +2123,126 @@ class TestWriteActionDispatchFlow:
         assert result["batchItemFailures"] == []
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["scope"] == {}
+
+
+class TestConcurrencyCap:
+    DISPATCH_QUEUE_ARN = "arn:aws:sqs:us-west-2:123:agent-dispatch-test.fifo"
+
+    def _make_event(self) -> dict:
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-cap-001",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
+        event["Records"][0]["eventSourceARN"] = self.DISPATCH_QUEUE_ARN
+        event["Records"][0]["receiptHandle"] = "rh-001"
+        return event
+
+    def _set_cap(self, monkeypatch, cap: int):
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        monkeypatch.setattr(dh, "MAX_CONCURRENT_AGENTS", cap, raising=False)
+
+    def _mock_running_tasks(self, mock_get_ecs, pages: list[int]):
+        paginator = mock_get_ecs.return_value.get_paginator.return_value
+        paginator.paginate.return_value = [
+            {"taskArns": [f"task-{p}-{i}" for i in range(n)]} for p, n in enumerate(pages)
+        ]
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_defers_message_when_at_cap(self, mock_get_ecs, mock_broker_cls, mock_get_sqs, monkeypatch):
+        self._set_cap(monkeypatch, 2)
+        self._mock_running_tasks(mock_get_ecs, [2])
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_broker_cls.return_value.mint_run_token.assert_not_called()
+        visibility_kwargs = mock_get_sqs.return_value.change_message_visibility.call_args.kwargs
+        assert visibility_kwargs["QueueUrl"] == "https://sqs.us-west-2.amazonaws.com/123/agent-dispatch-test.fifo"
+        assert visibility_kwargs["ReceiptHandle"] == "rh-001"
+        assert visibility_kwargs["VisibilityTimeout"] == 600
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_dispatches_when_below_cap(self, mock_get_ecs, mock_broker_cls, mock_get_sqs, monkeypatch):
+        self._set_cap(monkeypatch, 2)
+        self._mock_running_tasks(mock_get_ecs, [1])
+        mock_broker_cls.return_value = _mock_broker_success()
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == []
+        mock_get_ecs.return_value.run_task.assert_called_once()
+        mock_get_sqs.return_value.change_message_visibility.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_cap_of_zero_disables_enforcement(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+        self._set_cap(monkeypatch, 0)
+        mock_broker_cls.return_value = _mock_broker_success()
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == []
+        mock_get_ecs.return_value.get_paginator.assert_not_called()
+        mock_get_ecs.return_value.run_task.assert_called_once()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_counts_tasks_across_pages(self, mock_get_ecs, mock_broker_cls, mock_get_sqs, monkeypatch):
+        self._set_cap(monkeypatch, 100)
+        self._mock_running_tasks(mock_get_ecs, [100, 5])
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        paginate_kwargs = mock_get_ecs.return_value.get_paginator.return_value.paginate.call_args.kwargs
+        assert paginate_kwargs["desiredStatus"] == "RUNNING"
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_fails_open_when_count_errors(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+        self._set_cap(monkeypatch, 2)
+        mock_get_ecs.return_value.get_paginator.return_value.paginate.side_effect = RuntimeError("ecs down")
+        mock_broker_cls.return_value = _mock_broker_success()
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == []
+        mock_get_ecs.return_value.run_task.assert_called_once()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_defers_even_when_visibility_change_fails(self, mock_get_ecs, mock_broker_cls, mock_get_sqs, monkeypatch):
+        self._set_cap(monkeypatch, 1)
+        self._mock_running_tasks(mock_get_ecs, [1])
+        mock_get_sqs.return_value.change_message_visibility.side_effect = RuntimeError("sqs denied")
+
+        result = handler(self._make_event(), None)
+
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()

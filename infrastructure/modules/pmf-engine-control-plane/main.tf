@@ -97,6 +97,12 @@ variable "experiment_metadata_read_policy_arn" {
   default     = ""
 }
 
+variable "max_concurrent_agents" {
+  description = "Maximum number of concurrently RUNNING agent Fargate tasks. The dispatch Lambda defers at-cap messages back to the queue with an extended visibility timeout. 0 disables the cap."
+  type        = number
+  default     = 100
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_vpc" "selected" {
@@ -192,9 +198,13 @@ resource "aws_sqs_queue" "dispatch" {
   deduplication_scope         = "messageGroup"
   fifo_throughput_limit       = "perMessageGroupId"
 
+  # 30 receives (not 3): cap-deferred messages consume one receive per retry
+  # (10-minute visibility per deferral) — this tolerates ~5 hours of cap
+  # saturation before a healthy message dead-letters. Tradeoff: genuinely
+  # poison messages retry ~60 minutes before reaching the DLQ instead of ~6.
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dispatch_dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = 30
   })
 
   tags = {
@@ -329,9 +339,20 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
         Action = [
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes"
+          "sqs:GetQueueAttributes",
+          "sqs:ChangeMessageVisibility"
         ]
         Resource = aws_sqs_queue.dispatch.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = "ecs:ListTasks"
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = var.ecs_cluster_arn
+          }
+        }
       },
       {
         Effect   = "Allow"
@@ -390,18 +411,19 @@ resource "aws_lambda_function" "dispatch" {
 
   environment {
     variables = {
-      ENVIRONMENT           = var.environment
-      ECS_CLUSTER_ARN       = var.ecs_cluster_arn
-      ECS_TASK_DEFINITION   = var.ecs_task_definition_family
-      ECS_SUBNET_IDS        = join(",", var.ecs_subnet_ids)
-      ECS_SECURITY_GROUP_ID = var.ecs_security_group_id
-      ARTIFACT_BUCKET       = aws_s3_bucket.artifacts.id
-      CONTAINER_NAME        = "pmf-engine"
+      ENVIRONMENT                = var.environment
+      ECS_CLUSTER_ARN            = var.ecs_cluster_arn
+      ECS_TASK_DEFINITION        = var.ecs_task_definition_family
+      ECS_SUBNET_IDS             = join(",", var.ecs_subnet_ids)
+      ECS_SECURITY_GROUP_ID      = var.ecs_security_group_id
+      ARTIFACT_BUCKET            = aws_s3_bucket.artifacts.id
+      CONTAINER_NAME             = "pmf-engine"
       AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
       BROKER_URL                 = var.broker_url
       RESULTS_QUEUE_URL          = aws_sqs_queue.results.url
       SERVICE_TOKEN              = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
       EXPERIMENT_METADATA_BUCKET = var.experiment_metadata_bucket_name
+      MAX_CONCURRENT_AGENTS      = tostring(var.max_concurrent_agents)
     }
   }
 
@@ -422,6 +444,14 @@ resource "aws_lambda_event_source_mapping" "dispatch_sqs" {
   enabled          = true
 
   function_response_types = ["ReportBatchItemFailures"]
+
+  # FIFO scales Lambda concurrency to the number of active message groups
+  # (one per org), so a bulk dispatch could run hundreds of cap checks
+  # simultaneously and race straight past MAX_CONCURRENT_AGENTS. Capping at
+  # 2 bounds the check-then-launch race to 1 task of overshoot.
+  scaling_config {
+    maximum_concurrency = 2
+  }
 }
 
 # --- CloudWatch Alarms ---
