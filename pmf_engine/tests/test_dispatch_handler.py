@@ -627,6 +627,50 @@ class TestHandler:
         assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-bad"
         mock_ecs.run_task.assert_not_called()
 
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_malformed_message_with_run_id_notifies_gp_api(self, mock_get_ecs, mock_send_error_callback):
+        # A message that fails parse_dispatch_message validation but still has a
+        # recoverable run_id must notify gp-api (so its QUEUED row gets failed)
+        # AND batch-fail. Otherwise the row orphans until the slow 6h backstop.
+        event = {
+            "Records": [
+                {
+                    "messageId": "msg-bad",
+                    # Valid JSON with run_id but an invalid experiment_type
+                    # (uppercase) — parse_dispatch_message raises ValueError.
+                    "body": json.dumps(
+                        {
+                            "experiment_type": "BadType",
+                            "organization_slug": "org-123",
+                            "run_id": "run-malformed",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        sent_message = mock_send_error_callback.call_args[0][0]
+        assert sent_message["run_id"] == "run-malformed"
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "invalid-payload-run-malformed"
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_unparseable_body_batch_fails_without_callback(self, mock_get_ecs, mock_send_error_callback):
+        # No recoverable run_id — just batch-fail, no callback, no crash.
+        event = {"Records": [{"messageId": "msg-bad", "body": "not-json-at-all"}]}
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_not_called()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_reports_failure_on_empty_tasks_array(self, mock_get_ecs, mock_broker_cls):

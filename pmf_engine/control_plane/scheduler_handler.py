@@ -103,13 +103,16 @@ def _sweep_stuck_launching(store) -> None:
         logger.error(f"job {job.run_id} stuck in LAUNCHING; failing it")
         emit_dispatch_metric("SchedulerStuckLaunchingSwept", job.experiment_type)
         store.mark_failed(job.run_id)
-        _send_callback(
+        sent = _send_callback(
             job.run_id,
             "failed",
             experiment_id=job.experiment_type,
             organization_slug=job.organization_slug,
             error="Dispatch stalled while launching the agent task",
         )
+        if not sent:
+            logger.error(f"sweep failed-callback send failed for {job.run_id}; gp-api row may be orphaned")
+            emit_dispatch_metric("SchedulerSweepCallbackFailed", job.experiment_type)
 
 
 def handler(event, context) -> dict:
@@ -140,7 +143,11 @@ def handler(event, context) -> dict:
         logger.info(f"At cap: {running}/{MAX_CONCURRENT_AGENTS}; no slots")
         return {"launched": 0}
 
-    jobs = store.query_queued(limit=slots)
+    try:
+        jobs = store.query_queued(limit=slots)
+    except Exception as e:
+        logger.warning(f"query_queued failed ({type(e).__name__}: {e}); skipping this tick")
+        return {"launched": 0}
     launched = 0
 
     for job in jobs:
@@ -215,11 +222,14 @@ def _launch_one(store, job) -> bool:
         return True
 
     store.mark_failed(job.run_id)
-    _send_callback(
+    sent = _send_callback(
         job.run_id,
         "failed",
         experiment_id=job.experiment_type,
         organization_slug=job.organization_slug,
         error=result.get("error", "dispatch failed"),
     )
+    if not sent:
+        logger.error(f"failed-callback send failed for {job.run_id}; gp-api row may be orphaned")
+        emit_dispatch_metric("SchedulerFailedCallbackFailed", job.experiment_type)
     return False

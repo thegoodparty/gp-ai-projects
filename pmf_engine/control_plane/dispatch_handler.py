@@ -592,6 +592,21 @@ def handler(event: dict, context) -> dict:
         except ValueError as e:
             logger.error(f"Invalid message {message_id}: {e}")
             emit_dispatch_metric("InvalidDispatchPayload", "_unknown")
+            # gp-api creates the run row as QUEUED and its stale sweep is
+            # RUNNING-only, so a malformed message orphans that row until the
+            # slow 6h backstop. Best-effort recover run_id and notify so gp-api
+            # can fail the row now. Mirror the dispatch-misconfig callback path.
+            try:
+                partial = json.loads(body) if isinstance(body, str) else {}
+            except Exception:
+                partial = {}
+            if partial.get("run_id") and RESULTS_QUEUE_URL:
+                send_error_callback(
+                    partial,
+                    f"Malformed dispatch message: {e}",
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"invalid-payload-{partial['run_id']}",
+                )
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
 

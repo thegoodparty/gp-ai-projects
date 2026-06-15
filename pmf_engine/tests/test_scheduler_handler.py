@@ -167,3 +167,65 @@ def test_sweeps_stuck_launching_jobs(mock_launch, mock_sqs, mock_store, mock_cou
     body = json.loads(mock_sqs.return_value.send_message.call_args.kwargs["MessageBody"])
     assert body["data"]["status"] == "failed"
     assert body["data"]["runId"] == "r-stuck"
+
+
+@patch("pmf_engine.control_plane.scheduler_handler.emit_dispatch_metric")
+@patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
+@patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
+@patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
+@patch("pmf_engine.control_plane.scheduler_handler.launch_run")
+def test_failed_launch_callback_send_failure_is_logged_and_metriced(
+    mock_launch, mock_sqs, mock_store, mock_count, mock_metric
+):
+    # A failed launch whose `failed` callback send raises must still mark_failed,
+    # emit the orphan metric, and let the handler return normally.
+    mock_count.return_value = 0
+    store = mock_store.return_value
+    store.query_queued.return_value = [_job("r1", "HIGH")]
+    store.query_stuck_launching.return_value = []
+    mock_launch.return_value = {"status": "failed", "error": "Broker rejected the request"}
+    mock_sqs.return_value.send_message.side_effect = RuntimeError("sqs down")
+
+    result = sched.handler({}, None)
+
+    store.mark_failed.assert_called_once_with("r1")
+    assert result == {"launched": 0}
+    assert "SchedulerFailedCallbackFailed" in [c.args[0] for c in mock_metric.call_args_list]
+
+
+@patch("pmf_engine.control_plane.scheduler_handler.emit_dispatch_metric")
+@patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
+@patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
+@patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
+@patch("pmf_engine.control_plane.scheduler_handler.launch_run")
+def test_sweep_callback_send_failure_is_logged_and_metriced(mock_launch, mock_sqs, mock_store, mock_count, mock_metric):
+    # The sweep's `failed` callback send raising must not abort the sweep or the
+    # handler; it logs + emits the orphan metric and still marks the job failed.
+    mock_count.return_value = 3  # at cap, no new launches
+    store = mock_store.return_value
+    store.query_stuck_launching.return_value = [_job("r-stuck", "HIGH")]
+    mock_sqs.return_value.send_message.side_effect = RuntimeError("sqs down")
+
+    result = sched.handler({}, None)
+
+    store.mark_failed.assert_called_once_with("r-stuck")
+    assert result == {"launched": 0}
+    assert "SchedulerSweepCallbackFailed" in [c.args[0] for c in mock_metric.call_args_list]
+
+
+@patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
+@patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
+@patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
+@patch("pmf_engine.control_plane.scheduler_handler.launch_run")
+def test_query_queued_failure_does_not_propagate(mock_launch, mock_sqs, mock_store, mock_count):
+    # A DynamoDB throttle on query_queued must not raise out of handler (which
+    # would stall the stream shard); it skips the tick and returns normally.
+    mock_count.return_value = 0
+    store = mock_store.return_value
+    store.query_stuck_launching.return_value = []
+    store.query_queued.side_effect = RuntimeError("ProvisionedThroughputExceeded")
+
+    result = sched.handler({}, None)
+
+    assert result == {"launched": 0}
+    mock_launch.assert_not_called()
