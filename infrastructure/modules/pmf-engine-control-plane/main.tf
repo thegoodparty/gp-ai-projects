@@ -97,6 +97,12 @@ variable "experiment_metadata_read_policy_arn" {
   default     = ""
 }
 
+variable "max_concurrent_agents" {
+  description = "Maximum number of concurrently-running agent Fargate tasks the scheduler will allow. The scheduler counts RUNNING tasks and launches up to this cap."
+  type        = number
+  default     = 100
+}
+
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_vpc" "selected" {
@@ -194,8 +200,52 @@ resource "aws_sqs_queue" "dispatch" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dispatch_dlq.arn
-    maxReceiveCount     = 3
+    maxReceiveCount     = 5
   })
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+# --- DynamoDB: Job Queue ---
+
+resource "aws_dynamodb_table" "job_queue" {
+  name         = "agent-job-queue-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "run_id"
+
+  attribute {
+    name = "run_id"
+    type = "S"
+  }
+  attribute {
+    name = "gsi_pk"
+    type = "S"
+  }
+  attribute {
+    name = "queue_sort"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "queue-index"
+    hash_key        = "gsi_pk"
+    range_key       = "queue_sort"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  stream_enabled   = true
+  stream_view_type = "KEYS_ONLY"
+
+  point_in_time_recovery {
+    enabled = true
+  }
 
   tags = {
     Environment = var.environment
@@ -367,6 +417,11 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
         Resource = aws_sqs_queue.results.arn
       },
       {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.job_queue.arn
+      },
+      {
         Effect = "Allow"
         Action = "secretsmanager:GetSecretValue"
         Resource = [
@@ -390,18 +445,19 @@ resource "aws_lambda_function" "dispatch" {
 
   environment {
     variables = {
-      ENVIRONMENT           = var.environment
-      ECS_CLUSTER_ARN       = var.ecs_cluster_arn
-      ECS_TASK_DEFINITION   = var.ecs_task_definition_family
-      ECS_SUBNET_IDS        = join(",", var.ecs_subnet_ids)
-      ECS_SECURITY_GROUP_ID = var.ecs_security_group_id
-      ARTIFACT_BUCKET       = aws_s3_bucket.artifacts.id
-      CONTAINER_NAME        = "pmf-engine"
+      ENVIRONMENT                = var.environment
+      ECS_CLUSTER_ARN            = var.ecs_cluster_arn
+      ECS_TASK_DEFINITION        = var.ecs_task_definition_family
+      ECS_SUBNET_IDS             = join(",", var.ecs_subnet_ids)
+      ECS_SECURITY_GROUP_ID      = var.ecs_security_group_id
+      ARTIFACT_BUCKET            = aws_s3_bucket.artifacts.id
+      CONTAINER_NAME             = "pmf-engine"
       AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
       BROKER_URL                 = var.broker_url
       RESULTS_QUEUE_URL          = aws_sqs_queue.results.url
       SERVICE_TOKEN              = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
       EXPERIMENT_METADATA_BUCKET = var.experiment_metadata_bucket_name
+      JOB_TABLE_NAME             = aws_dynamodb_table.job_queue.name
     }
   }
 
@@ -422,6 +478,149 @@ resource "aws_lambda_event_source_mapping" "dispatch_sqs" {
   enabled          = true
 
   function_response_types = ["ReportBatchItemFailures"]
+}
+
+# --- Lambda: Scheduler ---
+# The scheduler reuses the dispatch Lambda package (same archive) with a
+# different handler entrypoint and reserved concurrency 1. It is the only
+# thing that calls ecs:RunTask, so the concurrency cap is exact.
+
+resource "aws_iam_role" "scheduler_lambda_role" {
+  name = "pmf-engine-scheduler-lambda-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "scheduler_basic" {
+  role       = aws_iam_role.scheduler_lambda_role.id
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "scheduler_vpc_access" {
+  role       = aws_iam_role.scheduler_lambda_role.id
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
+  name = "scheduler-permissions"
+  role = aws_iam_role.scheduler_lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:GetItem"]
+        Resource = [aws_dynamodb_table.job_queue.arn, "${aws_dynamodb_table.job_queue.arn}/index/*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:DescribeStream", "dynamodb:ListStreams"]
+        Resource = "${aws_dynamodb_table.job_queue.arn}/stream/*"
+      },
+      {
+        Effect    = "Allow"
+        Action    = "ecs:ListTasks"
+        Resource  = "*"
+        Condition = { ArnEquals = { "ecs:cluster" = var.ecs_cluster_arn } }
+      },
+      {
+        Effect    = "Allow"
+        Action    = "ecs:RunTask"
+        Resource  = "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task-definition/${var.ecs_task_definition_family}:*"
+        Condition = { ArnEquals = { "ecs:cluster" = var.ecs_cluster_arn } }
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = [var.ecs_task_execution_role_arn, var.ecs_task_role_arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = aws_sqs_queue.results.arn
+      },
+      {
+        Effect    = "Allow"
+        Action    = "cloudwatch:PutMetricData"
+        Resource  = "*"
+        Condition = { StringEquals = { "cloudwatch:namespace" = "PMFEngine" } }
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_function" "scheduler" {
+  function_name    = "pmf-engine-scheduler-${var.environment}"
+  filename         = data.archive_file.dispatch_lambda.output_path
+  source_code_hash = data.archive_file.dispatch_lambda.output_base64sha256
+  handler          = "scheduler_handler.handler"
+  runtime          = "python3.13"
+  role             = aws_iam_role.scheduler_lambda_role.arn
+  timeout          = 120
+  memory_size      = 256
+
+  reserved_concurrent_executions = 1
+
+  environment {
+    variables = {
+      ENVIRONMENT           = var.environment
+      ECS_CLUSTER_ARN       = var.ecs_cluster_arn
+      ECS_TASK_DEFINITION   = var.ecs_task_definition_family
+      ECS_SUBNET_IDS        = join(",", var.ecs_subnet_ids)
+      ECS_SECURITY_GROUP_ID = var.ecs_security_group_id
+      CONTAINER_NAME        = "pmf-engine"
+      BROKER_URL            = var.broker_url
+      RESULTS_QUEUE_URL     = aws_sqs_queue.results.url
+      SERVICE_TOKEN         = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
+      JOB_TABLE_NAME        = aws_dynamodb_table.job_queue.name
+      MAX_CONCURRENT_AGENTS = tostring(var.max_concurrent_agents)
+    }
+  }
+
+  vpc_config {
+    subnet_ids         = var.ecs_subnet_ids
+    security_group_ids = [aws_security_group.dispatch_lambda.id]
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "scheduler_stream" {
+  event_source_arn  = aws_dynamodb_table.job_queue.stream_arn
+  function_name     = aws_lambda_function.scheduler.arn
+  starting_position = "LATEST"
+  batch_size        = 100
+  # Coalesce a burst of inserts into one scheduler run rather than one-per-row.
+  maximum_batching_window_in_seconds = 1
+  enabled                            = true
+}
+
+resource "aws_cloudwatch_event_rule" "scheduler_tick" {
+  name                = "pmf-engine-scheduler-tick-${var.environment}"
+  schedule_expression = "rate(1 minute)"
+}
+
+resource "aws_cloudwatch_event_target" "scheduler_tick" {
+  rule = aws_cloudwatch_event_rule.scheduler_tick.name
+  arn  = aws_lambda_function.scheduler.arn
+}
+
+resource "aws_lambda_permission" "scheduler_tick" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.scheduler_tick.arn
 }
 
 # --- CloudWatch Alarms ---
