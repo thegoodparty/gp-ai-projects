@@ -67,7 +67,11 @@ def _send_callback(
     experiment_id: str = "unknown",
     organization_slug: str = "unknown",
     error: str | None = None,
-) -> None:
+) -> bool:
+    """Best-effort SQS callback to gp-api's results queue. Never raises —
+    returns True on a successful send, False otherwise. The launch path keys
+    its `mark_dispatched` decision on this so a failed `started` send leaves
+    the job LAUNCHING for the stuck-LAUNCHING sweep rather than orphaning it."""
     body = {
         "type": "agentExperimentResult",
         "data": {
@@ -78,12 +82,18 @@ def _send_callback(
             **({"error": error, "detail": error} if error else {}),
         },
     }
-    get_sqs_client().send_message(
-        QueueUrl=RESULTS_QUEUE_URL,
-        MessageBody=json.dumps(body),
-        MessageGroupId="agentExperiments",
-        MessageDeduplicationId=f"{run_id}-{status}",
-    )
+    try:
+        get_sqs_client().send_message(
+            QueueUrl=RESULTS_QUEUE_URL,
+            MessageBody=json.dumps(body),
+            MessageGroupId="agentExperiments",
+            MessageDeduplicationId=f"{run_id}-{status}",
+        )
+        return True
+    except Exception as e:
+        logger.exception(f"callback send failed for {run_id} status={status} ({type(e).__name__})")
+        emit_dispatch_metric("SchedulerCallbackSendFailed", experiment_id)
+        return False
 
 
 def _sweep_stuck_launching(store) -> None:
@@ -104,7 +114,16 @@ def _sweep_stuck_launching(store) -> None:
 
 def handler(event, context) -> dict:
     store = get_job_store()
-    _sweep_stuck_launching(store)
+    # The DynamoDB-stream ESM retries a failing batch until records expire and,
+    # with reserved concurrency 1, a single raise stalls ALL arrival-triggered
+    # dispatch behind it. So the handler must effectively never raise: every
+    # fallible step is guarded, and the 1-minute tick + idempotent design
+    # reconcile anything an individual op leaves behind.
+    try:
+        _sweep_stuck_launching(store)
+    except Exception as e:
+        logger.exception(f"stuck-LAUNCHING sweep failed ({type(e).__name__}); continuing")
+        emit_dispatch_metric("SchedulerSweepError", "_unknown")
 
     if MAX_CONCURRENT_AGENTS <= 0:
         logger.warning("MAX_CONCURRENT_AGENTS unset/0; scheduler will not launch")
@@ -127,56 +146,80 @@ def handler(event, context) -> dict:
     for job in jobs:
         if launched >= slots:
             break
+        # One job's unexpected error must never abort the batch — log + metric
+        # and move on. The transient-launch_run case is handled inside (leaves
+        # LAUNCHING for the sweep); this outer guard catches everything else.
         try:
-            store.claim(job.run_id)
+            if _launch_one(store, job):
+                launched += 1
         except JobClaimConflict:
             logger.info(f"job {job.run_id} already claimed; skipping")
             continue
-
-        message = {
-            "run_id": job.run_id,
-            "experiment_type": job.experiment_type,
-            "organization_slug": job.organization_slug,
-            "clerk_user_id": job.clerk_user_id,
-            "params": job.params,
-            "prior_artifact_versions": job.prior_artifact_versions,
-        }
-        experiment = dict(job.routing)  # model, timeout_seconds, *_version_id(s)
-        params_json = json.dumps(job.params)
-
-        try:
-            result = launch_run(
-                experiment=experiment,
-                message=message,
-                scope=job.routing.get("scope", {}),
-                params_json=params_json,
-            )
         except Exception as e:
-            # Transient (httpx during mint, ECS RunTask exception). Leave the
-            # job LAUNCHING; next tick won't re-pick it (it's out of the GSI),
-            # so the stuck-LAUNCHING sweep above recovers it on a later tick.
-            logger.exception(f"launch_run raised for {job.run_id} ({type(e).__name__}); left LAUNCHING")
-            emit_dispatch_metric("SchedulerLaunchTransient", job.experiment_type)
+            logger.exception(f"unexpected error dispatching {job.run_id} ({type(e).__name__}); continuing")
+            emit_dispatch_metric("SchedulerJobError", job.experiment_type)
             continue
-
-        if result["status"] == "launched":
-            store.mark_dispatched(job.run_id)
-            _send_callback(
-                job.run_id,
-                "started",
-                experiment_id=job.experiment_type,
-                organization_slug=job.organization_slug,
-            )
-            launched += 1
-        else:
-            store.mark_failed(job.run_id)
-            _send_callback(
-                job.run_id,
-                "failed",
-                experiment_id=job.experiment_type,
-                organization_slug=job.organization_slug,
-                error=result.get("error", "dispatch failed"),
-            )
 
     logger.info(f"scheduler launched {launched}/{slots} (running was {running})")
     return {"launched": launched}
+
+
+def _launch_one(store, job) -> bool:
+    """Claim, launch, and reconcile a single queued job. Returns True if a task
+    was launched (counts toward the slot budget). Raises JobClaimConflict if the
+    claim lost the race; the caller treats any other raise as a per-job error."""
+    store.claim(job.run_id)
+
+    message = {
+        "run_id": job.run_id,
+        "experiment_type": job.experiment_type,
+        "organization_slug": job.organization_slug,
+        "clerk_user_id": job.clerk_user_id,
+        "params": job.params,
+        "prior_artifact_versions": job.prior_artifact_versions,
+    }
+    experiment = dict(job.routing)  # model, timeout_seconds, *_version_id(s)
+    params_json = json.dumps(job.params)
+
+    try:
+        result = launch_run(
+            experiment=experiment,
+            message=message,
+            scope=job.routing.get("scope", {}),
+            params_json=params_json,
+        )
+    except Exception as e:
+        # Transient (httpx during mint, ECS RunTask exception). Leave the
+        # job LAUNCHING; next tick won't re-pick it (it's out of the GSI),
+        # so the stuck-LAUNCHING sweep recovers it on a later tick.
+        logger.exception(f"launch_run raised for {job.run_id} ({type(e).__name__}); left LAUNCHING")
+        emit_dispatch_metric("SchedulerLaunchTransient", job.experiment_type)
+        return False
+
+    if result["status"] == "launched":
+        # Send the `started` callback BEFORE marking dispatched. If the send
+        # fails, leave the job LAUNCHING (do NOT mark dispatched) — the
+        # stuck-LAUNCHING sweep reconciles it to FAILED later. This trades a
+        # rare ran-but-shows-FAILED for never silently orphaning a launched run.
+        sent = _send_callback(
+            job.run_id,
+            "started",
+            experiment_id=job.experiment_type,
+            organization_slug=job.organization_slug,
+        )
+        if not sent:
+            logger.error(f"started-callback send failed for {job.run_id}; leaving LAUNCHING for the sweep")
+            emit_dispatch_metric("SchedulerStartedCallbackFailed", job.experiment_type)
+            return False
+        store.mark_dispatched(job.run_id)
+        return True
+
+    store.mark_failed(job.run_id)
+    _send_callback(
+        job.run_id,
+        "failed",
+        experiment_id=job.experiment_type,
+        organization_slug=job.organization_slug,
+        error=result.get("error", "dispatch failed"),
+    )
+    return False
