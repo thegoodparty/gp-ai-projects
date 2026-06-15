@@ -182,6 +182,27 @@ def get_ecs_client():
     return _ecs_client
 
 
+JOB_TABLE_NAME = os.environ.get("JOB_TABLE_NAME", "")
+
+_job_store = None
+
+
+def get_job_store():
+    global _job_store
+    if _job_store is None:
+        try:
+            from .job_store import JobStore  # local import keeps cold-start lean
+        except ImportError:
+            from job_store import JobStore  # type: ignore[no-redef]
+        _job_store = JobStore(JOB_TABLE_NAME)
+    return _job_store
+
+
+def reset_job_store_for_tests() -> None:
+    global _job_store
+    _job_store = None
+
+
 def get_sqs_client():
     global _sqs_client
     if _sqs_client is None:
@@ -310,6 +331,8 @@ def _missing_critical_config() -> list[str]:
         missing.append("SERVICE_TOKEN")
     if not os.environ.get("EXPERIMENT_METADATA_BUCKET", "").strip():
         missing.append("EXPERIMENT_METADATA_BUCKET")
+    if not JOB_TABLE_NAME:
+        missing.append("JOB_TABLE_NAME")
     return missing
 
 
@@ -360,6 +383,11 @@ def parse_dispatch_message(body: str) -> dict:
     # Experiments that hit /agent-mcp will be 4xx'd by that route's guard.
     if "clerk_user_id" in data and data["clerk_user_id"] is not None and not isinstance(data["clerk_user_id"], str):
         raise ValueError("clerk_user_id must be a string when provided")
+
+    priority = data.get("priority", "DEFAULT")
+    if priority not in ("HIGH", "DEFAULT"):
+        raise ValueError("priority must be 'HIGH' or 'DEFAULT'")
+    data["priority"] = priority
 
     if data.get("params") is None:
         data["params"] = {}
@@ -717,52 +745,43 @@ def handler(event: dict, context) -> dict:
             if not sent:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
-        try:
-            result = launch_run(
-                experiment=experiment,
-                message=message,
-                scope=scope,
-                params_json=params_json,
-            )
-        except httpx.HTTPError:
-            # Transient mint failure — SQS retry.
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-        except Exception as e:
-            # Transient ECS RunTask exception — SQS retry. launch_run already
-            # logged, emitted the metric, and cleaned up the minted token.
-            send_error_callback(
-                message,
-                f"ECS RunTask exception: {type(e).__name__}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"runtask-exception-{message['run_id']}",
-            )
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
+        import time as _time
 
-        if result["status"] == "failed":
-            error = result["error"]
-            if error.startswith("ECS RunTask failed:"):
-                dedup = f"runtask-failed-{message['run_id']}"
-                send_error_callback(message, error, RESULTS_QUEUE_URL, dedup_id=dedup)
-                batch_item_failures.append({"itemIdentifier": message_id})
-            elif error.startswith("Unexpected dispatch error:"):
-                send_error_callback(
-                    message,
-                    error,
-                    RESULTS_QUEUE_URL,
-                    dedup_id=f"mint-exception-{message.get('run_id', 'unknown')}",
+        try:
+            from .job_store import QueuedJob
+        except ImportError:
+            from job_store import QueuedJob  # type: ignore[no-redef]
+
+        routing = {
+            "model": experiment["model"],
+            "timeout_seconds": experiment.get("timeout_seconds", 600),
+            "manifest_version_id": experiment.get("manifest_version_id"),
+            "instruction_version_id": experiment.get("instruction_version_id"),
+            "attachment_version_ids": experiment.get("attachment_version_ids"),
+            "scope": scope,
+        }
+        try:
+            get_job_store().put_queued_job(
+                QueuedJob(
+                    run_id=message["run_id"],
+                    experiment_type=experiment_id,
+                    organization_slug=message["organization_slug"],
+                    clerk_user_id=message.get("clerk_user_id"),
+                    priority=message["priority"],
+                    params=message["params"],
+                    routing=routing,
+                    prior_artifact_versions=message.get("prior_artifact_versions"),
+                    created_at_ms=int(_time.time() * 1000),
                 )
-                batch_item_failures.append({"itemIdentifier": message_id})
-            else:
-                sent = send_error_callback(
-                    message,
-                    error,
-                    RESULTS_QUEUE_URL,
-                    dedup_id=f"broker-rejected-{message['run_id']}",
-                )
-                if not sent:
-                    batch_item_failures.append({"itemIdentifier": message_id})
+            )
+        except Exception as e:
+            logger.exception(f"Failed to enqueue job for run {message['run_id']}: {e}")
+            emit_dispatch_metric("JobEnqueueFailed", experiment_id)
+            batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+        emit_dispatch_metric("JobEnqueued", experiment_id)
+        # Arrival is picked up by the scheduler via the table's DynamoDB stream;
+        # no explicit invoke needed here.
 
     return {"batchItemFailures": batch_item_failures}
 
