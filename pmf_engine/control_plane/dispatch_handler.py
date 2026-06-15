@@ -45,6 +45,8 @@ except ImportError:
 _ecs_client = None
 _sqs_client = None
 _cw_client = None
+_secrets_client = None
+_service_token: str | None = None
 _manifest_loader: ManifestRoutingLoader | None = None
 _broker_client: BrokerClient | None = None
 _validator_cache: dict[str, Draft7Validator] = {}
@@ -62,13 +64,38 @@ def _is_write_action(experiment: dict) -> bool:
     return any(experiment.get(f) is not None for f in _WRITE_ACTION_DISCRIMINATORS)
 
 
+def _get_secrets_client():
+    global _secrets_client
+    if _secrets_client is None:
+        _secrets_client = boto3.client("secretsmanager")
+    return _secrets_client
+
+
+def get_service_token() -> str:
+    """Fetch the broker service token from Secrets Manager, cached per warm
+    container. Reading at runtime keeps the secret out of Terraform state and
+    out of lambda:GetFunctionConfiguration, unlike a plaintext env var. A
+    fetch failure propagates so the launch/mint path treats it as transient."""
+    global _service_token
+    if _service_token is None:
+        resp = _get_secrets_client().get_secret_value(SecretId=SERVICE_TOKENS_SECRET_ARN)
+        _service_token = json.loads(resp["SecretString"])["SERVICE_TOKEN"]
+    return _service_token
+
+
+def reset_service_token_for_tests() -> None:
+    global _service_token, _secrets_client
+    _service_token = None
+    _secrets_client = None
+
+
 def get_broker_client() -> BrokerClient:
     """Process-cached BrokerClient. Safe across threads — BrokerClient holds
     only the URL + service token; httpx is invoked at module-level per call.
     """
     global _broker_client
     if _broker_client is None:
-        _broker_client = BrokerClient(BROKER_URL, SERVICE_TOKEN)
+        _broker_client = BrokerClient(BROKER_URL, get_service_token())
     return _broker_client
 
 
@@ -309,7 +336,7 @@ ECS_SUBNET_IDS = [s for s in os.environ.get("ECS_SUBNET_IDS", "").split(",") if 
 ECS_SECURITY_GROUP_ID = os.environ.get("ECS_SECURITY_GROUP_ID", "")
 RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
 BROKER_URL = os.environ.get("BROKER_URL", "")
-SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+SERVICE_TOKENS_SECRET_ARN = os.environ.get("SERVICE_TOKENS_SECRET_ARN", "")
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "pmf-engine")
 
 
@@ -327,8 +354,8 @@ def _missing_critical_config() -> list[str]:
         missing.append("RESULTS_QUEUE_URL")
     if not BROKER_URL:
         missing.append("BROKER_URL")
-    if not SERVICE_TOKEN:
-        missing.append("SERVICE_TOKEN")
+    if not SERVICE_TOKENS_SECRET_ARN:
+        missing.append("SERVICE_TOKENS_SECRET_ARN")
     if not os.environ.get("EXPERIMENT_METADATA_BUCKET", "").strip():
         missing.append("EXPERIMENT_METADATA_BUCKET")
     if not JOB_TABLE_NAME:

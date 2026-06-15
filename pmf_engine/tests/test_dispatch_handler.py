@@ -66,7 +66,14 @@ def _default_dispatch_env(monkeypatch):
     monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc", raising=False)
     monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo", raising=False)
     monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com", raising=False)
-    monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token-xyz", raising=False)
+    monkeypatch.setattr(
+        dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc", raising=False
+    )
+    # Stub at the secrets-client layer so the real get_service_token() runs in
+    # every dispatch/scheduler test path without hitting Secrets Manager.
+    _fake_secrets = MagicMock()
+    _fake_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"SERVICE_TOKEN": "svc-token-xyz"})}
+    monkeypatch.setattr(dh, "_get_secrets_client", lambda: _fake_secrets)
     monkeypatch.setenv("EXPERIMENT_METADATA_BUCKET", "agent-experiment-metadata-test")
     monkeypatch.setattr(dh, "JOB_TABLE_NAME", "agent-job-queue-test", raising=False)
     fake_loader = _build_synthetic_loader()
@@ -77,6 +84,7 @@ def _default_dispatch_env(monkeypatch):
     dh.reset_validator_cache_for_tests()
     dh.reset_broker_client_for_tests()
     dh.reset_job_store_for_tests()
+    dh.reset_service_token_for_tests()
 
 
 def _make_sqs_event(body: dict) -> dict:
@@ -928,6 +936,23 @@ class TestErrorCallbackStableDedup:
         assert result == {"status": "failed", "error": "Invalid experiment parameters"}
 
 
+class TestGetServiceToken:
+    def test_fetches_from_secrets_manager_and_caches(self, monkeypatch):
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        dh.reset_service_token_for_tests()
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
+        fake_client = MagicMock()
+        fake_client.get_secret_value.return_value = {"SecretString": json.dumps({"SERVICE_TOKEN": "tok"})}
+        monkeypatch.setattr(dh, "_get_secrets_client", lambda: fake_client)
+
+        assert dh.get_service_token() == "tok"
+        # Second call is served from the warm-container cache, not Secrets Manager.
+        assert dh.get_service_token() == "tok"
+        fake_client.get_secret_value.assert_called_once_with(SecretId="arn:aws:secretsmanager:us-west-2:123:secret:svc")
+        dh.reset_service_token_for_tests()
+
+
 class TestMissingCriticalEnvVars:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -940,7 +965,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc")
         monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo")
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
-        monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
 
         event = _make_sqs_event(
             {
@@ -971,7 +996,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc")
         monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo")
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
-        monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
 
         event = _make_sqs_event(
             {

@@ -109,10 +109,6 @@ data "aws_vpc" "selected" {
   id = var.vpc_id
 }
 
-data "aws_secretsmanager_secret_version" "service_tokens" {
-  secret_id = var.service_tokens_secret_arn
-}
-
 # --- S3: Artifact Bucket ---
 
 resource "aws_s3_bucket" "artifacts" {
@@ -437,7 +433,7 @@ resource "aws_lambda_function" "dispatch" {
       AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
       BROKER_URL                 = var.broker_url
       RESULTS_QUEUE_URL          = aws_sqs_queue.results.url
-      SERVICE_TOKEN              = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
+      SERVICE_TOKENS_SECRET_ARN  = var.service_tokens_secret_arn
       EXPERIMENT_METADATA_BUCKET = var.experiment_metadata_bucket_name
       JOB_TABLE_NAME             = aws_dynamodb_table.job_queue.name
     }
@@ -535,6 +531,11 @@ resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
         Resource  = "*"
         Condition = { StringEquals = { "cloudwatch:namespace" = "PMFEngine" } }
       },
+      {
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.service_tokens_secret_arn
+      },
     ]
   })
 }
@@ -553,17 +554,17 @@ resource "aws_lambda_function" "scheduler" {
 
   environment {
     variables = {
-      ENVIRONMENT           = var.environment
-      ECS_CLUSTER_ARN       = var.ecs_cluster_arn
-      ECS_TASK_DEFINITION   = var.ecs_task_definition_family
-      ECS_SUBNET_IDS        = join(",", var.ecs_subnet_ids)
-      ECS_SECURITY_GROUP_ID = var.ecs_security_group_id
-      CONTAINER_NAME        = "pmf-engine"
-      BROKER_URL            = var.broker_url
-      RESULTS_QUEUE_URL     = aws_sqs_queue.results.url
-      SERVICE_TOKEN         = try(jsondecode(data.aws_secretsmanager_secret_version.service_tokens.secret_string)["SERVICE_TOKEN"], "")
-      JOB_TABLE_NAME        = aws_dynamodb_table.job_queue.name
-      MAX_CONCURRENT_AGENTS = tostring(var.max_concurrent_agents)
+      ENVIRONMENT               = var.environment
+      ECS_CLUSTER_ARN           = var.ecs_cluster_arn
+      ECS_TASK_DEFINITION       = var.ecs_task_definition_family
+      ECS_SUBNET_IDS            = join(",", var.ecs_subnet_ids)
+      ECS_SECURITY_GROUP_ID     = var.ecs_security_group_id
+      CONTAINER_NAME            = "pmf-engine"
+      BROKER_URL                = var.broker_url
+      RESULTS_QUEUE_URL         = aws_sqs_queue.results.url
+      SERVICE_TOKENS_SECRET_ARN = var.service_tokens_secret_arn
+      JOB_TABLE_NAME            = aws_dynamodb_table.job_queue.name
+      MAX_CONCURRENT_AGENTS     = tostring(var.max_concurrent_agents)
     }
   }
 
