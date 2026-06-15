@@ -15,7 +15,6 @@ FAILED = "FAILED"
 _GSI_NAME = "queue-index"
 _PRIORITY_RANK = {"HIGH": 0, "DEFAULT": 1}
 _DISPATCHED_TTL_SECONDS = 24 * 3600
-_STUCK_SCAN_LIMIT = 200
 
 
 class JobClaimConflict(Exception):
@@ -118,23 +117,33 @@ class JobStore:
         self._set_terminal(run_id, FAILED)
 
     def query_stuck_launching(self, older_than_ms: int) -> list[QueuedJob]:
-        """Bounded scan for jobs stuck in LAUNCHING since before `older_than_ms`.
+        """Paginated scan for jobs stuck in LAUNCHING since before `older_than_ms`.
 
         A transient failure during launch leaves a job LAUNCHING and out of the
-        GSI, so it never gets re-picked. A small bounded Scan (capped at
-        _STUCK_SCAN_LIMIT) is sufficient at this volume — the LAUNCHING set is
-        only the in-flight launches, which is at most the concurrency cap."""
-        resp = self._client.scan(
-            TableName=self._table,
-            FilterExpression="#s = :launching AND claimed_at < :cutoff",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
+        GSI, so it never gets re-picked. DynamoDB applies a Scan's Limit to items
+        EXAMINED, before the FilterExpression — so a bounded scan would have its
+        budget consumed by DISPATCHED/FAILED rows (which linger up to 24h via TTL)
+        and never reach a LAUNCHING row once the table grows past the limit. We
+        page the full scan instead; the result is bounded by the concurrency cap,
+        not the table size, so accumulating matches is safe."""
+        items = []
+        kwargs = {
+            "TableName": self._table,
+            "FilterExpression": "#s = :launching AND claimed_at < :cutoff",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {
                 ":launching": {"S": LAUNCHING},
                 ":cutoff": {"N": str(older_than_ms)},
             },
-            Limit=_STUCK_SCAN_LIMIT,
-        )
-        return [self._to_job(i) for i in resp.get("Items", [])]
+        }
+        while True:
+            resp = self._client.scan(**kwargs)
+            items.extend(resp.get("Items", []))
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+        return [self._to_job(i) for i in items]
 
     def _set_terminal(self, run_id: str, status: str) -> None:
         ttl = int(time.time()) + _DISPATCHED_TTL_SECONDS

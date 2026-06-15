@@ -2,7 +2,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from pmf_engine.control_plane.job_store import JobStore, QueuedJob
+from pmf_engine.control_plane.job_store import LAUNCHING, JobStore, QueuedJob
 
 TABLE = "agent-job-queue-test"
 
@@ -106,3 +106,54 @@ def test_query_stuck_launching_returns_old_claimed_jobs(store):
     future = int(time.time() * 1000) + 60_000
     ids = {j.run_id for j in store.query_stuck_launching(older_than_ms=future)}
     assert ids == {"r-fresh", "r-stale"}
+
+
+def _launching_item(run_id, claimed_at_ms):
+    return {
+        "run_id": {"S": run_id},
+        "status": {"S": LAUNCHING},
+        "experiment_type": {"S": "smoke_test"},
+        "organization_slug": {"S": "org-1"},
+        "priority": {"S": "DEFAULT"},
+        "params": {"S": "{}"},
+        "routing": {"S": "{}"},
+        "created_at": {"N": "1000"},
+        "attempts": {"N": "1"},
+        "claimed_at": {"N": str(claimed_at_ms)},
+    }
+
+
+class _PaginatingScanClient:
+    """Stub DynamoDB client modeling DynamoDB's real Scan contract: Limit caps
+    items EXAMINED (before the FilterExpression), and a budget-exhausted page
+    returns a LastEvaluatedKey even when the post-filter Items list is empty.
+
+    The stuck LAUNCHING row only surfaces on page 2 — exactly the case the old
+    single-call Limit=200 scan starved on. moto can't reproduce this because it
+    doesn't model physical scan order, so we stub the boundary directly."""
+
+    def __init__(self, stuck_item):
+        self._stuck_item = stuck_item
+        self.scan_calls = 0
+
+    def scan(self, **kwargs):
+        self.scan_calls += 1
+        if "ExclusiveStartKey" not in kwargs:
+            # Page 1: budget consumed entirely by terminal rows that the filter
+            # rejects. No matching Items, but more table remains.
+            return {"Items": [], "LastEvaluatedKey": {"run_id": {"S": "term-199"}}}
+        # Page 2: the stuck LAUNCHING row, and the scan is now exhausted.
+        return {"Items": [self._stuck_item]}
+
+
+def test_query_stuck_launching_paginates_past_starved_first_page():
+    stuck = _launching_item("r-stuck", claimed_at_ms=5000)
+    client = _PaginatingScanClient(stuck)
+    store = JobStore("agent-job-queue-test", dynamodb_client=client)
+
+    # older_than_ms above claimed_at; the fix must page to find r-stuck. The old
+    # single-call scan returned page 1's empty Items and never followed the LEK.
+    jobs = store.query_stuck_launching(older_than_ms=10_000)
+
+    assert client.scan_calls == 2
+    assert [j.run_id for j in jobs] == ["r-stuck"]
