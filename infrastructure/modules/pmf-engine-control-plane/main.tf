@@ -385,24 +385,6 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
       },
       {
         Effect   = "Allow"
-        Action   = "ecs:RunTask"
-        Resource = "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task-definition/${var.ecs_task_definition_family}:*"
-        Condition = {
-          ArnEquals = {
-            "ecs:cluster" = var.ecs_cluster_arn
-          }
-        }
-      },
-      {
-        Effect = "Allow"
-        Action = "iam:PassRole"
-        Resource = [
-          var.ecs_task_execution_role_arn,
-          var.ecs_task_role_arn
-        ]
-      },
-      {
-        Effect   = "Allow"
         Action   = "cloudwatch:PutMetricData"
         Resource = "*"
         Condition = {
@@ -602,7 +584,20 @@ resource "aws_lambda_event_source_mapping" "scheduler_stream" {
   batch_size        = 100
   # Coalesce a burst of inserts into one scheduler run rather than one-per-row.
   maximum_batching_window_in_seconds = 1
-  enabled                            = true
+  # Bound stream retries so a poison batch can't block the shard for hours.
+  # The 1-minute tick + idempotent design reconcile anything dropped here.
+  maximum_retry_attempts        = 2
+  maximum_record_age_in_seconds = 3600
+  enabled                       = true
+
+  # Only wake the scheduler on inserts — claim/mark MODIFY events and TTL
+  # REMOVE events don't need a dispatch pass; the 1-minute tick handles
+  # slot-freed reconciliation.
+  filter_criteria {
+    filter {
+      pattern = jsonencode({ eventName = ["INSERT"] })
+    }
+  }
 }
 
 resource "aws_cloudwatch_event_rule" "scheduler_tick" {
