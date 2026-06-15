@@ -23,24 +23,24 @@ except (ImportError, OSError):
 
 try:
     from .broker_client import BrokerClient, BrokerError
-    from .scope_derivation import derive_scope
     from .jsonschema_errors import format_validation_errors
     from .manifest_loader import (
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from .scope_derivation import derive_scope
 except ImportError:
     from broker_client import BrokerClient, BrokerError
-    from scope_derivation import derive_scope  # type: ignore[no-redef]
     from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from scope_derivation import derive_scope  # type: ignore[no-redef]
 
 _ecs_client = None
 _sqs_client = None
@@ -343,7 +343,7 @@ def parse_dispatch_message(body: str) -> dict:
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, TypeError) as e:
-        raise ValueError(f"Invalid message body: {e}")
+        raise ValueError(f"Invalid message body: {e}") from e
 
     for field in ("experiment_type", "organization_slug", "run_id"):
         if not data.get(field):
@@ -423,6 +423,105 @@ def build_container_overrides(
     # above) and reads them directly. Duplicating them here would create a
     # second source of truth and risk env-var size limits for system_prompt.
     return {"containerOverrides": [{"name": container_name, "environment": env}]}
+
+
+def launch_run(
+    *,
+    experiment: dict,
+    message: dict,
+    scope: dict,
+    params_json: str,
+) -> dict:
+    """Mint a broker token and launch the Fargate task. Returns
+    {"status": "launched", "task_arn": ...} on success, or
+    {"status": "failed", "error": <user-safe>} when the run could not be
+    launched (broker rejection, ECS RunTask failure). Raises on transient
+    errors the caller should retry (httpx during mint, ECS RunTask exception).
+    """
+    experiment_id = message["experiment_type"]
+    prior_artifact_versions = message.get("prior_artifact_versions")
+    try:
+        broker = get_broker_client()
+        mint_result = broker.mint_run_token(
+            run_id=message["run_id"],
+            organization_slug=message["organization_slug"],
+            experiment_id=experiment_id,
+            scope=scope,
+            params=message["params"],
+            clerk_user_id=message.get("clerk_user_id"),
+            exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
+            prior_artifact_versions=prior_artifact_versions,
+        )
+    except BrokerError as e:
+        logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
+        emit_dispatch_metric("BrokerRejected", experiment_id)
+        return {"status": "failed", "error": e.user_safe_message or "Broker rejected the request"}
+    except httpx.HTTPError as e:
+        logger.warning(f"Transient network error during mint for run {message.get('run_id')}: {e}")
+        emit_dispatch_metric("MintTransient", experiment_id)
+        raise
+    except Exception as e:
+        logger.exception(f"Unexpected error during mint for run {message.get('run_id')}: {e}")
+        emit_dispatch_metric("MintUnexpected", experiment_id)
+        return {"status": "failed", "error": f"Unexpected dispatch error: {type(e).__name__}"}
+
+    overrides = build_container_overrides(
+        experiment=experiment,
+        message=message,
+        broker_token=mint_result["broker_token"],
+        broker_url=BROKER_URL,
+        container_name=CONTAINER_NAME,
+        params_json=params_json,
+    )
+
+    logger.info(
+        f"Dispatching experiment '{experiment_id}' for organization "
+        f"'{message['organization_slug']}' (run: {message['run_id']})"
+    )
+
+    minted_broker_token = mint_result["broker_token"]
+
+    try:
+        response = get_ecs_client().run_task(
+            cluster=ECS_CLUSTER_ARN,
+            taskDefinition=ECS_TASK_DEFINITION,
+            launchType="FARGATE",
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": ECS_SUBNET_IDS,
+                    "securityGroups": [ECS_SECURITY_GROUP_ID],
+                    "assignPublicIp": "DISABLED",
+                }
+            },
+            overrides=overrides,
+        )
+
+        failures = response.get("failures", [])
+        tasks = response.get("tasks", [])
+
+        if failures or not tasks:
+            failure_reasons = [f.get("reason", "unknown") for f in failures]
+            logger.error(
+                f"ECS RunTask failed (experiment={experiment_id}, " f"run={message['run_id']}): {failure_reasons}"
+            )
+            _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+            safe_summary = _classify_ecs_failure_reasons(failure_reasons)
+            kind = _classify_ecs_failure_kind(failure_reasons)
+            emit_dispatch_metric(f"ECSRunTaskFailed_{kind}", experiment_id)
+            return {"status": "failed", "error": f"ECS RunTask failed: {safe_summary}"}
+
+        task_arn = tasks[0]["taskArn"]
+        logger.info(f"Started Fargate task: {task_arn}")
+        return {"status": "launched", "task_arn": task_arn}
+
+    except Exception as e:
+        logger.exception(
+            f"ECS RunTask exception (experiment={experiment_id}, "
+            f"run={message['run_id']}, exception_type={type(e).__name__}): {e}"
+        )
+        emit_dispatch_metric("ECSRunTaskException", experiment_id)
+        _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+        raise
 
 
 def handler(event: dict, context) -> dict:
@@ -618,112 +717,20 @@ def handler(event: dict, context) -> dict:
             if not sent:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
-        prior_artifact_versions = message.get("prior_artifact_versions")
         try:
-            broker = get_broker_client()
-            mint_result = broker.mint_run_token(
-                run_id=message["run_id"],
-                organization_slug=message["organization_slug"],
-                experiment_id=experiment_id,
+            result = launch_run(
+                experiment=experiment,
+                message=message,
                 scope=scope,
-                params=message["params"],
-                clerk_user_id=message.get("clerk_user_id"),
-                exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
-                prior_artifact_versions=prior_artifact_versions,
+                params_json=params_json,
             )
-        except BrokerError as e:
-            logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
-            emit_dispatch_metric("BrokerRejected", experiment_id)
-            sent = send_error_callback(
-                message,
-                e.user_safe_message or "Broker rejected the request",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"broker-rejected-{message['run_id']}",
-            )
-            if not sent:
-                batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-        except httpx.HTTPError as e:
-            logger.warning(f"Transient network error during mint for run {message.get('run_id')}: {e}")
-            emit_dispatch_metric("MintTransient", experiment_id)
+        except httpx.HTTPError:
+            # Transient mint failure — SQS retry.
             batch_item_failures.append({"itemIdentifier": message_id})
             continue
         except Exception as e:
-            logger.exception(f"Unexpected error during mint for run {message.get('run_id')}: {e}")
-            emit_dispatch_metric("MintUnexpected", experiment_id)
-            send_error_callback(
-                message,
-                f"Unexpected dispatch error: {type(e).__name__}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"mint-exception-{message.get('run_id', 'unknown')}",
-            )
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-
-        overrides = build_container_overrides(
-            experiment=experiment,
-            message=message,
-            broker_token=mint_result["broker_token"],
-            broker_url=BROKER_URL,
-            container_name=CONTAINER_NAME,
-            params_json=params_json,
-        )
-
-        logger.info(
-            f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})"
-        )
-
-        minted_broker_token = mint_result["broker_token"]
-
-        try:
-            response = get_ecs_client().run_task(
-                cluster=ECS_CLUSTER_ARN,
-                taskDefinition=ECS_TASK_DEFINITION,
-                launchType="FARGATE",
-                networkConfiguration={
-                    "awsvpcConfiguration": {
-                        "subnets": ECS_SUBNET_IDS,
-                        "securityGroups": [ECS_SECURITY_GROUP_ID],
-                        "assignPublicIp": "DISABLED",
-                    }
-                },
-                overrides=overrides,
-            )
-
-            failures = response.get("failures", [])
-            tasks = response.get("tasks", [])
-
-            if failures or not tasks:
-                failure_reasons = [f.get("reason", "unknown") for f in failures]
-                logger.error(
-                    f"ECS RunTask failed for {message_id} "
-                    f"(experiment={experiment_id}, run={message['run_id']}): "
-                    f"{failure_reasons}"
-                )
-                _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
-                safe_summary = _classify_ecs_failure_reasons(failure_reasons)
-                kind = _classify_ecs_failure_kind(failure_reasons)
-                emit_dispatch_metric(f"ECSRunTaskFailed_{kind}", experiment_id)
-                send_error_callback(
-                    message,
-                    f"ECS RunTask failed: {safe_summary}",
-                    RESULTS_QUEUE_URL,
-                    dedup_id=f"runtask-failed-{message['run_id']}",
-                )
-                batch_item_failures.append({"itemIdentifier": message_id})
-                continue
-
-            task_arn = tasks[0]["taskArn"]
-            logger.info(f"Started Fargate task: {task_arn}")
-
-        except Exception as e:
-            logger.exception(
-                f"ECS RunTask exception for {message_id} "
-                f"(experiment={experiment_id}, run={message['run_id']}, "
-                f"exception_type={type(e).__name__}): {e}"
-            )
-            emit_dispatch_metric("ECSRunTaskException", experiment_id)
-            _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+            # Transient ECS RunTask exception — SQS retry. launch_run already
+            # logged, emitted the metric, and cleaned up the minted token.
             send_error_callback(
                 message,
                 f"ECS RunTask exception: {type(e).__name__}",
@@ -731,6 +738,31 @@ def handler(event: dict, context) -> dict:
                 dedup_id=f"runtask-exception-{message['run_id']}",
             )
             batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+
+        if result["status"] == "failed":
+            error = result["error"]
+            if error.startswith("ECS RunTask failed:"):
+                dedup = f"runtask-failed-{message['run_id']}"
+                send_error_callback(message, error, RESULTS_QUEUE_URL, dedup_id=dedup)
+                batch_item_failures.append({"itemIdentifier": message_id})
+            elif error.startswith("Unexpected dispatch error:"):
+                send_error_callback(
+                    message,
+                    error,
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"mint-exception-{message.get('run_id', 'unknown')}",
+                )
+                batch_item_failures.append({"itemIdentifier": message_id})
+            else:
+                sent = send_error_callback(
+                    message,
+                    error,
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"broker-rejected-{message['run_id']}",
+                )
+                if not sent:
+                    batch_item_failures.append({"itemIdentifier": message_id})
 
     return {"batchItemFailures": batch_item_failures}
 
