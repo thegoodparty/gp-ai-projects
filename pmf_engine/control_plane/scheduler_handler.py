@@ -102,7 +102,10 @@ def _sweep_stuck_launching(store) -> None:
     for job in store.query_stuck_launching(older_than_ms=cutoff):
         logger.error(f"job {job.run_id} stuck in LAUNCHING; failing it")
         emit_dispatch_metric("SchedulerStuckLaunchingSwept", job.experiment_type)
-        store.mark_failed(job.run_id)
+        # Notify gp-api BEFORE committing FAILED. If the SQS send fails, leave the
+        # job in LAUNCHING so the next sweep retries — once FAILED is persisted the
+        # job drops out of query_stuck_launching and the callback can never be
+        # re-sent, orphaning the gp-api row.
         sent = _send_callback(
             job.run_id,
             "failed",
@@ -111,8 +114,10 @@ def _sweep_stuck_launching(store) -> None:
             error="Dispatch stalled while launching the agent task",
         )
         if not sent:
-            logger.error(f"sweep failed-callback send failed for {job.run_id}; gp-api row may be orphaned")
+            logger.error(f"sweep failed-callback send failed for {job.run_id}; will retry on next tick")
             emit_dispatch_metric("SchedulerSweepCallbackFailed", job.experiment_type)
+            continue
+        store.mark_failed(job.run_id)
 
 
 def handler(event, context) -> dict:
@@ -225,7 +230,10 @@ def _launch_one(store, job) -> bool:
         store.mark_dispatched(job.run_id)
         return True
 
-    store.mark_failed(job.run_id)
+    # Notify gp-api BEFORE committing FAILED. If the send fails, leave the job in
+    # LAUNCHING (don't mark_failed) so the stuck-LAUNCHING sweep retries the
+    # callback later — a FAILED row drops out of query_stuck_launching, so a
+    # never-sent callback would orphan the gp-api row with no recovery path.
     sent = _send_callback(
         job.run_id,
         "failed",
@@ -234,6 +242,8 @@ def _launch_one(store, job) -> bool:
         error=result.get("error", "dispatch failed"),
     )
     if not sent:
-        logger.error(f"failed-callback send failed for {job.run_id}; gp-api row may be orphaned")
+        logger.error(f"failed-callback send failed for {job.run_id}; leaving LAUNCHING for the sweep")
         emit_dispatch_metric("SchedulerFailedCallbackFailed", job.experiment_type)
+        return False
+    store.mark_failed(job.run_id)
     return False

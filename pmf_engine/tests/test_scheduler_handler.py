@@ -177,8 +177,10 @@ def test_sweeps_stuck_launching_jobs(mock_launch, mock_sqs, mock_store, mock_cou
 def test_failed_launch_callback_send_failure_is_logged_and_metriced(
     mock_launch, mock_sqs, mock_store, mock_count, mock_metric
 ):
-    # A failed launch whose `failed` callback send raises must still mark_failed,
-    # emit the orphan metric, and let the handler return normally.
+    # A failed launch whose `failed` callback send raises must NOT mark_failed —
+    # the job is left in LAUNCHING so the stuck-LAUNCHING sweep retries the
+    # callback later (a FAILED row drops out of the sweep and can never be
+    # re-notified). It emits the orphan metric and returns normally.
     mock_count.return_value = 0
     store = mock_store.return_value
     store.query_queued.return_value = [_job("r1", "HIGH")]
@@ -188,7 +190,7 @@ def test_failed_launch_callback_send_failure_is_logged_and_metriced(
 
     result = sched.handler({}, None)
 
-    store.mark_failed.assert_called_once_with("r1")
+    store.mark_failed.assert_not_called()
     assert result == {"launched": 0}
     assert "SchedulerFailedCallbackFailed" in [c.args[0] for c in mock_metric.call_args_list]
 
@@ -200,7 +202,8 @@ def test_failed_launch_callback_send_failure_is_logged_and_metriced(
 @patch("pmf_engine.control_plane.scheduler_handler.launch_run")
 def test_sweep_callback_send_failure_is_logged_and_metriced(mock_launch, mock_sqs, mock_store, mock_count, mock_metric):
     # The sweep's `failed` callback send raising must not abort the sweep or the
-    # handler; it logs + emits the orphan metric and still marks the job failed.
+    # handler; it logs + emits the orphan metric and leaves the job in LAUNCHING
+    # (does NOT mark_failed) so the next sweep retries the callback.
     mock_count.return_value = 3  # at cap, no new launches
     store = mock_store.return_value
     store.query_stuck_launching.return_value = [_job("r-stuck", "HIGH")]
@@ -208,7 +211,7 @@ def test_sweep_callback_send_failure_is_logged_and_metriced(mock_launch, mock_sq
 
     result = sched.handler({}, None)
 
-    store.mark_failed.assert_called_once_with("r-stuck")
+    store.mark_failed.assert_not_called()
     assert result == {"launched": 0}
     assert "SchedulerSweepCallbackFailed" in [c.args[0] for c in mock_metric.call_args_list]
 

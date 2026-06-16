@@ -635,8 +635,11 @@ class TestHandler:
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_malformed_message_with_run_id_notifies_gp_api(self, mock_get_ecs, mock_send_error_callback):
         # A message that fails parse_dispatch_message validation but still has a
-        # recoverable run_id must notify gp-api (so its QUEUED row gets failed)
-        # AND batch-fail. Otherwise the row orphans until the slow 6h backstop.
+        # recoverable run_id notifies gp-api (so its QUEUED row gets failed). When
+        # the callback is delivered, the message is NOT retried — re-delivering a
+        # permanently-malformed message is pointless churn (mirrors the other
+        # permanent-fault paths).
+        mock_send_error_callback.return_value = True
         event = {
             "Records": [
                 {
@@ -660,8 +663,34 @@ class TestHandler:
         sent_message = mock_send_error_callback.call_args[0][0]
         assert sent_message["run_id"] == "run-malformed"
         assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "invalid-payload-run-malformed"
-        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
+        assert result["batchItemFailures"] == []
         mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_malformed_message_batch_fails_when_callback_send_fails(self, mock_get_ecs, mock_send_error_callback):
+        # If the recovery callback can't reach gp-api, the message must be retried
+        # (toward the DLQ) so the failure isn't silently dropped.
+        mock_send_error_callback.return_value = False
+        event = {
+            "Records": [
+                {
+                    "messageId": "msg-bad",
+                    "body": json.dumps(
+                        {
+                            "experiment_type": "BadType",
+                            "organization_slug": "org-123",
+                            "run_id": "run-malformed",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")

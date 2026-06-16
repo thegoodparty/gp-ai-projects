@@ -764,13 +764,22 @@ def handler(event: dict, context) -> dict:
             except Exception:
                 partial = {}
             if partial.get("run_id") and RESULTS_QUEUE_URL:
-                send_error_callback(
+                # Same pattern as the other permanent-fault paths: only retry the
+                # SQS message (toward the DLQ) if the callback did NOT reach gp-api.
+                # Retrying after a successful callback is pointless churn, and a
+                # later retry whose callback fails would re-orphan the QUEUED row.
+                sent = send_error_callback(
                     partial,
                     f"Malformed dispatch message: {e}",
                     RESULTS_QUEUE_URL,
                     dedup_id=f"invalid-payload-{partial['run_id']}",
                 )
-            batch_item_failures.append({"itemIdentifier": message_id})
+                if not sent:
+                    batch_item_failures.append({"itemIdentifier": message_id})
+            else:
+                # No run_id or no queue URL — can't notify gp-api; send to the DLQ
+                # for operator alarms.
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         experiment_id = message["experiment_type"]
