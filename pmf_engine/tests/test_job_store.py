@@ -56,6 +56,16 @@ def test_query_orders_high_before_default_then_oldest_first(store):
     assert ids == ["r-high-old", "r-high-new", "r-default-old"]
 
 
+def test_same_priority_same_timestamp_has_total_order(store):
+    # Same priority + same created_at_ms (a same-millisecond bulk burst) must not
+    # collide on the GSI range key — run_id breaks the tie deterministically.
+    store.put_queued_job(_job("r-bbb", "HIGH", 1000))
+    store.put_queued_job(_job("r-aaa", "HIGH", 1000))
+    store.put_queued_job(_job("r-ccc", "HIGH", 1000))
+    ids = [j.run_id for j in store.query_queued(limit=10)]
+    assert ids == ["r-aaa", "r-bbb", "r-ccc"]
+
+
 def test_claim_drops_job_from_queue_and_blocks_second_claim(store):
     store.put_queued_job(_job("r1", "HIGH", 1000))
     store.claim("r1")

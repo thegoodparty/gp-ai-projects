@@ -374,16 +374,11 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
         Effect   = "Allow"
         Action   = ["dynamodb:PutItem"]
         Resource = aws_dynamodb_table.job_queue.arn
-      },
-      {
-        # Only the service-tokens secret — the dispatch handler reads it via
-        # get_service_token(). The old AI_SECRETS_* wildcard was a pre-split
-        # artifact this Lambda never used; granting it exposed every AI-provider
-        # key in that namespace to a Lambda compromise.
-        Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = var.service_tokens_secret_arn
       }
+      # No secretsmanager:GetSecretValue here: post-split the dispatch/ingest
+      # handler only validates + writes a QUEUED job — it never mints a broker
+      # token. get_service_token() is reached only via launch_run(), which runs
+      # exclusively in the scheduler Lambda (whose role keeps the grant).
     ]
   })
 }

@@ -35,9 +35,12 @@ class QueuedJob(BaseModel):
     input_files: list | None = None
 
 
-def _queue_sort(priority: str, created_at_ms: int) -> str:
+def _queue_sort(priority: str, created_at_ms: int, run_id: str) -> str:
+    # run_id (the table's unique PK) is a tiebreaker so two jobs enqueued in the
+    # same millisecond at the same priority get a total order — without it the
+    # GSI range key collides and FIFO-within-priority is undefined for that pair.
     rank = _PRIORITY_RANK.get(priority, _PRIORITY_RANK["DEFAULT"])
-    return f"{rank}#{created_at_ms:013d}"
+    return f"{rank}#{created_at_ms:013d}#{run_id}"
 
 
 class JobStore:
@@ -57,7 +60,7 @@ class JobStore:
             "created_at": {"N": str(job.created_at_ms)},
             "attempts": {"N": str(job.attempts)},
             "gsi_pk": {"S": QUEUED},
-            "queue_sort": {"S": _queue_sort(job.priority, job.created_at_ms)},
+            "queue_sort": {"S": _queue_sort(job.priority, job.created_at_ms, job.run_id)},
         }
         if job.clerk_user_id is not None:
             item["clerk_user_id"] = {"S": job.clerk_user_id}
