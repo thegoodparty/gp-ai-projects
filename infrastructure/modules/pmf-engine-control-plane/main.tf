@@ -376,12 +376,13 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
         Resource = aws_dynamodb_table.job_queue.arn
       },
       {
-        Effect = "Allow"
-        Action = "secretsmanager:GetSecretValue"
-        Resource = [
-          "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}-*",
-          var.service_tokens_secret_arn
-        ]
+        # Only the service-tokens secret — the dispatch handler reads it via
+        # get_service_token(). The old AI_SECRETS_* wildcard was a pre-split
+        # artifact this Lambda never used; granting it exposed every AI-provider
+        # key in that namespace to a Lambda compromise.
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = var.service_tokens_secret_arn
       }
     ]
   })
@@ -406,7 +407,6 @@ resource "aws_lambda_function" "dispatch" {
       ECS_SECURITY_GROUP_ID      = var.ecs_security_group_id
       ARTIFACT_BUCKET            = aws_s3_bucket.artifacts.id
       CONTAINER_NAME             = "pmf-engine"
-      AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
       BROKER_URL                 = var.broker_url
       RESULTS_QUEUE_URL          = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN  = var.service_tokens_secret_arn
