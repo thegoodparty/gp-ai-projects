@@ -9,7 +9,7 @@ You are writing Python in `gp-ai-projects`. Read this before you `uv add` anythi
 
 - This is a **`uv` workspace**, not a collection of independent projects.
 - One root `pyproject.toml`, one `uv.lock`, one `.venv/` at the repo root.
-- Workspace members are listed under `[tool.uv.workspace] members` in the root `pyproject.toml`. Today: `shared`, `serve/v1_pipeline`, `hubspot_ddhq_match`, `clickup_bot`, `engineer_agent`, `meeting_qa`, `pmf_engine`, `broker`.
+- Workspace members are listed under `[tool.uv.workspace] members` in the root `pyproject.toml`. Today: `shared`, `serve/v1_pipeline`, `hubspot_ddhq_match`, `clickup_bot`, `engineer_agent`, `pmf_engine`, `broker`.
 - Other directories (e.g. `campaign_plan_lambda/`, `infrastructure/`, `api/`) are part of the repo but **not** workspace members. Their deps come from the root project's `dependencies` (or for `campaign_plan_lambda`, from the `[dependency-groups] campaign-plan-lambda` group).
 - Runtime Python is **3.13** (`.python-version`). Code-floor is 3.11 (ruff `target-version`, mypy `python_version`). Don't use 3.12+-only syntax until the targets are bumped.
 
@@ -23,7 +23,7 @@ You are writing Python in `gp-ai-projects`. Read this before you `uv add` anythi
   2. Append `<member>` to `[tool.uv.workspace] members` in root `pyproject.toml`.
   3. `uv sync` at the root.
   4. Commit `pyproject.toml`, the new `<member>/pyproject.toml`, and the updated `uv.lock` together.
-  5. If it's a Lambda, copy the structure from `meeting_qa/` (Dockerfile, `lambda_handler.py`, `tests/`) and add a matching `infrastructure/modules/<name>/`.
+  5. If it's a Lambda, copy the structure from an existing containerized member like `pmf_engine/` or `engineer_agent/` (Dockerfile, handler, `tests/`) and add a matching `infrastructure/modules/<name>/`.
 - **Running tests** →
   - Repo-root cross-member tests: `uv run pytest tests/` (or `make test`).
   - Per-member: `cd <member> && uv run pytest tests/`.
@@ -47,31 +47,33 @@ You are writing Python in `gp-ai-projects`. Read this before you `uv add` anythi
 
 `mypy.ini` is **gradual**:
 
-| Path | Strict? |
-|------|---------|
-| `serve.v1_pipeline.*` | **Yes** (`disallow_untyped_defs`) |
-| `shared.*` | **Yes** (`disallow_untyped_defs`) |
-| Everything else | **No** (`disallow_untyped_defs = False`) — but `check_untyped_defs = True`, `strict_optional = True`, `no_implicit_optional = True` are on globally |
+| Path                  | Strict?                                                                                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serve.v1_pipeline.*` | **Yes** (`disallow_untyped_defs`)                                                                                                                   |
+| `shared.*`            | **Yes** (`disallow_untyped_defs`)                                                                                                                   |
+| Everything else       | **No** (`disallow_untyped_defs = False`) — but `check_untyped_defs = True`, `strict_optional = True`, `no_implicit_optional = True` are on globally |
 
 `mypy-strict.ini` is a parking lot for tighter rules being rolled out incrementally. Don't promote modules into it casually.
 
 When you write new code in a strict module:
+
 - Type **all** function signatures.
-- If you must `# type: ignore`, narrow it with the error code: `# type: ignore[union-attr]`. Add a one-line comment for *why*.
+- If you must `# type: ignore`, narrow it with the error code: `# type: ignore[union-attr]`. Add a one-line comment for _why_.
 
 When you write new code in a non-strict module:
+
 - Type hints are encouraged, not required. But aim to leave the module in a state where someone could promote it to strict later.
 
 ## Common pitfalls
 
-- **`pip install` or `poetry install`.** Wrong tool. This repo is `uv`. Anything you read in old branches that says `pip install -r requirements.txt` is for legacy non-member dirs only (e.g. `apps/genie-slack-bot/` in a *different* repo).
+- **`pip install` or `poetry install`.** Wrong tool. This repo is `uv`. Anything you read in old branches that says `pip install -r requirements.txt` is for legacy non-member dirs only (e.g. `apps/genie-slack-bot/` in a _different_ repo).
 - **Per-member venvs.** There is one `.venv/` at the repo root. Members share it.
 - **Forgetting `uv.lock`.** Any change to `pyproject.toml` (root or member) **must** ship with the regenerated `uv.lock`. PR review will catch it; don't.
 - **Disabling the autouse Braintrust fixture in `conftest.py`.** Tests would then talk to the live Braintrust project. Don't.
 - **Importing `shared` by relative path or copy-paste.** `shared/` is a workspace member; declare it as a dep and `from shared.aws_clients import ...`.
 - **3.12+ syntax in code that ruff/mypy target as 3.11.** Both target `py311`. If you want to use newer syntax, bump both targets in lockstep.
 - **`# type: ignore` blanket suppression in strict modules.** Narrow it. Comment why.
-- **Adding a build workflow to `.github/workflows/` without testing it.** The existing build workflows are per-member. Copy from a similar one (`build-meeting-qa.yml` is recent and clean).
+- **Adding a build workflow to `.github/workflows/` without testing it.** The existing build workflows are per-member. Copy from a similar one (e.g. `build-pmf-engine.yml`).
 - **Editing `ai-rules/` directly.** Submodule. Changes go upstream.
 
 ## What "good" looks like

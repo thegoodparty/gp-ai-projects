@@ -34,7 +34,7 @@ Real env values are gitignored. Copy `.env.example` to `.env` and fill in the re
 cp .env.example .env
 ```
 
-`.env.example` ships the shared baseline: `TAVILY_API_KEY`, `GEMINI_API_KEY`, `DATABRICKS_API_KEY`, `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, `GOODPARTY_API_TOKEN`, `BRAINTRUST_API_KEY`, `ENVIRONMENT`. Most workspace members need only a subset of these — check the relevant member's `README.md` for what *that* member actually reads.
+`.env.example` ships the shared baseline: `TAVILY_API_KEY`, `GEMINI_API_KEY`, `DATABRICKS_API_KEY`, `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, `GOODPARTY_API_TOKEN`, `BRAINTRUST_API_KEY`, `ENVIRONMENT`. Most workspace members need only a subset of these — check the relevant member's `README.md` for what _that_ member actually reads.
 
 Other keys may be required by specific members (e.g., AWS profile / creds for boto3 if you're touching infra, or vendor keys like `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ClickUp tokens for the bot). Add them to your local `.env` as needed; if the key becomes broadly relevant, also add a placeholder to `.env.example` so the next person knows it exists.
 
@@ -47,6 +47,7 @@ uv sync
 ```
 
 This:
+
 1. Resolves the root `pyproject.toml` plus every workspace member.
 2. Materializes `.venv/` at the repo root.
 3. Uses the Python version pinned in `.python-version` (3.13).
@@ -84,7 +85,7 @@ make test           # uv run pytest tests/
 Per-member tests:
 
 ```bash
-cd meeting_qa && uv run pytest tests/
+cd broker && uv run pytest tests/
 cd pmf_engine && uv run pytest tests/
 # ... etc
 ```
@@ -98,12 +99,14 @@ uv run python -m <module>   # invoke its entry point if it has one
 ```
 
 Adding a dep that **only** that member needs:
+
 ```bash
 cd <member>
 uv add <package>            # updates <member>/pyproject.toml + root uv.lock
 ```
 
 Adding a dep that **multiple** members will use:
+
 ```bash
 cd shared
 uv add <package>            # add to shared, then have other members depend on shared
@@ -136,7 +139,7 @@ If you need real Braintrust calls **inside** a test (rare), set the key in that 
 - **mypy passes locally but PR review flags type errors** → mypy is scoped to `serve/v1_pipeline/` and `shared/` in `.pre-commit-config.yaml`. If you've added strict-mypy modules, update the `files:` regex in the config.
 - **Tests want to talk to Braintrust** → check `conftest.py`. The autouse fixture should keep it disabled. If a test sets `BRAINTRUST_API_KEY` itself, it must reset the singleton.
 - **`uv add` doesn't update the lockfile** → make sure you're inside a workspace dir (root or any member). `uv add` outside the workspace falls back to a different mode.
-- **CI build for a member fails on a transitive dep** → the CI image is built per-member; if your member depends on a new lib, ensure it's in *that member's* `pyproject.toml`, not just the root project's `dependencies`.
+- **CI build for a member fails on a transitive dep** → the CI image is built per-member; if your member depends on a new lib, ensure it's in _that member's_ `pyproject.toml`, not just the root project's `dependencies`.
 - **Secrets ended up in `.env`** → `.env` is gitignored; do not commit. Use `.env.example` for shape only.
 
 ## Where to go next
@@ -144,5 +147,4 @@ If you need real Braintrust calls **inside** a test (rare), set the key in that 
 - `README.md` — repo overview.
 - `CLAUDE.md` — agent + style guide.
 - `docs/architecture.md` — workspace shape, member catalog, data flow, CI map.
-- `MIGRATION_NOTES.md` — most recent example of migrating a standalone module into the workspace (`meeting_qa/`).
 - `ai-rules/` — org-wide review rules and skills (submodule).
