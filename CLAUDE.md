@@ -19,7 +19,7 @@ uv run pytest <path>              # single-file or single-test run
 make install-hooks                # one-time pre-commit setup
 
 # Per-member tests (members ship their own test suites)
-cd meeting_qa && uv run pytest tests/
+cd broker && uv run pytest tests/
 cd pmf_engine && uv run pytest tests/
 ```
 
@@ -27,15 +27,14 @@ CI workflows are mostly `build-*.yml` Docker→ECR builds per workspace member, 
 
 ## Pointer table — when in doubt
 
-| Doing | Read |
-|-------|------|
-| Adding a new workspace member | `docs/architecture.md` § Adding a workspace member |
-| First-time setup | `docs/getting-started.md` |
-| Working on a specific member | that member's `README.md` (e.g. `meeting_qa/README.md`, `pmf_engine/README.md`) |
-| Cross-member shared code | `shared/` (note: this is a workspace member, not just a directory — has its own `pyproject.toml`) |
-| Migrating something from a standalone repo | `MIGRATION_NOTES.md` (most recent example: `meeting_qa`) |
-| AI rule-by-rule code review | `ai-rules/` (git submodule) |
-| Why a thing is the way it is | `docs/adr/` (not yet seeded) |
+| Doing                         | Read                                                                                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| Adding a new workspace member | `docs/architecture.md` § Adding a workspace member                                                |
+| First-time setup              | `docs/getting-started.md`                                                                         |
+| Working on a specific member  | that member's `README.md` (e.g. `broker/README.md`, `pmf_engine/README.md`)                       |
+| Cross-member shared code      | `shared/` (note: this is a workspace member, not just a directory — has its own `pyproject.toml`) |
+| AI rule-by-rule code review   | `ai-rules/` (git submodule)                                                                       |
+| Why a thing is the way it is  | `docs/adr/` (not yet seeded)                                                                      |
 
 ## Code style
 
@@ -65,7 +64,6 @@ gp-ai-projects/                  # uv workspace root
 ├── hubspot_ddhq_match/          # WORKSPACE MEMBER — Lambda
 ├── clickup_bot/                 # WORKSPACE MEMBER — Lambda
 ├── engineer_agent/              # WORKSPACE MEMBER — Lambda
-├── meeting_qa/                  # WORKSPACE MEMBER — SQS-driven Lambda (recently migrated)
 ├── pmf_engine/                  # WORKSPACE MEMBER — Lambda
 ├── broker/                      # WORKSPACE MEMBER — broker service
 │
@@ -82,7 +80,7 @@ gp-ai-projects/                  # uv workspace root
 └── bronze_data/                 # not a member — data drop / config
 ```
 
-`meeting_qa/` is the cleanest reference for adding a new SQS-triggered Lambda member: `pyproject.toml` + `lambda_handler.py` + `Dockerfile` + `tests/` + a corresponding `infrastructure/modules/<name>/` Terraform module.
+`pmf_engine/` and `engineer_agent/` are good references for adding a new containerized Lambda member: each pairs a `pyproject.toml`, handler, `Dockerfile`, and `tests/` with a corresponding `infrastructure/modules/<name>/` Terraform module.
 
 ## Testing
 
