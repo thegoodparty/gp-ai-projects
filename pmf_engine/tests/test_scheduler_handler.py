@@ -161,12 +161,14 @@ def test_one_job_error_does_not_abort_batch(mock_launch, mock_sqs, mock_store, m
     store.mark_dispatched.assert_called_once_with("r-good")
 
 
+@patch("pmf_engine.control_plane.scheduler_handler._has_live_task")
 @patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
 @patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
 @patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
 @patch("pmf_engine.control_plane.scheduler_handler.launch_run")
-def test_sweeps_stuck_launching_jobs(mock_launch, mock_sqs, mock_store, mock_count):
+def test_sweeps_stuck_launching_jobs(mock_launch, mock_sqs, mock_store, mock_count, mock_live):
     mock_count.return_value = 3  # at cap, no new launches
+    mock_live.return_value = False  # no live task → genuinely stuck, fail it
     store = mock_store.return_value
     store.query_stuck_launching.return_value = [_job("r-stuck", "HIGH")]
     sched.handler({}, None)
@@ -174,6 +176,25 @@ def test_sweeps_stuck_launching_jobs(mock_launch, mock_sqs, mock_store, mock_cou
     body = json.loads(mock_sqs.return_value.send_message.call_args.kwargs["MessageBody"])
     assert body["data"]["status"] == "failed"
     assert body["data"]["runId"] == "r-stuck"
+
+
+@patch("pmf_engine.control_plane.scheduler_handler._has_live_task")
+@patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
+@patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
+@patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
+@patch("pmf_engine.control_plane.scheduler_handler.launch_run")
+def test_sweep_reconciles_stuck_job_with_live_task(mock_launch, mock_sqs, mock_store, mock_count, mock_live):
+    # A job stuck LAUNCHING but with a live Fargate task (mark_dispatched threw
+    # after run_task succeeded) must be reconciled to DISPATCHED, NOT failed —
+    # failing it would kill a running agent and drop its result.
+    mock_count.return_value = 3
+    mock_live.return_value = True  # a task tagged with this run_id is alive
+    store = mock_store.return_value
+    store.query_stuck_launching.return_value = [_job("r-live", "HIGH")]
+    sched.handler({}, None)
+    store.mark_dispatched.assert_called_once_with("r-live")
+    store.mark_failed.assert_not_called()
+    mock_sqs.return_value.send_message.assert_not_called()
 
 
 @patch("pmf_engine.control_plane.scheduler_handler.emit_dispatch_metric")
@@ -202,16 +223,20 @@ def test_failed_launch_callback_send_failure_is_logged_and_metriced(
     assert "SchedulerFailedCallbackFailed" in [c.args[0] for c in mock_metric.call_args_list]
 
 
+@patch("pmf_engine.control_plane.scheduler_handler._has_live_task")
 @patch("pmf_engine.control_plane.scheduler_handler.emit_dispatch_metric")
 @patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
 @patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
 @patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
 @patch("pmf_engine.control_plane.scheduler_handler.launch_run")
-def test_sweep_callback_send_failure_is_logged_and_metriced(mock_launch, mock_sqs, mock_store, mock_count, mock_metric):
+def test_sweep_callback_send_failure_is_logged_and_metriced(
+    mock_launch, mock_sqs, mock_store, mock_count, mock_metric, mock_live
+):
     # The sweep's `failed` callback send raising must not abort the sweep or the
     # handler; it logs + emits the orphan metric and leaves the job in LAUNCHING
     # (does NOT mark_failed) so the next sweep retries the callback.
     mock_count.return_value = 3  # at cap, no new launches
+    mock_live.return_value = False  # no live task → genuinely stuck
     store = mock_store.return_value
     store.query_stuck_launching.return_value = [_job("r-stuck", "HIGH")]
     mock_sqs.return_value.send_message.side_effect = RuntimeError("sqs down")

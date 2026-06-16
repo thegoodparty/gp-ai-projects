@@ -96,10 +96,39 @@ def _send_callback(
         return False
 
 
+def _has_live_task(run_id: str) -> bool:
+    """True if a Fargate task tagged with this run_id is still desired-RUNNING.
+    Tasks are launched with startedBy=run_id. Fail open (return True) on an ECS
+    error so a transient ListTasks blip can't cause the sweep to fail a job that
+    may have a live task."""
+    try:
+        resp = get_ecs_client().list_tasks(cluster=ECS_CLUSTER_ARN, startedBy=run_id, desiredStatus="RUNNING")
+        return len(resp.get("taskArns", [])) > 0
+    except Exception as e:
+        logger.warning(
+            f"list_tasks(startedBy={run_id}) failed ({type(e).__name__}); treating as live to avoid wrong-fail"
+        )
+        return True
+
+
 def _sweep_stuck_launching(store) -> None:
     """Fail jobs stuck in LAUNCHING past the threshold so they don't leak."""
     cutoff = int(time.time() * 1000) - _STUCK_LAUNCHING_MS
     for job in store.query_stuck_launching(older_than_ms=cutoff):
+        # A job can be stuck LAUNCHING with a LIVE task if mark_dispatched threw
+        # after run_task succeeded. Failing it here would kill a running agent
+        # and drop its result. Check ECS first: if a task tagged with this run_id
+        # is alive, reconcile the row to DISPATCHED instead of failing it.
+        if _has_live_task(job.run_id):
+            logger.warning(f"job {job.run_id} stuck LAUNCHING but has a live task; reconciling to DISPATCHED")
+            emit_dispatch_metric("SchedulerStuckLaunchingReconciled", job.experiment_type)
+            try:
+                store.mark_dispatched(job.run_id)
+            except Exception as e:
+                logger.warning(
+                    f"reconcile mark_dispatched failed for {job.run_id} ({type(e).__name__}); next sweep retries"
+                )
+            continue
         logger.error(f"job {job.run_id} stuck in LAUNCHING; failing it")
         emit_dispatch_metric("SchedulerStuckLaunchingSwept", job.experiment_type)
         # Notify gp-api BEFORE committing FAILED. If the SQS send fails, leave the
