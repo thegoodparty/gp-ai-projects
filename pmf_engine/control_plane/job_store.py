@@ -32,6 +32,7 @@ class QueuedJob(BaseModel):
     prior_artifact_versions: dict[str, str] | None
     created_at_ms: int
     attempts: int = 0
+    input_files: list | None = None
 
 
 def _queue_sort(priority: str, created_at_ms: int) -> str:
@@ -62,6 +63,8 @@ class JobStore:
             item["clerk_user_id"] = {"S": job.clerk_user_id}
         if job.prior_artifact_versions is not None:
             item["prior_artifact_versions"] = {"S": json.dumps(job.prior_artifact_versions)}
+        if job.input_files is not None:
+            item["input_files"] = {"S": json.dumps(job.input_files)}
         # Idempotent on the SQS run_id: a redelivered ingest message must not
         # overwrite an already-claimed/dispatched job back to QUEUED.
         try:
@@ -172,4 +175,5 @@ class JobStore:
             ),
             created_at_ms=int(item["created_at"]["N"]),
             attempts=int(item["attempts"]["N"]),
+            input_files=(json.loads(item["input_files"]["S"]) if "input_files" in item else None),
         )

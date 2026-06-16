@@ -70,6 +70,17 @@ data "terraform_remote_state" "agent_experiment_metadata" {
   }
 }
 
+data "terraform_remote_state" "agent_run_inputs" {
+  count = var.bootstrap ? 0 : 1
+
+  backend = "s3"
+  config = {
+    bucket = "goodparty-terraform-state-us-west-2"
+    key    = "agent-run-inputs/prod/terraform.tfstate"
+    region = "us-west-2"
+  }
+}
+
 resource "aws_secretsmanager_secret" "service_tokens" {
   name        = "broker-service-tokens-prod"
   description = "Plaintext SERVICE_TOKEN used by the dispatch Lambda to call broker /internal/mint-run-token. Hash lives in broker-prod."
@@ -113,9 +124,9 @@ module "broker" {
   results_queue_arn = data.aws_sqs_queue.results[0].arn
   results_queue_url = data.aws_sqs_queue.results[0].url
 
-  gp_api_sqs_queue_arn = data.aws_sqs_queue.results[0].arn
-
   sns_topic_arn = try(data.terraform_remote_state.fargate[0].outputs.sns_topic_arn, "")
+
+  agent_run_inputs_read_policy_arn = try(data.terraform_remote_state.agent_run_inputs[0].outputs.read_policy_arn, "")
 }
 
 output "security_group_id" {

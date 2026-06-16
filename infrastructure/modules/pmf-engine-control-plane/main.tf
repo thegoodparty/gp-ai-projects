@@ -248,37 +248,13 @@ resource "aws_dynamodb_table" "job_queue" {
   }
 }
 
-# --- SQS: Results Queue (consumed by gp-api) ---
-
-resource "aws_sqs_queue" "results_dlq" {
-  name                        = "agent-results-dlq-${var.environment}.fifo"
-  fifo_queue                  = true
-  message_retention_seconds   = 604800
-  content_based_deduplication = true
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-resource "aws_sqs_queue" "results" {
-  name                        = "agent-results-${var.environment}.fifo"
-  fifo_queue                  = true
-  visibility_timeout_seconds  = 300
-  message_retention_seconds   = 604800
-  content_based_deduplication = false
-  deduplication_scope         = "messageGroup"
-  fifo_throughput_limit       = "perMessageGroupId"
-
-  redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.results_dlq.arn
-    maxReceiveCount     = 3
-  })
-
-  tags = {
-    Environment = var.environment
-  }
-}
+# --- Results Queue ---
+# Agent result/error callbacks go to the gp-api results queue
+# (var.gp_api_sqs_queue_url / _arn) — the same queue the broker sends success
+# results to and gp-api's consumer polls. This module does NOT create its own
+# results queue: a separate queue here is an orphan nothing consumes, which
+# silently swallows dispatch-error callbacks (the run then only fails via the
+# 45-minute stale sweep instead of immediately).
 
 # --- Lambda: Dispatch Handler ---
 
@@ -392,7 +368,7 @@ resource "aws_iam_role_policy" "dispatch_lambda_permissions" {
       {
         Effect   = "Allow"
         Action   = "sqs:SendMessage"
-        Resource = aws_sqs_queue.results.arn
+        Resource = var.gp_api_sqs_queue_arn
       },
       {
         Effect   = "Allow"
@@ -432,7 +408,7 @@ resource "aws_lambda_function" "dispatch" {
       CONTAINER_NAME             = "pmf-engine"
       AI_SECRETS_NAME            = "AI_SECRETS_${upper(var.environment)}"
       BROKER_URL                 = var.broker_url
-      RESULTS_QUEUE_URL          = aws_sqs_queue.results.url
+      RESULTS_QUEUE_URL          = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN  = var.service_tokens_secret_arn
       EXPERIMENT_METADATA_BUCKET = var.experiment_metadata_bucket_name
       JOB_TABLE_NAME             = aws_dynamodb_table.job_queue.name
@@ -523,7 +499,7 @@ resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
       {
         Effect   = "Allow"
         Action   = "sqs:SendMessage"
-        Resource = aws_sqs_queue.results.arn
+        Resource = var.gp_api_sqs_queue_arn
       },
       {
         Effect    = "Allow"
@@ -561,7 +537,7 @@ resource "aws_lambda_function" "scheduler" {
       ECS_SECURITY_GROUP_ID     = var.ecs_security_group_id
       CONTAINER_NAME            = "pmf-engine"
       BROKER_URL                = var.broker_url
-      RESULTS_QUEUE_URL         = aws_sqs_queue.results.url
+      RESULTS_QUEUE_URL         = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN = var.service_tokens_secret_arn
       JOB_TABLE_NAME            = aws_dynamodb_table.job_queue.name
       MAX_CONCURRENT_AGENTS     = tostring(var.max_concurrent_agents)
@@ -665,28 +641,6 @@ resource "aws_cloudwatch_metric_alarm" "dispatch_dlq_depth" {
   }
 }
 
-resource "aws_cloudwatch_metric_alarm" "results_dlq_depth" {
-  count               = var.sns_topic_arn != "" ? 1 : 0
-  alarm_name          = "pmf-engine-results-dlq-${var.environment}"
-  alarm_description   = "Messages in PMF Engine results DLQ"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  namespace           = "AWS/SQS"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_actions       = [var.sns_topic_arn]
-
-  dimensions = {
-    QueueName = aws_sqs_queue.results_dlq.name
-  }
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
 resource "aws_cloudwatch_metric_alarm" "param_screening_bypassed" {
   count               = var.sns_topic_arn != "" ? 1 : 0
   alarm_name          = "pmf-engine-param-screening-bypassed-${var.environment}"
@@ -741,16 +695,6 @@ output "dispatch_queue_url" {
 output "dispatch_queue_arn" {
   value       = aws_sqs_queue.dispatch.arn
   description = "ARN of the agent dispatch FIFO queue"
-}
-
-output "results_queue_url" {
-  value       = aws_sqs_queue.results.url
-  description = "URL of the agent results FIFO queue (consumed by gp-api)"
-}
-
-output "results_queue_arn" {
-  value       = aws_sqs_queue.results.arn
-  description = "ARN of the agent results FIFO queue"
 }
 
 output "artifact_bucket_name" {

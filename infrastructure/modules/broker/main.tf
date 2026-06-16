@@ -68,13 +68,8 @@ variable "sns_topic_arn" {
   default     = ""
 }
 
-variable "gp_api_sqs_queue_arn" {
-  description = "ARN of the gp-api results queue (for reference only; broker sends to its own results queue)"
-  type        = string
-}
-
 variable "results_queue_arn" {
-  description = "ARN of the external SQS FIFO queue the broker sends results to (owned by the control-plane stack)"
+  description = "ARN of the external SQS FIFO queue the broker sends results to (the gp-api results queue, {branch}-Queue.fifo)"
   type        = string
 }
 
@@ -91,6 +86,12 @@ variable "public_zone_id" {
 
 variable "hostname" {
   description = "Fully-qualified broker hostname (ACM cert SAN + Route53 record). Example: broker-dev.ai.goodparty.org. Leave empty to use broker-{env}.ai.goodparty.org for non-prod or broker.ai.goodparty.org for prod."
+  type        = string
+  default     = ""
+}
+
+variable "agent_run_inputs_read_policy_arn" {
+  description = "ARN of the managed IAM policy granting GetObject on the agent-run-inputs bucket (sourced from the agent-run-inputs Terraform stack's read_policy_arn output). Attached to the broker task role so /inputs/read can fetch user-uploaded files on the runner's behalf. Empty string skips the attachment entirely (local-dev / pre-bucket bootstrap)."
   type        = string
   default     = ""
 }
@@ -123,7 +124,7 @@ resource "aws_cloudwatch_log_group" "broker" {
 
 resource "aws_secretsmanager_secret" "broker" {
   name        = "broker-${var.environment}"
-  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET"
+  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET, BRAINTRUST_API_KEY"
 
   tags = {
     Environment = var.environment
@@ -166,10 +167,11 @@ resource "aws_dynamodb_table" "scope_tickets" {
 }
 
 # --- SQS: Results Queue ---
-# The results queue itself is owned by the control-plane stack (agent-results-{env}.fifo).
-# Broker's access is granted via the broker task role's IAM policy (task_sqs_results below).
+# The broker sends run results to the gp-api results queue ({branch}-Queue.fifo), passed in
+# as var.results_queue_arn and looked up by the env config. The broker does not own the queue;
+# access is granted via the broker task role's IAM policy (task_sqs_results below).
 # No aws_sqs_queue_policy here — IAM role policy is sufficient and avoids conflicting with
-# any resource policy the control-plane owner may add later.
+# any resource policy the queue owner may add later.
 
 # --- IAM: Task Execution Role ---
 
@@ -244,6 +246,7 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
           "dynamodb:Query"
         ]
@@ -270,6 +273,17 @@ resource "aws_iam_role_policy" "task_s3" {
       }
     ]
   })
+}
+
+# Read-only access to the agent-run-inputs bucket (one per environment). The
+# managed policy is owned by the agent-run-inputs Terraform stack; we attach
+# it here so the broker task role gains GetObject on the bucket. /inputs/read
+# enforces per-request authorization against the ScopeTicket's enumerated
+# input_files list — this attachment is just the underlying AWS grant.
+resource "aws_iam_role_policy_attachment" "task_agent_run_inputs_read" {
+  count      = var.agent_run_inputs_read_policy_arn != "" ? 1 : 0
+  role       = aws_iam_role.task_role.name
+  policy_arn = var.agent_run_inputs_read_policy_arn
 }
 
 resource "aws_iam_role_policy_attachment" "task_experiment_metadata_read" {
@@ -694,6 +708,10 @@ resource "aws_ecs_task_definition" "broker" {
         {
           name      = "AGENT_MCP_TOKEN_SECRET"
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:AGENT_MCP_TOKEN_SECRET::"
+        },
+        {
+          name      = "BRAINTRUST_API_KEY"
+          valueFrom = "${aws_secretsmanager_secret.broker.arn}:BRAINTRUST_API_KEY::"
         }
       ]
     }

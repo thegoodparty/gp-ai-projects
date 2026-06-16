@@ -24,6 +24,12 @@ from broker.endpoints.anthropic_proxy import (
     get_upstream_client,
     router as anthropic_router,
 )
+from broker.endpoints.braintrust_proxy import (
+    get_braintrust_api_key,
+    get_broker_auth as braintrust_get_broker_auth,
+    get_upstream_client as braintrust_get_upstream_client,
+    router as braintrust_router,
+)
 from broker.endpoints.artifact_publish import (
     get_artifact_bucket as publish_get_artifact_bucket,
     get_broker_token_raw as publish_get_broker_token_raw,
@@ -39,6 +45,11 @@ from broker.endpoints.artifact_read import (
     get_s3_client as read_get_s3_client,
     get_scope_ticket as read_get_scope_ticket,
     router as read_router,
+)
+from broker.endpoints.inputs_read import (
+    get_s3_client as inputs_get_s3_client,
+    get_scope_ticket as inputs_get_scope_ticket,
+    router as inputs_router,
 )
 from broker.endpoints.databricks_query import (
     get_data_query_tracker as dbx_get_data_query_tracker,
@@ -58,6 +69,7 @@ from broker.endpoints.delete_run_token import (
 )
 from broker.endpoints.http_fetch import (
     get_browser_fetcher as http_get_browser_fetcher,
+    get_http_client as http_get_http_client,
     get_scope_ticket as http_get_scope_ticket,
     router as http_router,
 )
@@ -124,18 +136,23 @@ async def lifespan(app: FastAPI):
     upstream_client = httpx.AsyncClient(base_url="https://api.anthropic.com", timeout=300)
     s3_client = boto3.client("s3")
     sqs_client = boto3.client("sqs")
-    # Shared async client used by anthropic_proxy and agent_mcp_proxy. The
-    # unified /http/fetch endpoint routes through PlaywrightBrowserFetcher
-    # below — plain httpx is 403'd by Cloudflare's JS challenge on muni sites.
+    # Shared async client used by agent_mcp_proxy and the /http/fetch endpoint's
+    # non-browser paths. 30s suits short gp-api/MCP calls; the /http/fetch
+    # endpoint routes through PlaywrightBrowserFetcher below — plain httpx is
+    # 403'd by Cloudflare's JS challenge on muni sites.
     http_client = httpx.AsyncClient(timeout=30)
+    # Dedicated client for the Braintrust proxy. A 30s cap is too tight for the
+    # end-of-run /logs3 trace flush (batched spans); a timeout there 502s and
+    # silently loses telemetry with no retry. 300s matches the anthropic client.
+    braintrust_client = httpx.AsyncClient(timeout=300)
     browser_fetcher = PlaywrightBrowserFetcher()
     await browser_fetcher.start()
     callback_sender = CallbackSender(sqs_client=sqs_client, queue_url=secrets.results_queue_url)
     # Per-ticket counter feeding the artifact_publish anti-fabrication gate.
-    # Process-local; broker restart mid-run rejects publish (strictly safer
-    # than accepting a synthetic artifact from an agent whose data calls
-    # all failed).
-    data_query_tracker = DataQueryTracker()
+    # DynamoDB-backed (stamped on the scope-ticket item) so the count is shared
+    # across all broker instances — a run's query and its publish can land on
+    # different tasks behind the ALB.
+    data_query_tracker = DataQueryTracker(table_name=_resolve_table_name())
     artifact_bucket = os.environ.get("ARTIFACT_BUCKET", "gp-agent-artifacts-dev")
     env = os.environ.get("ENVIRONMENT", "dev").strip().lower()
     experiment_metadata_bucket = os.environ.get(
@@ -163,6 +180,10 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[get_upstream_client] = lambda: upstream_client
     app.dependency_overrides[get_anthropic_api_key] = lambda: secrets.anthropic_api_key
 
+    app.dependency_overrides[braintrust_get_broker_auth] = lambda: broker_auth
+    app.dependency_overrides[braintrust_get_upstream_client] = lambda: braintrust_client
+    app.dependency_overrides[get_braintrust_api_key] = lambda: secrets.braintrust_api_key
+
     app.dependency_overrides[publish_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[publish_get_s3_client] = lambda: s3_client
     app.dependency_overrides[publish_get_callback_sender] = lambda: callback_sender
@@ -174,6 +195,9 @@ async def lifespan(app: FastAPI):
     app.dependency_overrides[read_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[read_get_s3_client] = lambda: s3_client
     app.dependency_overrides[read_get_artifact_bucket] = lambda: artifact_bucket
+
+    app.dependency_overrides[inputs_get_scope_ticket] = _resolve_ticket_from_request
+    app.dependency_overrides[inputs_get_s3_client] = lambda: s3_client
 
     app.dependency_overrides[status_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[status_get_s3_client] = lambda: s3_client
@@ -208,6 +232,7 @@ async def lifespan(app: FastAPI):
 
     app.dependency_overrides[http_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[http_get_browser_fetcher] = lambda: browser_fetcher
+    app.dependency_overrides[http_get_http_client] = lambda: http_client
 
     app.dependency_overrides[agent_mcp_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[agent_mcp_get_agent_mcp_secret] = lambda: secrets.agent_mcp_token_secret
@@ -220,6 +245,7 @@ async def lifespan(app: FastAPI):
     finally:
         await upstream_client.aclose()
         await http_client.aclose()
+        await braintrust_client.aclose()
         await browser_fetcher.aclose()
 
 
@@ -237,8 +263,10 @@ async def auth_error_handler(request: Request, exc: AuthError):
 app.include_router(mint_router)
 app.include_router(delete_router)
 app.include_router(anthropic_router)
+app.include_router(braintrust_router)
 app.include_router(publish_router)
 app.include_router(read_router)
+app.include_router(inputs_router)
 app.include_router(status_router)
 app.include_router(databricks_router)
 app.include_router(upload_router)

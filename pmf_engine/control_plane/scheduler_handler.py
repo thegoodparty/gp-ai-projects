@@ -184,6 +184,10 @@ def _launch_one(store, job) -> bool:
         "clerk_user_id": job.clerk_user_id,
         "params": job.params,
         "prior_artifact_versions": job.prior_artifact_versions,
+        # User-input prefetch (develop): thread the persisted input_files back
+        # onto the dispatch envelope so launch_run's mint + the
+        # INPUT_FILES_JSON env builder see it, same as the pre-queue path did.
+        "_input_files": job.input_files,
     }
     experiment = dict(job.routing)  # model, timeout_seconds, *_version_id(s)
     params_json = json.dumps(job.params)

@@ -36,6 +36,8 @@ CLAUDE-*.md
 *smac3_output*/
 input*
 !meeting_qa/qa/inputs/
+!broker/endpoints/inputs_read.py
+!pmf_engine/runner/input_files.py
 *.zip
 enhanced_data/
 

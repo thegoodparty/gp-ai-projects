@@ -76,6 +76,10 @@ def _default_dispatch_env(monkeypatch):
     monkeypatch.setattr(dh, "_get_secrets_client", lambda: _fake_secrets)
     monkeypatch.setenv("EXPERIMENT_METADATA_BUCKET", "agent-experiment-metadata-test")
     monkeypatch.setattr(dh, "JOB_TABLE_NAME", "agent-job-queue-test", raising=False)
+    # Drives _input_files bucket validation in dispatch_handler (expected bucket
+    # is gp-agent-run-inputs-{ENVIRONMENT}). Test fixtures already use the
+    # `-dev` suffix in _VALID_INPUT_FILE, so we set ENVIRONMENT=dev.
+    monkeypatch.setenv("ENVIRONMENT", "dev")
     fake_loader = _build_synthetic_loader()
     monkeypatch.setattr(dh, "_manifest_loader", fake_loader, raising=False)
     monkeypatch.setattr(dh, "get_manifest_loader", lambda: fake_loader)
@@ -1086,6 +1090,41 @@ class TestMissingCriticalEnvVars:
         assert "EXPERIMENT_METADATA_BUCKET" in error_msg
         assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_missing_environment_routes_to_misconfig_callback_not_invalid_payload(
+        self, mock_get_ecs, mock_send_error_callback, monkeypatch
+    ):
+        """Bot-flagged regression: when ENVIRONMENT is unset, a dispatch
+        carrying `_input_files` made _validate_input_files raise ValueError,
+        which the previous handler caught as InvalidDispatchPayload (retry-
+        forever-to-DLQ) instead of surfacing the dispatch-misconfig callback
+        the operator needs to see. Verify the misconfig path now fires
+        BEFORE parse, regardless of whether the dispatch carries envelope keys.
+        """
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+        event = _make_sqs_event(
+            {
+                "experiment_type": "meeting_briefing",
+                "organization_slug": "org-123",
+                "run_id": "run-env-missing",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {
+                    "state": "WI",
+                    "_input_files": [_VALID_INPUT_FILE],
+                },
+            }
+        )
+
+        result = handler(event, None)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        error_msg = mock_send_error_callback.call_args[0][1]
+        assert "ENVIRONMENT" in error_msg
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "dispatch-misconfig-run-env-missing"
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+
 
 class TestParamsSizeLimit:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -1139,6 +1178,46 @@ class TestParamsSizeLimit:
         assert result["status"] == "launched"
         mock_broker.mint_run_token.assert_called_once()
         mock_ecs.run_task.assert_called_once()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_oversized_input_files_rejected_before_ecs(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
+        # Worst-case-shaped entries: bucket-name max + key-max + dest-max
+        # serialize to ~1.3 KB each. 10 entries → ~13 KB, well past the
+        # ECS RunTask containerOverrides budget. Verify the cap fires before
+        # ECS is called and gets a clean dispatch-side error callback rather
+        # than RunTask silently truncating / failing.
+        bucket = "gp-agent-run-inputs-dev"
+        oversized_entries = [
+            {
+                "bucket": bucket,
+                "key": "k" * 1024,
+                "dest": "f" * 200 + str(i),
+            }
+            for i in range(10)
+        ]
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-big-inputs",
+                "clerk_user_id": "user_test_dispatch",
+                "params": {
+                    **VALID_PARAMS,
+                    "_input_files": oversized_entries,
+                },
+            }
+        )
+
+        result = handler(event, None)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+        mock_send_error_callback.assert_called_once()
+        error_msg = mock_send_error_callback.call_args[0][1]
+        assert "_input_files" in error_msg
+        assert "exceeds limit" in error_msg
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "input-files-too-large-run-big-inputs"
+        assert result["batchItemFailures"] == []
 
 
 class TestRequiredParamsValidation:
@@ -2135,3 +2214,375 @@ class TestWriteActionDispatchFlow:
         assert result["status"] == "launched"
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["scope"] == {}
+
+
+# --- _input_files dispatch envelope ----------------------------------------
+# Reserved `_`-prefixed params key carrying enumerated S3 refs the runner
+# pre-fetches via the broker. Stripped from params before input_schema
+# validation and PARAMS_JSON, re-attached to the dispatch dict as
+# `_input_files` so downstream code (mint, env-var) reads it.
+
+_VALID_INPUT_FILE = {
+    "bucket": "gp-agent-run-inputs-dev",
+    "key": "uploads/org-123/run-001/agenda.pdf",
+    "dest": "agenda.pdf",
+}
+
+
+class TestInputFilesEnvelopeStripping:
+    def test_strips_input_files_from_params_to_top_level(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {"state": "WI", "_input_files": [_VALID_INPUT_FILE]},
+        }
+        result = parse_dispatch_message(json.dumps(body))
+        assert "_input_files" not in result["params"]
+        assert result["params"] == {"state": "WI"}
+        assert result["_input_files"] == [_VALID_INPUT_FILE]
+
+    def test_absent_input_files_leaves_dict_untouched(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {"state": "WI"},
+        }
+        result = parse_dispatch_message(json.dumps(body))
+        assert "_input_files" not in result
+        assert result["params"] == {"state": "WI"}
+
+    def test_rejects_unknown_envelope_key(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {"state": "WI", "_unknown_key": "value"},
+        }
+        with pytest.raises(ValueError, match="unknown _-prefixed key"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_path_traversal_in_dest(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [{"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "../etc/passwd"}],
+            },
+        }
+        with pytest.raises(ValueError, match="dest"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_slash_in_dest(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [{"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "sub/file.pdf"}],
+            },
+        }
+        with pytest.raises(ValueError, match="dest"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_path_traversal_in_bucket(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [{"bucket": "bucket/with/slashes", "key": "k", "dest": "f.pdf"}],
+            },
+        }
+        with pytest.raises(ValueError, match="bucket"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_wrong_environment_bucket(self, monkeypatch):
+        # Closes the bot-flagged hole where any caller controlling the SQS
+        # message could craft a bucket name and rely solely on broker IAM for
+        # defense. Dev dispatch must NOT authorize reads from the prod bucket.
+        monkeypatch.setenv("ENVIRONMENT", "dev")
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [
+                    {
+                        "bucket": "gp-agent-run-inputs-prod",
+                        "key": "k",
+                        "dest": "f.pdf",
+                    }
+                ],
+            },
+        }
+        with pytest.raises(ValueError, match="gp-agent-run-inputs-dev"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_when_environment_env_var_missing(self, monkeypatch):
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [_VALID_INPUT_FILE],
+            },
+        }
+        with pytest.raises(ValueError, match="ENVIRONMENT"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_dest_over_255_chars(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [
+                    {
+                        "bucket": "gp-agent-run-inputs-dev",
+                        "key": "k",
+                        # 256 chars — one past the broker's Pydantic max_length=255
+                        "dest": "a" * 256,
+                    }
+                ],
+            },
+        }
+        with pytest.raises(ValueError, match="dest"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_accepts_dest_at_exactly_255_chars(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [
+                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "a" * 255},
+                ],
+            },
+        }
+        # Just shy of the boundary; should parse cleanly.
+        result = parse_dispatch_message(json.dumps(body))
+        assert result["_input_files"][0]["dest"] == "a" * 255
+
+    def test_rejects_too_many_input_files(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [{"bucket": "b", "key": f"k{i}", "dest": f"f{i}.pdf"} for i in range(11)],
+            },
+        }
+        with pytest.raises(ValueError, match="too large"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_missing_required_keys(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": [{"bucket": "b", "key": "k"}],
+            },
+        }
+        with pytest.raises(ValueError, match="missing required keys"):
+            parse_dispatch_message(json.dumps(body))
+
+    def test_rejects_non_list_input_files(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-001",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {
+                "state": "WI",
+                "_input_files": {"bucket": "b", "key": "k", "dest": "x.pdf"},
+            },
+        }
+        with pytest.raises(ValueError, match="array"):
+            parse_dispatch_message(json.dumps(body))
+
+
+class TestBuildContainerOverridesInputFiles:
+    def test_emits_input_files_json_when_present(self):
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+            "_input_files": [_VALID_INPUT_FILE],
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "INPUT_FILES_JSON" in env_map
+        assert json.loads(env_map["INPUT_FILES_JSON"]) == [_VALID_INPUT_FILE]
+
+    def test_omits_input_files_json_when_absent(self):
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "INPUT_FILES_JSON" not in env_map
+
+    def test_omits_input_files_json_when_empty(self):
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+            "_input_files": [],
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "INPUT_FILES_JSON" not in env_map
+
+
+class TestInputFilesDispatchFlow:
+    """`_input_files` user-input prefetch across the queued-dispatch path.
+
+    Mint + ECS RunTask now happen in the scheduler's launch_run, not in ingest
+    (which only enqueues a QueuedJob). So the flow splits:
+      - ingest strips `_input_files` out of params and persists it on the job,
+      - launch_run threads it onto mint as `input_files` and emits the
+        INPUT_FILES_JSON env, while PARAMS_JSON stays free of the envelope key.
+    """
+
+    def test_ingest_persists_input_files_on_queued_job(self):
+        # Ingest enqueues a QueuedJob carrying input_files (stripped from params).
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        fake_store = MagicMock()
+        with patch.object(dh, "get_job_store", lambda: fake_store):
+            event = _make_sqs_event(
+                {
+                    "experiment_type": "smoke_test",
+                    "organization_slug": "org-123",
+                    "run_id": "run-pref-001",
+                    "clerk_user_id": "user_test_dispatch",
+                    "params": {**VALID_PARAMS, "_input_files": [_VALID_INPUT_FILE]},
+                }
+            )
+            result = handler(event, None)
+
+        assert result["batchItemFailures"] == []
+        queued_job = fake_store.put_queued_job.call_args.args[0]
+        assert queued_job.input_files == [_VALID_INPUT_FILE]
+        assert "_input_files" not in queued_job.params
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_launch_run_threads_input_files_to_mint_and_ecs_env(self, mock_get_ecs, mock_broker_cls):
+        mock_broker_cls.return_value = _mock_broker_success("tok-prefetch")
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
+
+        # The scheduler reconstructs this message from the QueuedJob, re-attaching
+        # `_input_files` (params already had it stripped at parse time).
+        message = _make_message("run-pref-001")
+        message["_input_files"] = [_VALID_INPUT_FILE]
+
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
+        )
+        assert result["status"] == "launched"
+
+        mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
+        assert mint_kwargs["input_files"] == [_VALID_INPUT_FILE]
+
+        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"]["containerOverrides"][0][
+            "environment"
+        ]
+        env_map = {e["name"]: e["value"] for e in env_list}
+        assert "INPUT_FILES_JSON" in env_map
+        assert json.loads(env_map["INPUT_FILES_JSON"]) == [_VALID_INPUT_FILE]
+        assert "_input_files" not in json.loads(env_map["PARAMS_JSON"])
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_launch_run_absent_input_files_passes_none_to_mint(self, mock_get_ecs, mock_broker_cls):
+        mock_broker_cls.return_value = _mock_broker_success("tok-no-prefetch")
+        mock_get_ecs.return_value.run_task.return_value = {
+            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
+            "failures": [],
+        }
+
+        message = _make_message("run-none-001")  # no _input_files
+
+        launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
+        )
+
+        mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
+        assert mint_kwargs["input_files"] is None
+        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"]["containerOverrides"][0][
+            "environment"
+        ]
+        env_map = {e["name"]: e["value"] for e in env_list}
+        assert "INPUT_FILES_JSON" not in env_map

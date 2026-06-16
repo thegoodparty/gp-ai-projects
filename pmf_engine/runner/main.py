@@ -14,8 +14,10 @@ from shared.logger import get_logger
 from .config import RunnerConfig, BrokerUrlSchemeError, validate_broker_url_scheme
 from .contract import validate_artifact_contract, ContractViolation
 from .harness.base import AgentHarness
+from .input_files import prefetch_input_files
 from .pmf_runtime import publish
 from .pmf_runtime.config import init_config
+from .pmf_runtime.egress_guard import MESSAGE as EGRESS_MESSAGE
 
 logger = get_logger(__name__)
 
@@ -31,7 +33,28 @@ _RESERVED_WORKSPACE_FILES = frozenset({
     "instruction.md",
     "contract_schema.json",
     "validate_output.py",
+    "SANDBOX.md",
 })
+
+_SANDBOX_DOC = EGRESS_MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip() + """
+
+## Allowed tools
+
+- WebSearch — discover URLs and facts. Start here.
+- pmf_runtime.http.head(url) — cheap check that a URL exists / resolves before citing. Use first.
+- pmf_runtime.http.get(url) — fetch a web page (HTML/JSON/CSV/XML text). The browser; escalate to this only if head fails.
+- pmf_runtime.http.download(url) — download a binary file (PDF, docx, xlsx) to the workspace.
+
+## Web-access escalation ladder
+
+WebSearch -> pmf_runtime.http.head -> pmf_runtime.http.get (browser, only if head fails)
+
+## Never
+
+Never use urllib, requests, httpx, curl, wget, or raw socket directly — they fail here, and never \
+retry them or reverse-engineer the runtime. There is no route out of this container except the \
+broker-proxied tools above.
+"""
 
 
 class AttachmentSafetyViolation(RuntimeError):
@@ -154,6 +177,39 @@ def _send_failed_to_sqs_directly(
             run_id, experiment_id,
         )
         return False
+
+
+def _report_failed_or_fallback(
+    *,
+    run_id: str,
+    experiment_id: str,
+    reason_code: str,
+    detail: str,
+    duration_seconds: float,
+) -> None:
+    """Send a terminal "failed" status via the broker; if the broker is
+    unreachable (report_status raises), fall back to a direct SQS failed
+    envelope so the gp-api run row flips PENDING → FAILED instead of hanging
+    forever. Mirrors the config-load failure path so every terminal handler
+    in main() is broker-down-safe."""
+    try:
+        publish.report_status(
+            "failed",
+            reason_code=reason_code,
+            detail=detail,
+            duration_seconds=duration_seconds,
+        )
+    except Exception as report_err:
+        logger.exception(
+            "failed_callback_send_failed errorType=ReportStatusError "
+            f"run_id={run_id} error={report_err}"
+        )
+        _send_failed_to_sqs_directly(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            reason_code=reason_code,
+            detail=detail,
+        )
 
 
 def _exit_on_pre_task_shutdown(
@@ -288,7 +344,14 @@ def _collect_workspace_files(
     total_size = 0
     if not os.path.isdir(root_dir):
         return collected
-    for dirpath, _dirnames, filenames in os.walk(root_dir):
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # User-uploaded inputs (e.g. agenda PDFs pre-fetched by the runner
+        # into /workspace/input/) may contain PII. Don't bundle them into
+        # the log capture that ships to gp-api after a failure — the agent
+        # already has them as part of its run inputs; logs are for the
+        # agent's WORK product, not its input data.
+        if dirpath == root_dir and "input" in dirnames:
+            dirnames.remove("input")
         for filename in filenames:
             if _is_sensitive_file(filename):
                 continue
@@ -363,7 +426,7 @@ async def run_experiment(
         harness = get_harness(config.harness)
 
     bt = BraintrustClient.get_instance()
-    bt.init("pmf-engine")
+    bt.init(f"pmf-engine-{config.environment}")
 
     workspace_dir = os.environ.get("WORKSPACE_DIR", "/workspace")
     start_time = time.monotonic()
@@ -394,18 +457,25 @@ async def run_experiment(
                     system_prompt=config.system_prompt,
                     permission_mode=config.permission_mode,
                     allowed_external_tools=config.allowed_external_tools,
+                    max_parallel_subagents=config.max_parallel_subagents,
+                    max_thinking_tokens=config.max_thinking_tokens,
                 )
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Harness failed for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush the span BEFORE report_status: a terminal status deletes
+                # this run's broker scope ticket, which invalidates the token the
+                # Braintrust proxy authenticates with. Logging/flushing after it
+                # drops the rollup batch with a 401.
+                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
                     detail=str(e),
                     duration_seconds=duration,
                 )
-                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
 
@@ -439,6 +509,16 @@ async def run_experiment(
                     # None / empty bytes case — preserve the empty marker
                     # for downstream tooling that branches on truncation.
                     rejected = {"_raw_bytes": "", "_truncated": False}
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={
+                    "status": "contract_violation",
+                    "error": str(e),
+                    "cost_usd": result.cost_usd,
+                    "num_turns": result.num_turns,
+                    "duration_seconds": duration,
+                })
+                bt.flush()
                 publish.report_status(
                     "contract_violation",
                     rejected_artifact=rejected,
@@ -447,18 +527,15 @@ async def run_experiment(
                     cost_usd=result.cost_usd,
                 )
                 _mark_callback_sent()
-                span.log(output={
-                    "status": "contract_violation",
-                    "error": str(e),
-                    "cost_usd": result.cost_usd,
-                    "num_turns": result.num_turns,
-                    "duration_seconds": duration,
-                })
                 return
             except Exception as e:
                 duration = time.monotonic() - start_time
                 logger.exception(f"Validator error for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code=type(e).__name__,
@@ -466,7 +543,6 @@ async def run_experiment(
                     duration_seconds=duration,
                     cost_usd=result.cost_usd,
                 )
-                span.log(output={"status": "failed", "error": str(e), "duration_seconds": duration})
                 _mark_callback_sent()
                 raise
 
@@ -476,6 +552,16 @@ async def run_experiment(
                 duration = time.monotonic() - start_time
                 logger.exception(f"Artifact not valid JSON for run {config.run_id}: {e}")
                 _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
+                # Flush before report_status deletes the broker scope ticket
+                # (see harness-failure branch above).
+                span.log(output={
+                    "status": "failed",
+                    "error": str(e),
+                    "cost_usd": result.cost_usd,
+                    "num_turns": result.num_turns,
+                    "duration_seconds": duration,
+                })
+                bt.flush()
                 publish.report_status(
                     "failed",
                     reason_code="InvalidJSON",
@@ -489,6 +575,24 @@ async def run_experiment(
             _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
 
             duration = time.monotonic() - start_time
+            # Intentional trace/status divergence: the trace records "success"
+            # and flushes HERE, before publish runs. Because publish deletes the
+            # scope ticket that authenticates the Braintrust proxy, if publish
+            # then fails and gp-api gets a "failed" status, this run's Braintrust
+            # trace will still read "success". That stale trace is a deliberate
+            # tradeoff of flush-before-delete, not a bug.
+            # Log + flush the root span BEFORE publish: publish deletes this
+            # run's broker scope ticket (anti-replay), which invalidates the
+            # token the Braintrust proxy authenticates with. Flushing after
+            # publish drops the run-level rollup with a 401.
+            span.log(output={
+                "status": "success",
+                "artifact": artifact,
+                "cost_usd": result.cost_usd,
+                "num_turns": result.num_turns,
+                "duration_seconds": duration,
+            })
+            bt.flush()
             try:
                 publish.publish(
                     artifact,
@@ -520,14 +624,9 @@ async def run_experiment(
                         f"for run {config.run_id}: {report_err}"
                     )
                 raise
-
-            span.log(output={
-                "status": "success",
-                "cost_usd": result.cost_usd,
-                "num_turns": result.num_turns,
-                "duration_seconds": duration,
-            })
     finally:
+        # Safety net for unexpected exits; terminal branches already flush the
+        # root span before the broker call that deletes the scope ticket.
         bt.flush()
 
 
@@ -689,10 +788,17 @@ async def main():
         os.makedirs(workspace_dir, exist_ok=True)
         os.makedirs(os.path.join(workspace_dir, "output"), exist_ok=True)
 
+        prefetch_input_files(workspace_dir, config.broker_url, config.broker_token)
+
         instruction_path = os.path.join(workspace_dir, "instruction.md")
         with open(instruction_path, "w") as f:
             f.write(config.instruction)
         logger.info(f"Wrote instruction to {instruction_path}")
+
+        sandbox_path = os.path.join(workspace_dir, "SANDBOX.md")
+        with open(sandbox_path, "w") as f:
+            f.write(_SANDBOX_DOC)
+        logger.info(f"Wrote sandbox doc to {sandbox_path}")
 
         if config.contract_schema:
             schema_path = os.path.join(workspace_dir, "contract_schema.json")
@@ -770,8 +876,9 @@ async def main():
                     exc_info=True,
                 )
         _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
-        publish.report_status(
-            "failed",
+        _report_failed_or_fallback(
+            run_id=config.run_id,
+            experiment_id=config.experiment_id,
             reason_code="Timeout",
             detail=f"Experiment timed out after {config.timeout_seconds}s",
             duration_seconds=time.monotonic() - main_start_time,
@@ -781,8 +888,9 @@ async def main():
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
         _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
-        publish.report_status(
-            "failed",
+        _report_failed_or_fallback(
+            run_id=config.run_id,
+            experiment_id=config.experiment_id,
             reason_code="Signal",
             detail="Task terminated by signal",
             duration_seconds=time.monotonic() - main_start_time,
@@ -795,8 +903,9 @@ async def main():
     except Exception as e:
         if _shutdown_requested:
             logger.warning(f"Task terminated by signal for run {config.run_id}")
-            publish.report_status(
-                "failed",
+            _report_failed_or_fallback(
+                run_id=config.run_id,
+                experiment_id=config.experiment_id,
                 reason_code="Signal",
                 detail="Task terminated by signal",
                 duration_seconds=time.monotonic() - main_start_time,
@@ -805,8 +914,9 @@ async def main():
 
         logger.exception(f"Unhandled error in main for run {config.run_id}: {e}")
         if not _is_callback_already_sent():
-            publish.report_status(
-                "failed",
+            _report_failed_or_fallback(
+                run_id=config.run_id,
+                experiment_id=config.experiment_id,
                 reason_code=type(e).__name__,
                 detail=f"Unhandled error: {e}",
                 duration_seconds=time.monotonic() - main_start_time,

@@ -232,6 +232,35 @@ async def test_publish_failure_then_report_status_failure_leaves_callback_unsent
 
 
 @pytest.mark.asyncio
+async def test_main_falls_back_to_sqs_when_outer_report_status_fails():
+    """Broker fully down: run_experiment raises (no callback marked), then main()'s
+    outer handler calls report_status which ALSO raises. Without an SQS fallback
+    the exception escapes main() and the gp-api run row hangs PENDING forever.
+    main() must fall back to _send_failed_to_sqs_directly, matching the config-load
+    failure path."""
+    from pmf_engine.runner.main import _reset_callback_marker
+
+    _reset_callback_marker()
+    config = _make_config(instruction="Do stuff", timeout_seconds=30)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish") as mock_publish:
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock) as mock_run:
+                            with patch("pmf_engine.runner.main._send_failed_to_sqs_directly") as mock_sqs:
+                                mock_run.side_effect = RuntimeError("kaboom")
+                                mock_publish.report_status.side_effect = Exception("broker down")
+                                with pytest.raises(Exception):
+                                    await main()
+
+    mock_sqs.assert_called_once()
+    assert mock_sqs.call_args.kwargs["run_id"] == config.run_id
+    assert mock_sqs.call_args.kwargs["experiment_id"] == config.experiment_id
+
+
+@pytest.mark.asyncio
 async def test_main_writes_instruction_to_workspace():
     with tempfile.TemporaryDirectory() as tmpdir:
         config = _make_config(instruction="# Test Instruction\n\nDo the thing.")
@@ -247,6 +276,53 @@ async def test_main_writes_instruction_to_workspace():
         assert os.path.exists(instruction_path)
         with open(instruction_path) as f:
             assert f.read() == "# Test Instruction\n\nDo the thing."
+
+
+@pytest.mark.asyncio
+async def test_main_writes_sandbox_doc_to_workspace():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = _make_config(instruction="# Test Instruction")
+
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", new_callable=AsyncMock):
+                            await main()
+
+        sandbox_path = os.path.join(tmpdir, "SANDBOX.md")
+        assert os.path.exists(sandbox_path)
+        with open(sandbox_path) as f:
+            content = f.read()
+        assert "no direct network egress" in content.lower()
+
+
+def test_sandbox_md_is_reserved_workspace_file():
+    from pmf_engine.runner.main import _RESERVED_WORKSPACE_FILES
+
+    assert "SANDBOX.md" in _RESERVED_WORKSPACE_FILES
+
+
+def test_sandbox_doc_embeds_egress_guard_message_as_single_source():
+    """The no-egress sandbox message must have ONE source of truth. The
+    SANDBOX.md doc the runner writes (`_SANDBOX_DOC`) and the runtime
+    SandboxEgressError text (`egress_guard.MESSAGE`) had drifted as two
+    hand-maintained near-copies. Pin that `_SANDBOX_DOC` is built by
+    embedding `egress_guard.MESSAGE` verbatim so the two cannot diverge.
+
+    `egress_guard.MESSAGE` ends with a self-referential "See /workspace/
+    SANDBOX.md." sentence that reads oddly inside SANDBOX.md itself, so the
+    runner is allowed to trim that trailing sentence when embedding. Assert
+    the core text (everything before that self-reference) is a substring.
+    """
+    from pmf_engine.runner.main import _SANDBOX_DOC
+    from pmf_engine.runner.pmf_runtime.egress_guard import MESSAGE
+
+    core = MESSAGE.split("See /workspace/SANDBOX.md")[0].rstrip()
+    assert core in _SANDBOX_DOC, (
+        "egress_guard.MESSAGE must be embedded verbatim in _SANDBOX_DOC so "
+        "the two no-egress messages share a single source and cannot drift"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -593,11 +669,12 @@ async def test_main_works_with_runner_config_default_attachments(tmp_path):
                         await main()
 
     mock_run.assert_called_once()
-    # Only instruction.md present — no spurious attachment files.
+    # Only runner-written sidecars present — no spurious attachment files.
     assert (tmp_path / "instruction.md").exists()
+    runner_sidecars = {"instruction.md", "SANDBOX.md"}
     extra_files = [
         p.name for p in tmp_path.iterdir()
-        if p.is_file() and p.name != "instruction.md"
+        if p.is_file() and p.name not in runner_sidecars
     ]
     assert extra_files == [], (
         f"default-attachments path must not create extra files; got: {extra_files!r}"
@@ -898,7 +975,9 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
     with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
         await run_experiment(config, harness=mock_harness)
 
-    mock_bt.init.assert_called_once_with("pmf-engine")
+    # Per-environment Braintrust project keeps prod a clean eval corpus,
+    # separate from dev/qa smoke noise. config.environment is "dev" here.
+    mock_bt.init.assert_called_once_with("pmf-engine-dev")
 
     call_kwargs = mock_bt.traced_span.call_args[1]
     assert call_kwargs["name"] == "experiment:hello_world"
@@ -915,8 +994,75 @@ async def test_run_experiment_traces_success_to_braintrust(mock_publish, _mock_l
     assert log_kwargs["output"]["cost_usd"] == 0.05
     assert log_kwargs["output"]["num_turns"] == 3
     assert log_kwargs["output"]["duration_seconds"] > 0
+    # The final artifact JSON is pushed into the trace output so Braintrust
+    # shows input(params)→output(artifact), not just rollup metadata.
+    assert log_kwargs["output"]["artifact"] == {"greeting": "hello"}
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_run_experiment_publishes_when_braintrust_flush_raises(mock_publish, _mock_logs):
+    """Graceful degradation: Braintrust being fully unavailable must not block
+    the run. When the broker returns 503/401 for the Braintrust proxy, the
+    client's flush() can raise. The run is a success regardless of whether
+    telemetry made it out the door — Braintrust is best-effort observability,
+    not part of the experiment's terminal contract.
+
+    Contract: even if bt.flush() raises (proxy down), run_experiment still
+    calls publish.publish(...) with the artifact and does NOT propagate the
+    Braintrust failure to the caller.
+    """
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+        session_id="sess-abc",
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+    # Simulate the Braintrust proxy being unreachable. In production the
+    # underlying batch logger's flush raises (proxy 401/503), but
+    # BraintrustClient.flush swallows it (logs .error, returns None) so the
+    # run is never blocked by telemetry. Model that swallow here: the public
+    # flush() the runner calls absorbs the proxy error instead of propagating.
+    flush_attempts = {"count": 0}
+
+    def swallowing_flush():
+        flush_attempts["count"] += 1
+        try:
+            raise RuntimeError("braintrust proxy 503")
+        except Exception:
+            # Matches BraintrustClient.flush: log + swallow, never re-raise.
+            return None
+
+    mock_bt.flush.side_effect = swallowing_flush
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        # MUST NOT raise — Braintrust failure is non-fatal to the run.
+        await run_experiment(config, harness=mock_harness)
+
+    assert flush_attempts["count"] >= 1, "expected the runner to attempt a Braintrust flush"
+
+    # The artifact still reaches the broker.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    assert call_args.kwargs.get("cost_usd") == pytest.approx(0.05)
+    # The run is NOT reported as failed just because telemetry couldn't flush.
+    failed_calls = [
+        c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"
+    ]
+    assert not failed_calls, (
+        f"Braintrust flush failure must not produce a failed status; got: {failed_calls!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -937,7 +1083,9 @@ async def test_run_experiment_traces_failure_to_braintrust(mock_publish, _mock_l
     assert log_kwargs["output"]["status"] == "failed"
     assert "Agent crashed" in log_kwargs["output"]["error"]
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
 
 
 @pytest.mark.asyncio
@@ -963,7 +1111,72 @@ async def test_run_experiment_traces_contract_violation_to_braintrust(mock_publi
     assert log_kwargs["output"]["status"] == "contract_violation"
     assert "greeting" in log_kwargs["output"]["error"]
 
-    mock_bt.flush.assert_called_once()
+    # flushed twice now: once in the terminal branch (before the broker call
+    # that deletes the scope ticket) + once in the finally safety net.
+    mock_bt.flush.assert_called()
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_braintrust_flushes_before_publish_deletes_scope_ticket(mock_publish, _mock_logs):
+    """The broker deletes this run's scope ticket on publish (anti-replay),
+    which invalidates the token the Braintrust proxy authenticates with. So the
+    root span output must be logged AND flushed BEFORE publish — otherwise the
+    run-level rollup batch is dropped with a 401. Lock the ordering."""
+    config = _make_config()
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+        session_id="sess-abc",
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    manager = MagicMock()
+    manager.attach_mock(mock_span.log, "span_log")
+    manager.attach_mock(mock_bt.flush, "flush")
+    manager.attach_mock(mock_publish.publish, "publish")
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        await run_experiment(config, harness=mock_harness)
+
+    order = [c[0] for c in manager.mock_calls]
+    assert "publish" in order and "span_log" in order and "flush" in order
+    assert order.index("span_log") < order.index("publish"), (
+        "root span output must be logged before publish deletes the scope ticket"
+    )
+    assert order.index("flush") < order.index("publish"), (
+        "Braintrust must flush before publish deletes the scope ticket"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_braintrust_flushes_before_report_status_on_failure(mock_publish, _mock_logs):
+    """Terminal report_status also deletes the scope ticket. The failure-path
+    span output + flush must precede it for the same reason."""
+    config = _make_config()
+    mock_harness = AsyncMock()
+    mock_harness.run.side_effect = RuntimeError("Agent crashed")
+    mock_bt, mock_span = _make_mock_bt()
+
+    manager = MagicMock()
+    manager.attach_mock(mock_span.log, "span_log")
+    manager.attach_mock(mock_bt.flush, "flush")
+    manager.attach_mock(mock_publish.report_status, "report_status")
+
+    with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+        with pytest.raises(RuntimeError, match="Agent crashed"):
+            await run_experiment(config, harness=mock_harness)
+
+    order = [c[0] for c in manager.mock_calls]
+    assert order.index("span_log") < order.index("report_status")
+    assert order.index("flush") < order.index("report_status")
 
 
 class TestMainErrorPaths:
@@ -1582,6 +1795,56 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
         )
         assert "workspace/config.env.yaml" not in keys, (
             f"config.env.yaml must NOT be collected (contains .env), got keys: {keys}"
+        )
+
+
+class TestCollectWorkspaceFilesSkipsUserInputs:
+    """User-uploaded inputs (e.g. agenda PDFs pre-fetched to
+    /workspace/input/) may contain PII. They must never end up in the log
+    bundle that ships to gp-api on failure — the agent's WORK product is what
+    we log, not its input data.
+    """
+
+    def test_input_subdirectory_pruned_from_log_capture(self, tmp_path):
+        from pmf_engine.runner.main import _collect_workspace_files
+
+        (tmp_path / "output").mkdir()
+        (tmp_path / "output" / "result.json").write_text('{"ok": true}')
+        (tmp_path / "instruction.md").write_text("agent instructions")
+
+        # The user-input subdir the prefetch helper creates.
+        (tmp_path / "input").mkdir()
+        (tmp_path / "input" / "agenda.pdf").write_bytes(b"%PDF-1.4 user data")
+
+        collected = _collect_workspace_files(str(tmp_path))
+        keys = set(collected.keys())
+
+        assert "workspace/output/result.json" in keys, (
+            f"output/result.json should be collected, got keys: {keys}"
+        )
+        assert "workspace/instruction.md" in keys, (
+            f"instruction.md should be collected, got keys: {keys}"
+        )
+        assert "workspace/input/agenda.pdf" not in keys, (
+            f"input/agenda.pdf must NOT be collected (user-uploaded), got keys: {keys}"
+        )
+
+    def test_nested_input_directory_below_top_level_is_collected(self, tmp_path):
+        # The prune-on-walk targets only the TOP-LEVEL `input` next to the
+        # workspace root. A non-top-level `input` directory created by an
+        # agent's own work (e.g. `output/components/input/foo.md`) is NOT
+        # user-uploaded and should still be captured.
+        from pmf_engine.runner.main import _collect_workspace_files
+
+        nested = tmp_path / "output" / "subtree" / "input"
+        nested.mkdir(parents=True)
+        (nested / "agent-note.md").write_text("agent wrote this")
+
+        collected = _collect_workspace_files(str(tmp_path))
+        keys = set(collected.keys())
+
+        assert "workspace/output/subtree/input/agent-note.md" in keys, (
+            f"nested input/ files should still be collected, got keys: {keys}"
         )
 
 

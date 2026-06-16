@@ -137,3 +137,31 @@ class TestInputValidation:
     def test_rejects_control_chars_or_excessive_length_district(self, bad_district):
         with pytest.raises(ValueError, match="district"):
             derive_scope("smoke_test", {"state": "NC", "district": bad_district})
+
+
+class TestDataRequiredUnlessPassthrough:
+    """Regression: the broker's NoDataQueriesSucceeded publish guard reads
+    `data_required_unless` from the ticket scope. derive_scope must carry it
+    through from the manifest, or legitimate no-data placeholder runs (e.g.
+    meeting_briefing's awaiting_agenda / no_meeting_found) get rejected at
+    publish even though no Databricks query is appropriate for that branch."""
+
+    def test_data_required_unless_is_carried_through(self):
+        manifest_scope = {
+            "allowed_tables": ["goodparty_data_catalog.dbt.int__l2_nationwide_uniform_w_haystaq"],
+            "max_rows": 50000,
+            "data_required_unless": {
+                "field": "briefing_status",
+                "values": ["awaiting_agenda", "no_meeting_found", "error"],
+            },
+        }
+        scope = derive_scope("meeting_briefing", {"state": "NC"}, manifest_scope=manifest_scope)
+
+        assert scope["data_required_unless"] == {
+            "field": "briefing_status",
+            "values": ["awaiting_agenda", "no_meeting_found", "error"],
+        }
+
+    def test_data_required_unless_absent_when_manifest_omits_it(self):
+        scope = derive_scope("web_only_experiment", {"state": "NC"}, manifest_scope={"max_rows": 50000})
+        assert scope.get("data_required_unless") is None

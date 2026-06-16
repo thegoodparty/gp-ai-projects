@@ -127,6 +127,9 @@ def test_dispatch_env_roundtrips_to_runner_config():
         "ANTHROPIC_API_KEY",
         "PARAMS_JSON",
         "TIMEOUT_SECONDS",
+        "BRAINTRUST_API_KEY",
+        "BRAINTRUST_APP_URL",
+        "BRAINTRUST_API_URL",
     ):
         assert critical in env_map, (
             f"dispatch_handler no longer sets {critical} — "
@@ -137,6 +140,11 @@ def test_dispatch_env_roundtrips_to_runner_config():
     assert env_map["BROKER_URL"] == "https://broker.example.com"
     assert env_map["ANTHROPIC_BASE_URL"] == "https://broker.example.com/anthropic"
     assert env_map["ANTHROPIC_API_KEY"] == "tok-test-123"
+    # Braintrust SDK routes both legs through the broker: the runner holds only
+    # the per-run broker token, the broker swaps in the real Braintrust key.
+    assert env_map["BRAINTRUST_API_KEY"] == "tok-test-123"
+    assert env_map["BRAINTRUST_APP_URL"] == "https://broker.example.com/braintrust/app"
+    assert env_map["BRAINTRUST_API_URL"] == "https://broker.example.com/braintrust/api"
 
     envelope = _broker_envelope(manifest, instruction)
 
