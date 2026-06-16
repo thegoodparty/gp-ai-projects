@@ -60,8 +60,13 @@ def test_launches_up_to_free_slots(mock_launch, mock_sqs, mock_store, mock_count
 @patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
 def test_no_launch_when_at_cap(mock_store, mock_count):
     mock_count.return_value = 3  # cap 3 -> 0 slots
+    store = mock_store.return_value
+    # Stub the sweep query so _sweep_stuck_launching runs cleanly — without this
+    # it iterates a bare MagicMock and TypeErrors, which the handler's try/except
+    # swallows, letting the test pass without actually exercising the cap path.
+    store.query_stuck_launching.return_value = []
     sched.handler({}, None)
-    mock_store.return_value.query_queued.assert_not_called()
+    store.query_queued.assert_not_called()
 
 
 @patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")
