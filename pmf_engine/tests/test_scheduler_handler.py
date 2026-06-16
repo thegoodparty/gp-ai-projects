@@ -116,10 +116,12 @@ def test_transient_launch_leaves_job_launching(mock_launch, mock_sqs, mock_store
 @patch("pmf_engine.control_plane.scheduler_handler.get_job_store")
 @patch("pmf_engine.control_plane.scheduler_handler.get_sqs_client")
 @patch("pmf_engine.control_plane.scheduler_handler.launch_run")
-def test_started_callback_send_failure_leaves_job_launching(mock_launch, mock_sqs, mock_store, mock_count):
-    # A successful launch whose `started` callback send raises must NOT mark the
-    # job dispatched — it stays LAUNCHING so the sweep reconciles it, and the
-    # handler returns normally (no exception escapes).
+def test_started_callback_send_failure_still_dispatches(mock_launch, mock_sqs, mock_store, mock_count):
+    # A successful launch means a real task is running, so the job MUST be marked
+    # dispatched even if the `started` callback send fails — otherwise the sweep
+    # would later FAIL a live task. The job must NOT be failed or left LAUNCHING;
+    # gp-api reconciles via the terminal callback / backstop. Handler returns
+    # the launch as counted, no exception escapes.
     mock_count.return_value = 0
     store = mock_store.return_value
     store.query_queued.return_value = [_job("r1", "HIGH")]
@@ -129,9 +131,9 @@ def test_started_callback_send_failure_leaves_job_launching(mock_launch, mock_sq
 
     result = sched.handler({}, None)
 
-    store.mark_dispatched.assert_not_called()
+    store.mark_dispatched.assert_called_once_with("r1")
     store.mark_failed.assert_not_called()
-    assert result == {"launched": 0}
+    assert result == {"launched": 1}
 
 
 @patch("pmf_engine.control_plane.scheduler_handler.count_running_tasks")

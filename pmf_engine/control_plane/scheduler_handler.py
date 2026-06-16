@@ -213,10 +213,15 @@ def _launch_one(store, job) -> bool:
         return False
 
     if result["status"] == "launched":
-        # Send the `started` callback BEFORE marking dispatched. If the send
-        # fails, leave the job LAUNCHING (do NOT mark dispatched) — the
-        # stuck-LAUNCHING sweep reconciles it to FAILED later. This trades a
-        # rare ran-but-shows-FAILED for never silently orphaning a launched run.
+        # RunTask succeeded — a real Fargate task is now running, so that is the
+        # source of truth: mark DISPATCHED unconditionally so the job leaves the
+        # stuck-LAUNCHING sweep's view. The `started` callback is best-effort: if
+        # the SQS send fails, do NOT leave the job LAUNCHING (the sweep would then
+        # send a `failed` callback and FAIL a live task, dropping its real result
+        # when the terminal callback lands). gp-api instead reconciles via the
+        # task's terminal callback (its relaxed guard accepts QUEUED -> terminal)
+        # or the 6h QUEUED backstop if the task dies silently.
+        store.mark_dispatched(job.run_id)
         sent = _send_callback(
             job.run_id,
             "started",
@@ -224,10 +229,10 @@ def _launch_one(store, job) -> bool:
             organization_slug=job.organization_slug,
         )
         if not sent:
-            logger.error(f"started-callback send failed for {job.run_id}; leaving LAUNCHING for the sweep")
+            logger.error(
+                f"started-callback send failed for {job.run_id}; task is running, gp-api will reconcile on terminal callback / backstop"
+            )
             emit_dispatch_metric("SchedulerStartedCallbackFailed", job.experiment_type)
-            return False
-        store.mark_dispatched(job.run_id)
         return True
 
     # Notify gp-api BEFORE committing FAILED. If the send fails, leave the job in
