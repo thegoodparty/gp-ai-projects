@@ -28,6 +28,7 @@ import os
 import pytest
 
 import pmf_engine.runner.qa_gate as qa_gate_mod
+from pmf_engine.runner.harness.base import EvaluatorHarnessParams, EvaluatorResult
 from pmf_engine.runner.qa_gate import Verdict, run_qa_gate
 
 
@@ -188,6 +189,52 @@ def _broker_env() -> dict:
 
 # Generous budget so the pre-flight check never trips unless a test sets it low.
 BIG_BUDGET = 10_000.0
+
+
+class FakeEvaluator:
+    """Records the params it was called with and writes a configurable
+    fragment array to the injected result_file_path, returning a configurable
+    EvaluatorResult. Mirrors the real run_evaluator contract: the engine reads
+    the canonical fragments from the file, not from the returned object."""
+
+    def __init__(
+        self,
+        *,
+        fragments: list[dict] | None = None,
+        write_file: bool = True,
+        file_contents: str | None = None,
+        result: EvaluatorResult | None = None,
+        raise_exc: BaseException | None = None,
+    ):
+        self.fragments = fragments if fragments is not None else [{"name": "faithfulness", "passed": True}]
+        self.write_file = write_file
+        self.file_contents = file_contents
+        self.result = result
+        self.raise_exc = raise_exc
+        self.calls: list[EvaluatorHarnessParams] = []
+
+    def __call__(self, params: EvaluatorHarnessParams) -> EvaluatorResult:
+        self.calls.append(params)
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        if self.write_file:
+            contents = self.file_contents if self.file_contents is not None else json.dumps(self.fragments)
+            with open(params.result_file_path, "w", encoding="utf-8") as fh:
+                fh.write(contents)
+        if self.result is not None:
+            return self.result
+        return EvaluatorResult(
+            fragments=self.fragments,
+            cost_usd=0.04,
+            duration_ms=1200,
+            num_turns=3,
+            session_id="eval-sess",
+            status="ok",
+        )
+
+
+def _never_called_evaluator(_params: EvaluatorHarnessParams) -> EvaluatorResult:
+    raise AssertionError("evaluator_runner should not have been invoked")
 
 
 # --------------------------------------------------------------------------
@@ -585,14 +632,21 @@ print(json.dumps([{"name": "loc", "passed": True, "cwd": os.getcwd()}]))
 
 
 def test_verdict_capped_at_8kb_truncates_violations_then_detail(workspace, gate_base):
-    # Produce many failing fragments with big detail strings so the serialized
-    # verdict blows past 8KB and forces truncation.
+    # Produce MANY failing fragments, each with a big detail string AND several
+    # non-detail fields (score/min_score/duration_ms), so the serialized verdict
+    # blows past 8KB and forces ALL THREE truncation steps:
+    #   1) drop violations, 2) drop per-check detail, 3) strip non-essential
+    #   check fields. 120 checks keep the post-step-2 array (~10KB with the extra
+    #   fields) above the cap so step 3 actually runs, while the post-step-3 array
+    #   (name/passed/type only, ~6.6KB) lands back under it.
     # main.py BUILDS the fragments itself (don't embed Python-invalid JSON
     # literals like `false`/`true` into the source — that would NameError).
     main_src = (
         "import json\n"
-        "big = 'X' * 2000\n"
-        "frags = [{'name': f'check_{i}', 'passed': False, 'detail': big} for i in range(12)]\n"
+        "big = 'X' * 200\n"
+        "frags = [{'name': f'check_{i}', 'passed': False, 'detail': big,\n"
+        "          'score': 0.5, 'min_score': 0.8, 'duration_ms': 1234}\n"
+        "         for i in range(120)]\n"
         "print(json.dumps(frags))\n"
     )
 
@@ -614,13 +668,19 @@ def test_verdict_capped_at_8kb_truncates_violations_then_detail(workspace, gate_
     assert len(serialized) <= 8 * 1024
     # 1) violations dropped first.
     assert d["violations"] == []
-    # 2) per-check detail stripped (this fixture is big enough to force step 3,
-    #    so no capped check carries 'detail') — and every check still carries
-    #    name + passed.
     for c in d["checks"]:
+        # 2) per-check detail stripped.
         assert "detail" not in c
+        # 3) step 3 RAN — the non-essential fields are gone (proves this fixture
+        #    actually exercises the final truncation step, not just step 2).
+        assert "score" not in c
+        assert "duration_ms" not in c
+        # ...but the ESSENTIAL trio survives: name + passed + type. `type` MUST
+        # survive: gp-api's zod requires it (queue.types.ts) and DLQs a check
+        # without it (contract C: every check carries a namespaced type).
         assert "name" in c
         assert "passed" in c
+        assert c["type"] == "deterministic"
     # The overall verdict still reports failure.
     assert d["pass"] is False
     assert verdict.pass_ is False
@@ -1024,3 +1084,421 @@ def test_fragment_detail_redacts_broker_token(workspace, gate_base):
     assert qa_gate_mod._REDACTED in detail
     # The whole serialized verdict is clean too.
     assert secret not in json.dumps(verdict.to_dict())
+
+
+# ==========================================================================
+# eval.md: the AI-evaluator stage (auto-detected second entrypoint, contract B)
+#
+# The gate auto-detects qa/eval.md and runs ONE evaluator agent via the
+# injected `evaluator_runner` adapter. Tests inject a FakeEvaluator that mirrors
+# the real run_evaluator contract: it writes a fragment array to the injected
+# result_file_path and returns an EvaluatorResult; the engine reads the
+# canonical fragments back from that file. The evaluator stage produces
+# `type: "agent"` fragments and contributes its model cost to the verdict's
+# cost_usd (the deterministic stage contributes 0).
+# ==========================================================================
+
+
+def test_evaluator_fragments_read_from_injected_result_file(workspace, gate_base):
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True, "score": 4.5}])
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "Judge the artifact for faithfulness."}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "evaluated"
+    assert verdict.pass_ is True
+    assert len(fake.calls) == 1
+    params = fake.calls[0]
+    assert isinstance(params, EvaluatorHarnessParams)
+    # The evaluator's instruction is the eval.md body.
+    assert params.instruction == "Judge the artifact for faithfulness."
+    # result_file_path is inside the gate dir, not workspace, not /tmp.
+    rfp = os.path.realpath(params.result_file_path)
+    assert rfp.startswith(os.path.realpath(gate_base))
+    assert not rfp.startswith(os.path.realpath(workspace) + os.sep)
+    assert not rfp.startswith("/tmp/")
+    # gate_cwd is the materialized gate dir, workspace passed through read-only.
+    assert os.path.realpath(params.gate_cwd).startswith(os.path.realpath(gate_base))
+    assert params.workspace_dir == workspace
+    # The faithfulness check is tagged type 'agent'.
+    agent_checks = [c for c in verdict.checks if c["name"] == "faithfulness"]
+    assert len(agent_checks) == 1
+    assert agent_checks[0]["type"] == "agent"
+
+
+def test_eval_only_folder_has_no_raw_output(workspace, gate_base):
+    """An eval.md-only folder never spawns main.py, so there is no deterministic
+    stdout to write to S3 — raw_output is None even though the gate ran."""
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+    )
+    assert _verdict(result).status == "evaluated"
+    assert _raw_output(result) is None
+
+
+def test_evaluator_missing_result_file_is_stage_error(workspace, gate_base):
+    fake = FakeEvaluator(write_file=False)
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_evaluator_unparseable_result_file_is_stage_error(workspace, gate_base):
+    fake = FakeEvaluator(write_file=True, file_contents="{not json")
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_evaluator_result_not_array_is_stage_error(workspace, gate_base):
+    fake = FakeEvaluator(write_file=True, file_contents=json.dumps({"name": "x", "passed": True}))
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_evaluator_runner_status_error_makes_verdict_error(workspace, gate_base):
+    fake = FakeEvaluator(
+        write_file=True,
+        result=EvaluatorResult(fragments=[], status="error"),
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_evaluator_runner_raising_is_stage_error_fail_open(workspace, gate_base):
+    """A runner that raises (a real bridge/SDK defect) is FAIL-OPEN: the stage
+    surfaces an error verdict, the gate never re-raises, the run still publishes."""
+    fake = FakeEvaluator(raise_exc=RuntimeError("evaluator bridge blew up"))
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_eval_md_present_without_runner_is_stage_error(workspace, gate_base):
+    """The gate detects eval.md but no evaluator_runner was injected (a wiring
+    defect). FAIL-OPEN: this surfaces an error verdict, never an exception."""
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=None,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+
+
+def test_both_stages_pass_true_only_when_all_fragments_pass(workspace, gate_base):
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "evaluated"
+    assert verdict.pass_ is True
+    # Both stages ran (deterministic-first), fragments from both present.
+    names = sorted(c["name"] for c in verdict.checks)
+    assert names == ["faithfulness", "grounding"]
+    assert len(fake.calls) == 1
+
+
+def test_both_stages_one_failing_fragment_yields_pass_false(workspace, gate_base):
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": False}])
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "evaluated"
+    assert verdict.pass_ is False
+
+
+def test_both_stages_forward_deterministic_raw_output(workspace, gate_base):
+    """When both stages run, raw_output is the DETERMINISTIC main.py stdout
+    (the evaluator fragments live in the gate dir, not the raw output)."""
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+    )
+    raw = _raw_output(result)
+    assert raw is not None
+    assert json.loads(raw) == [{"name": "grounding", "passed": True, "score": 0.91}]
+
+
+def test_insufficient_budget_for_both_stages_skips_both(workspace, gate_base):
+    """When both entrypoints are present, the pre-flight budget sums BOTH
+    stages' ceilings (deterministic.timeout_seconds + agent.timeout_seconds);
+    insufficient budget skips spawning anything (decision 11)."""
+    manifest = {
+        "blocking": False,
+        "deterministic": {"timeout_seconds": 120},
+        "agent": {"timeout_seconds": 300},
+    }
+    main_marker = workspace + "/MAIN_RAN_BUDGET"
+    main_src = f"open({main_marker!r}, 'w').close()\nimport json\nprint(json.dumps([]))\n"
+    fake = FakeEvaluator()
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(
+                files={"main.py": main_src, "eval.md": "judge"},
+                manifest=manifest,
+            ),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            # 420 required (120 + 300); give less.
+            remaining_budget_seconds=400.0,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+    assert not os.path.exists(main_marker), "no stage may run when budget is insufficient"
+    assert len(fake.calls) == 0
+    assert any("insufficient_budget" in v for v in verdict.violations)
+    # Required budget reflects the SUM of both present stages.
+    assert any("420" in v for v in verdict.violations)
+
+
+def test_blocking_true_still_runs_both_stages_observe_only(workspace, gate_base):
+    # blocking: true must NOT short-circuit; both stages still run and the
+    # verdict still rides the success path. (Observe-only.)
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(
+                files={"main.py": _MAIN_FAIL, "eval.md": "judge"},
+                manifest={"blocking": True},
+            ),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    # Deterministic stage failed, but the evaluator STILL ran (no short-circuit).
+    assert len(fake.calls) == 1
+    assert verdict.status == "evaluated"
+    assert verdict.pass_ is False
+
+
+def test_evaluator_empty_fragments_is_evaluated_but_pass_none(workspace, gate_base):
+    # The evaluator ran to completion (status 'ok') but emitted an empty
+    # fragment array. status is 'evaluated' (no stage error), but `all([])` is
+    # vacuously True today — pass MUST be None, not True. An entrypoint that
+    # produced zero fragments verified nothing.
+    fake = FakeEvaluator(fragments=[])
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "evaluated"
+    assert verdict.checks == []
+    assert verdict.pass_ is None
+
+
+def test_verdict_cost_is_zero_for_deterministic_only(workspace, gate_base):
+    """A deterministic-only run contributes 0 to cost_usd (no model spend)."""
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=_never_called_evaluator,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.cost_usd == 0.0
+
+
+def test_verdict_cost_sums_evaluator_model_cost(workspace, gate_base):
+    """cost_usd is summed across the stages that ran: 0 for the deterministic
+    stage plus the evaluator's model cost. With both stages the verdict carries
+    exactly the evaluator's cost (decision 12)."""
+    fake = FakeEvaluator(
+        fragments=[{"name": "faithfulness", "passed": True}],
+        result=EvaluatorResult(
+            fragments=[{"name": "faithfulness", "passed": True}],
+            cost_usd=0.0731,
+            status="ok",
+        ),
+    )
+    # FakeEvaluator with an explicit result does NOT write the file; force a write.
+    fake.write_file = True
+    fake.fragments = [{"name": "faithfulness", "passed": True}]
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "evaluated"
+    assert verdict.cost_usd == pytest.approx(0.0731)
+
+
+def test_evaluator_fragment_detail_redacts_broker_token(workspace, gate_base):
+    """A6 / contract D: a leaked BROKER_TOKEN that an evaluator prints into a
+    fragment detail must be REDACTED before it lands in the aggregated verdict
+    (the verdict travels to gp-api + Braintrust + the durable verdict.json).
+    Evaluator (`type: agent`) fragments pass through the SAME _normalize_fragment
+    redaction the deterministic fragments do."""
+    secret = "tok-eval-fragment-secret-7q6r5s4t"
+    fake = FakeEvaluator(
+        fragments=[{"name": "faithfulness", "passed": False, "detail": f"saw BROKER_TOKEN={secret} in artifact"}]
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"eval.md": "judge"}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+            remaining_budget_seconds=BIG_BUDGET,
+            evaluator_runner=fake,
+            gate_base_dir=gate_base,
+        )
+    )
+    agent = [c for c in verdict.checks if c["name"] == "faithfulness"]
+    assert len(agent) == 1
+    assert agent[0]["type"] == "agent"
+    detail = agent[0]["detail"]
+    # The live token must NOT survive into an evaluator fragment's detail.
+    assert secret not in detail
+    assert qa_gate_mod._REDACTED in detail
+    # The whole serialized verdict is clean too.
+    assert secret not in json.dumps(verdict.to_dict())
+
+
+def test_evaluator_status_error_log_carries_context(workspace, gate_base, gate_logs):
+    fake = FakeEvaluator(
+        write_file=True,
+        result=EvaluatorResult(
+            fragments=[],
+            status="error",
+            session_id="sess-99",
+            num_turns=7,
+            cost_usd=0.12,
+        ),
+    )
+    run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+        run_id="run-eval-1",
+    )
+    rec = [m for m in _messages(gate_logs) if "evaluator_status_error" in m]
+    assert len(rec) == 1
+    msg = rec[0]
+    assert "sess-99" in msg
+    assert "num_turns=7" in msg
+    assert "0.12" in msg
+    assert "run-eval-1" in msg

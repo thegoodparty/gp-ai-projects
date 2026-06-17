@@ -2670,8 +2670,10 @@ async def test_qa_gate_receives_artifact_bytes_envelope_and_remaining_budget(moc
     # remaining_budget = timeout - elapsed; elapsed is small but positive.
     assert captured["remaining_budget"] <= 600
     assert captured["remaining_budget"] > 0
-    # The deterministic-only gate takes NO evaluator_runner.
-    assert "evaluator_runner" not in captured["kwargs"]
+    # The hook injects the evaluator_runner adapter so the gate can run the
+    # eval.md stage when present (it is harmless on a main.py-only folder).
+    assert "evaluator_runner" in captured["kwargs"]
+    assert callable(captured["kwargs"]["evaluator_runner"])
 
 
 # ---------------------------------------------------------------------------
@@ -2747,6 +2749,115 @@ async def test_real_qa_gate_bridge_runs_deterministic_main_and_rides_publish(
     assert raw is not None
     parsed = json.loads(raw)
     assert {f["name"] for f in parsed} == {"faithfulness", "completeness"}
+
+    # Observe-only: no failure report despite pass=False.
+    failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
+    assert not failed_calls
+
+
+# ---------------------------------------------------------------------------
+# B2 (HIGH): REAL async/sync bridge integration for the EVALUATOR stage. The
+# deterministic bridge test above only exercises asyncio.to_thread; this one
+# exercises the FULL marshaling the hook restores: asyncio.to_thread -> sync
+# run_qa_gate -> the injected _evaluator_runner -> run_coroutine_threadsafe back
+# onto the loop -> async run_evaluator_agent. It runs the REAL _run_qa_gate_hook
+# and the REAL run_qa_gate engine against an eval.md-only folder, patching ONLY
+# run_evaluator_agent. It proves the marshaling works end-to-end and the verdict
+# (whose pass is derived from the fragments the fake evaluator writes) rides
+# publish.publish(qa_verdict=...).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_real_qa_gate_bridge_marshals_evaluator_and_rides_publish(
+    mock_publish, _mock_logs, tmp_path
+):
+    """End-to-end of the real async/sync bridge. With an eval.md-only qa folder,
+    the REAL run_qa_gate engine runs on a worker thread (asyncio.to_thread),
+    injects an evaluator_runner that bounces back onto the event loop
+    (run_coroutine_threadsafe) to call our fake run_evaluator_agent. The fake
+    WRITES a fragment array to the injected result_file_path and returns
+    status='ok'. The engine reads those fragments, derives pass, and the verdict
+    rides publish as qa_verdict — proving the marshaling actually ran. eval.md
+    only -> no deterministic stdout, so qa_raw_output is None."""
+    import pmf_engine.runner.qa_gate as qa_gate_mod
+
+    config = _make_config(
+        timeout_seconds=600,
+        qa_envelope={
+            "manifest": {"blocking": False},
+            "files": {"eval.md": "## Rubric\n\nGrade faithfulness."},
+            "resolved_qa_version_ids": {"eval.md": "ev1"},
+        },
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    captured_params = {}
+
+    async def fake_run_evaluator_agent(params, parent_span=None):
+        from pmf_engine.runner.harness.base import EvaluatorResult
+
+        captured_params["result_file_path"] = params.result_file_path
+        captured_params["gate_cwd"] = params.gate_cwd
+        captured_params["workspace_dir"] = params.workspace_dir
+        # The evaluator's job: write its fragment array to the injected path.
+        # One failing + one passing fragment → engine derives pass=False.
+        with open(params.result_file_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                [
+                    {"name": "faithfulness", "passed": False, "score": 2, "min_score": 4},
+                    {"name": "completeness", "passed": True},
+                ],
+                fh,
+            )
+        return EvaluatorResult(
+            fragments=[],
+            cost_usd=0.04,
+            duration_ms=900,
+            num_turns=5,
+            session_id="sess-real-bridge",
+            status="ok",
+        )
+
+    # Redirect the gate's materialization root to a writable tmp dir (the
+    # default "/qa-gate" is not creatable on the test host).
+    with patch.object(qa_gate_mod, "DEFAULT_QA_GATE_ROOT", str(tmp_path / "qa-gate-root")):
+        with patch(
+            "pmf_engine.runner.harness.claude_sdk.run_evaluator_agent",
+            side_effect=fake_run_evaluator_agent,
+        ):
+            with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                await run_experiment(config, harness=mock_harness)
+
+    # The real bridge invoked the (patched) evaluator with engine-built params.
+    assert captured_params, "the real bridge must have reached run_evaluator_agent"
+    assert captured_params["result_file_path"].endswith("evaluator_fragments.json")
+
+    # The verdict rode publish, derived from the fragments the evaluator wrote.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None, "the real-bridge verdict must ride publish as qa_verdict"
+    # Engine ran to completion (NOT a gate error) and produced a real verdict.
+    assert qa_dict["status"] == "evaluated"
+    assert qa_dict["pass"] is False, "one failing fragment → pass=False"
+    names = {c["name"] for c in qa_dict["checks"]}
+    assert {"faithfulness", "completeness"} <= names
+    # Gate cost accounting flowed through from the evaluator result.
+    assert qa_dict["cost_usd"] == pytest.approx(0.04)
+    # eval.md only: no deterministic main.py stdout to forward for the S3 write.
+    assert call_args.kwargs.get("qa_raw_output") is None
 
     # Observe-only: no failure report despite pass=False.
     failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
