@@ -383,6 +383,162 @@ class TestBuildContainerOverrides:
         env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
         assert "ATTACHMENT_VERSION_IDS" not in env_map
 
+    # ------------------------------------------------------------------
+    # QA gate version pins (contract G). QA_VERSION_IDS mirrors
+    # ATTACHMENT_VERSION_IDS exactly: a JSON {basename: VersionId} map with
+    # sort_keys=True, guarded by truthiness so an empty/absent map emits NO
+    # env var. The no-qa containerOverrides must stay byte-identical to today.
+    # ------------------------------------------------------------------
+
+    def test_qa_version_ids_serialized_to_env(self):
+        """When the routing dict carries qa_version_ids,
+        build_container_overrides MUST emit QA_VERSION_IDS as a JSON-encoded,
+        sorted env var so the runner can pin its broker qa fetch."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "qa_version_ids": {"manifest.json": "Vman", "main.py": "Vmain", "eval.md": "Veval"},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "QA_VERSION_IDS" in env_map
+        # sort_keys=True: env-var bytes must be deterministic across dispatches.
+        assert env_map["QA_VERSION_IDS"] == json.dumps(
+            {"manifest.json": "Vman", "main.py": "Vmain", "eval.md": "Veval"},
+            sort_keys=True,
+        )
+
+    def test_qa_version_ids_includes_manifest_json_on_versioned_bucket(self):
+        """Contract G: on a versioned bucket the qa map MUST include the
+        required manifest.json pin. Encodes that QA_VERSION_IDS carries the
+        manifest.json VersionId verbatim, not a special-cased value."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "qa_version_ids": {"manifest.json": "Vman_versioned"},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert json.loads(env_map["QA_VERSION_IDS"]) == {"manifest.json": "Vman_versioned"}
+
+    def test_qa_version_ids_omitted_when_empty(self):
+        """Empty qa_version_ids dict (unversioned bucket, contract-G reality)
+        must NOT produce an env var — the runner then fetches qa 'latest'."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "qa_version_ids": {},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "QA_VERSION_IDS" not in env_map
+
+    def test_qa_version_ids_omitted_when_absent(self):
+        """No qa_version_ids key on the routing dict → no env var.
+        Experiments without a qa/ folder must dispatch unchanged."""
+        experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env_map = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+        assert "QA_VERSION_IDS" not in env_map
+
+    def test_no_qa_container_overrides_byte_identical(self):
+        """The full containerOverrides env list for a no-qa experiment must be
+        BYTE-IDENTICAL whether or not the qa_version_ids machinery exists. A
+        no-qa experiment (no qa_version_ids key, or an empty map) produces the
+        exact same sorted (name, value) env list as one passing only attachment
+        pins. Asserts list equality, not just 'QA_VERSION_IDS not in env_map'."""
+        base_experiment = {
+            "model": "sonnet",
+            "timeout_seconds": 600,
+            "manifest_version_id": "mv1",
+            "instruction_version_id": "iv1",
+            "attachment_version_ids": {"lookup.csv": "Vlk"},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "params": {"district": "CA-12"},
+        }
+
+        def _sorted_env(experiment):
+            overrides = build_container_overrides(
+                experiment=experiment,
+                message=message,
+                broker_token="tok",
+                broker_url="https://broker.example.com",
+                container_name="pmf-engine",
+            )
+            env = overrides["containerOverrides"][0]["environment"]
+            return sorted((e["name"], e["value"]) for e in env)
+
+        baseline = _sorted_env(dict(base_experiment))
+        with_empty_qa = _sorted_env({**base_experiment, "qa_version_ids": {}})
+        with_absent_qa = _sorted_env(dict(base_experiment))
+
+        assert with_empty_qa == baseline
+        assert with_absent_qa == baseline
+        assert all(name != "QA_VERSION_IDS" for name, _ in baseline)
+
 
 class TestHandler:
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")

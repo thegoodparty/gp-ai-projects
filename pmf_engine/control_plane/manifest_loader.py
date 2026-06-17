@@ -57,6 +57,8 @@ class _IndexEntry(TypedDict, total=False):
     version: int
     mode: str
     manifest_key: str
+    qa_manifest_key: str
+    qa_keys: list[str]
 
 
 class ManifestRoutingLoader:
@@ -91,6 +93,9 @@ class ManifestRoutingLoader:
         # truth for the runner's attachment pin so a publish during the
         # dispatch→runner window can't swap bytes out under us.
         self._attachment_version_cache: dict[str, tuple[dict[str, str], float]] = {}
+        # Per-experiment cache of the qa folder's {basename: version_id} pins
+        # (contract G). Same role as the attachment cache, separate map.
+        self._qa_version_cache: dict[str, tuple[dict[str, str], float]] = {}
 
     # ---------- public ----------
 
@@ -128,10 +133,19 @@ class ManifestRoutingLoader:
         attachment_version_ids = self._fetch_attachment_version_ids(
             experiment_id, attachment_keys
         )
+        # QA gate folder pins (contract F → G). When the index entry carries no
+        # qa_manifest_key the experiment publishes no qa/ folder, so the map is
+        # {} and the dispatch guard omits QA_VERSION_IDS — byte-identical no-qa.
+        qa_version_ids = self._fetch_qa_version_ids(
+            experiment_id,
+            entry.get("qa_manifest_key"),
+            entry.get("qa_keys") or [],
+        )
         routing = _project_routing(manifest, experiment_id=experiment_id)
         routing["manifest_version_id"] = manifest_version_id
         routing["instruction_version_id"] = instruction_version_id
         routing["attachment_version_ids"] = attachment_version_ids
+        routing["qa_version_ids"] = qa_version_ids
         return routing
 
     def known_experiments(self) -> list[str]:
@@ -239,83 +253,147 @@ class ManifestRoutingLoader:
         self._instruction_version_cache[experiment_id] = (version_id, now)
         return version_id
 
-    def _fetch_attachment_version_ids(
-        self, experiment_id: str, attachment_keys: list[str]
+    def _fetch_version_ids(
+        self,
+        experiment_id: str,
+        subdir: str,
+        keys: list[str],
+        cache: dict[str, tuple[dict[str, str], float]],
     ) -> dict[str, str]:
-        """HEAD each attachment key, return {basename: VersionId}.
+        """HEAD each key under `{experiment_id}/{subdir}/`, return {basename:
+        VersionId}. Shared by `_fetch_attachment_version_ids` (subdir=
+        "attachments") and `_fetch_qa_version_ids` (subdir="qa"), so a future
+        change to the pinning contract lands on both surfaces at once.
 
-        Error-handling contract mirrors `_fetch_instruction_version_id`:
-        - `NoSuchKey` / `NoSuchVersion` / `"404"` on a single attachment:
-          WARN-log + skip that basename. Dispatch proceeds; the runner will
-          surface the missing attachment via the broker fetch when it tries
-          to materialize the workspace file.
+        Error-handling contract (load-bearing, identical for both subdirs):
+        - `NoSuchKey` / `NoSuchVersion` / `"404"` on a single key: WARN-log +
+          skip that basename. Dispatch proceeds; the runner surfaces the
+          missing file via the broker fetch when it materializes the workspace.
         - Any other ClientError (AccessDenied, ServiceUnavailable, SlowDown,
           throttling, transient 5xx): raise ManifestLoaderTransientError.
           Falling through to "latest" defeats the entire pinning system the
           dispatch-time HEAD was designed to guarantee.
-        - Wrong-prefix attachment_key (doesn't start with
-          `{experiment_id}/attachments/`): WARN-log + skip. Defense in depth
-          against publish-pipeline bugs / manual S3 edits.
+        - Wrong-prefix key (doesn't start with `{experiment_id}/{subdir}/`),
+          non-string key, or a key already seen: WARN-log + skip. Defense in
+          depth against publish-pipeline bugs / manual S3 edits, and the
+          seen-set dedupes a key that appears more than once (e.g. a qa
+          manifest listed in both qa_manifest_key and qa_keys).
+        - None VersionId is dropped — on an UNVERSIONED bucket head_object
+          returns no VersionId, so every pin is None and the map ends up empty
+          (manifest.json is never special-cased to fabricate a pin).
 
-        Cached under the same TTL as manifest+instruction so warm Lambdas
-        don't re-HEAD on every invocation.
+        Cached per-experiment under the same TTL as manifest+instruction so
+        warm Lambdas don't re-HEAD on every invocation.
         """
         now = time.monotonic()
-        cached = self._attachment_version_cache.get(experiment_id)
+        cached = cache.get(experiment_id)
         if cached and now - cached[1] < self._ttl:
             return cached[0]
 
         result: dict[str, str] = {}
-        expected_prefix = f"{experiment_id}/attachments/"
-        for ak in attachment_keys:
-            if not isinstance(ak, str) or not ak.startswith(expected_prefix):
+        expected_prefix = f"{experiment_id}/{subdir}/"
+        seen: set[str] = set()
+        for k in keys:
+            if not isinstance(k, str) or k in seen:
+                continue
+            seen.add(k)
+            if not k.startswith(expected_prefix):
                 logger.warning(
-                    "attachment_key has unexpected prefix — skipping: "
+                    "%s key has unexpected prefix — skipping: "
                     "experiment_id=%s key=%r expected_prefix=%s",
+                    subdir,
                     experiment_id,
-                    ak,
+                    k,
                     expected_prefix,
                 )
                 continue
-            basename = ak.split("/attachments/", 1)[1]
+            basename = k.split(f"/{subdir}/", 1)[1]
             try:
-                response = self._s3.head_object(Bucket=self._bucket, Key=ak)
+                response = self._s3.head_object(Bucket=self._bucket, Key=k)
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 request_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
                 if code in ("NoSuchKey", "NoSuchVersion", "404"):
                     logger.warning(
-                        "attachment object absent — proceeding without version pin: "
+                        "%s object absent — proceeding without version pin: "
                         "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
+                        subdir,
                         experiment_id,
-                        ak,
+                        k,
                         self._bucket,
                         code,
                         request_id,
                     )
                     continue
                 logger.error(
-                    "S3 HeadObject failed for attachment (NOT swallowed — version pin lost): "
+                    "S3 HeadObject failed for %s (NOT swallowed — version pin lost): "
                     "experiment_id=%s key=%s bucket=%s code=%s request_id=%s",
+                    subdir,
                     experiment_id,
-                    ak,
+                    k,
                     self._bucket,
                     code,
                     request_id,
                     exc_info=True,
                 )
                 raise ManifestLoaderTransientError(
-                    f"failed to head attachment s3://{self._bucket}/{ak} "
+                    f"failed to head {subdir} file s3://{self._bucket}/{k} "
                     f"for '{experiment_id}': {code} (request_id={request_id})"
                 ) from e
             version_id = response.get("VersionId")
             if version_id is not None:
                 result[basename] = version_id
 
-        if len(self._attachment_version_cache) >= _MANIFEST_CACHE_MAX:
-            self._attachment_version_cache.clear()
-        self._attachment_version_cache[experiment_id] = (result, now)
+        if len(cache) >= _MANIFEST_CACHE_MAX:
+            cache.clear()
+        cache[experiment_id] = (result, now)
         return result
+
+    def _fetch_attachment_version_ids(
+        self, experiment_id: str, attachment_keys: list[str]
+    ) -> dict[str, str]:
+        """HEAD each attachment key, return {basename: VersionId}.
+
+        Thin wrapper over `_fetch_version_ids` (subdir="attachments"); see that
+        method for the full error-handling contract. The runner will surface a
+        missing attachment via the broker fetch at workspace-materialize time.
+        """
+        return self._fetch_version_ids(
+            experiment_id,
+            "attachments",
+            attachment_keys,
+            self._attachment_version_cache,
+        )
+
+    def _fetch_qa_version_ids(
+        self,
+        experiment_id: str,
+        qa_manifest_key: str | None,
+        qa_keys: list[str],
+    ) -> dict[str, str]:
+        """HEAD the qa folder's manifest + each qa key, return {basename:
+        VersionId} (contract G).
+
+        Thin wrapper over `_fetch_version_ids` (subdir="qa"); see that method
+        for the full error-handling contract. Specific to qa:
+        - No `qa_manifest_key` → the experiment publishes no qa/ folder; return
+          {} so the dispatch guard omits QA_VERSION_IDS (byte-identical no-qa).
+        - The manifest key is prepended to the qa keys. `qa_keys` already
+          EXCLUDES manifest.json (carried separately), but the shared helper's
+          seen-set dedupes if an overlap ever appears, so each distinct key is
+          HEADed once.
+        - Contract-G reality: on an UNVERSIONED bucket every pin is None and
+          the map is empty — manifest.json is never special-cased to fabricate
+          a pin.
+        """
+        if not qa_manifest_key:
+            return {}
+        return self._fetch_version_ids(
+            experiment_id,
+            "qa",
+            [qa_manifest_key, *qa_keys],
+            self._qa_version_cache,
+        )
 
     def _get_object(self, key: str, label: str) -> tuple[bytes, str | None]:
         try:

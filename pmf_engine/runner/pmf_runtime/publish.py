@@ -47,6 +47,7 @@ def publish(
     artifact: dict,
     duration_seconds: float = 0,
     cost_usd: float = 0,
+    qa_verdict: dict | None = None,
 ) -> dict:
     from .config import get_config
 
@@ -55,6 +56,12 @@ def publish(
         "duration_seconds": duration_seconds,
         "cost_usd": cost_usd,
     }
+    # PMF QA gate (contract D): additive optional field. Omit the key entirely
+    # when no gate ran (no qa folder / pre-gate runner) so the payload is
+    # byte-identical to today; the broker forwards a present verdict verbatim
+    # as an opaque, size-capped passthrough.
+    if qa_verdict is not None:
+        body["qa_verdict"] = qa_verdict
 
     def _call() -> dict:
         response = get_config().client.post("/artifact/publish", json=body)

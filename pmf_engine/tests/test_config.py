@@ -996,3 +996,196 @@ def test_from_env_raises_on_non_dict_attachment_version_ids(monkeypatch):
     ):
         with pytest.raises(ValueError, match="object"):
             RunnerConfig.from_env()
+
+
+# ---------------------------------------------------------------------------
+# QA_VERSION_IDS env var → load_from_broker forwarding + qa envelope projection
+#
+# The PMF QA gate (contracts G/H): the dispatch Lambda serializes the qa folder
+# VersionId pins into the QA_VERSION_IDS env var (mirroring ATTACHMENT_VERSION_IDS).
+# The runner must deserialize it and forward it to load_from_broker, then project
+# the broker's `qa` envelope onto config.qa_envelope. The qa envelope is held in
+# memory and is NEVER routed through the /workspace attachment write loop.
+# ---------------------------------------------------------------------------
+
+
+def test_from_env_parses_qa_version_ids_from_env(monkeypatch, patched_broker_capturing):
+    """When QA_VERSION_IDS env var holds a JSON object, RunnerConfig must
+    deserialize it and forward the dict to load_from_broker."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv(
+        "QA_VERSION_IDS",
+        json.dumps({"manifest.json": "Vqa1", "eval.md": "Vqa2"}, sort_keys=True),
+    )
+
+    config = RunnerConfig.from_env()
+
+    assert patched_broker_capturing["qa_version_ids"] == {
+        "manifest.json": "Vqa1",
+        "eval.md": "Vqa2",
+    }
+    assert config.qa_version_ids == {"manifest.json": "Vqa1", "eval.md": "Vqa2"}
+
+
+def test_from_env_with_empty_qa_version_ids_passes_none(monkeypatch, patched_broker_capturing):
+    """Empty / unset QA_VERSION_IDS → load_from_broker called with
+    qa_version_ids=None so the POST body omits the key (unversioned dev bucket
+    falls through to 'latest')."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.delenv("QA_VERSION_IDS", raising=False)
+
+    config = RunnerConfig.from_env()
+
+    assert patched_broker_capturing["qa_version_ids"] is None
+    assert config.qa_version_ids is None
+
+
+def test_from_env_with_blank_qa_version_ids_passes_none(monkeypatch, patched_broker_capturing):
+    """Whitespace-only QA_VERSION_IDS is equivalent to unset."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("QA_VERSION_IDS", "   ")
+
+    config = RunnerConfig.from_env()
+
+    assert patched_broker_capturing["qa_version_ids"] is None
+
+
+def test_from_env_raises_on_malformed_qa_version_ids_json(monkeypatch):
+    """Garbage JSON in QA_VERSION_IDS must raise — silently falling back to
+    None would defeat qa version pinning."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("QA_VERSION_IDS", "not json")
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=_envelope_for_synthetic(),
+    ):
+        with pytest.raises(ValueError, match="QA_VERSION_IDS"):
+            RunnerConfig.from_env()
+
+
+def test_from_env_raises_on_non_dict_qa_version_ids(monkeypatch):
+    """QA_VERSION_IDS that decodes to a non-dict (list/string/number) must raise."""
+    _base_env_for_attachment_tests(monkeypatch)
+    monkeypatch.setenv("QA_VERSION_IDS", json.dumps([1, 2, 3]))
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=_envelope_for_synthetic(),
+    ):
+        with pytest.raises(ValueError, match="object"):
+            RunnerConfig.from_env()
+
+
+def test_from_env_projects_qa_envelope_onto_config(monkeypatch):
+    """The broker's `qa` envelope key is projected onto config.qa_envelope so
+    the runner can hand it to the gate engine. The qa bytes are held in memory
+    — never written to /workspace via the attachment loop."""
+    envelope = _envelope_for_synthetic()
+    qa_block = {
+        "manifest": {"blocking": False},
+        "files": {"eval.md": "# Evaluate\n"},
+        "resolved_qa_version_ids": {"manifest.json": "Vm1", "eval.md": "Ve1"},
+    }
+    envelope["qa"] = qa_block
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-qa-envelope")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-a")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.qa_envelope == qa_block
+    # qa files must NOT leak into attachments (the /workspace write loop).
+    assert "eval.md" not in config.attachments
+
+
+def test_from_env_qa_envelope_none_when_absent(monkeypatch):
+    """No `qa` key in the envelope → config.qa_envelope is None, so the gate
+    does not run and the run is byte-identical to a pre-gate run."""
+    envelope = _envelope_for_synthetic()
+    assert "qa" not in envelope
+    monkeypatch.setenv("EXPERIMENT_ID", SYNTHETIC_EXPERIMENT_ID)
+    monkeypatch.setenv("RUN_ID", "run-no-qa")
+    monkeypatch.setenv("ORGANIZATION_SLUG", "org-a")
+    monkeypatch.setenv("PARAMS_JSON", "{}")
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", "tok")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+
+    with patch(
+        "pmf_engine.runner.manifest_loader.load_from_broker",
+        return_value=envelope,
+    ):
+        config = RunnerConfig.from_env()
+
+    assert config.qa_envelope is None
+
+
+def test_runner_config_qa_fields_default_to_none():
+    """Direct construction without qa kwargs yields None for both qa fields
+    (legacy local-dev paths must work without explicit plumbing)."""
+    config = RunnerConfig(
+        experiment_id="x",
+        run_id="r",
+        organization_slug="o",
+        instruction="hi",
+    )
+    assert config.qa_envelope is None
+    assert config.qa_version_ids is None
+
+
+# ---------------------------------------------------------------------------
+# B5 (MEDIUM dup): _parse_version_ids_env — single helper used by BOTH the
+# ATTACHMENT_VERSION_IDS and QA_VERSION_IDS parse blocks. Behavior + error
+# messages are name-parameterized but otherwise identical.
+# ---------------------------------------------------------------------------
+
+
+class TestParseVersionIdsEnv:
+    def _parse(self, name: str):
+        from pmf_engine.runner.config import _parse_version_ids_env
+
+        return _parse_version_ids_env(name)
+
+    def test_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ATTACHMENT_VERSION_IDS", raising=False)
+        assert self._parse("ATTACHMENT_VERSION_IDS") is None
+
+    def test_blank_returns_none(self, monkeypatch):
+        monkeypatch.setenv("QA_VERSION_IDS", "   ")
+        assert self._parse("QA_VERSION_IDS") is None
+
+    def test_object_parsed_and_coerced_to_str_str(self, monkeypatch):
+        monkeypatch.setenv("QA_VERSION_IDS", json.dumps({"manifest.json": "V1", "eval.md": "V2"}))
+        assert self._parse("QA_VERSION_IDS") == {"manifest.json": "V1", "eval.md": "V2"}
+
+    def test_values_coerced_to_strings(self, monkeypatch):
+        # Defends the str(k)/str(v) coercion across the process boundary.
+        monkeypatch.setenv("ATTACHMENT_VERSION_IDS", json.dumps({"a.md": 7}))
+        assert self._parse("ATTACHMENT_VERSION_IDS") == {"a.md": "7"}
+
+    def test_malformed_json_raises_with_name_in_message(self, monkeypatch):
+        monkeypatch.setenv("ATTACHMENT_VERSION_IDS", "not json")
+        with pytest.raises(ValueError, match="Invalid ATTACHMENT_VERSION_IDS"):
+            self._parse("ATTACHMENT_VERSION_IDS")
+
+    def test_non_dict_raises_with_name_in_message(self, monkeypatch):
+        monkeypatch.setenv("QA_VERSION_IDS", json.dumps([1, 2, 3]))
+        with pytest.raises(ValueError, match="QA_VERSION_IDS must decode to an object"):
+            self._parse("QA_VERSION_IDS")
+
+    def test_error_messages_are_name_parameterized_identically(self, monkeypatch):
+        """The two callers differ ONLY by the var name embedded in the message;
+        the shape is otherwise identical."""
+        monkeypatch.setenv("ATTACHMENT_VERSION_IDS", json.dumps("scalar"))
+        with pytest.raises(ValueError, match="ATTACHMENT_VERSION_IDS must decode to an object, got str"):
+            self._parse("ATTACHMENT_VERSION_IDS")
+        monkeypatch.setenv("QA_VERSION_IDS", json.dumps("scalar"))
+        with pytest.raises(ValueError, match="QA_VERSION_IDS must decode to an object, got str"):
+            self._parse("QA_VERSION_IDS")

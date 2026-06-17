@@ -634,6 +634,210 @@ class TestAttachmentVersionIdPinning:
 
 
 # ---------------------------------------------------------------------------
+# QA gate VersionId pinning (contract G + the dispatch half of contract F/H)
+#
+# Index entries can declare `qa_manifest_key: "<id>/qa/manifest.json"` and
+# `qa_keys: ["<id>/qa/<file>", ...]` (qa_keys EXCLUDES manifest.json — it's
+# carried separately). To pin the qa spec the same way attachments are pinned,
+# Lambda HEADs the manifest key + each qa key, captures VersionIds, and forwards
+# them via routing['qa_version_ids'] keyed by basename.
+#
+# Symmetric error contract to _fetch_attachment_version_ids: a 404 on a single
+# qa file is benign (omit that basename); a wrong-prefix qa key is skipped with
+# a WARN; any other ClientError raises ManifestLoaderTransientError.
+#
+# Contract-G reality (verified): on an UNVERSIONED bucket (dev/local) head_object
+# returns no VersionId, so every pin is None and the map ends up EMPTY — the
+# dispatch guard then omits QA_VERSION_IDS and the runner fetches qa 'latest'.
+# manifest.json is NEVER special-cased to fabricate a pin.
+# ---------------------------------------------------------------------------
+
+
+class TestQaVersionIdPinning:
+    def _index_with_qa(self, qa_manifest_key: str, qa_keys: list[str]):
+        return _index_payload(
+            [
+                {
+                    "id": "smoke_test",
+                    "version": 1,
+                    "mode": "win",
+                    "manifest_key": "smoke_test/manifest.json",
+                    "instruction_key": "smoke_test/instruction.md",
+                    "qa_manifest_key": qa_manifest_key,
+                    "qa_keys": qa_keys,
+                },
+            ]
+        )
+
+    def _s3_with_manifest_and_instruction(self, qa_manifest_key: str, qa_keys: list[str]) -> FakeS3:
+        s3 = _fake_s3_with_index(self._index_with_qa(qa_manifest_key, qa_keys))
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="instr_v")
+        return s3
+
+    def test_routing_resolves_qa_version_ids_from_index_qa_keys(self):
+        """Happy path on a versioned bucket: the qa manifest key + each qa key
+        gets HEADed; the resulting VersionIds appear in routing['qa_version_ids']
+        keyed by basename, including manifest.json (the required qa file)."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        qa_keys = ["smoke_test/qa/main.py", "smoke_test/qa/eval.md"]
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, qa_keys)
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        s3.set_object(BUCKET, qa_keys[0], b"print(1)", version_id="qa_main_v")
+        s3.set_object(BUCKET, qa_keys[1], b"# eval", version_id="qa_eval_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {
+            "manifest.json": "qa_man_v",
+            "main.py": "qa_main_v",
+            "eval.md": "qa_eval_v",
+        }
+        # Behavioral: HEAD was actually called against the manifest + each qa key.
+        for k in [qa_manifest_key, *qa_keys]:
+            assert s3.calls_for_key(k) == [("head_object", BUCKET, k)], (
+                f"expected exactly one head_object call for {k}"
+            )
+
+    def test_routing_qa_version_ids_includes_manifest_on_versioned_bucket(self):
+        """Contract G: on a versioned bucket the map MUST include manifest.json
+        even when there are no other qa files (a bare deterministic-less spec)."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, [])
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_only")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {"manifest.json": "qa_man_only"}
+
+    def test_routing_qa_version_ids_empty_on_unversioned_bucket(self):
+        """Contract-G reality: on an UNVERSIONED bucket head_object returns no
+        VersionId, so EVERY pin is None and the map is empty — manifest.json is
+        NOT fabricated. The dispatch guard then omits QA_VERSION_IDS entirely
+        and the runner fetches qa 'latest'."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        qa_keys = ["smoke_test/qa/main.py"]
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, qa_keys)
+        # version_id=None models an unversioned bucket — head_object returns
+        # no VersionId for any object.
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id=None)
+        s3.set_object(BUCKET, qa_keys[0], b"print(1)", version_id=None)
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {}, (
+            "unversioned bucket yields an empty map — no fabricated manifest.json pin"
+        )
+
+    def test_routing_qa_version_ids_empty_when_no_qa_manifest_key(self):
+        """An index entry with no qa_manifest_key (experiment publishes no qa
+        folder) produces an empty dict so the dispatch guard omits the env var
+        and the no-qa containerOverrides stays byte-identical to today."""
+        s3 = _fake_s3_with_index(
+            _index_payload(
+                [
+                    {
+                        "id": "smoke_test",
+                        "version": 1,
+                        "mode": "win",
+                        "manifest_key": "smoke_test/manifest.json",
+                        "instruction_key": "smoke_test/instruction.md",
+                    },
+                ]
+            )
+        )
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="iv")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {}
+
+    def test_routing_omits_missing_qa_file_but_keeps_others(self):
+        """A single qa-file 404 is benign: that basename is omitted, other qa
+        files still get pinned. Mirrors the attachment-absent contract."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        qa_keys = ["smoke_test/qa/main.py", "smoke_test/qa/eval.md"]
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, qa_keys)
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        s3.set_object(BUCKET, qa_keys[0], b"print(1)", version_id="qa_main_v")
+        # eval.md is missing (404).
+        s3.set_error(BUCKET, qa_keys[1], code="404", op="HeadObject")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {
+            "manifest.json": "qa_man_v",
+            "main.py": "qa_main_v",
+        }, "missing qa file must be omitted; others must still be pinned"
+
+    def test_routing_skips_qa_key_with_wrong_prefix(self):
+        """Defense-in-depth: a qa_key not under the experiment's own qa/ prefix
+        is suspicious (publish-pipeline bug / manual S3 edit). Skip with a WARN
+        rather than exposing it under a misleading basename."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        qa_keys = [
+            "smoke_test/qa/main.py",
+            "other_experiment/qa/leaked.py",  # wrong prefix
+        ]
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, qa_keys)
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        s3.set_object(BUCKET, qa_keys[0], b"print(1)", version_id="qa_main_v")
+        s3.set_object(BUCKET, qa_keys[1], b"leak", version_id="leak_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["qa_version_ids"] == {
+            "manifest.json": "qa_man_v",
+            "main.py": "qa_main_v",
+        }, "wrong-prefix qa key must be skipped, not exposed under a bare basename"
+
+    def test_routing_raises_transient_on_qa_access_denied(self):
+        """AccessDenied on a qa HEAD means IAM drift — falling back to 'latest'
+        would silently defeat the version-pin guarantee. Must raise Transient
+        so SQS retries."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        qa_keys = ["smoke_test/qa/main.py"]
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, qa_keys)
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        s3.set_error(BUCKET, qa_keys[0], code="AccessDenied", op="HeadObject")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        with pytest.raises(ManifestLoaderError) as exc:
+            loader.routing_for("smoke_test")
+
+        assert isinstance(exc.value, ManifestLoaderTransientError), (
+            f"AccessDenied on qa HEAD must raise Transient, got {type(exc.value).__name__}"
+        )
+
+    def test_routing_with_qa_keys_still_returns_other_routing_fields(self):
+        """Pin: adding qa handling must not alter the rest of the routing dict.
+        model/timeout_seconds/input_schema/scope/manifest_version_id/
+        instruction_version_id/attachment_version_ids keep working."""
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        s3 = self._s3_with_manifest_and_instruction(qa_manifest_key, [])
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+
+        routing = loader.routing_for("smoke_test")
+
+        assert routing["model"] == "sonnet"
+        assert routing["timeout_seconds"] == 900
+        assert "input_schema" in routing
+        assert "scope" in routing
+        assert "manifest_version_id" in routing
+        assert routing["instruction_version_id"] == "instr_v"
+        assert routing["attachment_version_ids"] == {}
+        assert routing["qa_version_ids"] == {"manifest.json": "qa_man_v"}
+
+
+# ---------------------------------------------------------------------------
 # Scope validation (defense-in-depth on top of publish-time meta-schema)
 # ---------------------------------------------------------------------------
 

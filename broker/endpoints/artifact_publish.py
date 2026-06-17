@@ -3,6 +3,7 @@ import logging
 import os
 import re
 
+import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -14,9 +15,56 @@ from broker.pii_scanner import scan_artifact
 
 _PII_ENABLED_VALUES = {"1", "true", "yes"}
 
+# PMF QA gate (contract D): the verdict is forwarded verbatim to the SQS
+# callback, so it shares the callback's byte budget. The engine targets an
+# 8 KiB serialized verdict (contract C), truncating to fit; this broker-side
+# cap gives generous headroom over that target while still bounding a runaway
+# verdict before it can blow the SQS payload limit. The broker keeps the
+# verdict OPAQUE — this size check is the only verdict-specific gate.
+MAX_QA_VERDICT_BYTES = 64 * 1024
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/artifact", tags=["artifact"])
+
+# Process-cached CloudWatch client. boto3.client() does endpoint resolution +
+# credential fetching + TLS setup once; reused per call. Lazy-init at first
+# metric emission so import-time has no AWS deps (mirrors experiment_manifest).
+_cw_client = None
+
+
+def _get_cw_client():
+    global _cw_client
+    if _cw_client is None:
+        _cw_client = boto3.client("cloudwatch")
+    return _cw_client
+
+
+def _reset_cw_client_for_tests() -> None:
+    global _cw_client
+    _cw_client = None
+
+
+def _emit_metric(metric_name: str, dimensions: list[dict]) -> None:
+    """Emit a CloudWatch metric. Swallows all exceptions — metric emission must
+    never fail the calling code. Broker has a no-cross-package-deps rule, so
+    this is local instead of using shared.metrics (mirrors experiment_manifest).
+    """
+    try:
+        _get_cw_client().put_metric_data(
+            Namespace="Broker",
+            MetricData=[{
+                "MetricName": metric_name,
+                "Value": 1,
+                "Unit": "Count",
+                "Dimensions": dimensions,
+            }],
+        )
+    except Exception as e:
+        logger.warning(
+            "MetricEmissionFailed metric=%s exc_type=%s: %s",
+            metric_name, type(e).__name__, e, exc_info=True,
+        )
 
 _DANGEROUS_HTML_RE = re.compile(
     r"<script|<img\b|javascript:", re.IGNORECASE
@@ -35,6 +83,16 @@ class PublishRequest(BaseModel):
     artifact: dict
     duration_seconds: float = 0
     cost_usd: float = 0
+    # PMF QA gate (contract D, v1 observe-only). The runner attaches the
+    # gate's verdict here on the success path. The broker treats it as an
+    # OPAQUE passthrough — it does NOT re-run jsonschema or any shape check
+    # (it validates only `artifact`); the only verdict-specific gate is the
+    # MAX_QA_VERDICT_BYTES size cap enforced in the handler. This field MUST
+    # be DECLARED: pydantic's default extra='ignore' would silently drop an
+    # undeclared field, so the runner's verdict would never reach the handler.
+    # Absent / None = no gate ran (no qa folder, or a pre-gate runner) — the
+    # success path then stays byte-identical to today.
+    qa_verdict: dict | None = None
 
 
 class PublishResponse(BaseModel):
@@ -179,6 +237,31 @@ def artifact_publish(
     if fence_error:
         raise HTTPException(status_code=400, detail=fence_error)
 
+    # PMF QA gate (contract D): the verdict is opaque — no shape validation —
+    # but it rides the SQS callback, so a runaway verdict would blow the
+    # callback budget. Reject anything over MAX_QA_VERDICT_BYTES before we
+    # write to S3 or fire a callback. Nothing is published on rejection.
+    if req.qa_verdict is not None:
+        verdict_bytes = len(json.dumps(req.qa_verdict))
+        if verdict_bytes > MAX_QA_VERDICT_BYTES:
+            logger.error(
+                "qa_verdict_size_cap_exceeded run_id=%s experiment_id=%s "
+                "observed=%d cap=%d",
+                ticket.run_id, ticket.experiment_id, verdict_bytes, MAX_QA_VERDICT_BYTES,
+            )
+            _emit_metric("broker_qa_verdict_size_cap_exceeded", [
+                {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                {"Name": "experiment_id", "Value": ticket.experiment_id},
+            ])
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"qa_verdict too large: {verdict_bytes} bytes exceeds the "
+                    f"{MAX_QA_VERDICT_BYTES}-byte size cap (the verdict rides the "
+                    f"SQS callback budget)"
+                ),
+            )
+
     artifact_json = json.dumps(req.artifact)
     latest_key = f"{ticket.experiment_id}/{ticket.organization_slug}/latest.json"
     run_key = f"{ticket.experiment_id}/{ticket.run_id}/artifact.json"
@@ -248,6 +331,11 @@ def artifact_publish(
     # latest.json, a subsequent regeneration of this (or dependent) experiment
     # would silently change what a SUCCESS run "produced", breaking the STALE
     # invariant for any downstream experiment that depends on this artifact.
+    # Forward the QA verdict verbatim. req.qa_verdict defaults to None when no
+    # gate ran (no qa folder, or a pre-gate runner); send_result omits the
+    # qaVerdict key on the wire for a None verdict, so the no-qa success
+    # callback stays byte-identical to a pre-gate run (verified in
+    # test_callback_sender's omit-key tests).
     callback_sender.send_result(
         run_id=ticket.run_id,
         organization_slug=ticket.organization_slug,
@@ -257,6 +345,7 @@ def artifact_publish(
         artifact_bucket=bucket,
         duration_seconds=req.duration_seconds,
         cost_usd=req.cost_usd,
+        qa_verdict=req.qa_verdict,
     )
 
     try:

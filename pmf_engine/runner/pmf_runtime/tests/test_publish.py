@@ -70,6 +70,59 @@ class TestPublish:
         assert captured["body"]["duration_seconds"] == 42.5
         assert captured["body"]["cost_usd"] == 0.37
 
+    def test_publish_omits_qa_verdict_when_not_passed(self):
+        """The no-qa golden path is byte-identical to today: a publish call
+        without a qa_verdict must NOT add the key to the POST body, so a
+        pre-gate broker sees exactly the same payload it always has."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0)
+        assert "qa_verdict" not in captured["body"]
+
+    def test_publish_includes_qa_verdict_when_passed(self):
+        """When the QA gate produced a verdict (observe-only), publish forwards
+        it verbatim under the additive optional `qa_verdict` key (contract D).
+        The verdict body keeps its snake_case contract-C shape — the broker
+        treats it as an opaque passthrough."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {
+            "verdict_version": 1,
+            "qa_version_ids": {"manifest.json": "v1"},
+            "status": "evaluated",
+            "pass": False,
+            "checks": [{"name": "grounding", "passed": False}],
+            "violations": ["grounding: 0.6 < 0.8"],
+            "duration_ms": 9300,
+            "cost_usd": 0.05,
+        }
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0, qa_verdict=verdict)
+        assert captured["body"]["artifact"] == {"score": 0.95}
+        assert captured["body"]["qa_verdict"] == verdict
+
+    def test_publish_qa_verdict_none_omits_key(self):
+        """Explicit qa_verdict=None (the default the runner passes when the
+        gate did not run) is treated the same as omitted — no key in body."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0, qa_verdict=None)
+        assert "qa_verdict" not in captured["body"]
+
 
 class TestReportStatus:
     def setup_method(self):

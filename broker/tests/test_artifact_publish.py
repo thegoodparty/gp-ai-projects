@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from fastapi import FastAPI
@@ -415,6 +415,9 @@ class TestArtifactPublishVoterTargeting:
             assert kw["ContentType"] == "application/json"
             assert json.loads(kw["Body"]) == artifact
 
+        # The handler always forwards qa_verdict; it's None on the no-qa path.
+        # The byte-identical guarantee lives on the SQS wire (callback_sender
+        # omits the qaVerdict key for a None verdict), not in this call shape.
         mock_sender.send_result.assert_called_once_with(
             run_id="331e5b56-e316-45a3-bdb3-08f81c7fad00",
             organization_slug="4",
@@ -424,6 +427,7 @@ class TestArtifactPublishVoterTargeting:
             cost_usd=0,
             artifact_key="voter_targeting/331e5b56-e316-45a3-bdb3-08f81c7fad00/artifact.json",
             artifact_bucket="gp-agent-artifacts-dev",
+            qa_verdict=None,
         )
 
         mock_store.delete_ticket_and_run_lock.assert_called_once_with(
@@ -1034,3 +1038,243 @@ class TestArtifactPublishDataRequiredUnlessCarveOut:
         )
         assert "NoDataQueriesSucceeded" in resp.json()["detail"]
         mock_s3.put_object.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (contract D, v1 observe-only): /artifact/publish accepts an
+# optional `qa_verdict` and forwards it VERBATIM to the success callback.
+#
+# The broker treats the verdict as an OPAQUE passthrough: it validates only
+# `req.artifact` (the existing HTML/fence/anti-fabrication gates), never the
+# verdict shape. The only verdict-specific check is a size cap on the
+# serialized JSON (protects the SQS callback budget). `qa_verdict` MUST be a
+# DECLARED field on PublishRequest — pydantic's default extra='ignore' would
+# silently drop an undeclared field, so "not validated" must not be read as
+# "leave it off the model."
+# ---------------------------------------------------------------------------
+
+
+def _qa_verdict() -> dict:
+    return {
+        "verdict_version": 1,
+        "qa_version_ids": {"manifest.json": "V-man-1", "eval.md": "V-eval-1"},
+        "status": "evaluated",
+        "pass": False,
+        "checks": [
+            {"name": "faithfulness", "type": "agent", "model": "sonnet",
+             "passed": True, "score": 4.5, "min_score": 4, "cost_usd": 0.04},
+        ],
+        "violations": ["one human-readable string"],
+        "duration_ms": 9300,
+        "cost_usd": 0.05,
+    }
+
+
+class TestArtifactPublishQaVerdictPassthrough:
+    def test_qa_verdict_forwarded_verbatim_to_callback(self):
+        """An arbitrary opaque verdict dict is passed to send_result exactly
+        as received — no shape validation, no key transformation in the
+        handler (the callback layer owns camelCasing the envelope key only)."""
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        mock_sender.send_result.assert_called_once()
+        call_kwargs = mock_sender.send_result.call_args.kwargs
+        assert call_kwargs["qa_verdict"] == verdict
+
+    def test_arbitrary_opaque_verdict_shape_is_not_rejected(self):
+        """The broker does NOT re-run jsonschema or any shape check on the
+        verdict. A verdict with keys the broker has never heard of — even an
+        empty dict — publishes fine and is forwarded as-is."""
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        weird = {"totally": "unexpected", "nested": {"x": [1, 2, 3]}, "n": 42}
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": weird},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert mock_sender.send_result.call_args.kwargs["qa_verdict"] == weird
+
+    def test_qa_verdict_is_a_declared_field_that_survives_pydantic(self):
+        """If qa_verdict were undeclared, pydantic's extra='ignore' would
+        silently drop it and the handler would forward None — a regression
+        that's invisible at the HTTP layer. Pin that the declared field
+        reaches send_result intact."""
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        forwarded = mock_sender.send_result.call_args.kwargs.get("qa_verdict")
+        assert forwarded is not None, "declared qa_verdict was dropped by pydantic"
+        assert forwarded == verdict
+
+    def test_publish_without_verdict_passes_none_to_callback(self):
+        """Byte-identical no-qa path: omitting qa_verdict forwards None so the
+        callback omits the qaVerdict key. The success path stays unchanged for
+        every existing experiment."""
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        call_kwargs = mock_sender.send_result.call_args.kwargs
+        assert call_kwargs.get("qa_verdict") is None
+
+    def test_oversized_qa_verdict_rejected_400(self):
+        """The verdict is opaque, but unbounded — a runaway verdict would
+        blow the SQS callback budget. The handler size-caps the serialized
+        verdict and rejects an oversize one with a clear 400. Nothing is
+        published, no callback fires.
+
+        The reject path is observable: it logs an ERROR (so the run_id is in
+        CloudWatch logs) AND emits a CloudWatch metric, mirroring the other
+        broker reject/drift paths — otherwise an operator can't alert on a
+        runaway verdict, only stumble on individual 400s."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        # Build a verdict whose json.dumps length exceeds the cap.
+        oversized = {"blob": "x" * (MAX_QA_VERDICT_BYTES + 1)}
+        assert len(json.dumps(oversized)) > MAX_QA_VERDICT_BYTES
+
+        ticket = _make_ticket(run_id="run-oversize-verdict")
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with patch("broker.endpoints.artifact_publish._emit_metric") as mock_metric:
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact(), "qa_verdict": oversized},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "qa_verdict" in detail.lower() or "verdict" in detail.lower()
+        assert "size" in detail.lower() or "cap" in detail.lower() or "large" in detail.lower()
+        mock_s3.put_object.assert_not_called()
+        mock_sender.send_result.assert_not_called()
+        mock_store.delete_ticket_and_run_lock.assert_not_called()
+
+        # A CloudWatch metric fired for the reject (operator-alertable).
+        reject_calls = [
+            c for c in mock_metric.call_args_list
+            if c.args[0] == "broker_qa_verdict_size_cap_exceeded"
+        ]
+        assert reject_calls, "expected broker_qa_verdict_size_cap_exceeded metric on oversize reject"
+
+    def test_oversized_qa_verdict_logs_error_with_run_id(self, caplog):
+        """The oversize reject must log an ERROR carrying the run_id and the
+        observed/cap byte counts, so the rejection is diagnosable from logs."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        oversized = {"blob": "x" * (MAX_QA_VERDICT_BYTES + 1)}
+        ticket = _make_ticket(run_id="run-oversize-log")
+        app, _, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with caplog.at_level(logging.ERROR, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact(), "qa_verdict": oversized},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 400
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and r.name == "broker.endpoints.artifact_publish"
+        ]
+        assert error_records, "expected an ERROR log for the oversize verdict reject"
+        msg = error_records[0].getMessage()
+        assert "run-oversize-log" in msg
+        assert str(MAX_QA_VERDICT_BYTES) in msg
+
+    def test_verdict_at_cap_is_accepted(self):
+        """Pin the boundary: a verdict whose serialized length is exactly at
+        (not over) the cap publishes successfully."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        # Construct a dict that serializes to exactly MAX_QA_VERDICT_BYTES.
+        envelope = json.dumps({"blob": ""})  # {"blob": ""}
+        filler = MAX_QA_VERDICT_BYTES - len(envelope)
+        assert filler > 0
+        at_cap = {"blob": "x" * filler}
+        assert len(json.dumps(at_cap)) == MAX_QA_VERDICT_BYTES
+
+        app, mock_s3, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": at_cap},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        mock_sender.send_result.assert_called_once()
+        assert mock_sender.send_result.call_args.kwargs["qa_verdict"] == at_cap
+
+    def test_verdict_cap_is_exactly_64_kib(self):
+        """Pin the verdict cap to its ABSOLUTE value (64 KiB), not just to
+        whatever the imported constant happens to be. The boundary tests above
+        size their payloads off MAX_QA_VERDICT_BYTES, so widening the constant
+        (e.g. to 128 KiB) would silently keep them green — they'd just build a
+        bigger payload. This test catches that: a verdict one byte over 64 KiB
+        MUST 400, and one exactly at 64 KiB MUST publish, regardless of the
+        constant's value. (Mutant M5: cap-widening.)"""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        cap = 64 * 1024
+        # The constant itself must equal the documented byte budget.
+        assert MAX_QA_VERDICT_BYTES == cap
+
+        # One byte over the absolute 64 KiB cap → 400 (nothing published).
+        over_envelope = len(json.dumps({"blob": ""}))
+        over = {"blob": "x" * (cap - over_envelope + 1)}
+        assert len(json.dumps(over)) == cap + 1
+        app, mock_s3, mock_sender, _ = _create_app()
+        client = TestClient(app)
+        resp_over = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": over},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp_over.status_code == 400
+        mock_s3.put_object.assert_not_called()
+
+        # Exactly at the absolute 64 KiB cap → publishes.
+        at = {"blob": "x" * (cap - over_envelope)}
+        assert len(json.dumps(at)) == cap
+        app2, _, mock_sender2, _ = _create_app()
+        client2 = TestClient(app2)
+        resp_at = client2.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": at},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp_at.status_code == 200, resp_at.text
+        mock_sender2.send_result.assert_called_once()
