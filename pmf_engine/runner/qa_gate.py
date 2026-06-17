@@ -48,6 +48,14 @@ logger = get_logger(__name__)
 # mkdtemp subdir under it is rmtree'd (in the finally below).
 DEFAULT_QA_GATE_ROOT = "/qa-gate"
 
+
+def _default_gate_root() -> str:
+    """Resolve the gate's materialization root. Honors the QA_GATE_ROOT env var
+    (so the task def can relocate it to a writable mount without an image
+    rebuild), else DEFAULT_QA_GATE_ROOT. The runner image creates /qa-gate owned
+    by the non-root `agent` user, so the default is writable in the container."""
+    return os.environ.get("QA_GATE_ROOT", "").strip() or DEFAULT_QA_GATE_ROOT
+
 # Platform defaults (contract A). Authors override via qa/manifest.json.
 _DEFAULT_DETERMINISTIC_TIMEOUT = 120
 _DEFAULT_AGENT_MODEL = "sonnet"
@@ -192,7 +200,7 @@ def run_qa_gate(
         return None
 
     started = time.monotonic()
-    base = gate_base_dir or DEFAULT_QA_GATE_ROOT
+    base = gate_base_dir or _default_gate_root()
     gate_dir: str | None = None
     try:
         files = qa_envelope.get("files") or {}

@@ -908,3 +908,14 @@ def test_main_py_timeout_is_stage_error(workspace, gate_base):
     )
     assert verdict.status == "error"
     assert verdict.pass_ is None
+
+
+def test_default_gate_root_honors_qa_gate_root_env(monkeypatch):
+    """The gate root is env-configurable so the task def can point it at a
+    writable mount; blank/unset falls back to the (Dockerfile-created) default."""
+    monkeypatch.delenv("QA_GATE_ROOT", raising=False)
+    assert qa_gate_mod._default_gate_root() == qa_gate_mod.DEFAULT_QA_GATE_ROOT
+    monkeypatch.setenv("QA_GATE_ROOT", "/custom/writable-root")
+    assert qa_gate_mod._default_gate_root() == "/custom/writable-root"
+    monkeypatch.setenv("QA_GATE_ROOT", "   ")
+    assert qa_gate_mod._default_gate_root() == qa_gate_mod.DEFAULT_QA_GATE_ROOT

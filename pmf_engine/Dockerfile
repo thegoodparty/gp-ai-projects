@@ -93,8 +93,8 @@ RUN chmod +x /app/entrypoint.sh
 
 # Create non-root user (Claude CLI requires non-root for bypassPermissions)
 RUN useradd -m -s /bin/bash agent && \
-    mkdir -p /workspace /workspace/output /home/agent/.ssh /home/agent/.aws && \
-    chown -R agent:agent /workspace /home/agent /app
+    mkdir -p /workspace /workspace/output /home/agent/.ssh /home/agent/.aws /qa-gate && \
+    chown -R agent:agent /workspace /home/agent /app /qa-gate
 
 # Make pmf_runtime importable as a top-level package so agent scripts
 # can do `from pmf_runtime import databricks as sql` from any CWD.
