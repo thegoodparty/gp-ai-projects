@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import inspect
 import json
 import os
@@ -451,27 +450,25 @@ async def _run_qa_gate_hook(
     workspace_dir: str,
     remaining_budget_seconds: float,
 ):
-    """Run the PMF QA gate (v1 observe-only) and return its Verdict, or None.
+    """Run the PMF QA gate (v1 deterministic-only, observe-only) and return
+    ``(verdict, raw_output)``, or None.
 
     Returns None when no qa folder was published (config.qa_envelope is None) —
     the caller stays byte-identical to a pre-gate run. Otherwise returns a
-    Verdict that ALWAYS rides the publish path. FAIL-OPEN: this never raises.
-    run_qa_gate is already fail-open internally, but the spawn/adapter wiring
-    here is wrapped too so any unexpected error becomes an `error` verdict and
-    the run still publishes.
+    ``(Verdict, raw_output)`` tuple whose verdict ALWAYS rides the publish path,
+    and whose raw_output (the raw main.py stdout, or None) the broker writes to
+    S3. FAIL-OPEN: this never raises. run_qa_gate is already fail-open
+    internally, but the bridge here is wrapped too so any unexpected error
+    becomes an `error` verdict and the run still publishes.
 
     The no-qa decision lives in the gate engine itself (run_qa_gate returns
     None when config.qa_envelope is None), so this hook always delegates — one
     decision point, no drift.
 
-    The gate engine is synchronous (subprocess + a sync evaluator_runner). We
-    run it in a worker thread so it can't block this event loop, and the
-    injected evaluator_runner marshals the async `run_evaluator_agent`
-    coroutine back onto this loop via run_coroutine_threadsafe.
+    The gate engine is synchronous (a deterministic main.py subprocess). We run
+    it in a worker thread so it can't block this event loop.
     """
     from .qa_gate import Verdict
-    from .harness.base import EvaluatorHarnessParams, EvaluatorResult
-    from .harness.claude_sdk import run_evaluator_agent
 
     started = time.monotonic()
     try:
@@ -486,27 +483,6 @@ async def _run_qa_gate_hook(
             raw = os.environ.get(key, "").strip()
             if raw:
                 broker_env[key] = raw
-        loop = asyncio.get_running_loop()
-
-        def _evaluator_runner(params: EvaluatorHarnessParams) -> EvaluatorResult:
-            # Called from the gate's worker thread; bounce the coroutine back
-            # to the runner's event loop and block this thread until it
-            # resolves.
-            future = asyncio.run_coroutine_threadsafe(
-                run_evaluator_agent(params), loop
-            )
-            try:
-                return future.result(timeout=params.timeout_seconds + 30)
-            except concurrent.futures.TimeoutError:
-                # The coroutine outlived even run_evaluator_agent's own bound —
-                # cancel it (best-effort; it may already be past a cancellation
-                # point) and surface a stage error so observe still publishes.
-                future.cancel()
-                logger.warning(
-                    "qa_gate_evaluator_bridge_timeout run_id=%s experiment_id=%s timeout=%ss",
-                    config.run_id, config.experiment_id, params.timeout_seconds + 30,
-                )
-                return EvaluatorResult(status="error")
 
         return await asyncio.to_thread(
             run_qa_gate,
@@ -515,14 +491,13 @@ async def _run_qa_gate_hook(
             workspace_dir,
             broker_env,
             remaining_budget_seconds,
-            evaluator_runner=_evaluator_runner,
             **_qa_gate_correlation_kwargs(config),
         )
     except Exception as e:
-        # Defense-in-depth: run_qa_gate is fail-open, but the spawn/adapter
-        # plumbing around it is not. This branch ONLY fires on a real
-        # bridge/marshaling defect (the gate engine itself never raises), so
-        # log at ERROR with a stack trace — it is actionable, not routine.
+        # Defense-in-depth: run_qa_gate is fail-open, but the to_thread bridge
+        # around it is not. This branch ONLY fires on a real bridge/marshaling
+        # defect (the gate engine itself never raises), so log at ERROR with a
+        # stack trace — it is actionable, not routine.
         logger.exception(
             "qa_gate_hook_failed run_id=%s experiment_id=%s exc_type=%s: %s",
             config.run_id, config.experiment_id, type(e).__name__, e,
@@ -530,13 +505,14 @@ async def _run_qa_gate_hook(
         resolved = {}
         if isinstance(config.qa_envelope, dict):
             resolved = config.qa_envelope.get("resolved_qa_version_ids") or {}
-        return Verdict(
+        verdict = Verdict(
             status="error",
             qa_version_ids=resolved,
             pass_=None,
             violations=[f"qa_gate_hook_error: {type(e).__name__}: {e}"],
             duration_ms=int((time.monotonic() - started) * 1000),
         )
+        return verdict, None
 
 
 async def run_experiment(
@@ -703,13 +679,20 @@ async def run_experiment(
             # quarantines, fail-OPEN on a gate error (decisions 5, 6, 8, 10).
             elapsed = time.monotonic() - start_time
             remaining_budget = config.timeout_seconds - elapsed
-            qa_verdict = await _run_qa_gate_hook(
+            qa_gate_result = await _run_qa_gate_hook(
                 config=config,
                 artifact_bytes=result.artifact_bytes,
                 workspace_dir=workspace_dir,
                 remaining_budget_seconds=remaining_budget,
             )
-            qa_verdict_dict = qa_verdict.to_dict() if qa_verdict is not None else None
+            # The gate returns (verdict, raw_output) when a qa folder ran, else
+            # None (no qa folder — byte-identical to a pre-gate run). raw_output
+            # is the raw main.py stdout the broker writes durably to S3.
+            qa_verdict_dict = None
+            qa_raw_output = None
+            if qa_gate_result is not None:
+                qa_verdict, qa_raw_output = qa_gate_result
+                qa_verdict_dict = qa_verdict.to_dict()
 
             duration = time.monotonic() - start_time
             # Intentional trace/status divergence: the trace records "success"
@@ -736,15 +719,18 @@ async def run_experiment(
             span.log(output=success_output)
             bt.flush()
             try:
-                # No-qa path: omit qa_verdict entirely so the publish call is
-                # byte-identical to a pre-gate run. Present-verdict path: forward
-                # the contract-C dict as the additive optional field.
+                # No-qa path: omit qa_verdict/qa_raw_output entirely so the
+                # publish call is byte-identical to a pre-gate run. Present-verdict
+                # path: forward the contract-C dict and the raw main.py stdout
+                # (for the broker's durable S3 verdict.json write) as the additive
+                # optional fields.
                 publish_kwargs: dict = {
                     "duration_seconds": duration,
                     "cost_usd": result.cost_usd,
                 }
                 if qa_verdict_dict is not None:
                     publish_kwargs["qa_verdict"] = qa_verdict_dict
+                    publish_kwargs["qa_raw_output"] = qa_raw_output
                 publish.publish(artifact, **publish_kwargs)
                 _mark_callback_sent()
                 logger.info(f"Published artifact via broker for run {config.run_id}")

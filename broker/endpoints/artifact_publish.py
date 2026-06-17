@@ -23,6 +23,12 @@ _PII_ENABLED_VALUES = {"1", "true", "yes"}
 # verdict OPAQUE — this size check is the only verdict-specific gate.
 MAX_QA_VERDICT_BYTES = 64 * 1024
 
+# PMF QA gate (contract D / decision 13): the raw main.py stdout, written
+# durably to S3 only (it never rides the SQS callback), so it has its own,
+# larger budget — the same 1 MiB cap contract D specifies for the captured
+# stage stdout. Bounds a runaway raw output before the broker writes it.
+MAX_QA_RAW_OUTPUT_BYTES = 1024 * 1024
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/artifact", tags=["artifact"])
@@ -66,6 +72,17 @@ def _emit_metric(metric_name: str, dimensions: list[dict]) -> None:
             metric_name, type(e).__name__, e, exc_info=True,
         )
 
+def _is_precondition_failed(err: Exception) -> bool:
+    """True iff a boto3/ClientError carries a PreconditionFailed (HTTP 412)
+    error code — i.e. an IfNoneMatch=* write-once collision. Defensive against
+    non-ClientError exceptions and malformed error shapes (returns False)."""
+    try:
+        code = err.response["Error"]["Code"]  # type: ignore[attr-defined]
+    except (AttributeError, KeyError, TypeError):
+        return False
+    return code in ("PreconditionFailed", "412")
+
+
 _DANGEROUS_HTML_RE = re.compile(
     r"<script|<img\b|javascript:", re.IGNORECASE
 )
@@ -93,6 +110,15 @@ class PublishRequest(BaseModel):
     # Absent / None = no gate ran (no qa folder, or a pre-gate runner) — the
     # success path then stays byte-identical to today.
     qa_verdict: dict | None = None
+    # PMF QA gate (contract D / decision 13). The raw main.py stdout the gate
+    # captured, carried so the broker can write it durably to S3 alongside the
+    # aggregated verdict (the runner is sandboxed — the broker is its only
+    # egress). It NEVER rides the SQS callback, so it has its own 1 MiB budget
+    # rather than the verdict's callback-bound cap. Like qa_verdict, this MUST
+    # be DECLARED: pydantic's default extra='ignore' would silently drop an
+    # undeclared field, so the durable raw write would never happen. Absent /
+    # None = the broker writes only the aggregated verdict.
+    qa_raw_output: str | None = None
 
 
 class PublishResponse(BaseModel):
@@ -237,30 +263,49 @@ def artifact_publish(
     if fence_error:
         raise HTTPException(status_code=400, detail=fence_error)
 
-    # PMF QA gate (contract D): the verdict is opaque — no shape validation —
-    # but it rides the SQS callback, so a runaway verdict would blow the
-    # callback budget. Reject anything over MAX_QA_VERDICT_BYTES before we
-    # write to S3 or fire a callback. Nothing is published on rejection.
+    # PMF QA gate (contract D, v1 observe-only / fail-open): the qa-capture
+    # path must NEVER fail the publish. A 400 here would turn the run FAILED in
+    # the runner, breaking observe-only — so a size-cap breach SKIPS the durable
+    # S3 write instead of rejecting. The verdict still rides the SQS callback
+    # verbatim (the callback layer owns its own budget); only the durable
+    # verdict.json write is governed by MAX_QA_VERDICT_BYTES. An oversize verdict
+    # is LOGGED + metric-emitted + the verdict.json write is skipped.
+    skip_qa_verdict_write = False
     if req.qa_verdict is not None:
         verdict_bytes = len(json.dumps(req.qa_verdict))
         if verdict_bytes > MAX_QA_VERDICT_BYTES:
+            skip_qa_verdict_write = True
             logger.error(
                 "qa_verdict_size_cap_exceeded run_id=%s experiment_id=%s "
-                "observed=%d cap=%d",
+                "observed=%d cap=%d (fail-open: skipping durable verdict.json "
+                "write; the verdict still rides the callback)",
                 ticket.run_id, ticket.experiment_id, verdict_bytes, MAX_QA_VERDICT_BYTES,
             )
             _emit_metric("broker_qa_verdict_size_cap_exceeded", [
                 {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
                 {"Name": "experiment_id", "Value": ticket.experiment_id},
             ])
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"qa_verdict too large: {verdict_bytes} bytes exceeds the "
-                    f"{MAX_QA_VERDICT_BYTES}-byte size cap (the verdict rides the "
-                    f"SQS callback budget)"
-                ),
+
+    # PMF QA gate (contract D / decision 13, fail-open): the raw main.py output
+    # is written durably to S3 only (never the callback), with its own 1 MiB
+    # budget. An oversize raw output SKIPS the main_output.json write (LOG +
+    # metric) rather than rejecting — same observe-only / fail-open rule as the
+    # verdict. The aggregated verdict.json write and the callback are unaffected.
+    skip_qa_raw_write = False
+    if req.qa_raw_output is not None:
+        raw_bytes = len(req.qa_raw_output.encode("utf-8"))
+        if raw_bytes > MAX_QA_RAW_OUTPUT_BYTES:
+            skip_qa_raw_write = True
+            logger.error(
+                "qa_raw_output_size_cap_exceeded run_id=%s experiment_id=%s "
+                "observed=%d cap=%d (fail-open: skipping durable main_output.json "
+                "write; the aggregated verdict is unaffected)",
+                ticket.run_id, ticket.experiment_id, raw_bytes, MAX_QA_RAW_OUTPUT_BYTES,
             )
+            _emit_metric("broker_qa_raw_output_size_cap_exceeded", [
+                {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                {"Name": "experiment_id", "Value": ticket.experiment_id},
+            ])
 
     artifact_json = json.dumps(req.artifact)
     latest_key = f"{ticket.experiment_id}/{ticket.organization_slug}/latest.json"
@@ -326,6 +371,85 @@ def artifact_publish(
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to publish artifact to S3")
+
+    # PMF QA gate (contract D / decision 13): durable, observe-only S3 capture.
+    # When a verdict is present, write it (and the raw main.py output, when the
+    # runner included it) under the run's qa prefix — the same prefix where
+    # artifact.json already lives. This is INDEPENDENT of Braintrust and the
+    # SQS callback: the verdict survives even if both are lost. The runner is
+    # sandboxed (the broker is its only egress), so the broker performs the
+    # write.
+    #
+    # BEST-EFFORT and ADDITIVE: it runs only AFTER artifact.json succeeded
+    # (above), a failure is logged with run_id but does NOT fail the publish,
+    # and the verdict still rides the callback below. No qa_verdict => no qa
+    # write, so the no-qa key set stays byte-identical to a pre-gate publish.
+    # Both qa writes are write-once (IfNoneMatch=*), mirroring the artifact.json
+    # archive: a duplicate publish for the same run must not silently overwrite
+    # the per-run qa record. A write-once collision (PreconditionFailed / 412)
+    # is logged INFO and swallowed — best-effort / observe-only, never fatal.
+    if req.qa_verdict is not None and not skip_qa_verdict_write:
+        qa_verdict_key = f"{ticket.experiment_id}/{ticket.run_id}/qa/verdict.json"
+        try:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=qa_verdict_key,
+                Body=json.dumps(req.qa_verdict),
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except Exception as verdict_err:
+            if _is_precondition_failed(verdict_err):
+                logger.info(
+                    "qa verdict already captured run_id=%s experiment_id=%s key=%s "
+                    "(duplicate publish; write-once guard held, keeping the "
+                    "original per-run record)",
+                    ticket.run_id, ticket.experiment_id, qa_verdict_key,
+                )
+            else:
+                logger.warning(
+                    "qa verdict S3 capture failed run_id=%s experiment_id=%s key=%s "
+                    "bucket=%s. Best-effort durable capture; the verdict still rides "
+                    "the SQS callback and the Braintrust span.",
+                    ticket.run_id, ticket.experiment_id, qa_verdict_key, bucket,
+                    exc_info=True,
+                )
+
+    # The raw main.py output is the verdict's raw fragment output, so it is only
+    # written when a verdict is also present (no orphan main_output.json without
+    # a verdict.json) — preserving contract D's coupling. Its own size cap
+    # (skip_qa_raw_write) is independent of the verdict's.
+    if (
+        req.qa_verdict is not None
+        and req.qa_raw_output is not None
+        and not skip_qa_raw_write
+    ):
+        qa_raw_key = f"{ticket.experiment_id}/{ticket.run_id}/qa/main_output.json"
+        try:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=qa_raw_key,
+                Body=req.qa_raw_output,
+                # Raw main.py stdout is NOT guaranteed JSON (especially on
+                # stage-error paths), so it is stored as plain text.
+                ContentType="text/plain; charset=utf-8",
+                IfNoneMatch="*",
+            )
+        except Exception as raw_err:
+            if _is_precondition_failed(raw_err):
+                logger.info(
+                    "qa raw output already captured run_id=%s experiment_id=%s "
+                    "key=%s (duplicate publish; write-once guard held)",
+                    ticket.run_id, ticket.experiment_id, qa_raw_key,
+                )
+            else:
+                logger.warning(
+                    "qa raw output S3 capture failed run_id=%s experiment_id=%s "
+                    "key=%s bucket=%s. Best-effort durable capture; the aggregated "
+                    "verdict was still captured and rides the callback.",
+                    ticket.run_id, ticket.experiment_id, qa_raw_key, bucket,
+                    exc_info=True,
+                )
 
     # Callback carries the run-scoped immutable key. If we pointed gp-api at
     # latest.json, a subsequent regeneration of this (or dependent) experiment

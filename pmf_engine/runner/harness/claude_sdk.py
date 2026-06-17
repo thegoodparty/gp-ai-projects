@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import glob
 import json
 import os
@@ -21,7 +20,7 @@ from claude_agent_sdk import (
 from pmf_engine.runner.contract import format_contract_for_prompt
 from shared.logger import get_logger
 
-from .base import EvaluatorHarnessParams, EvaluatorResult, HarnessResult
+from .base import HarnessResult
 
 logger = get_logger(__name__)
 
@@ -44,15 +43,6 @@ class AgentStreamTruncatedError(RuntimeError):
 
 
 ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
-
-# QA-gate evaluator tool surface (PMF QA gate, PR-3). A SUBSET of ALLOWED_TOOLS,
-# NOT an extension: the evaluator only inspects evidence (Bash to cat/grep the
-# read-only /workspace, plus pmf_runtime.http over the broker for citation
-# checks) and may WebSearch. It must NOT mutate the workspace, so Write/Edit are
-# excluded; Glob/Grep are dropped too (the evaluator uses Bash for traversal).
-# Defined as its own constant so the assertable shape is locked and the
-# evaluator never rides ALLOWED_TOOLS' extend path.
-EVALUATOR_ALLOWED_TOOLS = ["Bash", "WebSearch"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
@@ -475,126 +465,6 @@ async def run_agent(
     raise AgentStreamTruncatedError("Agent stream ended without result")
 
 
-async def run_evaluator_agent(
-    params: EvaluatorHarnessParams,
-    parent_span=None,
-) -> EvaluatorResult:
-    """Run the QA-gate evaluator agent (PMF QA gate, PR-3).
-
-    NEW code, deliberately NOT a re-route of run_agent's branches, so the
-    primary path stays byte-identical. The evaluator is the OPPOSITE of the
-    primary agent on every axis:
-
-    - allowed_tools = EVALUATOR_ALLOWED_TOOLS (a SUBSET — Bash + WebSearch only,
-      not the ALLOWED_TOOLS extend path);
-    - mcp_servers = {} ALWAYS (it does NOT call _build_broker_mcp_servers): the
-      evaluator reaches the broker over HTTP via Bash + pmf_runtime using the
-      live BROKER_URL/BROKER_TOKEN env, not via an MCP server;
-    - system_prompt = params.system_prompt VERBATIM (build_system_prompt is
-      bypassed: no capability section, no preamble, no instruction concat);
-    - agents = None so the 'Agent' dispatch tool is denied by exclusion;
-    - cwd = params.gate_cwd so /workspace is read-only evidence.
-
-    FAIL-OPEN (v1 observe-only): an SDK error becomes status='error' rather than
-    a raised exception, so the run still publishes. Fragments are read by the
-    gate from params.result_file_path, so this returns fragments=[].
-    """
-    logger.info(
-        f"Starting QA evaluator agent (model: {params.model}, max_turns: {params.max_turns})"
-    )
-
-    resolved_permission_mode = _resolve_permission_mode()
-
-    options = ClaudeAgentOptions(
-        system_prompt=params.system_prompt,
-        allowed_tools=list(EVALUATOR_ALLOWED_TOOLS),
-        permission_mode=resolved_permission_mode,
-        mcp_servers={},
-        agents=None,
-        cwd=params.gate_cwd,
-        max_turns=params.max_turns,
-        model=params.model,
-        max_buffer_size=100 * 1024 * 1024,  # 100MB
-    )
-
-    prompt = (
-        f"{params.instruction}\n\n"
-        f"The workspace at {params.workspace_dir} is READ-ONLY evidence — do not "
-        "modify it. When you have finished grading, write your fragment array as a "
-        f"JSON array to this exact path: {params.result_file_path}"
-    )
-
-    # Mutable carrier so the inner drain coroutine can surface the
-    # ResultMessage metrics to the outer scope even when wait_for cancels it.
-    state: dict[str, object] = {
-        "cost_usd": 0.0,
-        "num_turns": 0,
-        "session_id": None,
-        "duration_ms": 0,
-        "result": None,  # "ok" | "error" | None (stream ended w/o ResultMessage)
-    }
-
-    async def _drain() -> None:
-        """Consume the SDK stream to its ResultMessage. Bounded by wait_for
-        below — on timeout, wait_for cancels this coroutine, which propagates
-        CancelledError into `query`'s async generator and tears it down (so the
-        underlying SDK session is not abandoned)."""
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, ResultMessage):
-                state["cost_usd"] = message.total_cost_usd or 0.0
-                state["num_turns"] = message.num_turns
-                state["session_id"] = message.session_id
-                state["duration_ms"] = message.duration_ms or 0
-                state["result"] = "error" if message.is_error else "ok"
-                if message.is_error:
-                    logger.warning(
-                        f"QA evaluator agent errored after {message.num_turns} turns "
-                        f"(session={message.session_id}): {message.result or 'unknown error'}"
-                    )
-                return
-
-    def _build(status: str) -> EvaluatorResult:
-        return EvaluatorResult(
-            fragments=[],
-            cost_usd=state["cost_usd"],  # type: ignore[arg-type]
-            duration_ms=state["duration_ms"],  # type: ignore[arg-type]
-            num_turns=state["num_turns"],  # type: ignore[arg-type]
-            session_id=state["session_id"],  # type: ignore[arg-type]
-            status=status,  # type: ignore[arg-type]
-        )
-
-    try:
-        # B1: enforce the evaluator's own timeout. Without this bound a stuck
-        # evaluator (a query that never reaches a ResultMessage) would consume
-        # the ENTIRE outer run budget. wait_for cancels the drain — and thus the
-        # underlying query — at params.timeout_seconds.
-        await asyncio.wait_for(_drain(), timeout=params.timeout_seconds)
-    except TimeoutError:
-        logger.warning(
-            f"QA evaluator agent timed out after {params.timeout_seconds}s "
-            f"(session={state['session_id']}) — cancelled, fail-open, status=error"
-        )
-        return _build("error")
-    except Exception as eval_err:
-        logger.warning(
-            f"QA evaluator agent raised {type(eval_err).__name__}: {eval_err} "
-            f"(session={state['session_id']}) — fail-open, status=error"
-        )
-        return _build("error")
-
-    if state["result"] == "ok":
-        logger.info(
-            f"QA evaluator completed: {state['num_turns']} turns. "
-            f"Cost: ${state['cost_usd']:.4f}. Session: {state['session_id']}"
-        )
-        return _build("ok")
-    if state["result"] == "error":
-        return _build("error")
-
-    logger.warning("QA evaluator stream ended without a ResultMessage — fail-open, status=error")
-    return _build("error")
-
-
 def collect_output_artifact(workspace_dir: str, experiment_id: str | None = None) -> tuple[bytes, str]:
     output_dir = os.path.join(workspace_dir, "output")
     files = [f for f in glob.glob(os.path.join(output_dir, "*")) if os.path.isfile(f)]
@@ -683,6 +553,3 @@ class ClaudeSdkHarness:
             num_turns=result["num_turns"],
             session_id=result["session_id"],
         )
-
-    async def run_evaluator(self, params: EvaluatorHarnessParams) -> EvaluatorResult:
-        return await run_evaluator_agent(params)

@@ -1,15 +1,18 @@
-"""Tests for the PMF QA gate engine (LANE A, v1 observe-only).
+"""Tests for the PMF QA gate engine (LANE A, v1 DETERMINISTIC-ONLY, observe-only).
 
 The engine grades the exact artifact bytes a run produced against an
-experiment's qa/ folder (a deterministic `main.py` subprocess and/or an
-`eval.md` evaluator agent), and emits a Verdict that ALWAYS rides the
-success/publish path. v1 is OBSERVE-ONLY: there is no blocking-fail branch,
-no quarantine, no fail-closed. A gate error becomes a Verdict with
-status 'error' and the run still publishes (fail-open).
+experiment's qa/ folder by running ONE deterministic `main.py` subprocess, and
+emits a Verdict that ALWAYS rides the success/publish path. v1 is
+DETERMINISTIC-ONLY and OBSERVE-ONLY: there is no AI evaluator, no eval.md, no
+blocking-fail branch, no quarantine, no fail-closed. A gate error becomes a
+Verdict with status 'error' and the run still publishes (fail-open).
 
-Tests inject a fake `evaluator_runner` and materialize tiny `main.py`
-fixtures through the qa_envelope, so the engine is exercised end-to-end with
-no real agent and no real subprocess crash beyond what a fixture script does.
+`run_qa_gate` returns a ``(verdict, raw_output)`` tuple (or ``None`` when no qa
+folder): ``raw_output`` is the raw ``main.py`` stdout the runner forwards to the
+broker for the durable S3 verdict.json write.
+
+Tests materialize tiny `main.py` fixtures through the qa_envelope, so the engine
+is exercised end-to-end with a real subprocess.
 
 The materialization base is injected (`gate_base_dir`) so the private qa dir
 lands outside both `workspace_dir` and `/tmp` (the runner's log sweep collects
@@ -25,7 +28,6 @@ import os
 import pytest
 
 import pmf_engine.runner.qa_gate as qa_gate_mod
-from pmf_engine.runner.harness.base import EvaluatorHarnessParams, EvaluatorResult
 from pmf_engine.runner.qa_gate import Verdict, run_qa_gate
 
 
@@ -57,6 +59,32 @@ def gate_logs():
         qa_gate_mod.logger.setLevel(prev_level)
 
 
+@pytest.fixture
+def gate_info_logs():
+    """Capture INFO+ records emitted by the qa_gate module logger.
+
+    Same propagate=False workaround as ``gate_logs`` but at INFO level so the
+    verdict summary log line (emitted at INFO) is observable."""
+
+    class _ListHandler(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.INFO)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _ListHandler()
+    qa_gate_mod.logger.addHandler(handler)
+    prev_level = qa_gate_mod.logger.level
+    qa_gate_mod.logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        qa_gate_mod.logger.removeHandler(handler)
+        qa_gate_mod.logger.setLevel(prev_level)
+
+
 def _messages(handler) -> list[str]:
     return [r.getMessage() for r in handler.records]
 
@@ -68,50 +96,20 @@ def _messages(handler) -> list[str]:
 ARTIFACT = json.dumps({"summary": {"total": 3}}).encode("utf-8")
 
 
-class FakeEvaluator:
-    """Records the params it was called with and writes a configurable
-    fragment array to the injected result_file_path, returning a configurable
-    EvaluatorResult. Mirrors the real run_evaluator contract: the engine reads
-    the canonical fragments from the file, not from the returned object."""
+def _verdict(result):
+    """Unwrap the (verdict, raw_output) tuple run_qa_gate returns.
 
-    def __init__(
-        self,
-        *,
-        fragments: list[dict] | None = None,
-        write_file: bool = True,
-        file_contents: str | None = None,
-        result: EvaluatorResult | None = None,
-        raise_exc: BaseException | None = None,
-    ):
-        self.fragments = fragments if fragments is not None else [{"name": "faithfulness", "passed": True}]
-        self.write_file = write_file
-        self.file_contents = file_contents
-        self.result = result
-        self.raise_exc = raise_exc
-        self.calls: list[EvaluatorHarnessParams] = []
-
-    def __call__(self, params: EvaluatorHarnessParams) -> EvaluatorResult:
-        self.calls.append(params)
-        if self.raise_exc is not None:
-            raise self.raise_exc
-        if self.write_file:
-            contents = self.file_contents if self.file_contents is not None else json.dumps(self.fragments)
-            with open(params.result_file_path, "w", encoding="utf-8") as fh:
-                fh.write(contents)
-        if self.result is not None:
-            return self.result
-        return EvaluatorResult(
-            fragments=self.fragments,
-            cost_usd=0.04,
-            duration_ms=1200,
-            num_turns=3,
-            session_id="eval-sess",
-            status="ok",
-        )
+    run_qa_gate returns None for no-qa, else a (Verdict, raw_output) tuple.
+    These helpers keep the per-test assertions focused on one half at a time."""
+    assert result is not None
+    verdict, _raw = result
+    return verdict
 
 
-def _never_called_evaluator(_params: EvaluatorHarnessParams) -> EvaluatorResult:
-    raise AssertionError("evaluator_runner should not have been invoked")
+def _raw_output(result):
+    assert result is not None
+    _verdict, raw = result
+    return raw
 
 
 def _envelope(
@@ -198,32 +196,32 @@ BIG_BUDGET = 10_000.0
 
 
 def test_no_qa_envelope_returns_none(workspace, gate_base):
-    verdict = run_qa_gate(
+    result = run_qa_gate(
         artifact_bytes=ARTIFACT,
         qa_envelope=None,
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
     )
-    assert verdict is None
+    assert result is None
 
 
 # --------------------------------------------------------------------------
-# Empty qa folder (neither entrypoint) -> skipped
+# qa folder with no main.py -> skipped
 # --------------------------------------------------------------------------
 
 
-def test_empty_qa_folder_is_skipped(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+def test_qa_folder_without_main_py_is_skipped(workspace, gate_base):
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert isinstance(verdict, Verdict)
     assert verdict.status == "skipped"
@@ -231,42 +229,57 @@ def test_empty_qa_folder_is_skipped(workspace, gate_base):
     assert verdict.verdict_version == 1
 
 
+def test_skipped_verdict_has_no_raw_output(workspace, gate_base):
+    """A skipped run never spawned main.py, so there is no raw stdout to write
+    to S3 — raw_output is None."""
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    assert _raw_output(result) is None
+
+
 # --------------------------------------------------------------------------
-# Insufficient budget -> error, no stage invoked
+# Insufficient budget -> error, main.py never invoked
 # --------------------------------------------------------------------------
 
 
-def test_insufficient_budget_returns_error_without_invoking_stages(workspace, gate_base):
+def test_insufficient_budget_returns_error_without_invoking_main(workspace, gate_base):
+    # Only deterministic.timeout_seconds is accounted in the pre-flight budget
+    # (the agent timeout term is gone with the evaluator).
     manifest = {
         "blocking": False,
         "deterministic": {"timeout_seconds": 120},
-        "agent": {"model": "sonnet", "max_turns": 20, "timeout_seconds": 300},
     }
-    ran_main = {"flag": False}
+    main_marker = workspace + "/MAIN_RAN"
+    main_src = f"open({main_marker!r}, 'w').close()\nimport json\nprint(json.dumps([]))\n"
 
-    def evaluator_must_not_run(_params):
-        ran_main["flag"] = True
-        raise AssertionError("evaluator invoked despite insufficient budget")
-
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(
-            files={"main.py": _MAIN_PASS, "eval.md": "judge this"},
-            manifest=manifest,
-        ),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        # 120 + 300 = 420 required; give less.
-        remaining_budget_seconds=100.0,
-        evaluator_runner=evaluator_must_not_run,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(
+                files={"main.py": main_src},
+                manifest=manifest,
+            ),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            # 120 required; give less.
+            remaining_budget_seconds=100.0,
+            gate_base_dir=gate_base,
+        )
     )
     assert isinstance(verdict, Verdict)
     assert verdict.status == "error"
     assert verdict.pass_ is None
-    assert ran_main["flag"] is False
+    assert not os.path.exists(main_marker), "main.py must not run when budget is insufficient"
     # Surfaces the reason in a discoverable way.
     assert any("insufficient_budget" in v for v in verdict.violations)
+    # Required budget reflects ONLY the deterministic timeout (no agent term).
+    assert any("120" in v for v in verdict.violations)
 
 
 # --------------------------------------------------------------------------
@@ -275,14 +288,15 @@ def test_insufficient_budget_returns_error_without_invoking_stages(workspace, ga
 
 
 def test_main_py_passing_fragment_yields_evaluated_pass(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert isinstance(verdict, Verdict)
     assert verdict.status == "evaluated"
@@ -293,20 +307,39 @@ def test_main_py_passing_fragment_yields_evaluated_pass(workspace, gate_base):
     assert verdict.checks[0]["type"] == "deterministic"
 
 
+def test_run_qa_gate_returns_raw_main_py_stdout(workspace, gate_base):
+    """run_qa_gate returns the raw main.py stdout alongside the verdict so
+    main.py can forward it to the broker for the durable S3 verdict.json write.
+    The raw output is the EXACT bytes/text the check emitted on stdout."""
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    raw = _raw_output(result)
+    assert raw is not None
+    parsed = json.loads(raw)
+    assert parsed == [{"name": "grounding", "passed": True, "score": 0.91}]
+
+
 # --------------------------------------------------------------------------
 # main.py: a failing fragment -> pass False
 # --------------------------------------------------------------------------
 
 
 def test_main_py_failing_fragment_yields_pass_false(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_FAIL}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_FAIL}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.status == "evaluated"
     assert verdict.pass_ is False
@@ -318,14 +351,15 @@ def test_main_py_failing_fragment_yields_pass_false(workspace, gate_base):
 
 
 def test_main_py_nonzero_exit_injects_synthetic_failing_fragment(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_NONZERO_EXIT}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_NONZERO_EXIT}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     # A crash is NOT a stage error in v1 — it's a synthetic failing fragment,
     # so pass is False (not None).
@@ -343,17 +377,57 @@ def test_main_py_nonzero_exit_injects_synthetic_failing_fragment(workspace, gate
 
 
 def test_main_py_unparseable_stdout_is_stage_error(workspace, gate_base):
-    verdict = run_qa_gate(
+    result = run_qa_gate(
         artifact_bytes=ARTIFACT,
         qa_envelope=_envelope(files={"main.py": _MAIN_UNPARSEABLE}),
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
     )
+    verdict = _verdict(result)
     assert verdict.status == "error"
     assert verdict.pass_ is None
+    # Fix 4: even on the unparseable stage-error path, raw_output is the decoded
+    # stdout so the broker can write it durably to main_output.json.
+    assert _raw_output(result) == "this is not json at all\n"
+
+
+def test_main_py_stdout_not_array_is_stage_error_with_raw_output(workspace, gate_base):
+    # Valid JSON, but an object not the contract-C array -> stage error.
+    main_src = "import json\nprint(json.dumps({'not': 'an array'}))\n"
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": main_src}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    verdict = _verdict(result)
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+    # Fix 4: raw_output is the decoded stdout the check emitted.
+    assert json.loads(_raw_output(result)) == {"not": "an array"}
+
+
+def test_main_py_empty_stdout_exit0_is_stage_error_with_empty_raw_output(workspace, gate_base):
+    # Exit 0 with empty stdout: no fragments -> stage error. raw_output is the
+    # decoded (empty) stdout, NOT None (the subprocess produced usable stdout).
+    main_src = "import sys\nsys.exit(0)\n"
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": main_src}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    verdict = _verdict(result)
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+    # Fix 4: empty stdout decodes to "" (a usable, in-cap value), not None.
+    assert _raw_output(result) == ""
 
 
 # --------------------------------------------------------------------------
@@ -362,14 +436,15 @@ def test_main_py_unparseable_stdout_is_stage_error(workspace, gate_base):
 
 
 def test_main_py_invalid_fragment_replaced_by_synthetic_failing(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_INVALID_FRAGMENT}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_INVALID_FRAGMENT}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     # The fragment had no name/passed -> replaced by a synthetic failing one.
     assert verdict.pass_ is False
@@ -384,14 +459,15 @@ def test_main_py_invalid_fragment_replaced_by_synthetic_failing(workspace, gate_
 
 
 def test_main_py_invoked_with_artifact_and_workspace_args_in_gate_cwd(workspace, gate_base):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_ECHO_ARGS}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_ECHO_ARGS}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     echo = verdict.checks[0]
     # `--artifact <path> --workspace <workspace_dir>`
@@ -404,132 +480,48 @@ def test_main_py_invoked_with_artifact_and_workspace_args_in_gate_cwd(workspace,
 
 
 # --------------------------------------------------------------------------
-# eval.md: evaluator reads fragments from the injected result_file_path
+# pass True iff ALL fragments passed
 # --------------------------------------------------------------------------
 
 
-def test_evaluator_fragments_read_from_injected_result_file(workspace, gate_base):
-    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True, "score": 4.5}])
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "Judge the artifact for faithfulness."}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
+def test_pass_true_only_when_all_fragments_pass(workspace, gate_base):
+    main_src = (
+        "import json\n"
+        "print(json.dumps([{'name': 'a', 'passed': True}, {'name': 'b', 'passed': True}]))\n"
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.status == "evaluated"
     assert verdict.pass_ is True
-    assert len(fake.calls) == 1
-    params = fake.calls[0]
-    assert isinstance(params, EvaluatorHarnessParams)
-    # The evaluator's instruction is the eval.md body.
-    assert params.instruction == "Judge the artifact for faithfulness."
-    # result_file_path is inside the gate dir, not workspace, not /tmp.
-    rfp = os.path.realpath(params.result_file_path)
-    assert rfp.startswith(os.path.realpath(gate_base))
-    assert not rfp.startswith(os.path.realpath(workspace) + os.sep)
-    assert not rfp.startswith("/tmp/")
-    # gate_cwd is the materialized gate dir, workspace passed through read-only.
-    assert os.path.realpath(params.gate_cwd).startswith(os.path.realpath(gate_base))
-    assert params.workspace_dir == workspace
-    # The faithfulness check is tagged type 'agent'.
-    agent_checks = [c for c in verdict.checks if c["name"] == "faithfulness"]
-    assert len(agent_checks) == 1
-    assert agent_checks[0]["type"] == "agent"
-
-
-# --------------------------------------------------------------------------
-# eval.md: missing result file -> stage error
-# --------------------------------------------------------------------------
-
-
-def test_evaluator_missing_result_file_is_stage_error(workspace, gate_base):
-    fake = FakeEvaluator(write_file=False)
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
-    )
-    assert verdict.status == "error"
-    assert verdict.pass_ is None
-
-
-def test_evaluator_unparseable_result_file_is_stage_error(workspace, gate_base):
-    fake = FakeEvaluator(write_file=True, file_contents="{not json")
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
-    )
-    assert verdict.status == "error"
-    assert verdict.pass_ is None
-
-
-# --------------------------------------------------------------------------
-# Both stages run; pass True iff ALL fragments passed
-# --------------------------------------------------------------------------
-
-
-def test_both_stages_pass_true_only_when_all_fragments_pass(workspace, gate_base):
-    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
-    )
-    assert verdict.status == "evaluated"
-    assert verdict.pass_ is True
-    # Both stages ran (deterministic-first), fragments from both present.
     names = sorted(c["name"] for c in verdict.checks)
-    assert names == ["faithfulness", "grounding"]
-    assert len(fake.calls) == 1
+    assert names == ["a", "b"]
 
 
-def test_both_stages_one_failing_fragment_yields_pass_false(workspace, gate_base):
-    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": False}])
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
+def test_pass_false_when_one_fragment_fails(workspace, gate_base):
+    main_src = (
+        "import json\n"
+        "print(json.dumps([{'name': 'a', 'passed': True}, {'name': 'b', 'passed': False}]))\n"
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.status == "evaluated"
     assert verdict.pass_ is False
-
-
-def test_evaluator_runner_status_error_makes_verdict_error(workspace, gate_base):
-    fake = FakeEvaluator(
-        write_file=True,
-        result=EvaluatorResult(fragments=[], status="error"),
-    )
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
-    )
-    assert verdict.status == "error"
-    assert verdict.pass_ is None
 
 
 # --------------------------------------------------------------------------
@@ -539,14 +531,15 @@ def test_evaluator_runner_status_error_makes_verdict_error(workspace, gate_base)
 
 def test_verdict_carries_resolved_qa_version_ids(workspace, gate_base):
     ids = {"manifest.json": "v-man", "main.py": "v-main"}
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}, resolved_qa_version_ids=ids),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}, resolved_qa_version_ids=ids),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.qa_version_ids == ids
 
@@ -557,20 +550,19 @@ def test_verdict_carries_resolved_qa_version_ids(workspace, gate_base):
 
 
 def test_qa_dir_materialized_outside_workspace_and_tmp_and_deleted(workspace, gate_base):
-    captured = {}
-
     _MAIN_REPORT_CWD = """\
 import json, os
 print(json.dumps([{"name": "loc", "passed": True, "cwd": os.getcwd()}]))
 """
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_REPORT_CWD, "eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=FakeEvaluator(),
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_REPORT_CWD}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     gate_cwd = next(c["cwd"] for c in verdict.checks if c.get("name") == "loc")
     real_gate = os.path.realpath(gate_cwd)
@@ -585,7 +577,6 @@ print(json.dumps([{"name": "loc", "passed": True, "cwd": os.getcwd()}]))
     assert real_gate.startswith(os.path.realpath(gate_base))
     # Deleted after the gate finished.
     assert not os.path.exists(gate_cwd)
-    captured["gate_cwd"] = gate_cwd
 
 
 # --------------------------------------------------------------------------
@@ -605,14 +596,15 @@ def test_verdict_capped_at_8kb_truncates_violations_then_detail(workspace, gate_
         "print(json.dumps(frags))\n"
     )
 
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": main_src}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     # Assert on the SERIALIZED verdict — that is the only thing the cap protects.
     # The untruncated `verdict.checks`/`verdict.violations` attributes are NOT
@@ -647,14 +639,15 @@ def test_internal_exception_yields_error_verdict_never_raises(workspace, gate_ba
         fh.write("x")
     bad_base = os.path.join(bad_parent, "nope")
 
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=bad_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=bad_base,
+        )
     )
     assert isinstance(verdict, Verdict)
     assert verdict.status == "error"
@@ -666,24 +659,22 @@ def test_internal_exception_yields_error_verdict_never_raises(workspace, gate_ba
 # --------------------------------------------------------------------------
 
 
-def test_blocking_true_still_runs_both_stages_observe_only(workspace, gate_base):
-    # blocking: true must NOT short-circuit; both stages still run and the
-    # verdict still rides the success path. (Observe-only.)
-    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(
-            files={"main.py": _MAIN_FAIL, "eval.md": "judge"},
-            manifest={"blocking": True},
-        ),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
+def test_blocking_true_still_runs_main_observe_only(workspace, gate_base):
+    # blocking: true must NOT short-circuit; main.py still runs and the verdict
+    # still rides the success path. (Observe-only.)
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(
+                files={"main.py": _MAIN_FAIL},
+                manifest={"blocking": True},
+            ),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
-    # Deterministic stage failed, but the evaluator STILL ran (no short-circuit).
-    assert len(fake.calls) == 1
     assert verdict.status == "evaluated"
     assert verdict.pass_ is False
 
@@ -693,20 +684,21 @@ def test_blocking_true_still_runs_both_stages_observe_only(workspace, gate_base)
 # --------------------------------------------------------------------------
 
 
-def test_evaluator_empty_fragments_is_evaluated_but_pass_none(workspace, gate_base):
-    # The evaluator ran to completion (status 'ok') but emitted an empty
-    # fragment array. status is 'evaluated' (no stage error), but `all([])` is
-    # vacuously True today — pass MUST be None, not True. An entrypoint that
-    # produced zero fragments verified nothing.
-    fake = FakeEvaluator(fragments=[])
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "judge"}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
-        gate_base_dir=gate_base,
+def test_empty_fragments_is_evaluated_but_pass_none(workspace, gate_base):
+    # main.py exits 0 with an empty JSON array. The stage didn't error, so
+    # status is 'evaluated' — but `all([])` is vacuously True today, and an
+    # entrypoint that produced zero fragments verified nothing, so pass MUST be
+    # None, not True (A1).
+    main_src = "import json\nprint(json.dumps([]))\n"
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.status == "evaluated"
     assert verdict.checks == []
@@ -721,14 +713,15 @@ def test_evaluator_empty_fragments_is_evaluated_but_pass_none(workspace, gate_ba
 def test_main_py_stderr_broker_token_redacted_from_verdict_detail(workspace, gate_base):
     secret = "tok-super-secret-9f8a7b6c5d"
     main_src = f"import sys\nsys.stderr.write('crashed; leaked BROKER_TOKEN={secret} oops\\n')\nsys.exit(2)\n"
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": main_src}),
-        workspace_dir=workspace,
-        broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     synthetic = [c for c in verdict.checks if c["name"] == "main_py_exit"]
     assert len(synthetic) == 1
@@ -747,44 +740,45 @@ def test_main_py_stderr_broker_token_redacted_from_verdict_detail(workspace, gat
 
 
 def test_main_py_subprocess_filenotfound_is_error_fail_open(workspace, gate_base, monkeypatch):
-    import pmf_engine.runner.qa_gate as qa_gate_mod
-
     def boom(*_a, **_k):
         raise FileNotFoundError("python3 not on PATH")
 
     monkeypatch.setattr(qa_gate_mod.subprocess, "Popen", boom)
 
-    verdict = run_qa_gate(
+    result = run_qa_gate(
         artifact_bytes=ARTIFACT,
         qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
     )
+    verdict = _verdict(result)
     assert isinstance(verdict, Verdict)
     assert verdict.status == "error"
     assert verdict.pass_ is None
+    # Fix 4: spawn failure never produced stdout -> raw_output None.
+    assert _raw_output(result) is None
 
 
 # --------------------------------------------------------------------------
-# A4: a PRESENT but invalid timeout/turns value logs a warning when coerced.
+# A4: a PRESENT but invalid timeout value logs a warning when coerced.
 # --------------------------------------------------------------------------
 
 
 def test_invalid_present_timeout_logs_coercion_warning(workspace, gate_base, gate_logs):
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(
-            files={"main.py": _MAIN_PASS},
-            manifest={"blocking": False, "deterministic": {"timeout_seconds": -5}},
-        ),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(
+                files={"main.py": _MAIN_PASS},
+                manifest={"blocking": False, "deterministic": {"timeout_seconds": -5}},
+            ),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     # Misconfiguration is discoverable; the run still proceeds on the default.
     assert verdict.status == "evaluated"
@@ -801,7 +795,6 @@ def test_absent_timeout_does_not_log_coercion_warning(workspace, gate_base, gate
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
     )
     # An ABSENT value taking the default is normal, not a misconfiguration.
@@ -820,7 +813,6 @@ def test_run_id_in_stage_error_log_line(workspace, gate_base, gate_logs):
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
         run_id="run-abc-123",
         experiment_id="exp-xyz",
@@ -831,38 +823,55 @@ def test_run_id_in_stage_error_log_line(workspace, gate_base, gate_logs):
 
 
 # --------------------------------------------------------------------------
-# A7: evaluator status-error log carries session_id/num_turns/cost + run_id.
+# Verdict summary INFO log fires so a smoke is CloudWatch-verifiable.
 # --------------------------------------------------------------------------
 
 
-def test_evaluator_status_error_log_carries_context(workspace, gate_base, gate_logs):
-    fake = FakeEvaluator(
-        write_file=True,
-        result=EvaluatorResult(
-            fragments=[],
-            status="error",
-            session_id="sess-99",
-            num_turns=7,
-            cost_usd=0.12,
-        ),
-    )
+def test_verdict_summary_logged_at_info(workspace, gate_base, gate_info_logs):
+    """After aggregating, the gate logs the verdict at INFO with status, pass,
+    check count, and run_id so a deployed smoke can verify the gate ran from
+    CloudWatch alone."""
     run_qa_gate(
         artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=fake,
         gate_base_dir=gate_base,
-        run_id="run-eval-1",
+        run_id="run-info-1",
     )
-    rec = [m for m in _messages(gate_logs) if "evaluator_status_error" in m]
-    assert len(rec) == 1
-    msg = rec[0]
-    assert "sess-99" in msg
-    assert "num_turns=7" in msg
-    assert "0.12" in msg
-    assert "run-eval-1" in msg
+    info = [
+        r for r in gate_info_logs.records
+        if "qa_gate_verdict" in r.getMessage() and r.levelno == logging.INFO
+    ]
+    assert len(info) == 1
+    msg = info[0].getMessage()
+    assert "status=evaluated" in msg
+    assert "pass=True" in msg
+    assert "checks=1" in msg
+    assert "run-info-1" in msg
+
+
+def test_verdict_summary_logged_for_skipped(workspace, gate_base, gate_info_logs):
+    """The summary log also fires on the skipped path (no main.py) so an empty
+    qa folder is visible in CloudWatch, not silent."""
+    run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+        run_id="run-skip-1",
+    )
+    info = [
+        r for r in gate_info_logs.records
+        if "qa_gate_verdict" in r.getMessage() and r.levelno == logging.INFO
+    ]
+    assert len(info) == 1
+    msg = info[0].getMessage()
+    assert "status=skipped" in msg
+    assert "run-skip-1" in msg
 
 
 # --------------------------------------------------------------------------
@@ -874,14 +883,15 @@ def test_evaluator_status_error_log_carries_context(workspace, gate_base, gate_l
 def test_main_py_stdout_over_cap_is_stage_error(workspace, gate_base):
     # Stream well past the 1MB cap on stdout.
     main_src = "import sys\nchunk = 'A' * 65536\nfor _ in range(40):\n    sys.stdout.write(chunk)\nsys.stdout.flush()\n"
-    verdict = run_qa_gate(
-        artifact_bytes=ARTIFACT,
-        qa_envelope=_envelope(files={"main.py": main_src}),
-        workspace_dir=workspace,
-        broker_env=_broker_env(),
-        remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
-        gate_base_dir=gate_base,
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
     )
     assert verdict.status == "error"
     assert verdict.pass_ is None
@@ -894,7 +904,7 @@ def test_main_py_stdout_over_cap_is_stage_error(workspace, gate_base):
 
 def test_main_py_timeout_is_stage_error(workspace, gate_base):
     main_src = "import time\ntime.sleep(30)\n"
-    verdict = run_qa_gate(
+    result = run_qa_gate(
         artifact_bytes=ARTIFACT,
         qa_envelope=_envelope(
             files={"main.py": main_src},
@@ -903,11 +913,13 @@ def test_main_py_timeout_is_stage_error(workspace, gate_base):
         workspace_dir=workspace,
         broker_env=_broker_env(),
         remaining_budget_seconds=BIG_BUDGET,
-        evaluator_runner=_never_called_evaluator,
         gate_base_dir=gate_base,
     )
+    verdict = _verdict(result)
     assert verdict.status == "error"
     assert verdict.pass_ is None
+    # Fix 4: a killed subprocess never yielded usable stdout -> raw_output None.
+    assert _raw_output(result) is None
 
 
 def test_default_gate_root_honors_qa_gate_root_env(monkeypatch):
@@ -919,3 +931,96 @@ def test_default_gate_root_honors_qa_gate_root_env(monkeypatch):
     assert qa_gate_mod._default_gate_root() == "/custom/writable-root"
     monkeypatch.setenv("QA_GATE_ROOT", "   ")
     assert qa_gate_mod._default_gate_root() == qa_gate_mod.DEFAULT_QA_GATE_ROOT
+
+
+# --------------------------------------------------------------------------
+# Fix 1 (HIGH): raw_output is capped by ENCODED bytes, never the broker cap.
+# decode(errors='replace') turns each invalid byte into U+FFFD (3 bytes), so a
+# within-cap stdout of invalid bytes could decode to ~3x its size and blow the
+# broker's 1 MiB cap. The returned raw_output must always encode to <= the cap.
+# --------------------------------------------------------------------------
+
+
+def test_raw_output_capped_by_encoded_bytes_for_invalid_utf8(workspace, gate_base):
+    # main.py writes ~1 MiB (just under the cap) of invalid UTF-8 bytes to
+    # stdout, with NO valid JSON. Under errors='replace' this would decode to
+    # ~3 MiB; the returned raw_output must encode to <= _MAIN_STDOUT_CAP.
+    near_cap = qa_gate_mod._MAIN_STDOUT_CAP - 4096
+    main_src = (
+        "import sys\n"
+        f"sys.stdout.buffer.write(b'\\xff' * {near_cap})\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": main_src}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    # Invalid bytes are not parseable JSON -> stage error, but raw_output is
+    # still the (capped) decoded stdout.
+    verdict = _verdict(result)
+    assert verdict.status == "error"
+    raw = _raw_output(result)
+    assert raw is not None
+    assert len(raw.encode("utf-8")) <= qa_gate_mod._MAIN_STDOUT_CAP
+
+
+# --------------------------------------------------------------------------
+# Fix 2 (MEDIUM): the broker token printed to STDOUT is redacted from
+# raw_output (which the broker writes durably to main_output.json on S3).
+# --------------------------------------------------------------------------
+
+
+def test_raw_output_redacts_broker_token_printed_to_stdout(workspace, gate_base):
+    secret = "tok-stdout-secret-1a2b3c4d5e"
+    # main.py prints the literal broker token on stdout (not as JSON fragments).
+    main_src = f"print('leaked BROKER_TOKEN={secret} to stdout')\n"
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": main_src}),
+        workspace_dir=workspace,
+        broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    raw = _raw_output(result)
+    assert raw is not None
+    # The live token must NOT survive into the durable S3 main_output.json.
+    assert secret not in raw
+    assert qa_gate_mod._REDACTED in raw
+
+
+# --------------------------------------------------------------------------
+# Fix 3 (MEDIUM): a broker token in an author-emitted fragment string field
+# (detail) is redacted before it lands in the aggregated verdict's checks.
+# --------------------------------------------------------------------------
+
+
+def test_fragment_detail_redacts_broker_token(workspace, gate_base):
+    secret = "tok-fragment-secret-9z8y7x6w5v"
+    main_src = (
+        "import json\n"
+        f"print(json.dumps([{{'name': 'leaky', 'passed': False, 'detail': 'saw BROKER_TOKEN={secret} oops'}}]))\n"
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    leaky = [c for c in verdict.checks if c["name"] == "leaky"]
+    assert len(leaky) == 1
+    detail = leaky[0]["detail"]
+    # The live token must NOT survive into the verdict (it travels to gp-api +
+    # Braintrust + the durable verdict.json).
+    assert secret not in detail
+    assert qa_gate_mod._REDACTED in detail
+    # The whole serialized verdict is clean too.
+    assert secret not in json.dumps(verdict.to_dict())

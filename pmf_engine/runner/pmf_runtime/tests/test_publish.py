@@ -123,6 +123,75 @@ class TestPublish:
         publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0, qa_verdict=None)
         assert "qa_verdict" not in captured["body"]
 
+    def test_publish_includes_qa_raw_output_when_passed(self):
+        """The raw main.py stdout (contract D) carries to the broker for the
+        durable S3 capture. When present, publish forwards it under the additive
+        optional `qa_raw_output` key alongside the aggregated verdict."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {
+            "verdict_version": 1,
+            "qa_version_ids": {"main.py": "v1"},
+            "status": "evaluated",
+            "pass": True,
+            "checks": [{"name": "grounding", "passed": True}],
+            "violations": [],
+            "duration_ms": 120,
+            "cost_usd": 0.0,
+        }
+        raw = '[{"name": "grounding", "passed": true, "detail": "1.0 >= 0.8"}]'
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_raw_output=raw,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert captured["body"]["qa_raw_output"] == raw
+
+    def test_publish_omits_qa_raw_output_when_none(self):
+        """Absent qa_raw_output (the default) must NOT add the key to the body.
+        A verdict-only publish (no raw output) carries exactly the verdict."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert "qa_raw_output" not in captured["body"]
+
+    def test_publish_no_qa_raw_output_body_byte_identical(self):
+        """A no-qa publish (neither verdict nor raw output) must be byte-identical
+        to today: the body carries only artifact/duration/cost, no qa keys."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0)
+        assert captured["body"] == {
+            "artifact": {"score": 0.95},
+            "duration_seconds": 1.0,
+            "cost_usd": 0.0,
+        }
+
 
 class TestReportStatus:
     def setup_method(self):
