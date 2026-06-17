@@ -29,6 +29,7 @@ cp "$PMF_DIR/control_plane/manifest_loader.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/jsonschema_errors.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/job_store.py" "$OUTPUT_DIR/"
 cp "$PMF_DIR/control_plane/scheduler_handler.py" "$OUTPUT_DIR/"
+cp "$PMF_DIR/control_plane/task_reaper.py" "$OUTPUT_DIR/"
 
 mkdir -p "$OUTPUT_DIR/shared"
 touch "$OUTPUT_DIR/shared/__init__.py"

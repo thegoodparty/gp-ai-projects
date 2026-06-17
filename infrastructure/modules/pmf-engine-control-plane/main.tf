@@ -590,6 +590,94 @@ resource "aws_lambda_permission" "scheduler_tick" {
   source_arn    = aws_cloudwatch_event_rule.scheduler_tick.arn
 }
 
+# --- Task reaper: reconcile RUNNING runs whose Fargate task died silently ---
+# Replaces the old gp-api time-based stale sweep. Fires when an agent task on
+# this cluster STOPS; the handler sends a `failed` callback only on a non-clean
+# exit (the runner reports its own result on a clean exit). Not in a VPC — it
+# only talks to SQS.
+
+resource "aws_iam_role" "task_reaper_role" {
+  name = "pmf-engine-task-reaper-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "task_reaper_basic" {
+  role       = aws_iam_role.task_reaper_role.id
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "task_reaper_permissions" {
+  name = "task-reaper-permissions"
+  role = aws_iam_role.task_reaper_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = var.gp_api_sqs_queue_arn
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_function" "task_reaper" {
+  function_name    = "pmf-engine-task-reaper-${var.environment}"
+  filename         = data.archive_file.dispatch_lambda.output_path
+  source_code_hash = data.archive_file.dispatch_lambda.output_base64sha256
+  handler          = "task_reaper.handler"
+  runtime          = "python3.13"
+  role             = aws_iam_role.task_reaper_role.arn
+  timeout          = 30
+  memory_size      = 128
+
+  environment {
+    variables = {
+      RESULTS_QUEUE_URL = var.gp_api_sqs_queue_url
+      CONTAINER_NAME    = "pmf-engine"
+    }
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "task_reaper" {
+  name        = "pmf-engine-task-reaper-${var.environment}"
+  description = "Reap agent runs whose Fargate task stopped without reporting a result"
+  event_pattern = jsonencode({
+    source      = ["aws.ecs"]
+    detail-type = ["ECS Task State Change"]
+    detail = {
+      clusterArn = [var.ecs_cluster_arn]
+      lastStatus = ["STOPPED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "task_reaper" {
+  rule = aws_cloudwatch_event_rule.task_reaper.name
+  arn  = aws_lambda_function.task_reaper.arn
+}
+
+resource "aws_lambda_permission" "task_reaper" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.task_reaper.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.task_reaper.arn
+}
+
 # --- CloudWatch Alarms ---
 
 resource "aws_cloudwatch_metric_alarm" "dispatch_lambda_errors" {
