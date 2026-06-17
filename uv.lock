@@ -788,6 +788,20 @@ wheels = [
 ]
 
 [[package]]
+name = "docker"
+version = "7.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "requests" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/9b/4a2ea29aeba62471211598dac5d96825bb49348fa07e906ea930394a83ce/docker-7.1.0.tar.gz", hash = "sha256:ad8c70e6e3f8926cb8a92619b832b4ea5299e2831c14284663184e200546fa6c", size = 117834, upload-time = "2024-05-23T11:13:57.216Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/26/57c6fb270950d476074c087527a558ccb6f4436657314bfb6cdf484114c4/docker-7.1.0-py3-none-any.whl", hash = "sha256:c96b93b7f0a746f9e77d325bcfb87422a3d8bd4f03136ae8a85b37f1898d5fc0", size = 147774, upload-time = "2024-05-23T11:13:55.01Z" },
+]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1255,7 +1269,7 @@ campaign-plan-lambda = [
 dev = [
     { name = "braintrust", extra = ["cli"] },
     { name = "jsonschema" },
-    { name = "moto", extra = ["s3"] },
+    { name = "moto", extra = ["dynamodb", "s3"] },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1319,7 +1333,7 @@ campaign-plan-lambda = [
 dev = [
     { name = "braintrust", extras = ["cli"], specifier = ">=0.12.1" },
     { name = "jsonschema", specifier = ">=4.20.0" },
-    { name = "moto", extras = ["s3", "sqs"], specifier = ">=5.0.0" },
+    { name = "moto", extras = ["s3", "sqs", "dynamodb"], specifier = ">=5.0.0" },
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
@@ -2262,6 +2276,10 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+dynamodb = [
+    { name = "docker" },
+    { name = "py-partiql-parser" },
+]
 s3 = [
     { name = "py-partiql-parser" },
     { name = "pyyaml" },

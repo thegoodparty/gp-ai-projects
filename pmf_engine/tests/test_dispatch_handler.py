@@ -7,11 +7,11 @@ import httpx
 import pytest
 
 from pmf_engine.control_plane.dispatch_handler import (
-    handler,
-    parse_dispatch_message,
     build_container_overrides,
+    handler,
+    launch_run,
+    parse_dispatch_message,
 )
-
 
 SYNTHETIC_MANIFEST_VERSION_ID = "test-manifest-v-abc123"
 SYNTHETIC_INSTRUCTION_VERSION_ID = "test-instruction-v-def456"
@@ -66,8 +66,16 @@ def _default_dispatch_env(monkeypatch):
     monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc", raising=False)
     monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo", raising=False)
     monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com", raising=False)
-    monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token-xyz", raising=False)
+    monkeypatch.setattr(
+        dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc", raising=False
+    )
+    # Stub at the secrets-client layer so the real get_service_token() runs in
+    # every dispatch/scheduler test path without hitting Secrets Manager.
+    _fake_secrets = MagicMock()
+    _fake_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"SERVICE_TOKEN": "svc-token-xyz"})}
+    monkeypatch.setattr(dh, "_get_secrets_client", lambda: _fake_secrets)
     monkeypatch.setenv("EXPERIMENT_METADATA_BUCKET", "agent-experiment-metadata-test")
+    monkeypatch.setattr(dh, "JOB_TABLE_NAME", "agent-job-queue-test", raising=False)
     # Drives _input_files bucket validation in dispatch_handler (expected bucket
     # is gp-agent-run-inputs-{ENVIRONMENT}). Test fixtures already use the
     # `-dev` suffix in _VALID_INPUT_FILE, so we set ENVIRONMENT=dev.
@@ -75,8 +83,12 @@ def _default_dispatch_env(monkeypatch):
     fake_loader = _build_synthetic_loader()
     monkeypatch.setattr(dh, "_manifest_loader", fake_loader, raising=False)
     monkeypatch.setattr(dh, "get_manifest_loader", lambda: fake_loader)
+    fake_store = MagicMock()
+    monkeypatch.setattr(dh, "get_job_store", lambda: fake_store)
     dh.reset_validator_cache_for_tests()
     dh.reset_broker_client_for_tests()
+    dh.reset_job_store_for_tests()
+    dh.reset_service_token_for_tests()
 
 
 def _make_sqs_event(body: dict) -> dict:
@@ -106,6 +118,26 @@ def _mock_broker_success(broker_token="tok-abc123"):
 VALID_PARAMS = {"state": "WI"}
 
 
+def _smoke_routing() -> dict:
+    """The routing dict the dispatch handler resolves for the synthetic
+    smoke_test manifest — what `ManifestRoutingLoader.routing_for('smoke_test')`
+    returns. launch_run consumes this directly now that handler no longer mints."""
+    from pmf_engine.tests.conftest import synthetic_manifest
+
+    return _routing_from_manifest(synthetic_manifest())
+
+
+def _make_message(run_id: str, params: dict | None = None, experiment_type: str = "smoke_test") -> dict:
+    return {
+        "experiment_type": experiment_type,
+        "organization_slug": "org-123",
+        "run_id": run_id,
+        "clerk_user_id": "user_test_dispatch",
+        "params": dict(VALID_PARAMS) if params is None else params,
+        "prior_artifact_versions": None,
+    }
+
+
 class TestParseDispatchMessage:
     def test_parses_valid_message(self):
         body = {
@@ -130,6 +162,35 @@ class TestParseDispatchMessage:
         }
         result = parse_dispatch_message(json.dumps(body))
         assert result["params"] == {}
+
+    def test_parse_defaults_priority_to_default(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "o",
+            "run_id": "r",
+            "clerk_user_id": "u",
+        }
+        assert parse_dispatch_message(json.dumps(body))["priority"] == "DEFAULT"
+
+    def test_parse_forwards_high_priority(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "o",
+            "run_id": "r",
+            "clerk_user_id": "u",
+            "priority": "HIGH",
+        }
+        assert parse_dispatch_message(json.dumps(body))["priority"] == "HIGH"
+
+    def test_parse_rejects_invalid_priority(self):
+        body = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "o",
+            "run_id": "r",
+            "priority": "URGENT",
+        }
+        with pytest.raises(ValueError, match="priority"):
+            parse_dispatch_message(json.dumps(body))
 
     def test_raises_on_missing_experiment_type(self):
         body = {"organization_slug": "org-123", "run_id": "run-001"}
@@ -227,7 +288,7 @@ class TestParseDispatchMessage:
             "organization_slug": "org-123",
             "run_id": "run-001",
             "clerk_user_id": "user_test_dispatch",
-            "prior_artifact_versions": {f"k{i}": f"e/r/artifact.json" for i in range(11)},
+            "prior_artifact_versions": {f"k{i}": "e/r/artifact.json" for i in range(11)},
         }
         with pytest.raises(ValueError, match="too large"):
             parse_dispatch_message(json.dumps(body))
@@ -327,9 +388,7 @@ class TestBuildContainerOverrides:
         # sort_keys=True: env-var bytes must be deterministic across dispatches
         # so idempotency checks / cache keys downstream don't churn on dict
         # iteration order.
-        assert env_map["ATTACHMENT_VERSION_IDS"] == json.dumps(
-            {"lookup.csv": "Vlk", "notes.md": "Vnt"}, sort_keys=True
-        )
+        assert env_map["ATTACHMENT_VERSION_IDS"] == json.dumps({"lookup.csv": "Vlk", "notes.md": "Vnt"}, sort_keys=True)
 
     def test_attachment_version_ids_omitted_when_empty(self):
         """Empty attachment_version_ids dict must NOT produce an env var
@@ -385,44 +444,66 @@ class TestBuildContainerOverrides:
 
 
 class TestHandler:
-    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_job_store")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_dispatches_valid_experiment(self, mock_get_ecs, mock_broker_cls):
-        mock_broker_cls.return_value = _mock_broker_success("tok-run001")
-        mock_ecs = mock_get_ecs.return_value
-        mock_ecs.run_task.return_value = {
-            "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
-            "failures": [],
-        }
-
+    def test_valid_message_enqueues_job_and_does_not_launch(self, mock_get_ecs, mock_get_store):
+        store = mock_get_store.return_value
         event = _make_sqs_event(
             {
                 "experiment_type": "smoke_test",
                 "organization_slug": "org-123",
-                "run_id": "run-001",
+                "run_id": "run-q1",
+                "clerk_user_id": "user_test_dispatch",
+                "priority": "HIGH",
+                "params": dict(VALID_PARAMS),
+            }
+        )
+        result = handler(event, None)
+        assert result["batchItemFailures"] == []
+        store.put_queued_job.assert_called_once()
+        job = store.put_queued_job.call_args.args[0]
+        assert job.run_id == "run-q1"
+        assert job.priority == "HIGH"
+        assert job.experiment_type == "smoke_test"
+        assert job.organization_slug == "org-123"
+        assert job.routing["model"] == "sonnet"
+        assert job.routing["manifest_version_id"] == SYNTHETIC_MANIFEST_VERSION_ID
+        assert job.routing["instruction_version_id"] == SYNTHETIC_INSTRUCTION_VERSION_ID
+        assert job.params == dict(VALID_PARAMS)
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.get_job_store")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_enqueue_defaults_priority_to_default(self, mock_get_ecs, mock_get_store):
+        store = mock_get_store.return_value
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-q2",
                 "clerk_user_id": "user_test_dispatch",
                 "params": dict(VALID_PARAMS),
             }
         )
+        handler(event, None)
+        job = store.put_queued_job.call_args.args[0]
+        assert job.priority == "DEFAULT"
 
+    @patch("pmf_engine.control_plane.dispatch_handler.get_job_store")
+    @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
+    def test_enqueue_failure_yields_batch_item_failure(self, mock_emit, mock_get_store):
+        mock_get_store.return_value.put_queued_job.side_effect = RuntimeError("dynamo down")
+        event = _make_sqs_event(
+            {
+                "experiment_type": "smoke_test",
+                "organization_slug": "org-123",
+                "run_id": "run-q3",
+                "clerk_user_id": "user_test_dispatch",
+                "params": dict(VALID_PARAMS),
+            }
+        )
         result = handler(event, None)
-        assert result["batchItemFailures"] == []
-        mock_ecs.run_task.assert_called_once()
-
-        call_kwargs = mock_ecs.run_task.call_args.kwargs
-        overrides = call_kwargs["overrides"]
-        env_list = overrides["containerOverrides"][0]["environment"]
-        env_map = {e["name"]: e["value"] for e in env_list}
-        assert env_map["EXPERIMENT_ID"] == "smoke_test"
-        assert env_map["RUN_ID"] == "run-001"
-        assert env_map["ORGANIZATION_SLUG"] == "org-123"
-        assert env_map["AGENT_MODEL"] == "sonnet"
-        assert "HARNESS" not in env_map  # dropped — runner hardcodes claude_sdk
-        assert env_map["BROKER_TOKEN"] == "tok-run001"
-        assert json.loads(env_map["PARAMS_JSON"]) == dict(VALID_PARAMS)
-        # Version pinning is the core race-defeater; assert end-to-end forwarding.
-        assert env_map["MANIFEST_VERSION_ID"] == SYNTHETIC_MANIFEST_VERSION_ID
-        assert env_map["INSTRUCTION_VERSION_ID"] == SYNTHETIC_INSTRUCTION_VERSION_ID
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -439,7 +520,7 @@ class TestHandler:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
         mock_ecs.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
         call_args = mock_send_error_callback.call_args
@@ -503,18 +584,17 @@ class TestHandler:
         )
 
         warning_records = [r for r in records if r.levelno == logging.WARNING and "nonexistent" in r.getMessage()]
-        assert warning_records == [], (
-            f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
-        )
+        assert (
+            warning_records == []
+        ), f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
 
-        assert any("smoke_test" in r.getMessage() for r in error_records), (
-            "Expected error log to include known experiment IDs for operator triage"
-        )
+        assert any(
+            "smoke_test" in r.getMessage() for r in error_records
+        ), "Expected error log to include known experiment IDs for operator triage"
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_reports_ecs_failure(self, mock_get_ecs, mock_send_error_callback, mock_broker_cls):
+    def test_reports_ecs_failure(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success()
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.return_value = {
@@ -522,24 +602,16 @@ class TestHandler:
             "failures": [{"reason": "RESOURCE:MEMORY"}],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert len(result["batchItemFailures"]) == 1
-        assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-001"
-        mock_send_error_callback.assert_called_once()
-        call_args = mock_send_error_callback.call_args
-        assert call_args[0][0]["run_id"] == "run-001"
-        assert call_args[0][1].startswith("ECS RunTask failed:")
-        assert "RESOURCE:MEMORY" not in call_args[0][1]
+        assert result["status"] == "failed"
+        assert result["error"].startswith("ECS RunTask failed:")
+        assert "RESOURCE:MEMORY" not in result["error"]
 
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_reports_failure_on_invalid_message(self, mock_get_ecs):
@@ -559,10 +631,82 @@ class TestHandler:
         assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-bad"
         mock_ecs.run_task.assert_not_called()
 
-    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_reports_failure_on_empty_tasks_array(self, mock_get_ecs, mock_send_error_callback, mock_broker_cls):
+    def test_malformed_message_with_run_id_notifies_gp_api(self, mock_get_ecs, mock_send_error_callback):
+        # A message that fails parse_dispatch_message validation but still has a
+        # recoverable run_id notifies gp-api (so its QUEUED row gets failed). When
+        # the callback is delivered, the message is NOT retried — re-delivering a
+        # permanently-malformed message is pointless churn (mirrors the other
+        # permanent-fault paths).
+        mock_send_error_callback.return_value = True
+        event = {
+            "Records": [
+                {
+                    "messageId": "msg-bad",
+                    # Valid JSON with run_id but an invalid experiment_type
+                    # (uppercase) — parse_dispatch_message raises ValueError.
+                    "body": json.dumps(
+                        {
+                            "experiment_type": "BadType",
+                            "organization_slug": "org-123",
+                            "run_id": "run-malformed",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        sent_message = mock_send_error_callback.call_args[0][0]
+        assert sent_message["run_id"] == "run-malformed"
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "invalid-payload-run-malformed"
+        assert result["batchItemFailures"] == []
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_malformed_message_batch_fails_when_callback_send_fails(self, mock_get_ecs, mock_send_error_callback):
+        # If the recovery callback can't reach gp-api, the message must be retried
+        # (toward the DLQ) so the failure isn't silently dropped.
+        mock_send_error_callback.return_value = False
+        event = {
+            "Records": [
+                {
+                    "messageId": "msg-bad",
+                    "body": json.dumps(
+                        {
+                            "experiment_type": "BadType",
+                            "organization_slug": "org-123",
+                            "run_id": "run-malformed",
+                        }
+                    ),
+                }
+            ]
+        }
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_called_once()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
+
+    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_unparseable_body_batch_fails_without_callback(self, mock_get_ecs, mock_send_error_callback):
+        # No recoverable run_id — just batch-fail, no callback, no crash.
+        event = {"Records": [{"messageId": "msg-bad", "body": "not-json-at-all"}]}
+
+        result = handler(event, None)
+
+        mock_send_error_callback.assert_not_called()
+        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-bad"}]
+        mock_get_ecs.return_value.run_task.assert_not_called()
+
+    @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
+    @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
+    def test_reports_failure_on_empty_tasks_array(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success()
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.return_value = {
@@ -570,22 +714,15 @@ class TestHandler:
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert len(result["batchItemFailures"]) == 1
-        assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-001"
-        mock_send_error_callback.assert_called_once()
-        call_args = mock_send_error_callback.call_args
-        assert call_args[0][0]["run_id"] == "run-001"
+        assert result["status"] == "failed"
+        assert result["error"].startswith("ECS RunTask failed:")
 
     @patch("pmf_engine.control_plane.dispatch_handler.get_sqs_client")
     def test_send_error_callback_sqs_failure_logged_not_thrown(self, mock_get_sqs):
@@ -622,31 +759,27 @@ class TestHandler:
         assert "SQS unreachable" in combined
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_exception_sends_error_callback(self, mock_get_ecs, mock_send_error_callback, mock_broker_cls):
-        mock_broker_cls.return_value = _mock_broker_success()
+    def test_ecs_exception_sends_error_callback(self, mock_get_ecs, mock_broker_cls):
+        # launch_run re-raises the raw ECS exception (transient — caller retries)
+        # after cleaning up the minted token. The user-facing sanitization
+        # (`ECS RunTask exception: <type>`) now lives in the handler that wraps
+        # launch_run; here we only assert launch_run propagates the original
+        # exception and cleaned up the token.
+        mock_broker = _mock_broker_success()
+        mock_broker_cls.return_value = mock_broker
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
-
-        result = handler(event, None)
-        assert len(result["batchItemFailures"]) == 1
-        assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-001"
-        mock_send_error_callback.assert_called_once()
-        call_args = mock_send_error_callback.call_args
-        assert call_args[0][0]["run_id"] == "run-001"
-        assert call_args[0][1] == "ECS RunTask exception: Exception"
-        assert "Network timeout" not in call_args[0][1]
+        message = _make_message("run-001")
+        with pytest.raises(Exception, match="Network timeout"):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
+        mock_broker.delete_run_token.assert_called_once()
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -655,19 +788,14 @@ class TestHandler:
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
-
-        result = handler(event, None)
-        assert len(result["batchItemFailures"]) == 1
-        assert result["batchItemFailures"][0]["itemIdentifier"] == "msg-001"
+        message = _make_message("run-001")
+        with pytest.raises(Exception, match="Network timeout"):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
 
 
 class TestBrokerFlow:
@@ -681,18 +809,14 @@ class TestBrokerFlow:
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        assert result["status"] == "launched"
         mock_ecs.run_task.assert_called_once()
 
         env_list = mock_ecs.run_task.call_args.kwargs["overrides"]["containerOverrides"][0]["environment"]
@@ -700,10 +824,9 @@ class TestBrokerFlow:
         assert env_map["BROKER_TOKEN"] == "tok-from-broker"
         assert env_map["BROKER_URL"] == "https://broker.example.com"
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_broker_400_sends_error_callback_no_ecs(self, mock_get_ecs, mock_broker_cls, mock_send_error_callback):
+    def test_broker_400_sends_error_callback_no_ecs(self, mock_get_ecs, mock_broker_cls):
         from pmf_engine.control_plane.broker_client import BrokerError
 
         mock_broker = mock_broker_cls.return_value
@@ -711,72 +834,50 @@ class TestBrokerFlow:
             400, "Param classifier rejected: nested objects", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        assert result == {"status": "failed", "error": "Invalid experiment parameters"}
         mock_get_ecs.return_value.run_task.assert_not_called()
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args[0][1] == "Invalid experiment parameters"
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "broker-rejected-run-001"
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_broker_401_sends_error_callback(self, mock_get_ecs, mock_broker_cls, mock_send_error_callback):
+    def test_broker_401_sends_error_callback(self, mock_get_ecs, mock_broker_cls):
         from pmf_engine.control_plane.broker_client import BrokerError
 
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = BrokerError(401, "Invalid service token")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        assert result == {"status": "failed", "error": "Broker rejected the request"}
         mock_get_ecs.return_value.run_task.assert_not_called()
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args[0][1] == "Broker rejected the request"
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_broker_400_without_user_safe_message_uses_generic(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_broker_400_without_user_safe_message_uses_generic(self, mock_get_ecs, mock_broker_cls):
         from pmf_engine.control_plane.broker_client import BrokerError
 
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = BrokerError(400, "Some detail", "")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-001")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        handler(event, None)
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args[0][1] == "Broker rejected the request"
+        assert result == {"status": "failed", "error": "Broker rejected the request"}
 
 
 class TestNonDictParamsGuard:
@@ -817,7 +918,7 @@ class TestNonDictParamsGuard:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
 
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
@@ -854,74 +955,79 @@ class TestNonDictParamsGuard:
 
 
 class TestErrorCallbackStableDedup:
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
+    # NOTE: error-callback dedup_id construction moved to the handler that wraps
+    # launch_run. launch_run itself only returns a status/error dict (or raises
+    # on transient errors). These tests now assert launch_run's classification
+    # of each failure mode; the stable-dedup mapping is covered at the handler
+    # layer.
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_runtask_failure_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls, mock_send_error_callback):
+    def test_ecs_runtask_failure_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success()
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [],
             "failures": [{"reason": "RESOURCE:MEMORY"}],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-abc",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-abc")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
+        assert result["status"] == "failed"
+        assert result["error"].startswith("ECS RunTask failed:")
 
-        handler(event, None)
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "runtask-failed-run-abc"
-
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_exception_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls, mock_send_error_callback):
+    def test_ecs_exception_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success()
         mock_get_ecs.return_value.run_task.side_effect = Exception("Network timeout")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-abc",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
+        message = _make_message("run-abc")
+        with pytest.raises(Exception, match="Network timeout"):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
 
-        handler(event, None)
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "runtask-exception-run-abc"
-
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_broker_rejection_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls, mock_send_error_callback):
+    def test_broker_rejection_uses_stable_dedup(self, mock_get_ecs, mock_broker_cls):
         from pmf_engine.control_plane.broker_client import BrokerError
 
         mock_broker_cls.return_value.mint_run_token.side_effect = BrokerError(
             400, "rejected", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-abc",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-abc")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
+        assert result == {"status": "failed", "error": "Invalid experiment parameters"}
 
-        handler(event, None)
-        mock_send_error_callback.assert_called_once()
-        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "broker-rejected-run-abc"
+
+class TestGetServiceToken:
+    def test_fetches_from_secrets_manager_and_caches(self, monkeypatch):
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        dh.reset_service_token_for_tests()
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
+        fake_client = MagicMock()
+        fake_client.get_secret_value.return_value = {"SecretString": json.dumps({"SERVICE_TOKEN": "tok"})}
+        monkeypatch.setattr(dh, "_get_secrets_client", lambda: fake_client)
+
+        assert dh.get_service_token() == "tok"
+        # Second call is served from the warm-container cache, not Secrets Manager.
+        assert dh.get_service_token() == "tok"
+        fake_client.get_secret_value.assert_called_once_with(SecretId="arn:aws:secretsmanager:us-west-2:123:secret:svc")
+        dh.reset_service_token_for_tests()
 
 
 class TestMissingCriticalEnvVars:
@@ -936,7 +1042,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc")
         monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo")
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
-        monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
 
         event = _make_sqs_event(
             {
@@ -967,7 +1073,7 @@ class TestMissingCriticalEnvVars:
         monkeypatch.setattr(dh, "ECS_SECURITY_GROUP_ID", "sg-abc")
         monkeypatch.setattr(dh, "RESULTS_QUEUE_URL", "https://sqs.example.com/callback.fifo")
         monkeypatch.setattr(dh, "BROKER_URL", "https://broker.example.com")
-        monkeypatch.setattr(dh, "SERVICE_TOKEN", "svc-token")
+        monkeypatch.setattr(dh, "SERVICE_TOKENS_SECRET_ARN", "arn:aws:secretsmanager:us-west-2:123:secret:svc")
 
         event = _make_sqs_event(
             {
@@ -979,7 +1085,7 @@ class TestMissingCriticalEnvVars:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
         error_msg = mock_send_error_callback.call_args[0][1]
@@ -1045,10 +1151,7 @@ class TestMissingCriticalEnvVars:
         mock_send_error_callback.assert_called_once()
         error_msg = mock_send_error_callback.call_args[0][1]
         assert "ENVIRONMENT" in error_msg
-        assert (
-            mock_send_error_callback.call_args.kwargs["dedup_id"]
-            == "dispatch-misconfig-run-env-missing"
-        )
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "dispatch-misconfig-run-env-missing"
         assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
 
@@ -1069,7 +1172,7 @@ class TestParamsSizeLimit:
             }
         )
 
-        result = handler(event, None)
+        handler(event, None)
 
         mock_get_ecs.return_value.run_task.assert_not_called()
         mock_send_error_callback.assert_called_once()
@@ -1081,7 +1184,8 @@ class TestParamsSizeLimit:
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_params_just_under_limit_proceed_to_ecs(self, mock_get_ecs, mock_broker_cls):
-        mock_broker_cls.return_value = _mock_broker_success()
+        mock_broker = _mock_broker_success()
+        mock_broker_cls.return_value = mock_broker
         mock_ecs = mock_get_ecs.return_value
         mock_ecs.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
@@ -1093,26 +1197,21 @@ class TestParamsSizeLimit:
         # use the optional `note` field rather than inventing a new key.
         small = {**VALID_PARAMS, "note": "x" * 100}
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": small,
-            }
+        message = _make_message("run-001", params=small)
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        assert result["status"] == "launched"
+        mock_broker.mint_run_token.assert_called_once()
         mock_ecs.run_task.assert_called_once()
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_oversized_input_files_rejected_before_ecs(
-        self, mock_get_ecs, mock_emit_metric, mock_send_error_callback
-    ):
+    def test_oversized_input_files_rejected_before_ecs(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
         # Worst-case-shaped entries: bucket-name max + key-max + dest-max
         # serialize to ~1.3 KB each. 10 entries → ~13 KB, well past the
         # ECS RunTask containerOverrides budget. Verify the cap fires before
@@ -1146,10 +1245,7 @@ class TestParamsSizeLimit:
         error_msg = mock_send_error_callback.call_args[0][1]
         assert "_input_files" in error_msg
         assert "exceeds limit" in error_msg
-        assert (
-            mock_send_error_callback.call_args.kwargs["dedup_id"]
-            == "input-files-too-large-run-big-inputs"
-        )
+        assert mock_send_error_callback.call_args.kwargs["dedup_id"] == "input-files-too-large-run-big-inputs"
         assert result["batchItemFailures"] == []
 
 
@@ -1223,55 +1319,42 @@ class TestRequiredParamsValidation:
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-ok",
-                "run_id": "run-ok",
-                "clerk_user_id": "user_test_dispatch",
-                "params": {"state": "WI"},
-            }
+        message = _make_message("run-ok", params={"state": "WI"})
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        handler(event, None)
-
+        assert result["status"] == "launched"
         mock_broker_cls.return_value.mint_run_token.assert_called_once()
         mock_get_ecs.return_value.run_task.assert_called_once()
 
 
 class TestTransientBrokerErrors:
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_transient_httpx_error_during_mint_yields_batch_item_failure(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_transient_httpx_error_during_mint_yields_batch_item_failure(self, mock_get_ecs, mock_broker_cls):
+        # launch_run re-raises transient httpx errors so the handler maps them
+        # to a batch_item_failure (SQS retry). The batch-level retry assertion
+        # is the handler's concern now.
         mock_broker = mock_broker_cls.return_value
         mock_broker.mint_run_token.side_effect = httpx.ConnectError("DNS failed")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-transient",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
-
-        result = handler(event, None)
-
-        assert isinstance(result, dict)
-        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        message = _make_message("run-transient")
+        with pytest.raises(httpx.HTTPError):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
         mock_get_ecs.return_value.run_task.assert_not_called()
-        mock_send_error_callback.assert_not_called()
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_broker_4xx_still_goes_through_existing_error_callback_path(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_broker_4xx_still_goes_through_existing_error_callback_path(self, mock_get_ecs, mock_broker_cls):
         from pmf_engine.control_plane.broker_client import BrokerError
 
         mock_broker = mock_broker_cls.return_value
@@ -1279,20 +1362,15 @@ class TestTransientBrokerErrors:
             400, "Param classifier rejected", "Invalid experiment parameters"
         )
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-terminal",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-terminal")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        result = handler(event, None)
-
-        assert result["batchItemFailures"] == []
-        mock_send_error_callback.assert_called_once()
+        assert result == {"status": "failed", "error": "Invalid experiment parameters"}
         mock_get_ecs.return_value.run_task.assert_not_called()
 
 
@@ -1303,31 +1381,25 @@ class TestDispatchHandlerErrorPathResilience:
     Also covers: if send_error_callback fails at the SQS layer, the caller
     must add to batch_item_failures so the message is re-delivered."""
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_programmer_error_during_mint_sends_callback_and_retries(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_programmer_error_during_mint_sends_callback_and_retries(self, mock_get_ecs, mock_broker_cls):
+        # An unexpected (non-BrokerError, non-httpx) exception during mint is
+        # caught by launch_run and returned as a sanitized failed dict carrying
+        # only the exception type name — never the raw message. The handler
+        # decides whether to retry from that dict.
         mock_broker_cls.side_effect = KeyError("missing config key somewhere")
-        mock_send_error_callback.return_value = True
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-x",
-                "run_id": "run-prog-err",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-prog-err")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        result = handler(event, None)
-
-        mock_send_error_callback.assert_called_once()
-        call_args = mock_send_error_callback.call_args
-        assert "run-prog-err" in str(call_args) or "run-prog-err" in call_args.kwargs.get("dedup_id", "")
-        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
+        assert result == {"status": "failed", "error": "Unexpected dispatch error: KeyError"}
+        assert "missing config key somewhere" not in result["error"]
         mock_get_ecs.return_value.run_task.assert_not_called()
 
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
@@ -1542,12 +1614,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
     generic message to send_error_callback.
     """
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_run_task_failure_callback_does_not_leak_raw_reason(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_ecs_run_task_failure_callback_does_not_leak_raw_reason(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success()
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [],
@@ -1563,35 +1632,35 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             ],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-iam-leak",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-iam-leak")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        handler(event, None)
-
-        mock_send_error_callback.assert_called_once()
-        error_str = mock_send_error_callback.call_args[0][1]
+        assert result["status"] == "failed"
+        error_str = result["error"]
         assert "arn:aws:iam" not in error_str, f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
-        assert "333022194791" not in error_str, (
-            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
-        )
+        assert (
+            "333022194791" not in error_str
+        ), f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
         assert "ECS RunTask failed" in error_str
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_run_task_exception_callback_does_not_leak_raw_exception_message(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_ecs_run_task_exception_callback_does_not_leak_raw_exception_message(self, mock_get_ecs, mock_broker_cls):
+        # On an ECS RunTask exception, launch_run re-raises the raw exception
+        # (so the handler can retry) AFTER cleaning up the minted token. The
+        # user-facing no-leak message (`ECS RunTask exception: <type>`, with no
+        # ARN/account-id) is built by the handler from `type(e).__name__` — see
+        # the handler-level coverage of that sanitization. Here we assert
+        # launch_run propagates the exception and cleaned up the token.
         from botocore.exceptions import ClientError
 
-        mock_broker_cls.return_value = _mock_broker_success()
+        mock_broker = _mock_broker_success()
+        mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.side_effect = ClientError(
             {
                 "Error": {
@@ -1605,32 +1674,19 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             "RunTask",
         )
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-iam-exc-leak",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
+        message = _make_message("run-iam-exc-leak")
+        with pytest.raises(ClientError):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
+        mock_broker.delete_run_token.assert_called_once()
 
-        handler(event, None)
-
-        mock_send_error_callback.assert_called_once()
-        error_str = mock_send_error_callback.call_args[0][1]
-        assert "arn:aws:iam" not in error_str, f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
-        assert "333022194791" not in error_str, (
-            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
-        )
-        assert "ClientError" in error_str, f"Expected exception type name in sanitized message, got: {error_str!r}"
-
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_run_task_failure_logs_full_detail_server_side(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_ecs_run_task_failure_logs_full_detail_server_side(self, mock_get_ecs, mock_broker_cls):
         import pmf_engine.control_plane.dispatch_handler as dh
 
         mock_broker_cls.return_value = _mock_broker_success()
@@ -1651,24 +1707,21 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         dh.logger.addHandler(collector)
         dh.logger.setLevel(logging.DEBUG)
         try:
-            event = _make_sqs_event(
-                {
-                    "experiment_type": "smoke_test",
-                    "organization_slug": "org-123",
-                    "run_id": "run-log-detail",
-                    "clerk_user_id": "user_test_dispatch",
-                    "params": dict(VALID_PARAMS),
-                }
+            message = _make_message("run-log-detail")
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
             )
-            handler(event, None)
         finally:
             dh.logger.removeHandler(collector)
             dh.logger.setLevel(original_level)
 
         combined = " ".join(r.getMessage() for r in records if r.levelno >= logging.ERROR)
-        assert "arn:aws:iam::333022194791" in combined, (
-            f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
-        )
+        assert (
+            "arn:aws:iam::333022194791" in combined
+        ), f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
 
 
 class TestRunTaskFailureCleansUpMintedTicket:
@@ -1680,12 +1733,9 @@ class TestRunTaskFailureCleansUpMintedTicket:
     Without this, a retry of the same run_id 409s against the stale
     run-lock until the lock's TTL expires (~4h)."""
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_run_task_returns_failures_triggers_delete_run_token(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_ecs_run_task_returns_failures_triggers_delete_run_token(self, mock_get_ecs, mock_broker_cls):
         mock_broker = _mock_broker_success("tok-to-clean")
         mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.return_value = {
@@ -1693,72 +1743,57 @@ class TestRunTaskFailureCleansUpMintedTicket:
             "tasks": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-x",
-                "run_id": "run-ecs-cap",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        message = _make_message("run-ecs-cap")
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        handler(event, None)
-
+        assert result["status"] == "failed"
         mock_broker.delete_run_token.assert_called_once_with(broker_token="tok-to-clean", run_id="run-ecs-cap")
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_ecs_run_task_raises_triggers_delete_run_token(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_ecs_run_task_raises_triggers_delete_run_token(self, mock_get_ecs, mock_broker_cls):
         mock_broker = _mock_broker_success("tok-to-clean-exc")
         mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.side_effect = RuntimeError("ECS control plane transient")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-x",
-                "run_id": "run-ecs-boom",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
-
-        handler(event, None)
+        message = _make_message("run-ecs-boom")
+        with pytest.raises(RuntimeError, match="ECS control plane transient"):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
 
         mock_broker.delete_run_token.assert_called_once_with(broker_token="tok-to-clean-exc", run_id="run-ecs-boom")
 
-    @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_delete_run_token_failure_does_not_prevent_error_callback(
-        self, mock_get_ecs, mock_broker_cls, mock_send_error_callback
-    ):
+    def test_delete_run_token_failure_does_not_prevent_error_callback(self, mock_get_ecs, mock_broker_cls):
+        # launch_run now RAISES on the run_task exception path so the handler
+        # retries. A cleanup failure must not mask the primary ECS exception:
+        # `_cleanup_minted_token` swallows the delete error internally, so the
+        # ORIGINAL ECS exception is the one that propagates.
         mock_broker = _mock_broker_success("tok-doomed")
         mock_broker.delete_run_token.side_effect = RuntimeError("broker unreachable")
         mock_broker_cls.return_value = mock_broker
         mock_get_ecs.return_value.run_task.side_effect = RuntimeError("ECS transient")
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-x",
-                "run_id": "run-double-fail",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
+        message = _make_message("run-double-fail")
+        with pytest.raises(RuntimeError, match="ECS transient"):
+            launch_run(
+                experiment=_smoke_routing(),
+                message=message,
+                scope={},
+                params_json=json.dumps(message["params"]),
+            )
 
-        result = handler(event, None)
-
-        mock_send_error_callback.assert_called_once()
-        assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}], (
-            "delete_run_token failing must NOT mask the primary ECS failure — "
-            "the error callback + batch_item_failures must still fire"
-        )
+        mock_broker.delete_run_token.assert_called_once()
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -1856,7 +1891,7 @@ class TestInputSchemaSortKeyMixedTypes:
         )
 
         # If the sort key blows up, this raises TypeError uncaught.
-        result = handler(event, None)
+        handler(event, None)
 
         # Validation should have caught the issues and emitted a callback,
         # NOT crashed.
@@ -1958,9 +1993,9 @@ class TestResolveRoutingFailures:
         assert routing["model"] == "sonnet"
         # known is only populated on the unknown-experiment branch (routing is None).
         assert known == []
-        assert not any(call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list), (
-            "happy path must not emit fallback metric"
-        )
+        assert not any(
+            call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list
+        ), "happy path must not emit fallback metric"
 
     def test_loader_transient_error_raises_and_emits_metric(self, monkeypatch):
         """S3 outage / IAM throttle → re-raise ManifestLoaderTransientError so
@@ -2070,9 +2105,14 @@ class TestResolveRoutingFailures:
 
 
 class TestWriteActionDispatchFlow:
+    # Scope derivation (write-action -> {} vs. read -> derive_scope) is the
+    # handler's job; launch_run forwards whatever scope it's handed straight to
+    # the broker. These tests assert that forwarding: a write-action run is
+    # dispatched with scope={}, and a legacy Databricks run with a derived scope
+    # reaches the broker unchanged.
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_write_action_routing_calls_broker_with_empty_scope(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+    def test_write_action_routing_calls_broker_with_empty_scope(self, mock_get_ecs, mock_broker_cls):
         write_action_routing = {
             "model": "sonnet",
             "timeout_seconds": 1500,
@@ -2090,15 +2130,6 @@ class TestWriteActionDispatchFlow:
             "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
             "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
         }
-        loader = MagicMock()
-        loader.routing_for.side_effect = lambda eid: write_action_routing if eid == "compliance_smoke_test" else None
-        loader.known_experiments.return_value = ["compliance_smoke_test"]
-
-        import pmf_engine.control_plane.dispatch_handler as dh
-
-        monkeypatch.setattr(dh, "_manifest_loader", loader, raising=False)
-        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
-        dh.reset_validator_cache_for_tests()
 
         mock_broker_cls.return_value = _mock_broker_success("tok-write-action")
         mock_get_ecs.return_value.run_task.return_value = {
@@ -2106,19 +2137,20 @@ class TestWriteActionDispatchFlow:
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "compliance_smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-write-001",
-                "clerk_user_id": "user_abc123",
-                "params": {"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
-            }
+        message = _make_message(
+            "run-write-001",
+            params={"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
+            experiment_type="compliance_smoke_test",
+        )
+        message["clerk_user_id"] = "user_abc123"
+        result = launch_run(
+            experiment=write_action_routing,
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
         )
 
-        result = handler(event, None)
-
-        assert result["batchItemFailures"] == []
+        assert result["status"] == "launched"
         mock_broker_cls.return_value.mint_run_token.assert_called_once()
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["scope"] == {}
@@ -2133,24 +2165,31 @@ class TestWriteActionDispatchFlow:
         """A routing dict without system_prompt or permission_mode flows
         through derive_scope (Databricks shape) — no behavior change for
         the existing 5 read-only experiments."""
+        from pmf_engine.control_plane.scope_derivation import derive_scope
+
         mock_broker_cls.return_value = _mock_broker_success("tok-legacy")
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-legacy",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
+        routing = _smoke_routing()
+        message = _make_message("run-legacy")
+        # The handler derives a non-empty scope for read experiments and hands
+        # it to launch_run; mirror that derivation here so the forwarded scope
+        # is the real Databricks shape, not {}.
+        scope = derive_scope(
+            message["experiment_type"],
+            message["params"],
+            manifest_scope=routing.get("scope"),
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        result = launch_run(
+            experiment=routing,
+            message=message,
+            scope=scope,
+            params_json=json.dumps(message["params"]),
+        )
+        assert result["status"] == "launched"
         mock_broker_cls.return_value.mint_run_token.assert_called_once()
         scope_arg = mock_broker_cls.return_value.mint_run_token.call_args.kwargs["scope"]
         assert "allowed_tables" in scope_arg
@@ -2158,7 +2197,7 @@ class TestWriteActionDispatchFlow:
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_permission_mode_alone_routes_as_write_action(self, mock_get_ecs, mock_broker_cls, monkeypatch):
+    def test_permission_mode_alone_routes_as_write_action(self, mock_get_ecs, mock_broker_cls):
         """A manifest with `permission_mode` but no `system_prompt` is still a
         write-action experiment per the loader's any-of projection rule, and
         must produce an empty scope dict — not flow through derive_scope.
@@ -2181,17 +2220,6 @@ class TestWriteActionDispatchFlow:
             "manifest_version_id": SYNTHETIC_MANIFEST_VERSION_ID,
             "instruction_version_id": SYNTHETIC_INSTRUCTION_VERSION_ID,
         }
-        loader = MagicMock()
-        loader.routing_for.side_effect = (
-            lambda eid: permission_mode_only_routing if eid == "compliance_smoke_test" else None
-        )
-        loader.known_experiments.return_value = ["compliance_smoke_test"]
-
-        import pmf_engine.control_plane.dispatch_handler as dh
-
-        monkeypatch.setattr(dh, "_manifest_loader", loader, raising=False)
-        monkeypatch.setattr(dh, "get_manifest_loader", lambda: loader)
-        dh.reset_validator_cache_for_tests()
 
         mock_broker_cls.return_value = _mock_broker_success("tok-permission-only")
         mock_get_ecs.return_value.run_task.return_value = {
@@ -2199,18 +2227,20 @@ class TestWriteActionDispatchFlow:
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "compliance_smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-pm-only",
-                "clerk_user_id": "user_abc123",
-                "params": {"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
-            }
+        message = _make_message(
+            "run-pm-only",
+            params={"campaign_id": "0a4c1b2e-1111-4222-8333-444444444444"},
+            experiment_type="compliance_smoke_test",
         )
-
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        message["clerk_user_id"] = "user_abc123"
+        # permission_mode signals write-action -> handler passes scope={}.
+        result = launch_run(
+            experiment=permission_mode_only_routing,
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
+        )
+        assert result["status"] == "launched"
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["scope"] == {}
 
@@ -2273,9 +2303,7 @@ class TestInputFilesEnvelopeStripping:
             "clerk_user_id": "user_test_dispatch",
             "params": {
                 "state": "WI",
-                "_input_files": [
-                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "../etc/passwd"}
-                ],
+                "_input_files": [{"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "../etc/passwd"}],
             },
         }
         with pytest.raises(ValueError, match="dest"):
@@ -2289,9 +2317,7 @@ class TestInputFilesEnvelopeStripping:
             "clerk_user_id": "user_test_dispatch",
             "params": {
                 "state": "WI",
-                "_input_files": [
-                    {"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "sub/file.pdf"}
-                ],
+                "_input_files": [{"bucket": "gp-agent-run-inputs-dev", "key": "k", "dest": "sub/file.pdf"}],
             },
         }
         with pytest.raises(ValueError, match="dest"):
@@ -2305,9 +2331,7 @@ class TestInputFilesEnvelopeStripping:
             "clerk_user_id": "user_test_dispatch",
             "params": {
                 "state": "WI",
-                "_input_files": [
-                    {"bucket": "bucket/with/slashes", "key": "k", "dest": "f.pdf"}
-                ],
+                "_input_files": [{"bucket": "bucket/with/slashes", "key": "k", "dest": "f.pdf"}],
             },
         }
         with pytest.raises(ValueError, match="bucket"):
@@ -2398,10 +2422,7 @@ class TestInputFilesEnvelopeStripping:
             "clerk_user_id": "user_test_dispatch",
             "params": {
                 "state": "WI",
-                "_input_files": [
-                    {"bucket": "b", "key": f"k{i}", "dest": f"f{i}.pdf"}
-                    for i in range(11)
-                ],
+                "_input_files": [{"bucket": "b", "key": f"k{i}", "dest": f"f{i}.pdf"} for i in range(11)],
             },
         }
         with pytest.raises(ValueError, match="too large"):
@@ -2505,40 +2526,65 @@ class TestBuildContainerOverridesInputFiles:
 
 
 class TestInputFilesDispatchFlow:
-    """End-to-end: dispatch SQS message with `_input_files` in params reaches
-    mint as a top-level kwarg and ECS as an INPUT_FILES_JSON env var, and
-    the agent's PARAMS_JSON does NOT contain the envelope key.
+    """`_input_files` user-input prefetch across the queued-dispatch path.
+
+    Mint + ECS RunTask now happen in the scheduler's launch_run, not in ingest
+    (which only enqueues a QueuedJob). So the flow splits:
+      - ingest strips `_input_files` out of params and persists it on the job,
+      - launch_run threads it onto mint as `input_files` and emits the
+        INPUT_FILES_JSON env, while PARAMS_JSON stays free of the envelope key.
     """
+
+    def test_ingest_persists_input_files_on_queued_job(self):
+        # Ingest enqueues a QueuedJob carrying input_files (stripped from params).
+        import pmf_engine.control_plane.dispatch_handler as dh
+
+        fake_store = MagicMock()
+        with patch.object(dh, "get_job_store", lambda: fake_store):
+            event = _make_sqs_event(
+                {
+                    "experiment_type": "smoke_test",
+                    "organization_slug": "org-123",
+                    "run_id": "run-pref-001",
+                    "clerk_user_id": "user_test_dispatch",
+                    "params": {**VALID_PARAMS, "_input_files": [_VALID_INPUT_FILE]},
+                }
+            )
+            result = handler(event, None)
+
+        assert result["batchItemFailures"] == []
+        queued_job = fake_store.put_queued_job.call_args.args[0]
+        assert queued_job.input_files == [_VALID_INPUT_FILE]
+        assert "_input_files" not in queued_job.params
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_input_files_flows_to_mint_and_ecs_env(self, mock_get_ecs, mock_broker_cls):
+    def test_launch_run_threads_input_files_to_mint_and_ecs_env(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success("tok-prefetch")
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-pref-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": {**VALID_PARAMS, "_input_files": [_VALID_INPUT_FILE]},
-            }
-        )
+        # The scheduler reconstructs this message from the QueuedJob, re-attaching
+        # `_input_files` (params already had it stripped at parse time).
+        message = _make_message("run-pref-001")
+        message["_input_files"] = [_VALID_INPUT_FILE]
 
-        result = handler(event, None)
-        assert result["batchItemFailures"] == []
+        result = launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
+        )
+        assert result["status"] == "launched"
 
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["input_files"] == [_VALID_INPUT_FILE]
-        assert "_input_files" not in mint_kwargs["params"]
 
-        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"][
-            "containerOverrides"
-        ][0]["environment"]
+        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"]["containerOverrides"][0][
+            "environment"
+        ]
         env_map = {e["name"]: e["value"] for e in env_list}
         assert "INPUT_FILES_JSON" in env_map
         assert json.loads(env_map["INPUT_FILES_JSON"]) == [_VALID_INPUT_FILE]
@@ -2546,29 +2592,26 @@ class TestInputFilesDispatchFlow:
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
-    def test_absent_input_files_passes_none_to_mint(self, mock_get_ecs, mock_broker_cls):
+    def test_launch_run_absent_input_files_passes_none_to_mint(self, mock_get_ecs, mock_broker_cls):
         mock_broker_cls.return_value = _mock_broker_success("tok-no-prefetch")
         mock_get_ecs.return_value.run_task.return_value = {
             "tasks": [{"taskArn": "arn:aws:ecs:us-west-2:123:task/abc"}],
             "failures": [],
         }
 
-        event = _make_sqs_event(
-            {
-                "experiment_type": "smoke_test",
-                "organization_slug": "org-123",
-                "run_id": "run-none-001",
-                "clerk_user_id": "user_test_dispatch",
-                "params": dict(VALID_PARAMS),
-            }
-        )
+        message = _make_message("run-none-001")  # no _input_files
 
-        handler(event, None)
+        launch_run(
+            experiment=_smoke_routing(),
+            message=message,
+            scope={},
+            params_json=json.dumps(message["params"]),
+        )
 
         mint_kwargs = mock_broker_cls.return_value.mint_run_token.call_args.kwargs
         assert mint_kwargs["input_files"] is None
-        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"][
-            "containerOverrides"
-        ][0]["environment"]
+        env_list = mock_get_ecs.return_value.run_task.call_args.kwargs["overrides"]["containerOverrides"][0][
+            "environment"
+        ]
         env_map = {e["name"]: e["value"] for e in env_list}
         assert "INPUT_FILES_JSON" not in env_map
