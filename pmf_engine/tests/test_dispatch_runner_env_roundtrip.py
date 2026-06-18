@@ -275,3 +275,66 @@ def test_attachment_version_ids_round_trip_dispatch_to_runner_request(monkeypatc
     assert len(factory.requests) == 1, (
         f"runner must hit broker exactly once, got {len(factory.requests)}"
     )
+
+
+def test_qa_version_ids_round_trip_dispatch_to_runner_request(monkeypatch):
+    """QA folder VersionIds captured at dispatch MUST reach the broker
+    request body unchanged.
+
+    Whole-pipeline contract test mirroring the attachment_version_ids
+    roundtrip: this fails if ANY link in
+        dispatch_handler → ECS env → runner config → manifest_loader → POST body
+    drops or mangles the qa_version_ids dict.
+
+    Without the full chain wired, every qa-folder fetch would silently fall
+    through to 'latest', re-opening the publish-during-run race for the qa
+    gate's manifest.json / main.py (contract G).
+    """
+    pin_dict = {"manifest.json": "Vm", "main.py": "Vmain"}
+    manifest = synthetic_manifest()
+    experiment_id = manifest["id"]
+    instruction = synthetic_instruction()
+    message = _base_message(experiment_id)
+
+    # 1. dispatch_handler serializes QA_VERSION_IDS env var
+    overrides = build_container_overrides(
+        experiment={
+            "model": manifest["model"],
+            "timeout_seconds": manifest["timeout_seconds"],
+            "manifest_version_id": "Mv1",
+            "instruction_version_id": "Iv1",
+            "qa_version_ids": pin_dict,
+        },
+        message=message,
+        broker_token="tok-qa-rt",
+        broker_url="https://broker.example.com",
+        container_name="pmf-engine",
+    )
+    env_map = _env_list_to_map(overrides["containerOverrides"][0]["environment"])
+    assert env_map["QA_VERSION_IDS"] == json.dumps(pin_dict, sort_keys=True), (
+        "dispatch_handler must serialize qa_version_ids as sort_keys JSON"
+    )
+
+    # 2. runner config parses + forwards to load_from_broker
+    envelope = _broker_envelope(manifest, instruction)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        # The key behavior under test: qa_version_ids made it into the broker
+        # request body. If anything between dispatch and here drops it, the
+        # assertion fails.
+        assert body.get("qa_version_ids") == pin_dict, (
+            f"runner did not forward qa pin dict to broker; body was {body!r}"
+        )
+        return httpx.Response(200, json=envelope)
+
+    factory = _ClientFactory(handler)
+
+    with patch.dict(os.environ, env_map, clear=False), \
+         patch("pmf_engine.runner.manifest_loader.httpx.Client", factory):
+        os.environ.pop("INSTRUCTION", None)
+        RunnerConfig.from_env()
+
+    assert len(factory.requests) == 1, (
+        f"runner must hit broker exactly once, got {len(factory.requests)}"
+    )

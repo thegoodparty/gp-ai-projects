@@ -21,6 +21,7 @@ lands outside both `workspace_dir` and `/tmp` (the runner's log sweep collects
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -498,6 +499,13 @@ def test_main_py_invalid_fragment_replaced_by_synthetic_failing(workspace, gate_
     assert all(c["passed"] is False for c in verdict.checks)
     assert len(verdict.checks) == 1
     assert verdict.checks[0]["passed"] is False
+    # FIX 2 (test tightening, no red phase — current code already satisfies
+    # these): the synthetic replacement is a named, typed, deterministic check
+    # whose detail explains the substitution, so an author can tell a malformed
+    # fragment from a real failing check in the verdict.
+    assert verdict.checks[0]["name"] == "invalid_fragment"
+    assert verdict.checks[0]["type"] == "deterministic"
+    assert "invalid fragment replaced" in verdict.checks[0]["detail"]
 
 
 # --------------------------------------------------------------------------
@@ -1502,3 +1510,183 @@ def test_evaluator_status_error_log_carries_context(workspace, gate_base, gate_l
     assert "num_turns=7" in msg
     assert "0.12" in msg
     assert "run-eval-1" in msg
+
+
+# ==========================================================================
+# FIX 1 (security): the gate's _SECRET_PATTERNS must mask the JSON-quoted
+# `"X-Broker-Token": "<value>"` shape (and a `Bearer <value>` shape) the runner's
+# main.py redaction already covers via _BROKER_TOKEN_PATTERN / _BEARER_TOKEN_PATTERN.
+# The gate's key=value pattern uses a key group of [A-Za-z0-9_]*, which does NOT
+# match a key containing '-' nor span the closing '"' on the JSON key, so a token
+# OTHER than the live BROKER_TOKEN printed in that shape leaks today.
+# ==========================================================================
+
+
+def test_x_broker_token_json_shape_redacted_in_fragment_detail_even_when_not_live(workspace, gate_base):
+    """A token in the `"X-Broker-Token": "<other>"` JSON shape — a DIFFERENT
+    value than the live BROKER_TOKEN — must be redacted in a fragment detail.
+    The explicit-token replacement can't catch it (wrong value); the gate's old
+    key=value pattern can't either (its key group is [A-Za-z0-9_]* and the JSON
+    key's closing '"' breaks adjacency). Only the ported _BROKER_TOKEN_PATTERN
+    (mirroring runner/main.py) masks it. This detail flows through
+    _normalize_fragment into verdict.checks, which egresses to gp-api +
+    Braintrust + the durable verdict.json."""
+    live = "tok-live-broker-0000000000"
+    other = "tok-OTHER-not-the-live-one-1234abcd"
+    detail = f'headers were {{"X-Broker-Token": "{other}"}}'
+    main_src = (
+        "import json\n"
+        f"print(json.dumps([{{'name': 'leaky', 'passed': False, 'detail': {json.dumps(detail)}}}]))\n"
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": live},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    leaky = [c for c in verdict.checks if c["name"] == "leaky"]
+    assert len(leaky) == 1
+    leaky_detail = leaky[0]["detail"]
+    # The non-live token value must NOT survive into the verdict.
+    assert other not in leaky_detail
+    assert other not in json.dumps(verdict.to_dict())
+    assert qa_gate_mod._REDACTED in leaky_detail
+    # The key is preserved so the structure stays diagnosable.
+    assert "X-Broker-Token" in leaky_detail
+
+
+def test_x_broker_token_raw_stdout_shape_redacted_in_raw_output(workspace, gate_base):
+    """When main.py prints the structural `"X-Broker-Token": "<other>"` shape
+    directly to stdout (the unescaped form the Claude SDK serializes a headers
+    dict into), the value must be masked in raw_output (the durable S3
+    main_output.json) by the ported _BROKER_TOKEN_PATTERN, even when <other> is
+    not the live BROKER_TOKEN. Non-JSON stdout -> stage error, but raw_output is
+    still the redacted decoded stdout."""
+    live = "tok-live-broker-0000000000"
+    other = "tok-OTHER-not-the-live-one-1234abcd"
+    line = f'config: "X-Broker-Token": "{other}"'
+    main_src = f"print({json.dumps(line)})\n"
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": main_src}),
+        workspace_dir=workspace,
+        broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": live},
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    raw = _raw_output(result)
+    assert raw is not None
+    assert other not in raw
+    assert qa_gate_mod._REDACTED in raw
+    assert "X-Broker-Token" in raw
+
+
+def test_bearer_token_shape_redacted_in_fragment_detail(workspace, gate_base):
+    """A `Bearer <value>` token in a fragment detail must be redacted even when
+    `<value>` is not the live BROKER_TOKEN. Mirrors main.py's _BEARER_TOKEN_PATTERN."""
+    live = "tok-live-broker-aaaaaaaaaa"
+    bearer_secret = "bearersecretvalue1234567890"
+    main_src = (
+        "import json\n"
+        f'print(json.dumps([{{"name": "leaky", "passed": False, '
+        f'"detail": "Authorization: Bearer {bearer_secret}"}}]))\n'
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": live},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    leaky = [c for c in verdict.checks if c["name"] == "leaky"]
+    assert len(leaky) == 1
+    detail = leaky[0]["detail"]
+    assert bearer_secret not in detail
+    assert qa_gate_mod._REDACTED in detail
+
+
+# ==========================================================================
+# FIX 3 (error-reporting): synthetic top-level `violations` strings built from
+# arbitrary exception text must be routed through _redact_secrets before egress.
+# Two paths: (a) run_qa_gate's own internal-error catch, and (b) main.py's
+# _run_qa_gate_hook 'qa_gate_hook_error' violation.
+# ==========================================================================
+
+
+def test_internal_error_violation_redacts_broker_token(workspace, gate_base, monkeypatch):
+    """The fail-open internal-error catch in run_qa_gate builds a violation from
+    arbitrary exception text. A BROKER_TOKEN embedded in that exception message
+    must be redacted before it lands in verdict.violations (which travels to
+    Braintrust + the durable verdict.json)."""
+    secret = "tok-internal-error-secret-9a8b7c"
+
+    def boom(*_a, **_k):
+        raise RuntimeError(f"boom leaked BROKER_TOKEN={secret} during materialize")
+
+    # Force the internal-error path by making materialization raise with the
+    # secret in the message.
+    monkeypatch.setattr(qa_gate_mod, "_materialize", boom)
+
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    joined = " ".join(verdict.violations)
+    assert secret not in joined
+    assert secret not in json.dumps(verdict.to_dict())
+    # The error is still discoverable.
+    assert any("qa_gate_internal_error" in v for v in verdict.violations)
+
+
+def test_hook_error_violation_redacts_broker_token(workspace, gate_base, monkeypatch):
+    """main.py's _run_qa_gate_hook builds a 'qa_gate_hook_error' violation from
+    arbitrary exception text on a bridge/marshaling defect. A BROKER_TOKEN in
+    that exception message must be redacted before it enters the Verdict."""
+    import pmf_engine.runner.main as runner_main
+
+    secret = "tok-hook-error-secret-1q2w3e4r"
+
+    monkeypatch.setenv("BROKER_URL", "https://broker.test")
+    monkeypatch.setenv("BROKER_TOKEN", secret)
+
+    # Make the gate spawn itself raise inside the hook with the secret in the
+    # message, exercising the hook's own except branch (defense-in-depth path).
+    def boom(*_a, **_k):
+        raise RuntimeError(f"bridge blew up; saw BROKER_TOKEN={secret} in env")
+
+    monkeypatch.setattr(runner_main, "run_qa_gate", boom)
+
+    class _Cfg:
+        qa_envelope = {"resolved_qa_version_ids": {"manifest.json": "v-man"}}
+        run_id = "run-hook-1"
+        experiment_id = "exp-hook-1"
+
+    result = asyncio.run(
+        runner_main._run_qa_gate_hook(
+            config=_Cfg(),
+            artifact_bytes=ARTIFACT,
+            workspace_dir=workspace,
+            remaining_budget_seconds=BIG_BUDGET,
+        )
+    )
+    assert result is not None
+    verdict, _raw = result
+    assert verdict.status == "error"
+    joined = " ".join(verdict.violations)
+    assert secret not in joined
+    assert secret not in json.dumps(verdict.to_dict())
+    assert any("qa_gate_hook_error" in v for v in verdict.violations)

@@ -99,6 +99,24 @@ _SECRET_PATTERNS = [
     ),
 ]
 
+# Ported from runner/main.py (_BROKER_TOKEN_PATTERN / _BEARER_TOKEN_PATTERN) so
+# the gate masks the SAME shapes the runner's log redaction does. The gate's
+# key=value pattern above uses a key group of [A-Za-z0-9_]*, which does NOT match
+# a key containing '-' nor span the closing '"' on a JSON key, so the JSON-quoted
+# `"X-Broker-Token": "<value>"` shape (the exact shape the Claude SDK serializes
+# into session JSONL / a misbehaving main.py might print) would otherwise pass
+# through unredacted whenever <value> is NOT the live BROKER_TOKEN. These two
+# patterns capture the prefix in group(1) and the secret value in group(2), so
+# the substitution preserves the parseable structure while masking only the value.
+# FOLLOW-UP: extract the redaction patterns + helper into a shared module so the
+# gate and runner/main.py can't drift again (deliberately NOT done here to keep
+# this change small).
+_BROKER_TOKEN_PATTERN = re.compile(
+    r'(?i)(X-Broker-Token["\']?\s*[=:]\s*["\']?)([A-Za-z0-9_\-/.+=]{8,})'
+)
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)(Bearer\s+)([A-Za-z0-9_\-/.+=]{8,})")
+_PREFIX_PRESERVING_PATTERNS = [_BROKER_TOKEN_PATTERN, _BEARER_TOKEN_PATTERN]
+
 # Serialized-verdict cap (contract C: 8 KB protects the callback budget).
 _VERDICT_BYTE_CAP = 8 * 1024
 
@@ -333,11 +351,15 @@ def run_qa_gate(
         return verdict, raw_output
     except Exception as e:  # fail-open — observe-only never raises to the caller
         logger.exception("qa_gate_internal_error errorType=%s: %s", type(e).__name__, e)
+        # The violation is built from arbitrary exception text, which can carry a
+        # leaked BROKER_TOKEN; redact it before it enters the Verdict (egress to
+        # Braintrust + the durable verdict.json), exactly like fragment fields.
+        violation = _redact_secrets(f"qa_gate_internal_error: {type(e).__name__}: {e}", broker_env)
         verdict = Verdict(
             status="error",
             qa_version_ids=(qa_envelope.get("resolved_qa_version_ids") or {}) if isinstance(qa_envelope, dict) else {},
             pass_=None,
-            violations=[f"qa_gate_internal_error: {type(e).__name__}: {e}"],
+            violations=[violation],
             duration_ms=_elapsed_ms(started),
         )
         _log_verdict(verdict, run_id)
@@ -654,6 +676,11 @@ def _redact_secrets(text: str, broker_env: dict) -> str:
             text = pat.sub(_mask_kv, text)
         else:
             text = pat.sub(_REDACTED, text)
+    # Prefix-preserving shapes: keep group(1) (the key + separator, e.g.
+    # `"X-Broker-Token": "` or `Bearer `) verbatim and mask only the value so the
+    # surrounding JSON/header structure stays parseable while the secret is gone.
+    for pat in _PREFIX_PRESERVING_PATTERNS:
+        text = pat.sub(lambda m: m.group(1) + _REDACTED, text)
     return text
 
 

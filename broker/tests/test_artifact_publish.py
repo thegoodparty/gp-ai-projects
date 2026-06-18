@@ -1854,3 +1854,135 @@ class TestArtifactPublishDurableQaVerdictS3Capture:
         mock_store.delete_ticket_and_run_lock.assert_called_once_with(
             BROKER_TOKEN, "di-qa-dup"
         )
+
+    def test_failed_verdict_write_skips_main_output_no_orphan(self):
+        """Write-level coupling: main_output.json is the verdict's raw fragment
+        output, so it must never be written when the sibling verdict.json write
+        FAILED. Today the two writes are coupled only at REQUEST level (both fire
+        whenever req.qa_verdict and req.qa_raw_output are present), independent of
+        whether the verdict.json PUT actually succeeded. So a transiently failed
+        verdict.json write (caught, logged, fail-open) could still be followed by
+        a successful main_output.json write → an orphan main_output.json with no
+        sibling verdict.json under the run's qa prefix.
+
+        Fix: gate the main_output.json write on the verdict.json write having
+        actually landed. Stays fail-open — the skipped write must NOT fail the
+        publish."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-fail-orphan",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-verdict-fail-orphan/qa/verdict.json"
+        main_output_key = "district_intel/di-verdict-fail-orphan/qa/main_output.json"
+
+        # A real (non-precondition) failure on the verdict.json write — caught,
+        # logged, fail-open. The sibling verdict does NOT exist afterward.
+        verdict_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise verdict_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": verdict,
+                "qa_raw_output": "raw stdout that would orphan",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Fail-open: the failed verdict.json write must NOT fail the publish.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict.json write was attempted (and failed).
+        assert verdict_key in keys_written
+        # CRITICAL: main_output.json must NOT be written — it would be an orphan
+        # with no sibling verdict.json.
+        assert main_output_key not in keys_written, (
+            f"orphan main_output.json written without a sibling verdict.json; "
+            f"keys written: {keys_written}"
+        )
+
+        # The callback still fired (the verdict still rides the callback), and
+        # the ticket was still cleaned up.
+        mock_sender.send_result.assert_called_once()
+        assert mock_sender.send_result.call_args.kwargs["qa_verdict"] == verdict
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-verdict-fail-orphan"
+        )
+
+    def test_verdict_412_already_exists_still_writes_main_output(self):
+        """The 412 (PreconditionFailed) branch on verdict.json means the sibling
+        verdict.json ALREADY exists from a prior publish — so main_output.json is
+        NOT an orphan and the raw write must still proceed. This pins that the
+        write-level coupling treats 'already captured' as 'sibling present', not
+        as a failed write."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-412-raw",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-verdict-412-raw/qa/verdict.json"
+        main_output_key = "district_intel/di-verdict-412-raw/qa/main_output.json"
+
+        precondition_error = ClientError(
+            error_response={
+                "Error": {"Code": "PreconditionFailed", "Message": "exists"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise precondition_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_raw_output": "raw stdout",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict sibling already exists (412), so main_output.json is NOT an
+        # orphan — the raw write MUST still happen.
+        assert main_output_key in keys_written, (
+            f"main_output.json was skipped even though the sibling verdict.json "
+            f"already exists (412 already-captured); keys written: {keys_written}"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-verdict-412-raw"
+        )

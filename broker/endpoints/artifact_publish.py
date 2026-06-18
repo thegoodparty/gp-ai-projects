@@ -7,7 +7,6 @@ import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from broker.auth import get_broker_token
 from broker.callback_sender import CallbackSender
 from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
@@ -345,7 +344,7 @@ def artifact_publish(
                         f"Artifact for run {ticket.run_id} was already published; "
                         "duplicate publish refused (archive is immutable)"
                     ),
-                )
+                ) from None
             raise
         try:
             s3_client.put_object(
@@ -370,7 +369,9 @@ def artifact_publish(
             ticket.run_id, ticket.experiment_id, bucket,
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="Failed to publish artifact to S3")
+        raise HTTPException(
+            status_code=500, detail="Failed to publish artifact to S3"
+        ) from None
 
     # PMF QA gate (contract D / decision 13): durable, observe-only S3 capture.
     # When a verdict is present, write it (and the raw main.py output, when the
@@ -388,6 +389,12 @@ def artifact_publish(
     # archive: a duplicate publish for the same run must not silently overwrite
     # the per-run qa record. A write-once collision (PreconditionFailed / 412)
     # is logged INFO and swallowed — best-effort / observe-only, never fatal.
+    # Tracks whether the sibling verdict.json actually exists in S3 after this
+    # block: True only when the put_object succeeded, OR when a duplicate publish
+    # hit the write-once 412 (the original verdict.json is already there). A
+    # caught/logged/fail-open failure leaves it False so the coupled raw write
+    # below is skipped — never an orphan main_output.json without a verdict.json.
+    verdict_written = False
     if req.qa_verdict is not None and not skip_qa_verdict_write:
         qa_verdict_key = f"{ticket.experiment_id}/{ticket.run_id}/qa/verdict.json"
         try:
@@ -398,8 +405,12 @@ def artifact_publish(
                 ContentType="application/json",
                 IfNoneMatch="*",
             )
+            verdict_written = True
         except Exception as verdict_err:
             if _is_precondition_failed(verdict_err):
+                # The sibling already exists from a prior publish, so the raw
+                # write below is NOT an orphan — treat as written.
+                verdict_written = True
                 logger.info(
                     "qa verdict already captured run_id=%s experiment_id=%s key=%s "
                     "(duplicate publish; write-once guard held, keeping the "
@@ -416,11 +427,12 @@ def artifact_publish(
                 )
 
     # The raw main.py output is the verdict's raw fragment output, so it is only
-    # written when a verdict is also present (no orphan main_output.json without
-    # a verdict.json) — preserving contract D's coupling. Its own size cap
+    # written when the sibling verdict.json actually landed in S3 (no orphan
+    # main_output.json without a verdict.json) — preserving contract D's coupling
+    # at the WRITE level, not just the request level. Its own size cap
     # (skip_qa_raw_write) is independent of the verdict's.
     if (
-        req.qa_verdict is not None
+        verdict_written
         and req.qa_raw_output is not None
         and not skip_qa_raw_write
     ):

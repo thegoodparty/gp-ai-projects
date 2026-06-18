@@ -13,8 +13,9 @@ import time
 
 from shared.braintrust import BraintrustClient
 from shared.logger import get_logger
-from .config import RunnerConfig, BrokerUrlSchemeError, validate_broker_url_scheme
-from .contract import validate_artifact_contract, ContractViolation
+
+from .config import BrokerUrlSchemeError, RunnerConfig, validate_broker_url_scheme
+from .contract import ContractViolation, validate_artifact_contract
 from .harness.base import AgentHarness
 from .input_files import prefetch_input_files
 from .pmf_runtime import publish
@@ -25,7 +26,7 @@ from .qa_gate import run_qa_gate
 logger = get_logger(__name__)
 
 _shutdown_requested = False
-_current_task: "asyncio.Task | None" = None
+_current_task: asyncio.Task | None = None
 _terminal_callback_sent = False
 
 # Files the runner writes itself during workspace setup. An attachment that
@@ -302,7 +303,7 @@ def _redact_line(line: str) -> str:
 def _redact_session_jsonl(source_path: str) -> str | None:
     try:
         fd, redacted_path = tempfile.mkstemp(suffix=".jsonl", prefix="session_redacted_")
-        with open(source_path, "r", errors="replace") as src, os.fdopen(fd, "w") as dst:
+        with open(source_path, errors="replace") as src, os.fdopen(fd, "w") as dst:
             for line in src:
                 dst.write(_redact_line(line))
         return redacted_path
@@ -474,7 +475,7 @@ async def _run_qa_gate_hook(
     """
     from .harness.base import EvaluatorHarnessParams, EvaluatorResult
     from .harness.claude_sdk import run_evaluator_agent
-    from .qa_gate import Verdict
+    from .qa_gate import Verdict, _redact_secrets
 
     started = time.monotonic()
     try:
@@ -533,11 +534,22 @@ async def _run_qa_gate_hook(
         resolved = {}
         if isinstance(config.qa_envelope, dict):
             resolved = config.qa_envelope.get("resolved_qa_version_ids") or {}
+        # The violation is built from arbitrary exception text, which can carry a
+        # leaked BROKER_TOKEN; redact it before it enters the Verdict (egress to
+        # Braintrust + the durable verdict.json). Rebuild broker_env from os.environ
+        # here so the live token is masked even if the try failed before broker_env
+        # was bound above.
+        redact_env: dict[str, str] = {}
+        for key in ("BROKER_URL", "BROKER_TOKEN"):
+            raw = os.environ.get(key, "").strip()
+            if raw:
+                redact_env[key] = raw
+        violation = _redact_secrets(f"qa_gate_hook_error: {type(e).__name__}: {e}", redact_env)
         verdict = Verdict(
             status="error",
             qa_version_ids=resolved,
             pass_=None,
-            violations=[f"qa_gate_hook_error: {type(e).__name__}: {e}"],
+            violations=[violation],
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return verdict, None
@@ -1022,7 +1034,7 @@ async def main():
         _current_task = asyncio.ensure_future(run_experiment(config))
         await asyncio.wait_for(_current_task, timeout=timeout)
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.error(f"Experiment timed out after {timeout}s for run {config.run_id}")
         if _current_task is not None and not _current_task.done():
             _current_task.cancel()
