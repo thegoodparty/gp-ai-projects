@@ -266,39 +266,21 @@ class TestCallbackSenderSqsFailureLogging:
         assert record.exc_info is not None
 
 
-class TestCallbackSenderQaVerdict:
-    """Contract E (PMF QA gate, v1 observe-only): the success callback's
-    `data` envelope gains an optional `qaVerdict` key. It rides ONLY the
-    success path in v1. The envelope key is camelCase (matching
-    experimentId/runId/organizationSlug); the verdict BODY is forwarded
-    verbatim — the broker keeps it opaque, so the snake_case verdict shape
-    from contract C is preserved untouched. When no verdict is passed
-    (no qa folder, or a pre-gate runner), the key is omitted entirely so
-    older messages parse byte-identically.
+class TestCallbackSenderNoQaVerdictOnCallback:
+    """gp-api is DROPPED as a consumer of the QA verdict — its SQS callback
+    schema strips qaVerdict, so forwarding it on the callback is dead weight.
+    The verdict's system of record is now (a) the broker's durable S3 write
+    (`<exp>/<run>/qa/verdict.json`) and (b) the runner's Braintrust span. The
+    callback must NEVER carry a `qaVerdict` key, and `send_result` must no
+    longer accept a `qa_verdict` parameter at all.
     """
 
-    def _verdict(self) -> dict:
-        # Snake_case body per contract C — the broker forwards verbatim and
-        # must NOT camelCase the inner keys.
-        return {
-            "verdict_version": 1,
-            "qa_version_ids": {"manifest.json": "V-man-1", "main.py": "V-main-1"},
-            "status": "evaluated",
-            "pass": False,
-            "checks": [
-                {"name": "grounding_coverage", "type": "deterministic",
-                 "passed": False, "score": 0.62, "threshold": 0.8},
-            ],
-            "violations": ["grounding_coverage 0.62 < 0.8"],
-            "duration_ms": 9300,
-            "cost_usd": 0.05,
-        }
-
-    def test_success_callback_carries_qa_verdict_camelcase_key_verbatim_body(self):
+    def test_success_callback_never_carries_qa_verdict_key(self):
+        """Even on a fully-populated success callback, the SQS `data` envelope
+        carries no `qaVerdict` key — the verdict does not ride the callback."""
         sqs = MagicMock()
         sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
 
-        verdict = self._verdict()
         sender.send_result(
             run_id="run-qa-1",
             organization_slug="org-7",
@@ -306,39 +288,12 @@ class TestCallbackSenderQaVerdict:
             status="success",
             artifact_key="voter_targeting/run-qa-1/artifact.json",
             artifact_bucket="gp-agent-artifacts-dev",
-            qa_verdict=verdict,
-        )
-
-        body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
-        # Envelope key is camelCase, sibling of experimentId/runId/organizationSlug.
-        assert body["data"]["qaVerdict"] == verdict
-        # Body is forwarded verbatim — snake_case inner keys preserved.
-        assert body["data"]["qaVerdict"]["verdict_version"] == 1
-        assert body["data"]["qaVerdict"]["qa_version_ids"] == {
-            "manifest.json": "V-man-1", "main.py": "V-main-1"
-        }
-        assert body["data"]["qaVerdict"]["cost_usd"] == 0.05
-        assert body["data"]["qaVerdict"]["pass"] is False
-
-    def test_success_callback_without_verdict_omits_key_entirely(self):
-        """Byte-identical no-qa path: a runner that never ran the gate
-        (no qa folder, or pre-gate image) passes no verdict, and the
-        callback must NOT carry a `qaVerdict` key — not None, absent."""
-        sqs = MagicMock()
-        sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
-
-        sender.send_result(
-            run_id="run-noqa-1",
-            organization_slug="org-7",
-            experiment_id="voter_targeting",
-            status="success",
         )
 
         body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
         assert "qaVerdict" not in body["data"]
-        # Pin the FULL data envelope key set so the no-qa callback stays
-        # byte-identical: no qaVerdict, and no accidental new key either. The
-        # pre-gate envelope carried exactly these 11 keys.
+        # Pin the FULL data envelope key set — exactly these 11 keys, with no
+        # qaVerdict and no accidental new key.
         assert set(body["data"].keys()) == {
             "experimentId",
             "runId",
@@ -353,37 +308,18 @@ class TestCallbackSenderQaVerdict:
             "error",
         }
 
-    def test_explicit_none_verdict_omits_key_entirely(self):
-        """qa_verdict=None is the explicit no-gate signal; the key must be
-        omitted, never serialized as null."""
+    def test_send_result_does_not_accept_qa_verdict_parameter(self):
+        """The qa_verdict parameter is REMOVED. Passing it must raise a
+        TypeError — there is no longer any path for the verdict onto the
+        callback."""
         sqs = MagicMock()
         sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
 
-        sender.send_result(
-            run_id="run-noqa-2",
-            organization_slug="org-7",
-            experiment_id="voter_targeting",
-            status="success",
-            qa_verdict=None,
-        )
-
-        body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
-        assert "qaVerdict" not in body["data"]
-
-    def test_qa_verdict_does_not_change_dedup_id_for_success(self):
-        """The MessageDeduplicationId stays `{run_id}-{status}` — carrying
-        the verdict on the success callback must not alter dedup semantics."""
-        sqs = MagicMock()
-        sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
-
-        sender.send_result(
-            run_id="run-qa-dedup",
-            organization_slug="org-7",
-            experiment_id="voter_targeting",
-            status="success",
-            qa_verdict=self._verdict(),
-        )
-
-        call_kwargs = sqs.send_message.call_args[1]
-        assert call_kwargs["MessageDeduplicationId"] == "run-qa-dedup-success"
-        assert call_kwargs["MessageGroupId"] == "run-qa-dedup"
+        with pytest.raises(TypeError):
+            sender.send_result(
+                run_id="run-qa-reject",
+                organization_slug="org-7",
+                experiment_id="voter_targeting",
+                status="success",
+                qa_verdict={"pass": False},
+            )

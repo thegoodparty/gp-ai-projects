@@ -635,20 +635,22 @@ print(json.dumps([{"name": "loc", "passed": True, "cwd": os.getcwd()}]))
 
 
 # --------------------------------------------------------------------------
-# 8KB serialized cap: truncation order (violations, then per-check detail)
+# No truncation: to_dict returns the FULL verdict (S3 + Braintrust, no size cap)
 # --------------------------------------------------------------------------
 
 
-def test_verdict_capped_at_8kb_truncates_violations_then_detail(workspace, gate_base):
+def test_verdict_to_dict_returns_large_verdict_fully_intact(workspace, gate_base):
+    # gp-api is DROPPED — it no longer consumes the SQS callback's qaVerdict, so
+    # the 8KB serialization cap that existed solely to protect the callback budget
+    # is gone. The verdict's system of record is now (a) the broker's durable S3
+    # verdict.json (no size limit) and (b) the runner's Braintrust span output.
+    # to_dict() must therefore return the FULL verdict: every violation, every
+    # check, and every per-check field including the big `detail` strings.
+    #
     # Produce MANY failing fragments, each with a big detail string AND several
-    # non-detail fields (score/min_score/duration_ms), so the serialized verdict
-    # blows past 8KB and forces ALL THREE truncation steps:
-    #   1) drop violations, 2) drop per-check detail, 3) strip non-essential
-    #   check fields. 120 checks keep the post-step-2 array (~10KB with the extra
-    #   fields) above the cap so step 3 actually runs, while the post-step-3 array
-    #   (name/passed/type only, ~6.6KB) lands back under it.
-    # main.py BUILDS the fragments itself (don't embed Python-invalid JSON
-    # literals like `false`/`true` into the source — that would NameError).
+    # non-detail fields — well past the old 8KB cap — and assert NOTHING is
+    # dropped. main.py BUILDS the fragments itself (don't embed Python-invalid
+    # JSON literals like `false`/`true` into the source — that would NameError).
     main_src = (
         "import json\n"
         "big = 'X' * 200\n"
@@ -668,27 +670,26 @@ def test_verdict_capped_at_8kb_truncates_violations_then_detail(workspace, gate_
             gate_base_dir=gate_base,
         )
     )
-    # Assert on the SERIALIZED verdict — that is the only thing the cap protects.
-    # The untruncated `verdict.checks`/`verdict.violations` attributes are NOT
-    # the contract; `to_dict()` output is.
     d = verdict.to_dict()
-    serialized = json.dumps(d)
-    assert len(serialized) <= 8 * 1024
-    # 1) violations dropped first.
-    assert d["violations"] == []
+    # The serialized verdict is well over the OLD 8KB cap — proving no cap clamps
+    # it anymore (120 checks * (200-byte detail + score/min_score/duration_ms)
+    # plus 120 violations is ~30KB+).
+    assert len(json.dumps(d)) > 8 * 1024
+    # All 120 checks survive.
+    assert len(d["checks"]) == 120
+    # All violations survive (one per failing check).
+    assert len(d["violations"]) == 120
+    # Every per-check field is intact: name + passed + type AND the big detail
+    # plus the non-essential score / min_score / duration_ms passthroughs.
+    big = "X" * 200
     for c in d["checks"]:
-        # 2) per-check detail stripped.
-        assert "detail" not in c
-        # 3) step 3 RAN — the non-essential fields are gone (proves this fixture
-        #    actually exercises the final truncation step, not just step 2).
-        assert "score" not in c
-        assert "duration_ms" not in c
-        # ...but the ESSENTIAL trio survives: name + passed + type. `type` MUST
-        # survive: gp-api's zod requires it (queue.types.ts) and DLQs a check
-        # without it (contract C: every check carries a namespaced type).
-        assert "name" in c
-        assert "passed" in c
         assert c["type"] == "deterministic"
+        assert c["passed"] is False
+        assert c["name"].startswith("check_")
+        assert c["detail"] == big
+        assert c["score"] == 0.5
+        assert c["min_score"] == 0.8
+        assert c["duration_ms"] == 1234
     # The overall verdict still reports failure.
     assert d["pass"] is False
     assert verdict.pass_ is False

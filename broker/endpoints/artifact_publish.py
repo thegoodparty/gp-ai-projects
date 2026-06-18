@@ -14,13 +14,14 @@ from broker.pii_scanner import scan_artifact
 
 _PII_ENABLED_VALUES = {"1", "true", "yes"}
 
-# PMF QA gate (contract D): the verdict is forwarded verbatim to the SQS
-# callback, so it shares the callback's byte budget. The engine targets an
-# 8 KiB serialized verdict (contract C), truncating to fit; this broker-side
-# cap gives generous headroom over that target while still bounding a runaway
-# verdict before it can blow the SQS payload limit. The broker keeps the
-# verdict OPAQUE — this size check is the only verdict-specific gate.
-MAX_QA_VERDICT_BYTES = 64 * 1024
+# PMF QA gate (contract D): the verdict is written durably to S3 ONLY (gp-api
+# was dropped as a callback consumer, so the verdict no longer rides the SQS
+# callback). With no callback budget to protect, this cap is a generous S3
+# sanity bound (1 MiB, mirroring MAX_QA_RAW_OUTPUT_BYTES) — normal KB-range
+# verdicts always get the durable write; only an absurd, runaway verdict is
+# skipped (fail-open). The broker keeps the verdict OPAQUE — this size check
+# is the only verdict-specific gate.
+MAX_QA_VERDICT_BYTES = 1024 * 1024
 
 # PMF QA gate (contract D / decision 13): the raw main.py stdout, written
 # durably to S3 only (it never rides the SQS callback), so it has its own,
@@ -100,21 +101,23 @@ class PublishRequest(BaseModel):
     duration_seconds: float = 0
     cost_usd: float = 0
     # PMF QA gate (contract D, v1 observe-only). The runner attaches the
-    # gate's verdict here on the success path. The broker treats it as an
-    # OPAQUE passthrough — it does NOT re-run jsonschema or any shape check
-    # (it validates only `artifact`); the only verdict-specific gate is the
-    # MAX_QA_VERDICT_BYTES size cap enforced in the handler. This field MUST
-    # be DECLARED: pydantic's default extra='ignore' would silently drop an
-    # undeclared field, so the runner's verdict would never reach the handler.
-    # Absent / None = no gate ran (no qa folder, or a pre-gate runner) — the
-    # success path then stays byte-identical to today.
+    # gate's verdict here on the success path so the broker can write it
+    # durably to S3 (`<exp>/<run>/qa/verdict.json`) — the verdict's system of
+    # record now that gp-api was dropped as a callback consumer. The broker
+    # treats it as an OPAQUE passthrough — it does NOT re-run jsonschema or any
+    # shape check (it validates only `artifact`); the only verdict-specific
+    # gate is the MAX_QA_VERDICT_BYTES size cap enforced in the handler. This
+    # field MUST be DECLARED: pydantic's default extra='ignore' would silently
+    # drop an undeclared field, so the runner's verdict would never reach the
+    # handler. Absent / None = no gate ran (no qa folder, or a pre-gate runner)
+    # — the broker then writes no qa/verdict.json.
     qa_verdict: dict | None = None
     # PMF QA gate (contract D / decision 13). The raw main.py stdout the gate
     # captured, carried so the broker can write it durably to S3 alongside the
     # aggregated verdict (the runner is sandboxed — the broker is its only
-    # egress). It NEVER rides the SQS callback, so it has its own 1 MiB budget
-    # rather than the verdict's callback-bound cap. Like qa_verdict, this MUST
-    # be DECLARED: pydantic's default extra='ignore' would silently drop an
+    # egress). It NEVER rides the SQS callback, so it has its own 1 MiB budget,
+    # the same generous S3-sanity bound as the verdict's cap. Like qa_verdict,
+    # this MUST be DECLARED: pydantic's default extra='ignore' would silently drop an
     # undeclared field, so the durable raw write would never happen. Absent /
     # None = the broker writes only the aggregated verdict.
     qa_raw_output: str | None = None
@@ -265,10 +268,10 @@ def artifact_publish(
     # PMF QA gate (contract D, v1 observe-only / fail-open): the qa-capture
     # path must NEVER fail the publish. A 400 here would turn the run FAILED in
     # the runner, breaking observe-only — so a size-cap breach SKIPS the durable
-    # S3 write instead of rejecting. The verdict still rides the SQS callback
-    # verbatim (the callback layer owns its own budget); only the durable
-    # verdict.json write is governed by MAX_QA_VERDICT_BYTES. An oversize verdict
-    # is LOGGED + metric-emitted + the verdict.json write is skipped.
+    # S3 write instead of rejecting. The verdict goes ONLY to S3 (gp-api was
+    # dropped as a callback consumer), so the cap is a generous 1 MiB S3 sanity
+    # bound; only an absurd, runaway verdict is skipped. An oversize verdict is
+    # LOGGED + metric-emitted + the verdict.json write is skipped.
     skip_qa_verdict_write = False
     if req.qa_verdict is not None:
         verdict_bytes = len(json.dumps(req.qa_verdict))
@@ -277,7 +280,7 @@ def artifact_publish(
             logger.error(
                 "qa_verdict_size_cap_exceeded run_id=%s experiment_id=%s "
                 "observed=%d cap=%d (fail-open: skipping durable verdict.json "
-                "write; the verdict still rides the callback)",
+                "write)",
                 ticket.run_id, ticket.experiment_id, verdict_bytes, MAX_QA_VERDICT_BYTES,
             )
             _emit_metric("broker_qa_verdict_size_cap_exceeded", [
@@ -382,9 +385,9 @@ def artifact_publish(
     # write.
     #
     # BEST-EFFORT and ADDITIVE: it runs only AFTER artifact.json succeeded
-    # (above), a failure is logged with run_id but does NOT fail the publish,
-    # and the verdict still rides the callback below. No qa_verdict => no qa
-    # write, so the no-qa key set stays byte-identical to a pre-gate publish.
+    # (above), a failure is logged with run_id but does NOT fail the publish.
+    # No qa_verdict => no qa write, so the no-qa key set stays byte-identical to
+    # a pre-gate publish.
     # Both qa writes are write-once (IfNoneMatch=*), mirroring the artifact.json
     # archive: a duplicate publish for the same run must not silently overwrite
     # the per-run qa record. A write-once collision (PreconditionFailed / 412)
@@ -420,8 +423,8 @@ def artifact_publish(
             else:
                 logger.warning(
                     "qa verdict S3 capture failed run_id=%s experiment_id=%s key=%s "
-                    "bucket=%s. Best-effort durable capture; the verdict still rides "
-                    "the SQS callback and the Braintrust span.",
+                    "bucket=%s. Best-effort durable capture; the verdict is still "
+                    "recoverable from the Braintrust span.",
                     ticket.run_id, ticket.experiment_id, qa_verdict_key, bucket,
                     exc_info=True,
                 )
@@ -458,7 +461,7 @@ def artifact_publish(
                 logger.warning(
                     "qa raw output S3 capture failed run_id=%s experiment_id=%s "
                     "key=%s bucket=%s. Best-effort durable capture; the aggregated "
-                    "verdict was still captured and rides the callback.",
+                    "verdict.json was still captured.",
                     ticket.run_id, ticket.experiment_id, qa_raw_key, bucket,
                     exc_info=True,
                 )
@@ -467,11 +470,10 @@ def artifact_publish(
     # latest.json, a subsequent regeneration of this (or dependent) experiment
     # would silently change what a SUCCESS run "produced", breaking the STALE
     # invariant for any downstream experiment that depends on this artifact.
-    # Forward the QA verdict verbatim. req.qa_verdict defaults to None when no
-    # gate ran (no qa folder, or a pre-gate runner); send_result omits the
-    # qaVerdict key on the wire for a None verdict, so the no-qa success
-    # callback stays byte-identical to a pre-gate run (verified in
-    # test_callback_sender's omit-key tests).
+    # The QA verdict does NOT ride the callback: gp-api was dropped as a
+    # verdict consumer (its callback schema strips it). The verdict's system of
+    # record is the durable S3 verdict.json write above plus the runner's
+    # Braintrust span.
     callback_sender.send_result(
         run_id=ticket.run_id,
         organization_slug=ticket.organization_slug,
@@ -481,7 +483,6 @@ def artifact_publish(
         artifact_bucket=bucket,
         duration_seconds=req.duration_seconds,
         cost_usd=req.cost_usd,
-        qa_verdict=req.qa_verdict,
     )
 
     try:

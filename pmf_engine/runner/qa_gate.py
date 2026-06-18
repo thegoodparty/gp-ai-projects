@@ -117,9 +117,6 @@ _BROKER_TOKEN_PATTERN = re.compile(
 _BEARER_TOKEN_PATTERN = re.compile(r"(?i)(Bearer\s+)([A-Za-z0-9_\-/.+=]{8,})")
 _PREFIX_PRESERVING_PATTERNS = [_BROKER_TOKEN_PATTERN, _BEARER_TOKEN_PATTERN]
 
-# Serialized-verdict cap (contract C: 8 KB protects the callback budget).
-_VERDICT_BYTE_CAP = 8 * 1024
-
 VerdictStatus = Literal["evaluated", "error", "skipped"]
 
 _EVALUATOR_SYSTEM_PROMPT = (
@@ -141,7 +138,8 @@ _EVALUATOR_SYSTEM_PROMPT = (
 class Verdict:
     """Engine output (contract C). ``pass_`` carries the ``pass`` field
     (``pass`` is a Python keyword); ``to_dict`` emits it under the wire key
-    ``pass`` and applies the 8 KB serialization cap."""
+    ``pass``. The full verdict is serialized uncapped (it lands in the broker's
+    durable S3 ``verdict.json`` and the Braintrust span — no callback budget)."""
 
     status: VerdictStatus
     verdict_version: int = 1
@@ -153,56 +151,26 @@ class Verdict:
     cost_usd: float = 0.0
 
     def to_dict(self) -> dict:
-        """Serialize to the contract-C wire shape, capped at 8 KB.
+        """Serialize to the contract-C wire shape, UNCAPPED.
 
-        Truncation order (contract C): drop ``violations`` first, then per-check
-        ``detail``, then strip every non-essential check field (keeping
-        ``name``/``passed``/``type`` — ``type`` is required by gp-api's zod and
-        is NOT a droppable passthrough). ``pass``/``status``/version/ids always
-        survive.
+        gp-api is dropped — it no longer consumes the SQS callback's qaVerdict
+        (its schema strips it). The verdict's system of record is now the
+        broker's durable S3 ``verdict.json`` (no size limit) and the runner's
+        Braintrust span output, so there is no callback budget to protect: the
+        full verdict ships, every violation and every per-check field (including
+        ``detail``) intact. Redaction and the synthetic-fragment behavior are
+        unchanged — only the size truncation is gone.
         """
-        checks: list[dict] = [dict(c) for c in self.checks]
-        violations: list[str] = list(self.violations)
-
-        def _assemble() -> dict:
-            return {
-                "verdict_version": self.verdict_version,
-                "qa_version_ids": self.qa_version_ids,
-                "status": self.status,
-                "pass": self.pass_,
-                "checks": checks,
-                "violations": violations,
-                "duration_ms": self.duration_ms,
-                "cost_usd": self.cost_usd,
-            }
-
-        if _serialized_len(_assemble()) <= _VERDICT_BYTE_CAP:
-            return _assemble()
-
-        # 1) drop violations
-        violations = []
-        if _serialized_len(_assemble()) <= _VERDICT_BYTE_CAP:
-            return _assemble()
-
-        # 2) drop per-check detail
-        for c in checks:
-            c.pop("detail", None)
-        if _serialized_len(_assemble()) <= _VERDICT_BYTE_CAP:
-            return _assemble()
-
-        # 3) strip every check down to name/passed/type. `type` is essential,
-        #    NOT a droppable passthrough field: gp-api's zod requires it on every
-        #    check (queue.types.ts) and DLQs the whole callback on a check that
-        #    lacks it. It is one short string per check, so keeping it is cheap.
-        checks = [
-            {"name": c.get("name"), "passed": c.get("passed"), "type": c.get("type")}
-            for c in checks
-        ]
-        return _assemble()
-
-
-def _serialized_len(payload: dict) -> int:
-    return len(json.dumps(payload))
+        return {
+            "verdict_version": self.verdict_version,
+            "qa_version_ids": self.qa_version_ids,
+            "status": self.status,
+            "pass": self.pass_,
+            "checks": [dict(c) for c in self.checks],
+            "violations": list(self.violations),
+            "duration_ms": self.duration_ms,
+            "cost_usd": self.cost_usd,
+        }
 
 
 def run_qa_gate(

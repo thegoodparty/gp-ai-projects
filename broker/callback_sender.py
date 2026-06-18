@@ -21,11 +21,7 @@ class CallbackSender:
         cost_usd: float = 0,
         reason_code: str = "",
         detail: str = "",
-        qa_verdict: dict | None = None,
     ):
-        # Heterogeneous value types (str / float / dict), so type the inner
-        # `data` dict explicitly — otherwise mypy infers a narrow value type
-        # from the literal and rejects the conditional qaVerdict assignment.
         data: dict[str, object] = {
             "experimentId": experiment_id,
             "runId": run_id,
@@ -45,14 +41,6 @@ class CallbackSender:
             "error": detail,
         }
         body = {"type": "agentExperimentResult", "data": data}
-        # PMF QA gate (contract E, v1 observe-only): the verdict rides the
-        # success callback only. The envelope key is camelCase to match the
-        # other data.* keys; the verdict BODY is forwarded verbatim (the
-        # broker keeps it opaque), so its snake_case contract-C shape is
-        # preserved. Omit the key entirely when no gate ran (no qa folder, or
-        # a pre-gate runner) so older messages parse byte-identically.
-        if qa_verdict is not None:
-            data["qaVerdict"] = qa_verdict
         if not self.queue_url:
             logger.info("callback skipped (no queue_url): %s %s", run_id, status)
             return
