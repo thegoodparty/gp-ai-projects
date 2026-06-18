@@ -97,12 +97,6 @@ variable "experiment_metadata_read_policy_arn" {
   default     = ""
 }
 
-variable "max_concurrent_agents" {
-  description = "Fallback cap on concurrently-running agent Fargate tasks, used only when the live SSM parameter /pmf-engine/<env>/max-concurrent-agents is missing or unreadable. The live cap is that SSM parameter (operator-editable with no deploy), which the scheduler reads each tick."
-  type        = number
-  default     = 100
-}
-
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_vpc" "selected" {
@@ -253,8 +247,9 @@ resource "aws_dynamodb_table" "job_queue" {
 # (var.gp_api_sqs_queue_url / _arn) — the same queue the broker sends success
 # results to and gp-api's consumer polls. This module does NOT create its own
 # results queue: a separate queue here is an orphan nothing consumes, which
-# silently swallows dispatch-error callbacks (the run then only fails via the
-# 45-minute stale sweep instead of immediately).
+# silently swallows dispatch-error callbacks (the run would then never fail —
+# there is no time-based stale sweep; reconciliation is the ECS task-stopped
+# reaper, which only covers tasks that actually launched).
 
 # --- Lambda: Dispatch Handler ---
 
@@ -544,9 +539,8 @@ resource "aws_lambda_function" "scheduler" {
       RESULTS_QUEUE_URL         = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN = var.service_tokens_secret_arn
       JOB_TABLE_NAME            = aws_dynamodb_table.job_queue.name
-      # Fallback floor only — the live cap is the SSM parameter below, read each
-      # tick. This applies if the parameter is missing or SSM is unreachable.
-      MAX_CONCURRENT_AGENTS       = tostring(var.max_concurrent_agents)
+      # Live cap, read each tick. Edit with `ssm put-parameter --overwrite`, no
+      # deploy. If missing/unreadable the scheduler falls back to a hard-coded 50.
       MAX_CONCURRENT_AGENTS_PARAM = "/pmf-engine/${var.environment}/max-concurrent-agents"
     }
   }

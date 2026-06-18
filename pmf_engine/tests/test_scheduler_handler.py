@@ -283,21 +283,19 @@ class TestGetMaxConcurrentAgents:
         assert _REAL_GET_CAP() == 150
         fake.get_parameter.assert_called_once_with(Name="/pmf-engine/dev/max-concurrent-agents")
 
-    def test_falls_back_to_env_when_ssm_read_fails(self, monkeypatch):
+    def test_falls_back_to_hardcoded_when_ssm_read_fails(self, monkeypatch):
         monkeypatch.setattr(
             sched, "MAX_CONCURRENT_AGENTS_PARAM", "/pmf-engine/dev/max-concurrent-agents", raising=False
         )
-        monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_ENV", 100, raising=False)
         fake = MagicMock()
         fake.get_parameter.side_effect = RuntimeError("ssm unavailable")
         monkeypatch.setattr(sched, "get_ssm_client", lambda: fake)
-        assert _REAL_GET_CAP() == 100
+        assert _REAL_GET_CAP() == 50
 
-    def test_uses_env_when_no_param_configured(self, monkeypatch):
+    def test_uses_hardcoded_when_no_param_configured(self, monkeypatch):
         monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_PARAM", "", raising=False)
-        monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_ENV", 42, raising=False)
         # get_ssm_client must not even be called when no param is configured.
         monkeypatch.setattr(
             sched, "get_ssm_client", lambda: (_ for _ in ()).throw(AssertionError("SSM should not be queried"))
         )
-        assert _REAL_GET_CAP() == 42
+        assert _REAL_GET_CAP() == 50

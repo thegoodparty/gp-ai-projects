@@ -23,11 +23,11 @@ except ImportError:  # Lambda flat-package import
     from dispatch_handler import emit_dispatch_metric, get_sqs_client, launch_run  # type: ignore[no-redef]
     from job_store import JobClaimConflict, JobStore  # type: ignore[no-redef]
 
-# Fallback cap, baked in by Terraform. The live cap is the SSM parameter named
-# by MAX_CONCURRENT_AGENTS_PARAM (read each tick); this env var is only used when
-# the parameter isn't configured or the read fails, so a transient SSM blip can't
-# silently drop the cap to 0 and stop all dispatch.
-MAX_CONCURRENT_AGENTS_ENV = int(os.environ.get("MAX_CONCURRENT_AGENTS", "0") or 0)
+# The live cap is the SSM parameter named by MAX_CONCURRENT_AGENTS_PARAM, read
+# each tick. When the parameter isn't configured or the read fails we fall back
+# to a conservative hard-coded floor rather than disabling the cap — a transient
+# SSM blip must not drop the cap to 0 and stall all dispatch.
+_FALLBACK_MAX_CONCURRENT_AGENTS = 50
 MAX_CONCURRENT_AGENTS_PARAM = os.environ.get("MAX_CONCURRENT_AGENTS_PARAM", "")
 ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
@@ -58,20 +58,20 @@ def get_ssm_client():
 
 def get_max_concurrent_agents() -> int:
     """Live cap, read from SSM each tick so an operator can change it with a
-    single `ssm put-parameter` and no deploy. Falls back to the
-    MAX_CONCURRENT_AGENTS env var when the parameter isn't configured or the read
-    fails (transient SSM error / param missing) — never silently disables the cap."""
+    single `ssm put-parameter` and no deploy. Falls back to the hard-coded
+    _FALLBACK_MAX_CONCURRENT_AGENTS when the parameter isn't configured or the
+    read fails (transient SSM error / param missing) — never disables the cap."""
     if not MAX_CONCURRENT_AGENTS_PARAM:
-        return MAX_CONCURRENT_AGENTS_ENV
+        return _FALLBACK_MAX_CONCURRENT_AGENTS
     try:
         resp = get_ssm_client().get_parameter(Name=MAX_CONCURRENT_AGENTS_PARAM)
         return int(resp["Parameter"]["Value"])
     except Exception as e:
         logger.warning(
             f"SSM get_parameter({MAX_CONCURRENT_AGENTS_PARAM}) failed ({type(e).__name__}: {e}); "
-            f"falling back to env cap {MAX_CONCURRENT_AGENTS_ENV}"
+            f"falling back to {_FALLBACK_MAX_CONCURRENT_AGENTS}"
         )
-        return MAX_CONCURRENT_AGENTS_ENV
+        return _FALLBACK_MAX_CONCURRENT_AGENTS
 
 
 def get_job_store():
