@@ -97,12 +97,6 @@ variable "experiment_metadata_read_policy_arn" {
   default     = ""
 }
 
-variable "max_concurrent_agents" {
-  description = "Maximum number of concurrently-running agent Fargate tasks the scheduler will allow. The scheduler counts RUNNING tasks and launches up to this cap."
-  type        = number
-  default     = 100
-}
-
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_vpc" "selected" {
@@ -253,8 +247,9 @@ resource "aws_dynamodb_table" "job_queue" {
 # (var.gp_api_sqs_queue_url / _arn) — the same queue the broker sends success
 # results to and gp-api's consumer polls. This module does NOT create its own
 # results queue: a separate queue here is an orphan nothing consumes, which
-# silently swallows dispatch-error callbacks (the run then only fails via the
-# 45-minute stale sweep instead of immediately).
+# silently swallows dispatch-error callbacks (the run would then never fail —
+# there is no time-based stale sweep; reconciliation is the ECS task-stopped
+# reaper, which only covers tasks that actually launched).
 
 # --- Lambda: Dispatch Handler ---
 
@@ -507,6 +502,15 @@ resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
         Action   = "secretsmanager:GetSecretValue"
         Resource = var.service_tokens_secret_arn
       },
+      {
+        # Live, operator-tunable concurrency cap. The parameter is created out of
+        # band (not a Terraform resource) so it can be edited with one
+        # `ssm put-parameter` and no apply; the scheduler reads it each tick and
+        # falls back to the MAX_CONCURRENT_AGENTS env var if it's absent.
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/pmf-engine/${var.environment}/max-concurrent-agents"
+      },
     ]
   })
 }
@@ -535,7 +539,9 @@ resource "aws_lambda_function" "scheduler" {
       RESULTS_QUEUE_URL         = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN = var.service_tokens_secret_arn
       JOB_TABLE_NAME            = aws_dynamodb_table.job_queue.name
-      MAX_CONCURRENT_AGENTS     = tostring(var.max_concurrent_agents)
+      # Live cap, read each tick. Edit with `ssm put-parameter --overwrite`, no
+      # deploy. If missing/unreadable the scheduler falls back to a hard-coded 50.
+      MAX_CONCURRENT_AGENTS_PARAM = "/pmf-engine/${var.environment}/max-concurrent-agents"
     }
   }
 
