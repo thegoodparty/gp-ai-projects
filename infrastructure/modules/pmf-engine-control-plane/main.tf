@@ -98,7 +98,7 @@ variable "experiment_metadata_read_policy_arn" {
 }
 
 variable "max_concurrent_agents" {
-  description = "Maximum number of concurrently-running agent Fargate tasks the scheduler will allow. The scheduler counts RUNNING tasks and launches up to this cap."
+  description = "Fallback cap on concurrently-running agent Fargate tasks, used only when the live SSM parameter /pmf-engine/<env>/max-concurrent-agents is missing or unreadable. The live cap is that SSM parameter (operator-editable with no deploy), which the scheduler reads each tick."
   type        = number
   default     = 100
 }
@@ -507,6 +507,15 @@ resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
         Action   = "secretsmanager:GetSecretValue"
         Resource = var.service_tokens_secret_arn
       },
+      {
+        # Live, operator-tunable concurrency cap. The parameter is created out of
+        # band (not a Terraform resource) so it can be edited with one
+        # `ssm put-parameter` and no apply; the scheduler reads it each tick and
+        # falls back to the MAX_CONCURRENT_AGENTS env var if it's absent.
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/pmf-engine/${var.environment}/max-concurrent-agents"
+      },
     ]
   })
 }
@@ -535,7 +544,10 @@ resource "aws_lambda_function" "scheduler" {
       RESULTS_QUEUE_URL         = var.gp_api_sqs_queue_url
       SERVICE_TOKENS_SECRET_ARN = var.service_tokens_secret_arn
       JOB_TABLE_NAME            = aws_dynamodb_table.job_queue.name
-      MAX_CONCURRENT_AGENTS     = tostring(var.max_concurrent_agents)
+      # Fallback floor only — the live cap is the SSM parameter below, read each
+      # tick. This applies if the parameter is missing or SSM is unreachable.
+      MAX_CONCURRENT_AGENTS       = tostring(var.max_concurrent_agents)
+      MAX_CONCURRENT_AGENTS_PARAM = "/pmf-engine/${var.environment}/max-concurrent-agents"
     }
   }
 

@@ -23,7 +23,12 @@ except ImportError:  # Lambda flat-package import
     from dispatch_handler import emit_dispatch_metric, get_sqs_client, launch_run  # type: ignore[no-redef]
     from job_store import JobClaimConflict, JobStore  # type: ignore[no-redef]
 
-MAX_CONCURRENT_AGENTS = int(os.environ.get("MAX_CONCURRENT_AGENTS", "0") or 0)
+# Fallback cap, baked in by Terraform. The live cap is the SSM parameter named
+# by MAX_CONCURRENT_AGENTS_PARAM (read each tick); this env var is only used when
+# the parameter isn't configured or the read fails, so a transient SSM blip can't
+# silently drop the cap to 0 and stop all dispatch.
+MAX_CONCURRENT_AGENTS_ENV = int(os.environ.get("MAX_CONCURRENT_AGENTS", "0") or 0)
+MAX_CONCURRENT_AGENTS_PARAM = os.environ.get("MAX_CONCURRENT_AGENTS_PARAM", "")
 ECS_CLUSTER_ARN = os.environ.get("ECS_CLUSTER_ARN", "")
 RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
 JOB_TABLE_NAME = os.environ.get("JOB_TABLE_NAME", "")
@@ -34,6 +39,7 @@ _STUCK_LAUNCHING_MS = 10 * 60 * 1000
 
 _ecs_client = None
 _job_store = None
+_ssm_client = None
 
 
 def get_ecs_client():
@@ -41,6 +47,31 @@ def get_ecs_client():
     if _ecs_client is None:
         _ecs_client = boto3.client("ecs")
     return _ecs_client
+
+
+def get_ssm_client():
+    global _ssm_client
+    if _ssm_client is None:
+        _ssm_client = boto3.client("ssm")
+    return _ssm_client
+
+
+def get_max_concurrent_agents() -> int:
+    """Live cap, read from SSM each tick so an operator can change it with a
+    single `ssm put-parameter` and no deploy. Falls back to the
+    MAX_CONCURRENT_AGENTS env var when the parameter isn't configured or the read
+    fails (transient SSM error / param missing) — never silently disables the cap."""
+    if not MAX_CONCURRENT_AGENTS_PARAM:
+        return MAX_CONCURRENT_AGENTS_ENV
+    try:
+        resp = get_ssm_client().get_parameter(Name=MAX_CONCURRENT_AGENTS_PARAM)
+        return int(resp["Parameter"]["Value"])
+    except Exception as e:
+        logger.warning(
+            f"SSM get_parameter({MAX_CONCURRENT_AGENTS_PARAM}) failed ({type(e).__name__}: {e}); "
+            f"falling back to env cap {MAX_CONCURRENT_AGENTS_ENV}"
+        )
+        return MAX_CONCURRENT_AGENTS_ENV
 
 
 def get_job_store():
@@ -162,8 +193,9 @@ def handler(event, context) -> dict:
         logger.exception(f"stuck-LAUNCHING sweep failed ({type(e).__name__}); continuing")
         emit_dispatch_metric("SchedulerSweepError", "_unknown")
 
-    if MAX_CONCURRENT_AGENTS <= 0:
-        logger.warning("MAX_CONCURRENT_AGENTS unset/0; scheduler will not launch")
+    cap = get_max_concurrent_agents()
+    if cap <= 0:
+        logger.warning("max concurrent agents unset/0; scheduler will not launch")
         return {"launched": 0}
 
     try:
@@ -172,9 +204,9 @@ def handler(event, context) -> dict:
         logger.warning(f"count_running_tasks failed ({type(e).__name__}: {e}); skipping this tick")
         return {"launched": 0}
 
-    slots = MAX_CONCURRENT_AGENTS - running
+    slots = cap - running
     if slots <= 0:
-        logger.info(f"At cap: {running}/{MAX_CONCURRENT_AGENTS}; no slots")
+        logger.info(f"At cap: {running}/{cap}; no slots")
         return {"launched": 0}
 
     try:

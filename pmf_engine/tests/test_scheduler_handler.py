@@ -1,10 +1,14 @@
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import pmf_engine.control_plane.scheduler_handler as sched
 from pmf_engine.control_plane.job_store import QueuedJob
+
+# Captured at import, before the autouse fixture stubs the module attribute, so
+# the SSM tests below can exercise the real implementation.
+_REAL_GET_CAP = sched.get_max_concurrent_agents
 
 
 def _job(run_id, priority):
@@ -30,7 +34,9 @@ def _job(run_id, priority):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS", 3, raising=False)
+    # The live cap is read via get_max_concurrent_agents() (SSM each tick); stub
+    # it to 3 so the existing slot/cap tests are unaffected by the SSM plumbing.
+    monkeypatch.setattr(sched, "get_max_concurrent_agents", lambda: 3)
     monkeypatch.setattr(sched, "RESULTS_QUEUE_URL", "https://sqs/cb.fifo", raising=False)
 
 
@@ -264,3 +270,34 @@ def test_query_queued_failure_does_not_propagate(mock_launch, mock_sqs, mock_sto
 
     assert result == {"launched": 0}
     mock_launch.assert_not_called()
+
+
+class TestGetMaxConcurrentAgents:
+    def test_reads_live_value_from_ssm(self, monkeypatch):
+        monkeypatch.setattr(
+            sched, "MAX_CONCURRENT_AGENTS_PARAM", "/pmf-engine/dev/max-concurrent-agents", raising=False
+        )
+        fake = MagicMock()
+        fake.get_parameter.return_value = {"Parameter": {"Value": "150"}}
+        monkeypatch.setattr(sched, "get_ssm_client", lambda: fake)
+        assert _REAL_GET_CAP() == 150
+        fake.get_parameter.assert_called_once_with(Name="/pmf-engine/dev/max-concurrent-agents")
+
+    def test_falls_back_to_env_when_ssm_read_fails(self, monkeypatch):
+        monkeypatch.setattr(
+            sched, "MAX_CONCURRENT_AGENTS_PARAM", "/pmf-engine/dev/max-concurrent-agents", raising=False
+        )
+        monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_ENV", 100, raising=False)
+        fake = MagicMock()
+        fake.get_parameter.side_effect = RuntimeError("ssm unavailable")
+        monkeypatch.setattr(sched, "get_ssm_client", lambda: fake)
+        assert _REAL_GET_CAP() == 100
+
+    def test_uses_env_when_no_param_configured(self, monkeypatch):
+        monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_PARAM", "", raising=False)
+        monkeypatch.setattr(sched, "MAX_CONCURRENT_AGENTS_ENV", 42, raising=False)
+        # get_ssm_client must not even be called when no param is configured.
+        monkeypatch.setattr(
+            sched, "get_ssm_client", lambda: (_ for _ in ()).throw(AssertionError("SSM should not be queried"))
+        )
+        assert _REAL_GET_CAP() == 42
