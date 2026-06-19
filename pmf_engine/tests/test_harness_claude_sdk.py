@@ -1897,3 +1897,118 @@ class TestFinalizeInjection:
 
         assert calls["n"] == 1
         assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_finalize_agent_write_of_result_file_yields_status_ok(self):
+        """FIX 5(a): a finalize whose agent ACTUALLY WRITES the result file is a
+        success. The primary hits error_max_turns having written nothing; the
+        finalize fake mirrors the real Bash write — it dumps a valid fragment
+        array to params.result_file_path — and yields a clean ResultMessage.
+        Assert: exactly two queries, the file exists with the expected fragments
+        on disk, and status='ok'. The old finalize test asserted status without
+        any fake ever writing a file, so a live finalize that emitted a clean
+        ResultMessage but failed to write the verdict still 'passed'. This locks
+        the file-write half of the contract."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        expected_fragments = [
+            {"check": "faithfulness", "score": 4, "evidence": "every claim cited"},
+            {"check": "completeness", "score": 5, "evidence": "all sections present"},
+        ]
+
+        calls: list[dict] = []
+        result_file_path_holder: dict[str, str] = {}
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-write")
+
+        async def gen_finalize():
+            with open(result_file_path_holder["path"], "w") as f:
+                json.dump(expected_fragments, f)
+            yield _make_result_message(
+                is_error=False, subtype="result", num_turns=1, session_id="sess-write")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": options})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            result_file_path_holder["path"] = rf
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+
+            assert not os.path.exists(rf), "result file must not exist before the finalize writes it"
+
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+            assert len(calls) == 2, "primary + exactly one finalize query"
+            assert os.path.exists(rf), "the finalize agent must have written the result file"
+            with open(rf) as f:
+                on_disk = json.load(f)
+            assert on_disk == expected_fragments
+
+        assert result.status == "ok", "a finalize that writes the verdict is treated as a success"
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_bounded_by_its_own_timeout(self):
+        """FIX 5(b): the finalize resume MUST be bounded by its own wait_for. The
+        primary cuts on error_max_turns instantly (so the primary timeout does
+        not fire and the finalize is reached), then the finalize query HANGS far
+        longer than the budget. With params.timeout_seconds tiny, the finalize
+        timeout is min(_FINALIZE_TIMEOUT_SECONDS, timeout_seconds) = tiny, so the
+        finalize's wait_for cancels the hung query and run_evaluator_agent returns
+        status='error' (fail-open) in well under the sleep duration.
+
+        Non-vacuous: this test currently PASSES. If the finalize's
+        `asyncio.wait_for(drain(...), timeout=finalize_timeout)` in _finalize were
+        removed, the finalize drain would await the hung query directly, the 30s
+        sleep would run to completion, the test would block ~30s, and the
+        `elapsed < 10` assertion (plus the cancellation flag) would fail."""
+        import time as _time
+
+        from pmf_engine.runner.harness.base import EvaluatorResult
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        finalize_cancelled = {"was_cancelled": False}
+        calls = {"n": 0}
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-fin-hang")
+
+        async def gen_finalize_hangs():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                finalize_cancelled["was_cancelled"] = True
+                raise
+            yield _make_result_message()  # pragma: no cover
+
+        def fake_query(prompt, options):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return gen_primary()
+            return gen_finalize_hangs()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gc, workspace_dir=ws, result_file_path=rf, timeout_seconds=1)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    t0 = _time.monotonic()
+                    result = await run_evaluator_agent(params)
+                    elapsed = _time.monotonic() - t0
+
+        assert calls["n"] == 2, "primary cut, then exactly one finalize attempt"
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "error", "a hung finalize must surface status='error' (fail-open)"
+        assert elapsed < 10, f"finalize must be bounded by its own timeout; took {elapsed:.1f}s"
+        assert finalize_cancelled["was_cancelled"], (
+            "the hung finalize query must be cancelled by its wait_for, not abandoned"
+        )

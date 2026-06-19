@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -2368,3 +2369,117 @@ class TestArtifactPublishDurableQaEvalTranscriptS3Capture:
 
         keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
         assert not any(k.endswith("eval_transcript.jsonl") for k in keys_written)
+
+
+class TestQaPublishCrossSurfaceContract:
+    """Meet-in-the-middle contract test crossing the runner-producer ->
+    broker-consumer boundary for the qa publish fields.
+
+    The qa_verdict / qa_raw_output / qa_eval_transcript field names are bare
+    string literals duplicated on both sides (the runner's publish() request
+    body and the broker's PublishRequest model). There is no shared schema, so
+    a producer-side rename ships green and silently disables the durable S3
+    write — pydantic's extra='ignore' drops the now-unknown key before the
+    handler ever sees it. This test builds the REAL producer body and feeds it
+    into the REAL consumer model so a rename on either side fails it.
+    """
+
+    def _capture_producer_body(
+        self,
+        verdict: dict,
+        qa_raw_output: str,
+        qa_eval_transcript: str,
+    ) -> dict:
+        """Drive the runner's publish client against an in-process MockTransport
+        and return the exact JSON body it POSTs to /artifact/publish. No AWS, no
+        network."""
+        from pmf_engine.runner.pmf_runtime import config as runtime_config
+        from pmf_engine.runner.pmf_runtime.publish import publish as runner_publish
+
+        captured: dict = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "artifact_key": "exp/run/artifact.json",
+                    "artifact_bucket": "gp-agent-artifacts-test",
+                    "callback_sent": True,
+                },
+            )
+
+        cfg = runtime_config.init_config(
+            broker_url="http://broker.test",
+            broker_token=BROKER_TOKEN,
+        )
+        cfg._client = httpx.Client(
+            base_url="http://broker.test",
+            headers={"X-Broker-Token": BROKER_TOKEN},
+            transport=httpx.MockTransport(_handler),
+        )
+        try:
+            runner_publish(
+                artifact=_valid_artifact(),
+                qa_verdict=verdict,
+                qa_raw_output=qa_raw_output,
+                qa_eval_transcript=qa_eval_transcript,
+            )
+        finally:
+            cfg.close()
+            runtime_config._config = None
+
+        assert "body" in captured, "producer never POSTed a body to /artifact/publish"
+        return captured["body"]
+
+    def test_qa_fields_round_trip_producer_body_into_consumer_model(self):
+        """The runner's publish() emits qa_verdict / qa_raw_output /
+        qa_eval_transcript under keys the broker's PublishRequest reads back
+        VERBATIM. PublishRequest(**body) is the load-bearing assertion: a rename
+        on either side leaves the corresponding field at its None default and
+        the equality checks below fail."""
+        from broker.endpoints.artifact_publish import PublishRequest
+        from pmf_engine.runner.qa_gate import Verdict
+
+        verdict = Verdict(
+            status="evaluated",
+            pass_=False,
+            checks=[{"name": "sources_resolve", "passed": False, "detail": "404 on src-2"}],
+            violations=["source src-2 is unreachable"],
+            duration_ms=4200,
+            cost_usd=0.0731,
+        ).to_dict()
+        qa_raw_output = "[{\"name\": \"sources_resolve\", \"passed\": false}]"
+        qa_eval_transcript = '{"turn":1}'
+
+        body = self._capture_producer_body(
+            verdict=verdict,
+            qa_raw_output=qa_raw_output,
+            qa_eval_transcript=qa_eval_transcript,
+        )
+
+        req = PublishRequest(**body)
+
+        assert req.qa_verdict == verdict
+        assert req.qa_raw_output == qa_raw_output
+        assert req.qa_eval_transcript == qa_eval_transcript
+
+    def test_producer_qa_keys_exactly_match_consumer_model_fields(self):
+        """Pin the wire-key contract directly: every qa_* key the producer emits
+        is a declared field on the consumer model (not silently dropped by
+        extra='ignore'), and every qa_* model field has a producer key feeding
+        it. A rename on either side breaks this set equality."""
+        from broker.endpoints.artifact_publish import PublishRequest
+        from pmf_engine.runner.qa_gate import Verdict
+
+        body = self._capture_producer_body(
+            verdict=Verdict(status="evaluated", pass_=True).to_dict(),
+            qa_raw_output="[]",
+            qa_eval_transcript='{"turn":1}',
+        )
+
+        producer_qa_keys = {k for k in body if k.startswith("qa_")}
+        consumer_qa_fields = {f for f in PublishRequest.model_fields if f.startswith("qa_")}
+
+        assert producer_qa_keys == {"qa_verdict", "qa_raw_output", "qa_eval_transcript"}
+        assert producer_qa_keys == consumer_qa_fields

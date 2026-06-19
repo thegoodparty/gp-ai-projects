@@ -7,9 +7,10 @@ DETERMINISTIC-ONLY and OBSERVE-ONLY: there is no AI evaluator, no eval.md, no
 blocking-fail branch, no quarantine, no fail-closed. A gate error becomes a
 Verdict with status 'error' and the run still publishes (fail-open).
 
-`run_qa_gate` returns a ``(verdict, raw_output)`` tuple (or ``None`` when no qa
-folder): ``raw_output`` is the raw ``main.py`` stdout the runner forwards to the
-broker for the durable S3 verdict.json write.
+`run_qa_gate` returns a ``(verdict, raw_output, eval_transcript)`` tuple (or
+``None`` when no qa folder): ``raw_output`` is the raw ``main.py`` stdout and
+``eval_transcript`` is the evaluator's redacted per-turn JSONL transcript — the
+runner forwards both to the broker for the durable S3 verdict.json write.
 
 Tests materialize tiny `main.py` fixtures through the qa_envelope, so the engine
 is exercised end-to-end with a real subprocess.
@@ -25,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+from unittest import mock
 
 import pytest
 
@@ -1847,3 +1849,301 @@ def test_hook_error_violation_redacts_broker_token(workspace, gate_base, monkeyp
     assert any("qa_gate_hook_error" in v for v in verdict.violations)
     # The defense-in-depth fallback carries no evaluator transcript.
     assert _transcript is None
+
+
+# ==========================================================================
+# FIX 1 (security HIGH): _normalize_fragment redacts the BROKER_TOKEN at ANY
+# depth, not only in top-level string values. A token nested inside a fragment's
+# `evidence` dict, a `samples` list, or any deeper structure would otherwise
+# reach the durable verdict.json + the Braintrust span UNREDACTED, because the
+# old code only ran _redact_secrets over top-level string values of the check
+# dict. Redaction must recurse into nested dicts/lists while leaving structure
+# and non-string leaves (ints/floats/bools/None) intact.
+# ==========================================================================
+
+
+def test_normalize_fragment_redacts_token_nested_in_dict_and_list():
+    """The live BROKER_TOKEN planted in a NESTED field (a dict value, a list
+    element) of a fragment must be redacted by _normalize_fragment, while a
+    non-secret nested value (surrounding text, a numeric score, a nested key
+    name) is preserved intact and the structure is unchanged."""
+    token = "tok-nested-secret-9f8a7b6c5d4e"
+    broker_env = {"BROKER_URL": "https://broker.test", "BROKER_TOKEN": token}
+    frag = {
+        "name": "leaky",
+        "passed": False,
+        "score": 0.42,
+        "evidence": {
+            "leaked": f"x-api-key: {token}",
+            "note": "this surrounding text must survive",
+            "depth": {"deeper": f"still {token} here", "kept": "deep-keep"},
+        },
+        "samples": [f"echoed {token}", "clean sample", {"inner": f"again {token}"}],
+        "count": 3,
+        "ok": True,
+    }
+    check = qa_gate_mod._normalize_fragment(frag, "deterministic", broker_env)
+
+    serialized = json.dumps(check)
+    # The token is gone EVERYWHERE — nested dict values, nested lists, deep dicts.
+    assert token not in serialized
+    assert qa_gate_mod._REDACTED in serialized
+
+    # Non-secret nested values are preserved intact (text, numbers, bools, keys).
+    assert "this surrounding text must survive" in check["evidence"]["note"]
+    assert check["evidence"]["depth"]["kept"] == "deep-keep"
+    assert check["score"] == 0.42
+    assert check["count"] == 3
+    assert check["ok"] is True
+    # Structure is preserved: evidence stays a dict, samples stays a list of the
+    # same length with the nested dict still a dict.
+    assert isinstance(check["evidence"], dict)
+    assert isinstance(check["samples"], list)
+    assert len(check["samples"]) == 3
+    assert isinstance(check["samples"][2], dict)
+    # The clean sample text is preserved verbatim.
+    assert "clean sample" in check["samples"]
+    # type tagging still applied.
+    assert check["type"] == "deterministic"
+
+
+def test_nested_fragment_token_redacted_through_full_gate(workspace, gate_base):
+    """End-to-end: main.py emits a fragment with the live BROKER_TOKEN buried in
+    a nested `evidence` dict and a `samples` list. The token must not survive
+    into the aggregated verdict (which egresses to gp-api + Braintrust + the
+    durable verdict.json), while non-secret nested text/numbers are preserved."""
+    secret = "tok-nested-e2e-secret-1a2b3c4d5e"
+    # main.py BUILDS the fragment itself so Python-invalid JSON literals
+    # (false/true) never land in the source. The secret is injected as a string.
+    main_src = (
+        "import json\n"
+        f"s = {json.dumps(secret)}\n"
+        "frag = {'name': 'leaky', 'passed': False,\n"
+        "        'evidence': {'leaked': 'saw ' + s + ' in headers', 'kept': 'evidence-keep'},\n"
+        "        'samples': ['echoed ' + s, 'sample-keep'],\n"
+        "        'score': 0.7}\n"
+        "print(json.dumps([frag]))\n"
+    )
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": main_src}),
+            workspace_dir=workspace,
+            broker_env={"BROKER_URL": "https://broker.test", "BROKER_TOKEN": secret},
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    leaky = [c for c in verdict.checks if c["name"] == "leaky"]
+    assert len(leaky) == 1
+    serialized = json.dumps(verdict.to_dict())
+    assert secret not in serialized
+    assert qa_gate_mod._REDACTED in serialized
+    # Non-secret nested values survive.
+    assert leaky[0]["evidence"]["kept"] == "evidence-keep"
+    assert "sample-keep" in leaky[0]["samples"]
+    assert leaky[0]["score"] == 0.7
+
+
+def test_invalid_fragment_synthetic_detail_redacts_nested_token():
+    """A malformed fragment (missing the required bool `passed`) is replaced by
+    the synthetic `invalid_fragment` check whose `detail` embeds the rejected
+    fragment via json.dumps. A BROKER_TOKEN buried in that rejected fragment must
+    NOT survive into the synthetic detail — that detail egresses to the durable
+    verdict.json + the Braintrust span exactly like a valid fragment's. The
+    non-secret structure of the rejected fragment is still echoed for diagnosis."""
+    token = "tok-invalid-frag-secret-7e0f70d6"
+    broker_env = {"BROKER_URL": "https://broker.test", "BROKER_TOKEN": token}
+    frag = {"name": "missing_passed", "evidence": {"buried": f"saw {token} in headers"}}
+    check = qa_gate_mod._normalize_fragment(frag, "agent", broker_env)
+
+    assert check["name"] == "invalid_fragment"
+    assert check["passed"] is False
+    assert check["type"] == "agent"
+    serialized = json.dumps(check)
+    assert token not in serialized
+    assert qa_gate_mod._REDACTED in check["detail"]
+    # The rejected fragment is still echoed for diagnosis: its non-secret name
+    # and the surrounding text survive so an author can identify the bad fragment.
+    assert "missing_passed" in check["detail"]
+    assert "in headers" in check["detail"]
+
+
+def test_invalid_non_dict_fragment_synthetic_detail_redacts_token():
+    """A fragment that is not a dict at all (e.g. a bare string the evaluator
+    printed) is also routed to the synthetic `invalid_fragment` branch via
+    json.dumps. A BROKER_TOKEN inside that string must be masked in the detail."""
+    token = "tok-nondict-frag-secret-1a2b3c4d"
+    broker_env = {"BROKER_URL": "https://broker.test", "BROKER_TOKEN": token}
+    check = qa_gate_mod._normalize_fragment(f"raw fragment with {token} leaked", "agent", broker_env)
+
+    assert check["name"] == "invalid_fragment"
+    assert token not in json.dumps(check)
+    assert qa_gate_mod._REDACTED in check["detail"]
+
+
+# ==========================================================================
+# FIX 2 (security MEDIUM): when _redact_secrets is called with a non-empty
+# broker_env that LACKS a usable BROKER_TOKEN, the bare-token replacement (the
+# ONLY thing that catches the bare uuid) is silently a no-op — a single point of
+# failure. The gate must log an ERROR (observability — redaction is degraded)
+# and still apply the shape-based regexes. We do NOT add a broad UUID pattern:
+# a legitimate run_id/uuid in a fragment must NOT be over-redacted.
+# ==========================================================================
+
+
+def test_redact_secrets_flags_degraded_state_when_token_missing():
+    """A non-empty broker_env that lacks a usable BROKER_TOKEN means the bare-
+    token replacement can't run — the redaction is degraded. _redact_secrets must
+    log an error so the degraded state is observable, while still applying the
+    shape-based regexes (so a Bearer/X-Broker-Token shape is still masked)."""
+    broker_env = {"BROKER_URL": "https://broker.test"}
+    text = "Authorization: Bearer leakedvalue1234567890 in headers"
+    with mock.patch.object(qa_gate_mod.logger, "error") as err:
+        out = qa_gate_mod._redact_secrets(text, broker_env)
+    # The degraded state is flagged at error level.
+    assert err.call_count == 1
+    # Shape-based regexes STILL run — the Bearer value is masked even with no token.
+    assert "leakedvalue1234567890" not in out
+    assert qa_gate_mod._REDACTED in out
+
+
+def test_redact_secrets_does_not_flag_or_over_redact_with_valid_token():
+    """With a usable BROKER_TOKEN, redaction is NOT degraded: no error is logged,
+    and a normal UUID (e.g. a run_id) that is NOT the token is preserved — the
+    fix must not introduce a broad UUID pattern that over-redacts."""
+    token = "tok-valid-broker-aaaaaaaaaa"
+    broker_env = {"BROKER_URL": "https://broker.test", "BROKER_TOKEN": token}
+    run_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    text = f"processing run_id={run_id} normally"
+    with mock.patch.object(qa_gate_mod.logger, "error") as err:
+        out = qa_gate_mod._redact_secrets(text, broker_env)
+    assert err.call_count == 0
+    # A legitimate uuid run_id is NOT over-redacted.
+    assert run_id in out
+    assert qa_gate_mod._REDACTED not in out
+
+
+def test_redact_secrets_empty_broker_env_does_not_flag():
+    """An EMPTY broker_env carries no broker context at all (no broker configured),
+    so the degraded-redaction error must NOT fire — flagging is only for the case
+    where a broker IS expected but the token is missing/empty."""
+    with mock.patch.object(qa_gate_mod.logger, "error") as err:
+        out = qa_gate_mod._redact_secrets("nothing secret here", {})
+    assert err.call_count == 0
+    assert out == "nothing secret here"
+
+
+# ==========================================================================
+# FIX 4 (test-engineer): lock four existing guards that survived mutation. Each
+# asserts a specific value and would FAIL under the stated mutation.
+# ==========================================================================
+
+
+def test_budget_exactly_equal_to_required_runs_stage(workspace, gate_base):
+    """When remaining_budget_seconds EXACTLY equals the required ceiling, the
+    stage RUNS — the pre-flight uses strict `<` (only spawns nothing when budget
+    is STRICTLY less than required). Mutation caught: `<` -> `<=` would skip the
+    exactly-equal case and return an error verdict."""
+    manifest = {"blocking": False, "deterministic": {"timeout_seconds": 120}}
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope=_envelope(files={"main.py": _MAIN_PASS}, manifest=manifest),
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            # EXACTLY equal to the 120s required ceiling.
+            remaining_budget_seconds=120.0,
+            gate_base_dir=gate_base,
+        )
+    )
+    # Equal budget is sufficient: the stage runs and the fragment is evaluated,
+    # NOT an insufficient_budget error.
+    assert verdict.status == "evaluated"
+    assert verdict.pass_ is True
+    assert not any("insufficient_budget" in v for v in verdict.violations)
+
+
+def test_truthy_nonbool_passed_replaced_by_invalid_fragment():
+    """A fragment with a TRUTHY but NON-BOOL `passed` (e.g. the int 1) is invalid
+    and must be replaced by the synthetic `invalid_fragment` failing check.
+    Mutation caught: dropping the `isinstance(frag.get("passed"), bool)` clause
+    would let `passed: 1` through as a real (truthy) check."""
+    frag = {"name": "x", "passed": 1}
+    check = qa_gate_mod._normalize_fragment(frag, "deterministic", _broker_env())
+    assert check["name"] == "invalid_fragment"
+    assert check["passed"] is False
+    assert check["type"] == "deterministic"
+    assert "invalid fragment replaced" in check["detail"]
+
+
+def test_materialize_rejects_subdir_name_via_basename_equality_clause(tmp_path):
+    """`_materialize` rejects a qa file name that is NOT its own basename
+    (`sub/dir/x.py`) with a specific ``ValueError`` BEFORE any write. This name
+    has no `..` and no leading `/`, so ONLY the `name != os.path.basename(name)`
+    clause rejects it. Mutation caught: dropping that clause changes the failure
+    from a deliberate ``ValueError('unsafe qa file basename')`` raised pre-write
+    to an incidental ``FileNotFoundError`` (the intermediate dirs don't exist) —
+    so asserting the SPECIFIC ValueError + message isolates the clause."""
+    gate_dir = str(tmp_path / "gate")
+    os.mkdir(gate_dir)
+    with pytest.raises(ValueError, match="unsafe qa file basename") as exc:
+        qa_gate_mod._materialize(gate_dir, {"blocking": False}, {"sub/dir/x.py": "print('nested')"})
+    assert "sub/dir/x.py" in str(exc.value)
+    # The unsafe file is rejected pre-write: neither its nested name nor any
+    # intermediate `sub/` dir is created under the gate dir. (manifest.json is
+    # written first and legitimately remains.)
+    assert not os.path.exists(os.path.join(gate_dir, "sub"))
+    assert not os.path.exists(os.path.join(gate_dir, "sub", "dir", "x.py"))
+
+
+def test_path_traversal_qa_file_escapes_nothing_through_full_gate(workspace, gate_base):
+    """End-to-end: a malicious `../evil.py` shipped alongside a valid `main.py`
+    (so materialization actually runs) surfaces an error verdict and writes
+    NOTHING outside the gate dir. The unsafe name is rejected pre-write by
+    `_materialize`'s guards; fail-open turns the rejection into an error verdict."""
+    sentinel_parent = os.path.dirname(os.path.realpath(gate_base))
+    evil_target = os.path.join(sentinel_parent, "evil.py")
+    if os.path.exists(evil_target):
+        os.remove(evil_target)
+
+    verdict = _verdict(
+        run_qa_gate(
+            artifact_bytes=ARTIFACT,
+            qa_envelope={
+                "manifest": {"blocking": False},
+                "files": {"main.py": _MAIN_PASS, "../evil.py": f"open({evil_target!r}, 'w').close()"},
+                "resolved_qa_version_ids": {"manifest.json": "v-man"},
+            },
+            workspace_dir=workspace,
+            broker_env=_broker_env(),
+            remaining_budget_seconds=BIG_BUDGET,
+            gate_base_dir=gate_base,
+        )
+    )
+    assert verdict.status == "error"
+    assert verdict.pass_ is None
+    assert not os.path.exists(evil_target)
+
+
+def test_agent_max_turns_clamped_to_engine_ceiling_before_evaluator(workspace, gate_base):
+    """A manifest agent.max_turns above the engine ceiling is clamped to
+    _MAX_AGENT_TURNS before reaching the evaluator. The value the evaluator
+    actually receives (params.max_turns) must equal _MAX_AGENT_TURNS, not the
+    author's 999. Mutation caught: dropping the `min(..., _MAX_AGENT_TURNS)`
+    clamp would forward the raw 999."""
+    fake = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}])
+    manifest = {"blocking": False, "agent": {"max_turns": 999}}
+    run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}, manifest=manifest),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+    )
+    assert len(fake.calls) == 1
+    assert fake.calls[0].max_turns == qa_gate_mod._MAX_AGENT_TURNS
+    # Sanity: the author's raw value was NOT forwarded.
+    assert fake.calls[0].max_turns != 999

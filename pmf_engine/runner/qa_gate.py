@@ -638,10 +638,22 @@ def _redact_secrets(text: str, broker_env: dict) -> str:
 
     The explicit token is masked first (longest, most specific), then generic
     patterns catch token shapes we don't know the literal of.
+
+    When ``broker_env`` is non-empty (a broker context IS present) but carries no
+    usable BROKER_TOKEN, the explicit-token replacement — the ONLY thing that
+    masks the bare uuid token — cannot run, so the redaction is DEGRADED. That
+    case is logged at error level for observability; the shape-based regexes
+    still run, and no broad uuid pattern is added (it would over-redact
+    legitimate run_ids).
     """
     token = broker_env.get("BROKER_TOKEN")
     if token and isinstance(token, str) and len(token) >= 4:
         text = text.replace(token, _REDACTED)
+    elif broker_env:
+        logger.error(
+            "qa_gate_redaction_degraded: broker_env present but no usable BROKER_TOKEN; "
+            "bare-token masking skipped, only shape-based patterns applied"
+        )
 
     def _mask_kv(m: re.Match) -> str:
         return f"{m.group(1)}={_REDACTED}"
@@ -799,19 +811,43 @@ def _normalize_fragment(frag: object, stage_type: str, broker_env: dict | None =
     field) would leak. Every string value is run through ``_redact_secrets``
     using ``broker_env`` so the live BROKER_TOKEN never lands in the verdict."""
     if not isinstance(frag, dict) or not isinstance(frag.get("name"), str) or not isinstance(frag.get("passed"), bool):
+        detail = f"invalid fragment replaced: {json.dumps(frag, default=str)[:512]}"
+        if broker_env is not None:
+            detail = _redact_secrets(detail, broker_env)
         return {
             "name": "invalid_fragment",
             "type": stage_type,
             "passed": False,
-            "detail": f"invalid fragment replaced: {json.dumps(frag, default=str)[:512]}",
+            "detail": detail,
         }
     check = dict(frag)
     check["type"] = stage_type
     if broker_env is not None:
         for k, v in check.items():
-            if isinstance(v, str):
-                check[k] = _redact_secrets(v, broker_env)
+            check[k] = _redact_value(v, broker_env)
     return check
+
+
+def _redact_value(value: object, broker_env: dict) -> object:
+    """Recursively apply ``_redact_secrets`` to every ``str`` leaf in ``value``,
+    rebuilding the same structure. dict values and list/tuple elements are walked
+    at any depth; non-str leaves (int/float/bool/None) and the structure itself
+    are left untouched. Value-only: dict KEYS are not rewritten (a key is not an
+    egress surface for a secret value and rewriting keys could collide). Never
+    raises — a redaction failure falls back to returning the value unchanged so
+    the gate stays fail-open."""
+    try:
+        if isinstance(value, str):
+            return _redact_secrets(value, broker_env)
+        if isinstance(value, dict):
+            return {k: _redact_value(v, broker_env) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_redact_value(v, broker_env) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_redact_value(v, broker_env) for v in value)
+        return value
+    except Exception:
+        return value
 
 
 def _build_violations(checks: list[dict]) -> list[str]:
