@@ -56,6 +56,7 @@ class EvaluatorResult:
     num_turns: int = 0
     session_id: str | None = None
     status: Literal["ok", "error"] = "ok"
+    eval_transcript: str = ""
 
 
 @runtime_checkable

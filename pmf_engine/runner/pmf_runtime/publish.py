@@ -49,6 +49,7 @@ def publish(
     cost_usd: float = 0,
     qa_verdict: dict | None = None,
     qa_raw_output: str | None = None,
+    qa_eval_transcript: str | None = None,
 ) -> dict:
     from .config import get_config
 
@@ -69,6 +70,13 @@ def publish(
     # when absent so a verdict-only / no-qa publish stays byte-identical.
     if qa_raw_output is not None:
         body["qa_raw_output"] = qa_raw_output
+    # PMF QA gate (contract D): the evaluator's redacted per-turn JSONL
+    # transcript, carried so the broker can write it durably to S3 alongside the
+    # verdict. Omit the key when absent (no evaluator ran / no-qa) so the payload
+    # stays byte-identical; an empty string ('' = evaluator ran but empty) is
+    # DISTINCT from None and IS forwarded.
+    if qa_eval_transcript is not None:
+        body["qa_eval_transcript"] = qa_eval_transcript
 
     def _call() -> dict:
         response = get_config().client.post("/artifact/publish", json=body)

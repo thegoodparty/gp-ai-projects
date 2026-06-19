@@ -2022,3 +2022,349 @@ class TestArtifactPublishDurableQaVerdictS3Capture:
         mock_store.delete_ticket_and_run_lock.assert_called_once_with(
             BROKER_TOKEN, "di-verdict-412-raw"
         )
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (eval transcript): durable S3 eval_transcript.jsonl capture.
+#
+# When the evaluator AGENT ran (eval.md present), the runner forwards the
+# per-turn JSONL transcript as `qa_eval_transcript` (already redacted
+# runner-side in qa_gate._run_evaluator). The broker writes it durably to
+# `<exp>/<run>/qa/eval_transcript.jsonl`, mirroring main_output.json EXACTLY:
+# opaque passthrough (NO broker redaction), its own 1 MiB size cap (measured in
+# true UTF-8 bytes, fail-open), write-once (IfNoneMatch=*), and gated on the
+# sibling verdict.json having actually landed (no orphan transcript).
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactPublishDurableQaEvalTranscriptS3Capture:
+    def test_qa_eval_transcript_written_to_run_prefix_jsonl_key(self):
+        """A present qa_eval_transcript is written verbatim to
+        `<exp>/<run>/qa/eval_transcript.jsonl` as application/x-ndjson,
+        write-once. The body is the EXACT transcript string the runner forwarded
+        (broker is an opaque passthrough — no redaction, no transformation)."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-transcript",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        transcript = '{"turn":1,"kind":"assistant"}\n{"turn":0,"kind":"result"}'
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": transcript,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        transcript_calls = [
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-qa-transcript/qa/eval_transcript.jsonl"
+        ]
+        assert len(transcript_calls) == 1, (
+            f"expected one eval_transcript.jsonl write under the qa prefix, got keys: "
+            f"{[c.kwargs['Key'] for c in mock_s3.put_object.call_args_list]}"
+        )
+        tc = transcript_calls[0]
+        assert tc.kwargs["Bucket"] == "gp-agent-artifacts-dev"
+        assert tc.kwargs["Body"] == transcript
+        assert tc.kwargs["ContentType"] == "application/x-ndjson"
+        assert tc.kwargs.get("IfNoneMatch") == "*"
+
+    def test_qa_eval_transcript_is_declared_field_surviving_pydantic(self):
+        """If qa_eval_transcript were undeclared, pydantic's extra='ignore'
+        would silently drop it and the durable transcript write would never
+        happen. Pin that the declared field reaches the handler and drives a
+        transcript write."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-declared",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        transcript = "EVAL-TRANSCRIPT-MARKER"
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": transcript,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        transcript_bodies = [
+            c.kwargs["Body"] for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-transcript-declared/qa/eval_transcript.jsonl"
+            and c.kwargs["Body"] == transcript
+        ]
+        assert transcript_bodies, (
+            "declared qa_eval_transcript was dropped by pydantic — no transcript write"
+        )
+
+    def test_oversize_qa_eval_transcript_is_fail_open_skips_write_but_publishes(self):
+        """v1 fail-open: an oversize qa_eval_transcript must NOT 400. The broker
+        LOGS + emits the metric + SKIPS the durable eval_transcript.jsonl write,
+        but STILL writes artifact.json + verdict.json + main_output.json, STILL
+        fires the callback, and STILL deletes the ticket."""
+        from broker.endpoints.artifact_publish import MAX_QA_EVAL_TRANSCRIPT_BYTES
+
+        oversize = "x" * (MAX_QA_EVAL_TRANSCRIPT_BYTES + 1)
+        assert len(oversize.encode("utf-8")) > MAX_QA_EVAL_TRANSCRIPT_BYTES
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-oversize-transcript",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with patch("broker.endpoints.artifact_publish._emit_metric") as mock_metric:
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_raw_output": "raw stdout",
+                    "qa_eval_transcript": oversize,
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        # Fail-open: 200, NOT 400.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        # verdict.json + main_output.json STILL written.
+        assert "district_intel/di-oversize-transcript/qa/verdict.json" in keys_written
+        assert "district_intel/di-oversize-transcript/qa/main_output.json" in keys_written
+        # The oversize eval_transcript.jsonl write was SKIPPED.
+        assert "district_intel/di-oversize-transcript/qa/eval_transcript.jsonl" not in keys_written
+
+        # Callback still fired with the verdict; ticket cleaned up.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-oversize-transcript"
+        )
+
+        # Observable: a CloudWatch metric fired for the transcript skip.
+        skip_calls = [
+            c for c in mock_metric.call_args_list
+            if c.args[0] == "broker_qa_eval_transcript_size_cap_exceeded"
+        ]
+        assert skip_calls, (
+            "expected broker_qa_eval_transcript_size_cap_exceeded metric on oversize skip"
+        )
+
+    def test_qa_eval_transcript_write_gated_on_verdict_written_no_orphan(self):
+        """Write-level coupling: eval_transcript.jsonl must never be written when
+        the sibling verdict.json write FAILED (no orphan transcript). When the
+        verdict write hits a NON-412 error (verdict_written stays False), the
+        transcript write is SKIPPED. Stays fail-open."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-orphan",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-transcript-orphan/qa/verdict.json"
+        transcript_key = "district_intel/di-transcript-orphan/qa/eval_transcript.jsonl"
+
+        verdict_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise verdict_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": "transcript that would orphan",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Fail-open: the failed verdict.json write must NOT fail the publish.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict.json write was attempted (and failed).
+        assert verdict_key in keys_written
+        # CRITICAL: eval_transcript.jsonl must NOT be written — it would be an
+        # orphan with no sibling verdict.json.
+        assert transcript_key not in keys_written, (
+            f"orphan eval_transcript.jsonl written without a sibling verdict.json; "
+            f"keys written: {keys_written}"
+        )
+
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-orphan"
+        )
+
+    def test_verdict_412_already_exists_still_writes_eval_transcript(self):
+        """The 412 (PreconditionFailed) branch on verdict.json means the sibling
+        ALREADY exists from a prior publish — so eval_transcript.jsonl is NOT an
+        orphan and the transcript write MUST still proceed."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-412",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-transcript-412/qa/verdict.json"
+        transcript_key = "district_intel/di-transcript-412/qa/eval_transcript.jsonl"
+
+        precondition_error = ClientError(
+            error_response={
+                "Error": {"Code": "PreconditionFailed", "Message": "exists"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise precondition_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": "transcript line",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        assert transcript_key in keys_written, (
+            f"eval_transcript.jsonl was skipped even though the sibling verdict.json "
+            f"already exists (412 already-captured); keys written: {keys_written}"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-412"
+        )
+
+    def test_qa_eval_transcript_write_failure_does_not_fail_publish(self, caplog):
+        """The durable transcript write is best-effort: a generic S3 failure on
+        ONLY the eval_transcript.jsonl write must NOT fail the publish (others
+        succeed). The broker logs a WARNING and returns 200."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-write-flake",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        transcript_key = "district_intel/di-transcript-write-flake/qa/eval_transcript.jsonl"
+        transcript_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == transcript_key:
+                raise transcript_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        with caplog.at_level(logging.WARNING, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_eval_transcript": "transcript line",
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        warning_records = [
+            r for r in caplog.records
+            if r.name == "broker.endpoints.artifact_publish"
+            and r.levelno == logging.WARNING
+            and "di-transcript-write-flake" in r.getMessage()
+        ]
+        assert warning_records, (
+            "expected a WARNING log mentioning the run_id for the failed transcript write"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-write-flake"
+        )
+
+    def test_eval_transcript_cap_equals_one_mib(self):
+        """Pin the transcript cap to its ABSOLUTE value (1 MiB) and to the
+        raw-output cap (both are the same generous S3-sanity bound)."""
+        from broker.endpoints.artifact_publish import (
+            MAX_QA_EVAL_TRANSCRIPT_BYTES,
+            MAX_QA_RAW_OUTPUT_BYTES,
+        )
+
+        assert MAX_QA_EVAL_TRANSCRIPT_BYTES == 1024 * 1024
+        assert MAX_QA_EVAL_TRANSCRIPT_BYTES == MAX_QA_RAW_OUTPUT_BYTES
+
+    def test_no_eval_transcript_writes_no_transcript_key(self):
+        """Byte-identical no-transcript path: when qa_eval_transcript is absent,
+        no eval_transcript.jsonl key is written (verdict.json still written)."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-no-transcript",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": _qa_verdict()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        assert not any(k.endswith("eval_transcript.jsonl") for k in keys_written)

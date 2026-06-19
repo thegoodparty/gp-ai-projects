@@ -452,14 +452,15 @@ async def _run_qa_gate_hook(
     workspace_dir: str,
     remaining_budget_seconds: float,
 ):
-    """Run the PMF QA gate (v1 observe-only) and return ``(verdict, raw_output)``,
-    or None.
+    """Run the PMF QA gate (v1 observe-only) and return
+    ``(verdict, raw_output, eval_transcript)``, or None.
 
     Returns None when no qa folder was published (config.qa_envelope is None) —
     the caller stays byte-identical to a pre-gate run. Otherwise returns a
-    ``(Verdict, raw_output)`` tuple whose verdict ALWAYS rides the publish path,
-    and whose raw_output (the raw main.py stdout, or None) the broker writes to
-    S3. FAIL-OPEN: this never raises. run_qa_gate is already fail-open
+    ``(Verdict, raw_output, eval_transcript)`` tuple whose verdict ALWAYS rides
+    the publish path; raw_output (the raw main.py stdout, or None) and
+    eval_transcript (the evaluator's redacted JSONL, or None) the broker writes
+    to S3. FAIL-OPEN: this never raises. run_qa_gate is already fail-open
     internally, but the spawn/adapter wiring here is wrapped too so any
     unexpected error becomes an `error` verdict and the run still publishes.
 
@@ -552,7 +553,7 @@ async def _run_qa_gate_hook(
             violations=[violation],
             duration_ms=int((time.monotonic() - started) * 1000),
         )
-        return verdict, None
+        return verdict, None, None
 
 
 async def run_experiment(
@@ -725,13 +726,16 @@ async def run_experiment(
                 workspace_dir=workspace_dir,
                 remaining_budget_seconds=remaining_budget,
             )
-            # The gate returns (verdict, raw_output) when a qa folder ran, else
-            # None (no qa folder — byte-identical to a pre-gate run). raw_output
-            # is the raw main.py stdout the broker writes durably to S3.
+            # The gate returns (verdict, raw_output, eval_transcript) when a qa
+            # folder ran, else None (no qa folder — byte-identical to a pre-gate
+            # run). raw_output is the raw main.py stdout; eval_transcript is the
+            # evaluator's redacted JSONL transcript — both written durably to S3
+            # by the broker. eval_transcript is None for a main.py-only folder.
             qa_verdict_dict = None
             qa_raw_output = None
+            qa_eval_transcript = None
             if qa_gate_result is not None:
-                qa_verdict, qa_raw_output = qa_gate_result
+                qa_verdict, qa_raw_output, qa_eval_transcript = qa_gate_result
                 qa_verdict_dict = qa_verdict.to_dict()
 
             duration = time.monotonic() - start_time
@@ -771,6 +775,12 @@ async def run_experiment(
                 if qa_verdict_dict is not None:
                     publish_kwargs["qa_verdict"] = qa_verdict_dict
                     publish_kwargs["qa_raw_output"] = qa_raw_output
+                    # Additive, byte-identical no-qa path: only forward the
+                    # transcript when an evaluator actually ran (None for a
+                    # main.py-only folder). The broker omits the durable
+                    # eval_transcript.jsonl write when the field is absent.
+                    if qa_eval_transcript is not None:
+                        publish_kwargs["qa_eval_transcript"] = qa_eval_transcript
                 publish.publish(artifact, **publish_kwargs)
                 _mark_callback_sent()
                 logger.info(f"Published artifact via broker for run {config.run_id}")

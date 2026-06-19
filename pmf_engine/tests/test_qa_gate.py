@@ -99,19 +99,26 @@ ARTIFACT = json.dumps({"summary": {"total": 3}}).encode("utf-8")
 
 
 def _verdict(result):
-    """Unwrap the (verdict, raw_output) tuple run_qa_gate returns.
+    """Unwrap the (verdict, raw_output, eval_transcript) tuple run_qa_gate returns.
 
-    run_qa_gate returns None for no-qa, else a (Verdict, raw_output) tuple.
-    These helpers keep the per-test assertions focused on one half at a time."""
+    run_qa_gate returns None for no-qa, else a (Verdict, raw_output,
+    eval_transcript) tuple. These helpers keep the per-test assertions focused
+    on one piece at a time."""
     assert result is not None
-    verdict, _raw = result
+    verdict, _raw, _transcript = result
     return verdict
 
 
 def _raw_output(result):
     assert result is not None
-    _verdict, raw = result
+    _verdict, raw, _transcript = result
     return raw
+
+
+def _transcript(result):
+    assert result is not None
+    _verdict, _raw, transcript = result
+    return transcript
 
 
 def _envelope(
@@ -206,12 +213,14 @@ class FakeEvaluator:
         file_contents: str | None = None,
         result: EvaluatorResult | None = None,
         raise_exc: BaseException | None = None,
+        eval_transcript: str = "",
     ):
         self.fragments = fragments if fragments is not None else [{"name": "faithfulness", "passed": True}]
         self.write_file = write_file
         self.file_contents = file_contents
         self.result = result
         self.raise_exc = raise_exc
+        self.eval_transcript = eval_transcript
         self.calls: list[EvaluatorHarnessParams] = []
 
     def __call__(self, params: EvaluatorHarnessParams) -> EvaluatorResult:
@@ -231,6 +240,7 @@ class FakeEvaluator:
             num_turns=3,
             session_id="eval-sess",
             status="ok",
+            eval_transcript=self.eval_transcript,
         )
 
 
@@ -1514,6 +1524,150 @@ def test_evaluator_status_error_log_carries_context(workspace, gate_base, gate_l
 
 
 # ==========================================================================
+# eval_transcript: the 3rd run_qa_gate tuple element (the JSONL evaluator
+# transcript, REDACTED runner-side by the gate's _redact_secrets chokepoint
+# before it is forwarded to the broker for the durable S3 eval_transcript.jsonl
+# write). None for a main-only folder (no evaluator ran); the redacted string
+# for an eval.md folder.
+# ==========================================================================
+
+
+def test_run_evaluator_threads_redacted_transcript_to_caller(workspace, gate_base):
+    """The evaluator's RAW transcript (carrying the live BROKER_TOKEN) is
+    REDACTED by the gate's _redact_secrets before it leaves the gate, then
+    returned as the 3rd tuple element. The token must be gone; the result must
+    still be parseable JSONL (redaction is value-only, structure-preserving)."""
+    token = _broker_env()["BROKER_TOKEN"]  # "tok-123"
+    raw_transcript = "\n".join([
+        json.dumps({"turn": 1, "kind": "assistant", "text": "grading", "tools": []}),
+        json.dumps({
+            "turn": 1,
+            "kind": "tool_result",
+            "results": [{"tool_use_id": "t1", "is_error": False,
+                         "content": f'headers {{"X-Broker-Token": "{token}"}}'}],
+        }),
+        json.dumps({"turn": 0, "kind": "result", "status": "ok", "subtype": "result",
+                    "is_error": False, "num_turns": 2, "session_id": "sess-x",
+                    "cost_usd": 0.04, "duration_ms": 900}),
+    ])
+    fake = FakeEvaluator(
+        fragments=[{"name": "faithfulness", "passed": True}],
+        eval_transcript=raw_transcript,
+    )
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+    )
+    transcript = _transcript(result)
+    assert transcript is not None
+    # The live token is masked; the redaction marker is present.
+    assert token not in transcript
+    assert qa_gate_mod._REDACTED in transcript
+    # Still parseable JSONL — every non-empty line is a JSON object.
+    lines = [ln for ln in transcript.splitlines() if ln.strip()]
+    assert len(lines) == 3
+    for ln in lines:
+        json.loads(ln)
+
+
+def test_eval_only_folder_returns_transcript_main_only_returns_none(workspace, gate_base):
+    """The 3rd tuple element distinguishes three states:
+    - main.py-only (no evaluator ran)        -> None
+    - eval.md, evaluator emitted a transcript -> the redacted string
+    - eval.md, evaluator emitted empty ''      -> '' (ran but empty)."""
+    # main.py-only: no evaluator, so transcript is None.
+    main_only = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": _MAIN_PASS}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=_never_called_evaluator,
+        gate_base_dir=gate_base,
+    )
+    assert _transcript(main_only) is None
+
+    # eval.md with an empty transcript -> '' (ran but produced nothing).
+    fake_empty = FakeEvaluator(fragments=[{"name": "faithfulness", "passed": True}], eval_transcript="")
+    eval_empty = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake_empty,
+        gate_base_dir=gate_base,
+    )
+    assert _transcript(eval_empty) == ""
+
+    # eval.md with a non-empty transcript -> the string.
+    fake_full = FakeEvaluator(
+        fragments=[{"name": "faithfulness", "passed": True}],
+        eval_transcript=json.dumps({"turn": 0, "kind": "result", "status": "ok"}),
+    )
+    eval_full = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake_full,
+        gate_base_dir=gate_base,
+    )
+    assert _transcript(eval_full) == json.dumps({"turn": 0, "kind": "result", "status": "ok"})
+
+
+def test_both_stages_transcript_is_from_evaluator(workspace, gate_base):
+    """When both stages run, the 3rd tuple element is the evaluator's transcript
+    (the deterministic stage has no transcript). raw_output is still the
+    deterministic stdout — the two are independent."""
+    fake = FakeEvaluator(
+        fragments=[{"name": "faithfulness", "passed": True}],
+        eval_transcript=json.dumps({"turn": 0, "kind": "result", "status": "ok"}),
+    )
+    result = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={"main.py": _MAIN_PASS, "eval.md": "judge"}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        evaluator_runner=fake,
+        gate_base_dir=gate_base,
+    )
+    assert json.loads(_transcript(result))["kind"] == "result"
+    assert json.loads(_raw_output(result)) == [{"name": "grounding", "passed": True, "score": 0.91}]
+
+
+def test_skipped_and_no_qa_have_no_transcript(workspace, gate_base):
+    """Skipped (qa folder, no entrypoints) and no-qa (None envelope) both carry
+    no evaluator transcript."""
+    skipped = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=_envelope(files={}),
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    assert _transcript(skipped) is None
+
+    no_qa = run_qa_gate(
+        artifact_bytes=ARTIFACT,
+        qa_envelope=None,
+        workspace_dir=workspace,
+        broker_env=_broker_env(),
+        remaining_budget_seconds=BIG_BUDGET,
+        gate_base_dir=gate_base,
+    )
+    assert no_qa is None
+
+
+# ==========================================================================
 # FIX 1 (security): the gate's _SECRET_PATTERNS must mask the JSON-quoted
 # `"X-Broker-Token": "<value>"` shape (and a `Bearer <value>` shape) the runner's
 # main.py redaction already covers via _BROKER_TOKEN_PATTERN / _BEARER_TOKEN_PATTERN.
@@ -1685,9 +1839,11 @@ def test_hook_error_violation_redacts_broker_token(workspace, gate_base, monkeyp
         )
     )
     assert result is not None
-    verdict, _raw = result
+    verdict, _raw, _transcript = result
     assert verdict.status == "error"
     joined = " ".join(verdict.violations)
     assert secret not in joined
     assert secret not in json.dumps(verdict.to_dict())
     assert any("qa_gate_hook_error" in v for v in verdict.violations)
+    # The defense-in-depth fallback carries no evaluator transcript.
+    assert _transcript is None

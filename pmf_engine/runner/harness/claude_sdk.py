@@ -79,6 +79,28 @@ _RESEARCHER_MAX_TURNS = 20
 # by the SDK at session start (per the SDK's slugified-tool-name convention).
 _BROKER_MCP_SERVER_NAME = "broker"
 
+# QA-gate evaluator finalize-injection (resume-once-to-finalize). When the
+# primary evaluator query hits the turn ceiling without writing a verdict, the
+# harness resumes the SAME SDK session EXACTLY ONCE — tools disabled so it can
+# only emit text — and asks the judge to write its fragment array from the
+# evidence already gathered. Bounded three ways: allowed_tools=[] (no
+# re-investigation), _FINALIZE_MAX_TURNS re-applied on the second query (the CLI
+# emits a terminal ResultMessage and exits), and its own asyncio.wait_for.
+_FINALIZE_MAX_TURNS = 2
+_FINALIZE_TIMEOUT_SECONDS = 45
+# Per-experiment escape hatch: flip to False to disable the finalize entirely if
+# it ever misbehaves in dev (a max_turns cut then degrades to status=error).
+_FINALIZE_ON_MAX_TURNS = True
+# SDK subtype that marks a turn-ceiling cut (vs a genuine agent error). Only this
+# subtype is resume-worthy; a genuine error or the cancelled-mid-stream timeout
+# path is NOT.
+_MAX_TURNS_SUBTYPE = "error_max_turns"
+# Max chars of a tool-result content kept per transcript record (bounds a huge
+# re-fetched source so the JSONL can't blow the broker's 1 MiB durable cap).
+_TRANSCRIPT_TOOL_RESULT_CAP = 4000
+# Max chars of a tool-use input kept per transcript record.
+_TRANSCRIPT_TOOL_INPUT_CAP = 2000
+
 
 def _resolve_permission_mode(override: str | None = None) -> str:
     if override is not None:
@@ -475,6 +497,52 @@ async def run_agent(
     raise AgentStreamTruncatedError("Agent stream ended without result")
 
 
+async def _finalize(state, params, primary_options, drain) -> None:
+    """Resume the evaluator's SDK session ONCE to give it a tool-free chance to
+    write its verdict after a turn-ceiling cut.
+
+    Mutates ``state`` in place via ``drain`` (the same closure that drained the
+    primary): on a clean finalize ResultMessage ``state['result']`` flips to
+    'ok' and a SECOND terminal record is appended to ``state['transcript']``.
+    Bounded by allowed_tools=[] (no re-investigation), max_turns and its own
+    wait_for. Best-effort: any failure leaves ``state`` at its post-primary
+    values (status stays 'error'), so a stuck/erroring finalize is fail-open."""
+    finalize_options = ClaudeAgentOptions(
+        system_prompt=primary_options.system_prompt,
+        allowed_tools=[],
+        permission_mode=primary_options.permission_mode,
+        mcp_servers={},
+        agents=None,
+        cwd=primary_options.cwd,
+        max_turns=_FINALIZE_MAX_TURNS,
+        model=primary_options.model,
+        resume=state["session_id"],
+        max_buffer_size=100 * 1024 * 1024,
+    )
+    finalize_prompt = (
+        "Stop investigating. Based ONLY on the evidence you have already "
+        "gathered, write your fragment array now as a JSON array to "
+        f"{params.result_file_path}. Do not use any tools."
+    )
+    finalize_timeout = min(_FINALIZE_TIMEOUT_SECONDS, params.timeout_seconds)
+    logger.info(
+        "qa_evaluator_finalize_resume session=%s timeout=%ss max_turns=%d",
+        state["session_id"], finalize_timeout, _FINALIZE_MAX_TURNS,
+    )
+    try:
+        await asyncio.wait_for(drain(finalize_prompt, finalize_options), timeout=finalize_timeout)
+    except TimeoutError:
+        logger.warning(
+            "qa_evaluator_finalize_timeout session=%s timeout=%ss — fail-open, status=error",
+            state["session_id"], finalize_timeout,
+        )
+    except Exception as fin_err:
+        logger.warning(
+            "qa_evaluator_finalize_raised %s: %s (session=%s) — fail-open, status=error",
+            type(fin_err).__name__, fin_err, state["session_id"],
+        )
+
+
 async def run_evaluator_agent(
     params: EvaluatorHarnessParams,
     parent_span=None,
@@ -526,34 +594,130 @@ async def run_evaluator_agent(
 
     # Mutable carrier so the inner drain coroutine can surface the
     # ResultMessage metrics to the outer scope even when wait_for cancels it.
+    # `transcript` accumulates one RAW (unredacted) record per evaluator turn
+    # plus a terminal record per query() invocation; it survives wait_for
+    # cancellation exactly like the other metrics because it lives out here.
+    # `subtype` carries the SDK ResultMessage.subtype the finalize gate reads.
     state: dict[str, object] = {
         "cost_usd": 0.0,
         "num_turns": 0,
         "session_id": None,
         "duration_ms": 0,
         "result": None,  # "ok" | "error" | None (stream ended w/o ResultMessage)
+        "subtype": None,
+        "transcript": [],
     }
 
-    async def _drain() -> None:
+    async def _drain(drain_prompt: str, drain_options: ClaudeAgentOptions) -> None:
         """Consume the SDK stream to its ResultMessage. Bounded by wait_for
         below — on timeout, wait_for cancels this coroutine, which propagates
         CancelledError into `query`'s async generator and tears it down (so the
-        underlying SDK session is not abandoned)."""
-        async for message in query(prompt=prompt, options=options):
+        underlying SDK session is not abandoned).
+
+        Records every turn into state['transcript'] as a RAW (unredacted) JSON
+        record. Redaction is the GATE's job (the single chokepoint in
+        qa_gate._run_evaluator), so the harness file stays free of the gate's
+        redaction symbols and the two workstreams' files stay disjoint."""
+        transcript: list[dict] = state["transcript"]  # type: ignore[assignment]
+        turn = 0
+        async for message in query(prompt=drain_prompt, options=drain_options):
             if isinstance(message, ResultMessage):
                 state["cost_usd"] = message.total_cost_usd or 0.0
                 state["num_turns"] = message.num_turns
                 state["session_id"] = message.session_id
                 state["duration_ms"] = message.duration_ms or 0
+                state["subtype"] = message.subtype
                 state["result"] = "error" if message.is_error else "ok"
+                transcript.append({
+                    "turn": 0,
+                    "kind": "result",
+                    "status": "error" if message.is_error else "ok",
+                    "subtype": message.subtype,
+                    "is_error": message.is_error,
+                    "num_turns": message.num_turns,
+                    "session_id": message.session_id,
+                    "cost_usd": message.total_cost_usd or 0.0,
+                    "duration_ms": message.duration_ms or 0,
+                })
                 if message.is_error:
                     logger.warning(
                         f"QA evaluator agent errored after {message.num_turns} turns "
                         f"(session={message.session_id}): {message.result or 'unknown error'}"
                     )
                 return
+            # Per-turn observability. The SDK reports only the final ResultMessage
+            # (which can be a bare "unknown error" on a max_turns/timeout cut), so
+            # without this the evaluator's turns are invisible — we can't see WHY a
+            # judge ran long (re-fetching sources? flailing?). Log METADATA ONLY
+            # (tool names + truncated inputs + char counts), never raw tool-result
+            # content, so no secret can leak into the logs.
+            if isinstance(message, AssistantMessage):
+                turn += 1
+                tools = [
+                    f"{b.name}:{str(b.input)[:80]}"
+                    for b in message.content
+                    if isinstance(b, ToolUseBlock)
+                ]
+                text_chars = sum(
+                    len(b.text or "")
+                    for b in message.content
+                    if isinstance(b, TextBlock)
+                )
+                logger.info(
+                    "qa_evaluator_turn=%d tools=%s text_chars=%d",
+                    turn, tools or None, text_chars,
+                )
+                text = "".join(
+                    b.text or "" for b in message.content if isinstance(b, TextBlock)
+                )
+                transcript.append({
+                    "turn": turn,
+                    "kind": "assistant",
+                    "text": text,
+                    "tools": [
+                        {"name": b.name, "input": str(b.input)[:_TRANSCRIPT_TOOL_INPUT_CAP]}
+                        for b in message.content
+                        if isinstance(b, ToolUseBlock)
+                    ],
+                })
+            elif isinstance(message, UserMessage):
+                content = getattr(message, "content", None)
+                if isinstance(content, list):
+                    sizes = [
+                        len(b.content)
+                        if isinstance(b.content, str)
+                        else len(json.dumps(b.content, default=str))
+                        for b in content
+                        if isinstance(b, ToolResultBlock)
+                    ]
+                    if sizes:
+                        logger.info(
+                            "qa_evaluator_turn=%d tool_result_chars=%s total=%d",
+                            turn, sizes, sum(sizes),
+                        )
+                    results = []
+                    for b in content:
+                        if not isinstance(b, ToolResultBlock):
+                            continue
+                        raw_content = (
+                            b.content if isinstance(b.content, str)
+                            else json.dumps(b.content, default=str)
+                        )
+                        results.append({
+                            "tool_use_id": b.tool_use_id,
+                            "is_error": b.is_error,
+                            "content": raw_content[:_TRANSCRIPT_TOOL_RESULT_CAP],
+                        })
+                    if results:
+                        transcript.append({
+                            "turn": turn,
+                            "kind": "tool_result",
+                            "results": results,
+                        })
 
     def _build(status: str) -> EvaluatorResult:
+        records: list[dict] = state["transcript"]  # type: ignore[assignment]
+        eval_transcript = "\n".join(json.dumps(r, default=str) for r in records)
         return EvaluatorResult(
             fragments=[],
             cost_usd=state["cost_usd"],  # type: ignore[arg-type]
@@ -561,20 +725,22 @@ async def run_evaluator_agent(
             num_turns=state["num_turns"],  # type: ignore[arg-type]
             session_id=state["session_id"],  # type: ignore[arg-type]
             status=status,  # type: ignore[arg-type]
+            eval_transcript=eval_transcript,
         )
 
+    timed_out = False
     try:
         # B1: enforce the evaluator's own timeout. Without this bound a stuck
         # evaluator (a query that never reaches a ResultMessage) would consume
         # the ENTIRE outer run budget. wait_for cancels the drain — and thus the
         # underlying query — at params.timeout_seconds.
-        await asyncio.wait_for(_drain(), timeout=params.timeout_seconds)
+        await asyncio.wait_for(_drain(prompt, options), timeout=params.timeout_seconds)
     except TimeoutError:
         logger.warning(
             f"QA evaluator agent timed out after {params.timeout_seconds}s "
             f"(session={state['session_id']}) — cancelled, fail-open, status=error"
         )
-        return _build("error")
+        timed_out = True
     except Exception as eval_err:
         logger.warning(
             f"QA evaluator agent raised {type(eval_err).__name__}: {eval_err} "
@@ -582,6 +748,22 @@ async def run_evaluator_agent(
         )
         return _build("error")
 
+    # Resume-once-to-finalize: ONLY on a clean turn-ceiling cut (NOT the timeout
+    # path, which cancelled the query mid-stream and is tearing the session
+    # down). Tools disabled + a tiny turn cap + its own wait_for bound it so it
+    # can't loop or re-investigate. EXACTLY ONE attempt — a finalize that again
+    # hits the ceiling does NOT recurse.
+    if (
+        not timed_out
+        and _FINALIZE_ON_MAX_TURNS
+        and state["result"] == "error"
+        and state["subtype"] == _MAX_TURNS_SUBTYPE
+        and state["session_id"]
+    ):
+        await _finalize(state, params, options, _drain)
+
+    if timed_out:
+        return _build("error")
     if state["result"] == "ok":
         logger.info(
             f"QA evaluator completed: {state['num_turns']} turns. "

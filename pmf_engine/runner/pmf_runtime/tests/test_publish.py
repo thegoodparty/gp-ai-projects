@@ -1,4 +1,5 @@
 import json
+
 import httpx
 import pytest
 
@@ -191,6 +192,70 @@ class TestPublish:
             "duration_seconds": 1.0,
             "cost_usd": 0.0,
         }
+
+    def test_publish_includes_qa_eval_transcript_when_passed(self):
+        """The evaluator's redacted JSONL transcript (contract D) carries to the
+        broker for the durable S3 eval_transcript.jsonl write. When present,
+        publish forwards it under the additive optional `qa_eval_transcript`
+        key — mirroring qa_raw_output exactly."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        transcript = '{"turn": 1, "kind": "assistant"}\n{"turn": 0, "kind": "result"}'
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_eval_transcript=transcript,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert captured["body"]["qa_eval_transcript"] == transcript
+
+    def test_publish_omits_qa_eval_transcript_when_none(self):
+        """Absent qa_eval_transcript (the default) must NOT add the key to the
+        body — a verdict-only / main-only publish carries no transcript key."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+        )
+        assert "qa_eval_transcript" not in captured["body"]
+
+    def test_publish_empty_qa_eval_transcript_is_forwarded(self):
+        """An empty-string transcript ('' = evaluator ran but produced nothing)
+        is DISTINCT from None (no evaluator). The empty string is forwarded so
+        the broker can record that the evaluator ran with an empty transcript."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_eval_transcript="",
+        )
+        assert captured["body"]["qa_eval_transcript"] == ""
 
 
 class TestReportStatus:

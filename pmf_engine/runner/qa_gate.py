@@ -18,9 +18,11 @@ OUTSIDE ``/tmp`` (the runner's log sweep collects /tmp .md/.json — see
 runner/main.py ``_collect_log_files`` + ``_SAFE_TMP_EXTENSIONS``), then deleted
 when the gate finishes.
 
-``run_qa_gate`` returns a ``(verdict, raw_output)`` tuple (or ``None`` when no
-qa folder): ``raw_output`` is the raw ``main.py`` stdout the runner forwards to
-the broker for the durable S3 ``verdict.json`` write (contract D).
+``run_qa_gate`` returns a ``(verdict, raw_output, eval_transcript)`` tuple (or
+``None`` when no qa folder): ``raw_output`` is the raw ``main.py`` stdout and
+``eval_transcript`` is the evaluator's redacted per-turn JSONL transcript — the
+runner forwards both to the broker for the durable S3 ``verdict.json`` /
+``main_output.json`` / ``eval_transcript.jsonl`` writes (contract D).
 
 See ``~/work/docs/pmf-qa-gate-contracts.md`` contracts A/B/C/D.
 """
@@ -183,18 +185,22 @@ def run_qa_gate(
     gate_base_dir: str | None = None,
     run_id: str | None = None,
     experiment_id: str | None = None,
-) -> tuple[Verdict, str | None] | None:
-    """Run the QA gate over ``artifact_bytes`` and return ``(verdict, raw_output)``,
-    or None.
+) -> tuple[Verdict, str | None, str | None] | None:
+    """Run the QA gate over ``artifact_bytes`` and return
+    ``(verdict, raw_output, eval_transcript)``, or None.
 
     Returns None when ``qa_envelope`` is None (no qa folder — the caller is
     byte-identical to a pre-gate run). Otherwise always returns a
-    ``(Verdict, raw_output)`` tuple and NEVER raises: any unexpected internal
-    error is folded into a Verdict with ``status == "error"`` (fail-open,
-    observe-only). ``raw_output`` is the raw ``main.py`` stdout (str), or None
-    when no main.py ran (skipped / insufficient budget / internal error before
-    the subprocess, or an eval.md-only folder) — the runner forwards it to the
-    broker for the durable S3 ``verdict.json`` write.
+    ``(Verdict, raw_output, eval_transcript)`` tuple and NEVER raises: any
+    unexpected internal error is folded into a Verdict with
+    ``status == "error"`` (fail-open, observe-only). ``raw_output`` is the raw
+    ``main.py`` stdout (str), or None when no main.py ran (skipped / insufficient
+    budget / internal error before the subprocess, or an eval.md-only folder) —
+    the runner forwards it to the broker for the durable S3 ``verdict.json``
+    write. ``eval_transcript`` is the evaluator's per-turn JSONL transcript
+    (already REDACTED by the gate), or None when no evaluator ran (a main.py-only
+    folder / skipped / insufficient budget / internal error) — the runner
+    forwards it to the broker for the durable S3 ``eval_transcript.jsonl`` write.
 
     Two entrypoints, both auto-detected (contract B): ``qa/main.py`` (the
     deterministic stage) AND/OR ``qa/eval.md`` (the evaluator stage). The gate
@@ -232,7 +238,7 @@ def run_qa_gate(
                 duration_ms=_elapsed_ms(started),
             )
             _log_verdict(verdict, run_id)
-            return verdict, None
+            return verdict, None, None
 
         det_timeout, agent_model, agent_turns, agent_timeout = _resolve_budgets(manifest, run_id)
         _warn_if_blocking(manifest)
@@ -254,7 +260,7 @@ def run_qa_gate(
                 duration_ms=_elapsed_ms(started),
             )
             _log_verdict(verdict, run_id)
-            return verdict, None
+            return verdict, None, None
 
         # Materialize qa files into a private dir OUTSIDE workspace AND /tmp.
         os.makedirs(base, exist_ok=True)
@@ -265,6 +271,7 @@ def run_qa_gate(
         stage_error = False
         cost_usd = 0.0
         raw_output: str | None = None
+        eval_transcript: str | None = None
 
         # Deterministic-first (contract B). In observe both stages always run.
         if has_main:
@@ -280,7 +287,7 @@ def run_qa_gate(
             stage_error = stage_error or det_error
 
         if has_eval:
-            ev_checks, ev_error, ev_cost = _run_evaluator(
+            ev_checks, ev_error, ev_cost, eval_transcript = _run_evaluator(
                 gate_dir=gate_dir,
                 eval_body=files[_EVAL_MD],
                 workspace_dir=workspace_dir,
@@ -316,7 +323,7 @@ def run_qa_gate(
             cost_usd=cost_usd,
         )
         _log_verdict(verdict, run_id)
-        return verdict, raw_output
+        return verdict, raw_output, eval_transcript
     except Exception as e:  # fail-open — observe-only never raises to the caller
         logger.exception("qa_gate_internal_error errorType=%s: %s", type(e).__name__, e)
         # The violation is built from arbitrary exception text, which can carry a
@@ -331,7 +338,7 @@ def run_qa_gate(
             duration_ms=_elapsed_ms(started),
         )
         _log_verdict(verdict, run_id)
-        return verdict, None
+        return verdict, None, None
     finally:
         if gate_dir is not None:
             shutil.rmtree(gate_dir, ignore_errors=True)
@@ -663,13 +670,23 @@ def _run_evaluator(
     evaluator_runner: Callable[[EvaluatorHarnessParams], EvaluatorResult] | None,
     broker_env: dict,
     run_id: str | None = None,
-) -> tuple[list[dict], bool, float]:
+) -> tuple[list[dict], bool, float, str | None]:
     """Spawn the evaluator via the injected runner and read its fragment array
-    from the injected result_file_path. Returns (checks, error, cost_usd).
+    from the injected result_file_path. Returns
+    ``(checks, error, cost_usd, eval_transcript)``.
 
     A missing ``evaluator_runner`` (none injected though eval.md is present),
     a missing/unparseable result file, a runner-raised exception, or an
     EvaluatorResult with status 'error' -> stage error.
+
+    ``eval_transcript`` is the evaluator's per-turn JSONL transcript
+    (``EvaluatorResult.eval_transcript``), REDACTED here — the gate is the
+    single redaction chokepoint. The harness emits RAW records (so it stays free
+    of the gate's redaction symbols and the two workstreams' files stay
+    disjoint); the gate masks the live BROKER_TOKEN + secret shapes via
+    ``_redact_secrets`` BEFORE the string leaves the gate dir and is forwarded to
+    the broker's durable S3 eval_transcript.jsonl write. None when no runner ran
+    (so the caller can omit the publish field entirely).
 
     A6 (redact evaluator fragments): the evaluator's fragment array flows
     verbatim into ``Verdict.checks`` -> the durable verdict.json + the SQS
@@ -680,7 +697,7 @@ def _run_evaluator(
     """
     if evaluator_runner is None:
         logger.warning("qa_gate_evaluator_no_runner_injected run_id=%s", run_id)
-        return [], True, 0.0
+        return [], True, 0.0, None
 
     result_file_path = os.path.join(gate_dir, "evaluator_fragments.json")
     params = EvaluatorHarnessParams(
@@ -698,9 +715,14 @@ def _run_evaluator(
         result = evaluator_runner(params)
     except Exception as e:
         logger.exception("qa_gate_evaluator_runner_failed errorType=%s run_id=%s: %s", type(e).__name__, run_id, e)
-        return [], True, 0.0
+        return [], True, 0.0, None
 
     cost = result.cost_usd if result is not None else 0.0
+    # Capture + REDACT the evaluator's per-turn transcript here — the gate is
+    # the single redaction chokepoint. Forwarded even on a stage error so a
+    # truncated/errored run is still diagnosable (the v1 observe-only value).
+    # None when no result object was returned (the broker omits the field).
+    transcript = _redact_transcript(result, broker_env) if result is not None else None
     if result is None or result.status == "error":
         # A7: carry the evaluator's own accounting so a status-error is
         # actionable (which session, how many turns, what it cost).
@@ -711,25 +733,39 @@ def _run_evaluator(
             result.cost_usd if result is not None else None,
             run_id,
         )
-        return [], True, cost
+        return [], True, cost, transcript
 
     if not os.path.exists(result_file_path):
         logger.warning("qa_gate_evaluator_result_file_missing path=%s run_id=%s", result_file_path, run_id)
-        return [], True, cost
+        return [], True, cost, transcript
 
     try:
         with open(result_file_path, encoding="utf-8") as fh:
             raw = json.load(fh)
     except (OSError, json.JSONDecodeError, ValueError):
         logger.warning("qa_gate_evaluator_result_file_unparseable path=%s run_id=%s", result_file_path, run_id)
-        return [], True, cost
+        return [], True, cost, transcript
 
     if not isinstance(raw, list):
         logger.warning("qa_gate_evaluator_result_not_array type=%s run_id=%s", type(raw).__name__, run_id)
-        return [], True, cost
+        return [], True, cost, transcript
 
     checks = [_normalize_fragment(frag, "agent", broker_env) for frag in raw]
-    return checks, False, cost
+    return checks, False, cost, transcript
+
+
+def _redact_transcript(result: EvaluatorResult, broker_env: dict) -> str | None:
+    """Redact the evaluator's JSONL transcript before it leaves the gate.
+
+    The harness emits RAW records (disjoint-files rule); the gate masks the live
+    BROKER_TOKEN + secret shapes via ``_redact_secrets`` (value-only,
+    structure-preserving) so the durable S3 eval_transcript.jsonl can never carry
+    a token. Returns the redacted string ("" stays "", distinguishing 'ran but
+    empty' from 'no evaluator' = None)."""
+    transcript = getattr(result, "eval_transcript", "")
+    if not transcript:
+        return transcript
+    return _redact_secrets(transcript, broker_env)
 
 
 def _safe_raw_output(stdout: bytes, broker_env: dict) -> str:

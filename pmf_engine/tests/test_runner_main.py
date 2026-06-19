@@ -12,7 +12,7 @@ import pytest
 
 from pmf_engine.runner.config import RunnerConfig
 from pmf_engine.runner.harness.base import HarnessResult
-from pmf_engine.runner.main import run_experiment, get_harness, main
+from pmf_engine.runner.main import get_harness, main, run_experiment
 
 
 class Clock:
@@ -81,8 +81,9 @@ class TestUploadLogsObservability:
         BufferingHandler to the specific logger instead.
         """
         import logging
-        from pmf_engine.runner.main import _upload_logs
+
         import pmf_engine.runner.main as _main_mod
+        from pmf_engine.runner.main import _upload_logs
 
         workspace = tmp_path
         (workspace / "conversation.jsonl").write_text('{"type":"assistant"}\n')
@@ -554,6 +555,7 @@ async def test_attachment_safety_violation_log_includes_error_type(tmp_path):
     structured log with errorType=reserved_basename so ops can grep
     CloudWatch for the specific cause without parsing free-form messages."""
     import logging
+
     import pmf_engine.runner.main as _main_mod
 
     config = _make_config(
@@ -1468,8 +1470,9 @@ class TestCallbackLifecycleFix:
 
     @pytest.mark.asyncio
     async def test_sigterm_handler_cancels_current_task(self):
-        import pmf_engine.runner.main as main_module
         import signal as signal_module
+
+        import pmf_engine.runner.main as main_module
 
         main_module._shutdown_requested = False
 
@@ -1515,8 +1518,9 @@ class TestCallbackLifecycleFix:
 
         async def cancel_soon():
             await asyncio.sleep(0.05)
-            import pmf_engine.runner.main as main_module
             import signal as signal_module
+
+            import pmf_engine.runner.main as main_module
             main_module._handle_signal(signal_module.SIGTERM)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1757,8 +1761,8 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
 
     def test_credentials_json_excluded_despite_json_allowlist(self, tmp_path):
         from pmf_engine.runner.main import (
-            _collect_workspace_files,
             _SAFE_TMP_EXTENSIONS,
+            _collect_workspace_files,
         )
 
         (tmp_path / "credentials.json").write_text('{"api_key": "secret"}')
@@ -1778,8 +1782,8 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
 
     def test_env_pattern_excluded_despite_yaml_allowlist(self, tmp_path):
         from pmf_engine.runner.main import (
-            _collect_workspace_files,
             _SAFE_TMP_EXTENSIONS,
+            _collect_workspace_files,
         )
 
         (tmp_path / "config.env.yaml").write_text("key: value\n")
@@ -2282,6 +2286,7 @@ class TestBearerTokenRedaction:
         diffing / cwltail-style tools that consume the redacted file still
         work."""
         import json as _json
+
         from pmf_engine.runner.main import _redact_line
 
         original = '{"event": "session_start", "headers": {"Authorization": "Bearer tok-12345678"}}'
@@ -2355,6 +2360,7 @@ class TestBrokerTokenRedaction:
         """The substitution must leave surrounding JSON parseable — the
         value's closing `"` is outside the captured token, so it stays."""
         import json as _json
+
         from pmf_engine.runner.main import _redact_line
 
         original = (
@@ -2412,10 +2418,14 @@ def _make_verdict(**overrides):
     return Verdict(**defaults)
 
 
-def _gate_returns(verdict, raw_output='[{"name": "grounding", "passed": true}]'):
-    """Build the (verdict, raw_output) tuple run_qa_gate returns so a patched
-    run_qa_gate matches the real engine's contract."""
-    return verdict, raw_output
+def _gate_returns(
+    verdict,
+    raw_output='[{"name": "grounding", "passed": true}]',
+    eval_transcript=None,
+):
+    """Build the (verdict, raw_output, eval_transcript) tuple run_qa_gate returns
+    so a patched run_qa_gate matches the real engine's contract."""
+    return verdict, raw_output, eval_transcript
 
 
 @pytest.mark.asyncio
@@ -2455,6 +2465,9 @@ async def test_no_qa_folder_publish_is_byte_identical(mock_publish, _mock_logs):
     )
     assert "qa_raw_output" not in call_args.kwargs, (
         "no-qa path must not pass qa_raw_output to publish"
+    )
+    assert "qa_eval_transcript" not in call_args.kwargs, (
+        "no-qa path must not pass qa_eval_transcript to publish"
     )
 
     # span.log success output carries no qa_verdict key.
@@ -2561,9 +2574,10 @@ async def test_observe_mode_failing_verdict_still_publishes_with_qa_verdict(mock
 @patch("pmf_engine.runner.main._upload_logs")
 @patch("pmf_engine.runner.main.publish")
 async def test_publish_receives_qa_verdict_and_qa_raw_output(mock_publish, _mock_logs):
-    """The runner forwards BOTH the aggregated verdict dict (qa_verdict) and the
-    raw main.py stdout (qa_raw_output) to publish.publish, so the broker can do
-    the durable S3 verdict.json write (decision 13, contract D)."""
+    """The runner forwards the aggregated verdict dict (qa_verdict), the raw
+    main.py stdout (qa_raw_output), AND the evaluator's redacted JSONL transcript
+    (qa_eval_transcript) to publish.publish, so the broker can do the durable S3
+    writes (decision 13, contract D)."""
     config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}})
     fake_result = HarnessResult(
         artifact_bytes=b'{"greeting": "hello"}',
@@ -2576,8 +2590,12 @@ async def test_publish_receives_qa_verdict_and_qa_raw_output(mock_publish, _mock
     mock_bt, _mock_span = _make_mock_bt()
 
     raw = '[{"name": "grounding", "passed": true, "score": 0.91}]'
+    transcript = '{"turn": 1, "kind": "assistant"}\n{"turn": 0, "kind": "result"}'
 
-    with patch("pmf_engine.runner.main.run_qa_gate", return_value=(_make_verdict(), raw)):
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), raw, transcript),
+    ):
         with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
             await run_experiment(config, harness=mock_harness)
 
@@ -2587,6 +2605,72 @@ async def test_publish_receives_qa_verdict_and_qa_raw_output(mock_publish, _mock
     assert qa_dict is not None and qa_dict["status"] == "evaluated"
     # The exact raw main.py stdout is forwarded verbatim for the S3 write.
     assert call_args.kwargs.get("qa_raw_output") == raw
+    # The evaluator's redacted transcript rides for the durable eval_transcript.jsonl.
+    assert call_args.kwargs.get("qa_eval_transcript") == transcript
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_omits_qa_eval_transcript_when_gate_returns_none(mock_publish, _mock_logs):
+    """A main.py-only gate run returns eval_transcript=None (no evaluator). The
+    runner must NOT pass qa_eval_transcript to publish (so the broker omits the
+    durable write), while still forwarding the verdict + raw output."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {"main.py": "x"}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    raw = '[{"name": "grounding", "passed": true}]'
+
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), raw, None),
+    ):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    call_args = mock_publish.publish.call_args
+    assert call_args.kwargs.get("qa_verdict") is not None
+    assert call_args.kwargs.get("qa_raw_output") == raw
+    assert "qa_eval_transcript" not in call_args.kwargs, (
+        "a main-only gate run (eval_transcript None) must omit the publish field"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_forwards_empty_qa_eval_transcript(mock_publish, _mock_logs):
+    """An eval.md run whose evaluator produced an EMPTY transcript ('') forwards
+    that empty string (distinct from None=no-evaluator), so the broker records
+    the evaluator ran."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {"eval.md": "judge"}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), None, ""),
+    ):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    call_args = mock_publish.publish.call_args
+    assert call_args.kwargs.get("qa_eval_transcript") == ""
 
 
 @pytest.mark.asyncio
@@ -2997,6 +3081,7 @@ async def test_qa_gate_hook_defense_in_depth_catch_logs_at_error(mock_publish, _
     raises). That is actionable, so it must log at ERROR with a stack trace
     (logger.exception), NOT a WARNING. Capture the record's level + exc_info."""
     import logging
+
     import pmf_engine.runner.main as _main_mod
 
     config = _make_config(

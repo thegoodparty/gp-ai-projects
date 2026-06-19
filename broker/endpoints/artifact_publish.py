@@ -29,6 +29,14 @@ MAX_QA_VERDICT_BYTES = 1024 * 1024
 # stage stdout. Bounds a runaway raw output before the broker writes it.
 MAX_QA_RAW_OUTPUT_BYTES = 1024 * 1024
 
+# PMF QA gate (eval transcript): the per-turn evaluator-agent JSONL transcript,
+# written durably to S3 only (never the SQS callback), so it has the same
+# generous 1 MiB S3-sanity bound as the raw stage stdout. Measured in true
+# UTF-8 bytes (it is a str field, mirroring MAX_QA_RAW_OUTPUT_BYTES, NOT the
+# verdict's json.dumps char count). Bounds a runaway transcript before the
+# broker writes it.
+MAX_QA_EVAL_TRANSCRIPT_BYTES = 1024 * 1024
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/artifact", tags=["artifact"])
@@ -121,6 +129,17 @@ class PublishRequest(BaseModel):
     # undeclared field, so the durable raw write would never happen. Absent /
     # None = the broker writes only the aggregated verdict.
     qa_raw_output: str | None = None
+    # PMF QA gate (eval transcript). The per-turn evaluator-agent JSONL
+    # transcript the gate assembled and ALREADY redacted runner-side (in
+    # qa_gate._run_evaluator) — the broker is an opaque passthrough and does NOT
+    # redact it. Carried so the broker can write it durably to S3 alongside the
+    # verdict (the runner is sandboxed — the broker is its only egress). It
+    # NEVER rides the SQS callback, so it has its own 1 MiB budget. Like the
+    # other qa fields, this MUST be DECLARED: pydantic's default extra='ignore'
+    # would silently drop an undeclared field, so the durable transcript write
+    # would never happen. Absent / None = no evaluator agent ran (main-only qa
+    # folder, or a pre-transcript runner) — the broker writes no transcript.
+    qa_eval_transcript: str | None = None
 
 
 class PublishResponse(BaseModel):
@@ -309,6 +328,31 @@ def artifact_publish(
                 {"Name": "experiment_id", "Value": ticket.experiment_id},
             ])
 
+    # PMF QA gate (eval transcript, fail-open): the per-turn evaluator-agent
+    # JSONL transcript is written durably to S3 only (never the callback), with
+    # its own 1 MiB budget. It is a str field, so the cap is measured in true
+    # UTF-8 bytes (mirroring the raw-output path, NOT the verdict's json.dumps
+    # char count). An oversize transcript SKIPS the eval_transcript.jsonl write
+    # (LOG + metric) rather than rejecting — same observe-only / fail-open rule
+    # as the verdict and raw output. The verdict.json + main_output.json writes
+    # and the callback are unaffected.
+    skip_qa_eval_transcript_write = False
+    if req.qa_eval_transcript is not None:
+        transcript_bytes = len(req.qa_eval_transcript.encode("utf-8"))
+        if transcript_bytes > MAX_QA_EVAL_TRANSCRIPT_BYTES:
+            skip_qa_eval_transcript_write = True
+            logger.error(
+                "qa_eval_transcript_size_cap_exceeded run_id=%s experiment_id=%s "
+                "observed=%d cap=%d (fail-open: skipping durable "
+                "eval_transcript.jsonl write; the aggregated verdict is unaffected)",
+                ticket.run_id, ticket.experiment_id, transcript_bytes,
+                MAX_QA_EVAL_TRANSCRIPT_BYTES,
+            )
+            _emit_metric("broker_qa_eval_transcript_size_cap_exceeded", [
+                {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                {"Name": "experiment_id", "Value": ticket.experiment_id},
+            ])
+
     artifact_json = json.dumps(req.artifact)
     latest_key = f"{ticket.experiment_id}/{ticket.organization_slug}/latest.json"
     run_key = f"{ticket.experiment_id}/{ticket.run_id}/artifact.json"
@@ -463,6 +507,44 @@ def artifact_publish(
                     "key=%s bucket=%s. Best-effort durable capture; the aggregated "
                     "verdict.json was still captured.",
                     ticket.run_id, ticket.experiment_id, qa_raw_key, bucket,
+                    exc_info=True,
+                )
+
+    # The evaluator-agent transcript is coupled to the verdict the same way the
+    # raw main.py output is: it is only written when the sibling verdict.json
+    # actually landed in S3 (no orphan eval_transcript.jsonl without a
+    # verdict.json). Its own size cap (skip_qa_eval_transcript_write) is
+    # independent of the verdict's and the raw's. The broker writes it VERBATIM
+    # — redaction already happened runner-side in qa_gate._run_evaluator.
+    if (
+        verdict_written
+        and req.qa_eval_transcript is not None
+        and not skip_qa_eval_transcript_write
+    ):
+        qa_transcript_key = f"{ticket.experiment_id}/{ticket.run_id}/qa/eval_transcript.jsonl"
+        try:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=qa_transcript_key,
+                Body=req.qa_eval_transcript,
+                # Newline-delimited JSON (one record per evaluator turn), not a
+                # single JSON document — stored as application/x-ndjson.
+                ContentType="application/x-ndjson",
+                IfNoneMatch="*",
+            )
+        except Exception as transcript_err:
+            if _is_precondition_failed(transcript_err):
+                logger.info(
+                    "qa eval transcript already captured run_id=%s experiment_id=%s "
+                    "key=%s (duplicate publish; write-once guard held)",
+                    ticket.run_id, ticket.experiment_id, qa_transcript_key,
+                )
+            else:
+                logger.warning(
+                    "qa eval transcript S3 capture failed run_id=%s experiment_id=%s "
+                    "key=%s bucket=%s. Best-effort durable capture; the aggregated "
+                    "verdict.json was still captured.",
+                    ticket.run_id, ticket.experiment_id, qa_transcript_key, bucket,
                     exc_info=True,
                 )
 
