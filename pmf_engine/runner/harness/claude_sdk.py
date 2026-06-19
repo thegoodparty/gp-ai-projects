@@ -47,12 +47,15 @@ ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
 
 # QA-gate evaluator tool surface (PMF QA gate, PR-3). A SUBSET of ALLOWED_TOOLS,
 # NOT an extension: the evaluator only inspects evidence (Bash to cat/grep the
-# read-only /workspace, plus pmf_runtime.http over the broker for citation
-# checks) and may WebSearch. It must NOT mutate the workspace, so Write/Edit are
-# excluded; Glob/Grep are dropped too (the evaluator uses Bash for traversal).
-# Defined as its own constant so the assertable shape is locked and the
-# evaluator never rides ALLOWED_TOOLS' extend path.
-EVALUATOR_ALLOWED_TOOLS = ["Bash", "WebSearch"]
+# read-only /workspace via Bash). The evaluator is EDITORIAL, not
+# investigative: it scores the artifact's own embedded content against the
+# rubric and does NOT re-fetch sources or web-search — claim-level grounding is
+# the deterministic gate's job (main.py / source_extract), and re-investigation
+# burns the turn budget. So WebSearch is excluded along with Write/Edit (no
+# workspace mutation) and Glob/Grep (Bash covers traversal). Defined as its own
+# constant so the assertable shape is locked and the evaluator never rides
+# ALLOWED_TOOLS' extend path.
+EVALUATOR_ALLOWED_TOOLS = ["Bash"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
@@ -568,8 +571,9 @@ async def run_evaluator_agent(
     primary path stays byte-identical. The evaluator is the OPPOSITE of the
     primary agent on every axis:
 
-    - allowed_tools = EVALUATOR_ALLOWED_TOOLS (a SUBSET — Bash + WebSearch only,
-      not the ALLOWED_TOOLS extend path);
+    - allowed_tools = EVALUATOR_ALLOWED_TOOLS (a SUBSET — Bash only, not the
+      ALLOWED_TOOLS extend path; the evaluator is editorial, not investigative,
+      so no WebSearch);
     - mcp_servers = {} ALWAYS (it does NOT call _build_broker_mcp_servers): the
       evaluator reaches the broker over HTTP via Bash + pmf_runtime using the
       live BROKER_URL/BROKER_TOKEN env, not via an MCP server;

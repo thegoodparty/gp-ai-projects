@@ -1194,7 +1194,7 @@ async def test_evaluator_logs_each_turn():
 
     from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
 
-    big = "S" * 5000  # a large tool result (e.g. a re-fetched source) — its size must surface
+    big = "S" * 5000  # a large tool result (e.g. a big artifact read) — its size must surface
 
     async def fake_query(prompt, options):
         yield AssistantMessage(model="sonnet", content=[
@@ -1205,7 +1205,8 @@ async def test_evaluator_logs_each_turn():
         yield UserMessage(content=[
             ToolResultBlock(tool_use_id="t1", content=big, is_error=False)])
         yield AssistantMessage(model="sonnet", content=[
-            ToolUseBlock(id="t2", name="WebSearch", input={"query": "waunakee budget"})])
+            ToolUseBlock(id="t2", name="Bash",
+                         input={"command": "cat /workspace/artifact.json"})])
         yield UserMessage(content=[
             ToolResultBlock(tool_use_id="t2", content="results", is_error=False)])
         yield _make_result_message(
@@ -1225,10 +1226,11 @@ async def test_evaluator_logs_each_turn():
         " ".join(str(a) for a in call.args) for call in mock_logger.info.call_args_list
     ]
     blob = "\n".join(rendered)
-    # one per-turn line per assistant turn, naming the tool(s) used
-    assert any("qa_evaluator_turn=%d tools=%s" in r and "Bash" in r for r in rendered), rendered
-    assert any("qa_evaluator_turn=%d tools=%s" in r and "WebSearch" in r for r in rendered), rendered
-    # tool-result sizes are logged so a large source read (5000 chars) is visible
+    # one per-turn line per assistant turn (two turns here), each naming its tool(s)
+    turn_lines = [r for r in rendered if "qa_evaluator_turn=%d tools=%s" in r]
+    assert len(turn_lines) == 2, turn_lines
+    assert all("Bash" in r for r in turn_lines), turn_lines
+    # tool-result sizes are logged so a large artifact read (5000 chars) is visible
     assert any("tool_result_chars" in r and "5000" in r for r in rendered), blob
 
 
@@ -1430,17 +1432,19 @@ class TestEvaluatorResultDataclass:
 
 class TestEvaluatorHarness:
     @pytest.mark.asyncio
-    async def test_allowed_tools_is_exactly_bash_and_websearch(self):
-        """The evaluator's tool surface is a SUBSET — exactly Bash + WebSearch,
-        NOT an extension of ALLOWED_TOOLS. No Write/Edit/Glob/Grep."""
+    async def test_allowed_tools_is_exactly_bash(self):
+        """The evaluator's tool surface is a SUBSET — exactly Bash, NOT an
+        extension of ALLOWED_TOOLS. No WebSearch (the evaluator is editorial,
+        not investigative — grounding is the deterministic gate's job), no
+        Write/Edit/Glob/Grep."""
         from pmf_engine.runner.harness.claude_sdk import EVALUATOR_ALLOWED_TOOLS
 
         captured = await _run_evaluator_capture_options()
         options = captured["options"]
 
-        assert options.allowed_tools == ["Bash", "WebSearch"]
+        assert options.allowed_tools == ["Bash"]
         assert options.allowed_tools == EVALUATOR_ALLOWED_TOOLS
-        for excluded in ("Write", "Edit", "Glob", "Grep"):
+        for excluded in ("WebSearch", "Write", "Edit", "Glob", "Grep"):
             assert excluded not in options.allowed_tools
 
     @pytest.mark.asyncio
