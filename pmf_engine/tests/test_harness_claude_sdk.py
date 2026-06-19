@@ -25,10 +25,11 @@ def _make_result_message(
     session_id: str = "sess-123",
     is_error: bool = False,
     subtype: str = "result",
+    duration_ms: int = 1000,
 ) -> ResultMessage:
     return ResultMessage(
         subtype=subtype,
-        duration_ms=1000,
+        duration_ms=duration_ms,
         duration_api_ms=900,
         is_error=is_error,
         num_turns=num_turns,
@@ -669,19 +670,33 @@ async def test_params_wrapped_in_untrusted_data_delimiter():
 # ---------------------------------------------------------------------------
 
 
+def _snapshot_options(options):
+    """Sever list-field aliasing on a captured ClaudeAgentOptions.
+
+    ClaudeAgentOptions stores allowed_tools (and other list fields) BY REFERENCE
+    (field(default_factory=list), no copy). A capture fake that stashes the live
+    options and asserts on it later can read a list the harness mutated after the
+    query call — an intermittent flake. Snapshot the list contents AT CAPTURE
+    TIME so assertions see exactly what was passed to query()."""
+    if isinstance(getattr(options, "allowed_tools", None), list):
+        options.allowed_tools = list(options.allowed_tools)
+    return options
+
+
 def _make_options_capture():
     """Fake `query` that snapshots the ClaudeAgentOptions it receives.
 
     Returns (capture_dict, fake_query). After `await harness.run(...)`,
     `capture_dict["options"]` is the actual ClaudeAgentOptions the harness
     built — exposes allowed_tools / permission_mode / system_prompt /
-    mcp_servers for direct assertion.
+    mcp_servers for direct assertion. List fields are snapshotted at capture
+    time so a later harness mutation can't leak into the assertion.
     """
     captured: dict = {}
 
     async def fake_query(prompt, options):
         captured["prompt"] = prompt
-        captured["options"] = options
+        captured["options"] = _snapshot_options(options)
         yield _make_result_message(
             result="Done", total_cost_usd=0.01, num_turns=1, session_id="sess-capture"
         )
@@ -1516,6 +1531,33 @@ class TestEvaluatorHarness:
             assert result_file_path in prompt
 
     @pytest.mark.asyncio
+    async def test_primary_prompt_states_turn_budget_so_agent_self_paces(self):
+        """The primary evaluator prompt must tell the judge its turn budget so it
+        self-paces and writes a partial verdict before busting the ceiling. The
+        budget number (params.max_turns) and the 'even if your analysis is
+        incomplete' guidance must both be present, plus a self-pace pivot turn
+        two before the ceiling so the judge stops investigating in time. For
+        max_turns=9 the pivot is turn 7 (kills a -2->-1 off-by-one mutant)."""
+        captured = await _run_evaluator_capture_options(max_turns=9)
+        prompt = captured["prompt"]
+
+        assert "9 turns" in prompt
+        assert "By turn 7" in prompt
+        assert "even if your analysis is incomplete" in prompt
+
+    @pytest.mark.asyncio
+    async def test_primary_prompt_pivot_floored_at_one_for_tiny_budgets(self):
+        """FIX 3: the self-pace pivot (max_turns - 2) is FLOORED at 1, so a tiny
+        budget can't produce 'By turn 0' or a negative pivot. For max_turns=2 the
+        pivot is turn 1, not turn 0."""
+        captured = await _run_evaluator_capture_options(max_turns=2)
+        prompt = captured["prompt"]
+
+        assert "2 turns" in prompt
+        assert "By turn 1" in prompt
+        assert "By turn 0" not in prompt
+
+    @pytest.mark.asyncio
     async def test_returns_evaluator_result_with_metrics_from_query(self):
         """run_evaluator_agent returns an EvaluatorResult populated from the
         query ResultMessage — cost/turns/session — status 'ok' on clean exit.
@@ -1723,27 +1765,31 @@ class TestPrimaryPathRegressionAfterEvaluator:
 
 
 # ---------------------------------------------------------------------------
-# Finalize-injection (resume-once-to-finalize)
+# Finalize-injection (fresh-query-to-finalize)
 #
 # When the primary evaluator query hits the turn ceiling (subtype
-# 'error_max_turns') without writing a verdict, the harness resumes the SAME
-# session EXACTLY ONCE with tools disabled and a tiny finalize budget, asking
-# the judge to write its fragment array from the evidence already gathered. This
-# is bounded three ways (allowed_tools=[], max_turns=_FINALIZE_MAX_TURNS, its own
-# wait_for) and triggers ONLY on the clean error_max_turns path — never on a
-# genuine error or the cancelled-mid-stream timeout path.
+# 'error_max_turns') without writing a verdict, the harness runs EXACTLY ONE
+# FRESH query (no resume) that re-feeds the rubric + artifact and asks the judge
+# to read the artifact once, score it, and write its fragment array. A fresh
+# query only makes broker-routed messages-API calls (which work on Fargate),
+# whereas a resume reliably hangs there. It is bounded three ways
+# (allowed_tools=["Bash"], max_turns=_FINALIZE_MAX_TURNS, its own wait_for) and
+# triggers ONLY on the clean error_max_turns path — never on a genuine error or
+# the cancelled-mid-stream timeout path.
 # ---------------------------------------------------------------------------
 
 
 class TestFinalizeInjection:
     @pytest.mark.asyncio
-    async def test_resume_on_max_turns_yields_status_ok_and_captures_finalize(self):
-        """call#1 hits error_max_turns (no result file). The harness resumes the
-        SAME session ONCE with allowed_tools=["Bash"] (the proven file-write path —
-        WebSearch is dropped so it cannot fetch new sources; max_turns is the real
-        bound on re-investigation) and max_turns=_FINALIZE_MAX_TURNS, and call#2
-        returns a clean ResultMessage. Assert: query invoked TWICE, the resume
-        options carried resume=session_id + Bash-only tools + the finalize turn cap,
+    async def test_fresh_query_on_max_turns_yields_status_ok_and_captures_finalize(self):
+        """call#1 hits error_max_turns (no result file). The harness runs ONE
+        FRESH query (NOT a resume — a resume reliably hangs on Fargate) with
+        allowed_tools=["Bash"] (the proven file-write path; WebSearch is dropped
+        so it cannot fetch new sources; max_turns is the real bound on
+        re-investigation) and max_turns=_FINALIZE_MAX_TURNS, and call#2 returns a
+        clean ResultMessage. Assert: query invoked TWICE, the finalize options
+        carry NO resume + Bash-only tools + the finalize turn cap, the finalize
+        prompt re-feeds the rubric (params.instruction) and the result file path,
         final status='ok', and the transcript carries BOTH terminal records."""
         from pmf_engine.runner.harness.claude_sdk import _FINALIZE_MAX_TURNS, run_evaluator_agent
 
@@ -1758,7 +1804,7 @@ class TestFinalizeInjection:
                 is_error=False, subtype="result", num_turns=1, session_id="sess-x")
 
         def fake_query(prompt, options):
-            calls.append({"prompt": prompt, "options": options})
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
             if len(calls) == 1:
                 return gen_primary()
             return gen_finalize()
@@ -1770,13 +1816,14 @@ class TestFinalizeInjection:
                 with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
                     result = await run_evaluator_agent(params)
 
-        assert len(calls) == 2, "resume must run exactly one finalize query"
+        assert len(calls) == 2, "fresh finalize must run exactly one query"
         finalize_opts = calls[1]["options"]
-        assert finalize_opts.resume == "sess-x"
+        assert finalize_opts.resume is None, "finalize must be a FRESH query, not a resume"
         assert finalize_opts.allowed_tools == ["Bash"]
         assert "WebSearch" not in finalize_opts.allowed_tools
         assert finalize_opts.max_turns == _FINALIZE_MAX_TURNS
-        # The finalize prompt must direct a Bash write from existing evidence.
+        # The fresh finalize prompt must re-feed the rubric and the result file path.
+        assert params.instruction in calls[1]["prompt"]
         assert params.result_file_path in calls[1]["prompt"]
 
         assert result.status == "ok"
@@ -1787,9 +1834,107 @@ class TestFinalizeInjection:
         assert terminals[1]["subtype"] == "result"
 
     @pytest.mark.asyncio
-    async def test_no_resume_on_genuine_error(self):
+    async def test_finalize_accumulates_cost_and_turns_across_primary_and_finalize(self):
+        """FIX 1: the EvaluatorResult cost/turns/duration must SUM the primary's
+        spend with the finalize's, not be clobbered by the finalize's lone
+        ResultMessage. The primary bursts the ceiling having burned $0.10 / 20
+        turns / 9000ms; the finalize cleanly resolves at $0.03 / 2 turns /
+        1500ms. The aggregate the gate accounts against is $0.13 / 22 turns /
+        10500ms — anything less under-counts the finalize-salvaged run's true
+        spend. duration_ms in particular is wall-clock the gate bills against, so
+        it must accumulate exactly like cost and turns, not reflect only the
+        finalize.
+
+        The PER-TERMINAL transcript records, by contrast, must still carry each
+        message's OWN cost/turns/duration ([0.10/20/9000] and [0.03/2/1500]) —
+        the transcript is a ledger of what each query did, not a running total."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls: list[dict] = []
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", total_cost_usd=0.10,
+                num_turns=20, duration_ms=9000, session_id="sess-acc")
+
+        async def gen_finalize():
+            yield _make_result_message(
+                is_error=False, subtype="result", total_cost_usd=0.03,
+                num_turns=2, duration_ms=1500, session_id="sess-acc")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert len(calls) == 2
+        assert result.status == "ok"
+        assert result.cost_usd == pytest.approx(0.13), "cost must SUM primary + finalize"
+        assert result.num_turns == 22, "turns must SUM primary + finalize"
+        assert result.duration_ms == 10500, "duration_ms must SUM primary + finalize"
+
+        records = _parse_jsonl(result.eval_transcript)
+        terminals = [r for r in records if r["kind"] == "result"]
+        assert len(terminals) == 2, terminals
+        assert terminals[0]["cost_usd"] == pytest.approx(0.10)
+        assert terminals[0]["num_turns"] == 20
+        assert terminals[0]["duration_ms"] == 9000
+        assert terminals[1]["cost_usd"] == pytest.approx(0.03)
+        assert terminals[1]["num_turns"] == 2
+        assert terminals[1]["duration_ms"] == 1500
+
+    @pytest.mark.asyncio
+    async def test_finalize_prompt_points_at_readonly_artifact(self):
+        """FIX 4 + FIX 6: the finalize prompt must (a) re-feed the artifact
+        LOCATION (params.workspace_dir) so the fresh judge knows where to read,
+        and (b) carry the same READ-ONLY / do-not-modify warning the primary
+        prompt does — the finalize has Bash and could otherwise mutate the
+        evidence it is meant to grade."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls: list[dict] = []
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-ro")
+
+        async def gen_finalize():
+            yield _make_result_message(
+                is_error=False, subtype="result", num_turns=1, session_id="sess-ro")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+        assert len(calls) == 2
+        finalize_prompt = calls[1]["prompt"]
+        assert params.workspace_dir in finalize_prompt
+        lowered = finalize_prompt.lower()
+        assert "read-only" in lowered
+        assert "do not modify" in lowered or "do not change" in lowered
+
+    @pytest.mark.asyncio
+    async def test_no_finalize_on_genuine_error(self):
         """A non-max_turns error (error_during_execution) must NOT trigger a
-        resume — resuming a genuinely-failed session double-bills for nothing."""
+        finalize — re-running a genuinely-failed evaluation double-bills for
+        nothing."""
         from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
 
         calls = {"n": 0}
@@ -1809,14 +1954,16 @@ class TestFinalizeInjection:
                 with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
                     result = await run_evaluator_agent(params)
 
-        assert calls["n"] == 1, "genuine error must not resume"
+        assert calls["n"] == 1, "genuine error must not finalize"
         assert result.status == "error"
 
     @pytest.mark.asyncio
-    async def test_no_resume_on_timeout_path(self):
-        """The timeout path cancels the first query mid-stream (the session is
-        being torn down), so NO resume happens there — exactly one query, fast,
-        status='error'."""
+    async def test_no_finalize_when_evaluator_times_out(self):
+        """A timed-out evaluator must NOT finalize. The fake never yields a
+        ResultMessage — it hangs past the (tiny) timeout, so wait_for cancels the
+        first query mid-stream (the session is being torn down) and the
+        `not timed_out` guard short-circuits the finalize. Exactly one query,
+        fast, status='error'."""
         import time as _time
 
         from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
@@ -1838,12 +1985,12 @@ class TestFinalizeInjection:
                     result = await run_evaluator_agent(params)
                     elapsed = _time.monotonic() - t0
 
-        assert calls["n"] == 1, "timeout path must not resume"
+        assert calls["n"] == 1, "timeout path must not finalize"
         assert result.status == "error"
         assert elapsed < 10, f"must be bounded by the timeout; took {elapsed:.1f}s"
 
     @pytest.mark.asyncio
-    async def test_resume_is_bounded_to_one_attempt(self):
+    async def test_finalize_is_bounded_to_one_attempt(self):
         """Both the primary AND the finalize hit error_max_turns -> the finalize
         is attempted ONCE and does NOT recurse into a third query. status='error'
         (fail-open). Proves no runaway loop."""
@@ -1930,7 +2077,7 @@ class TestFinalizeInjection:
                 is_error=False, subtype="result", num_turns=1, session_id="sess-write")
 
         def fake_query(prompt, options):
-            calls.append({"prompt": prompt, "options": options})
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
             if len(calls) == 1:
                 return gen_primary()
             return gen_finalize()

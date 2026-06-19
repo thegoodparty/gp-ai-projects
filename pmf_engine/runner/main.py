@@ -475,7 +475,7 @@ async def _run_qa_gate_hook(
     run_coroutine_threadsafe.
     """
     from .harness.base import EvaluatorHarnessParams, EvaluatorResult
-    from .harness.claude_sdk import run_evaluator_agent
+    from .harness.claude_sdk import _FINALIZE_TIMEOUT_SECONDS, run_evaluator_agent
     from .qa_gate import Verdict, _redact_secrets
 
     started = time.monotonic()
@@ -500,16 +500,18 @@ async def _run_qa_gate_hook(
             future = asyncio.run_coroutine_threadsafe(
                 run_evaluator_agent(params), loop
             )
+            bridge_timeout = params.timeout_seconds + _FINALIZE_TIMEOUT_SECONDS + 30
             try:
-                return future.result(timeout=params.timeout_seconds + 30)
+                return future.result(timeout=bridge_timeout)
             except concurrent.futures.TimeoutError:
-                # The coroutine outlived even run_evaluator_agent's own bound —
-                # cancel it (best-effort; it may already be past a cancellation
-                # point) and surface a stage error so observe still publishes.
+                # The coroutine outlived even run_evaluator_agent's own bound
+                # (primary timeout PLUS a fresh-query finalize) — cancel it
+                # (best-effort; it may already be past a cancellation point) and
+                # surface a stage error so observe still publishes.
                 future.cancel()
                 logger.warning(
                     "qa_gate_evaluator_bridge_timeout run_id=%s experiment_id=%s timeout=%ss",
-                    config.run_id, config.experiment_id, params.timeout_seconds + 30,
+                    config.run_id, config.experiment_id, bridge_timeout,
                 )
                 return EvaluatorResult(status="error")
 

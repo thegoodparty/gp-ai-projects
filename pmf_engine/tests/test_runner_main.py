@@ -2951,6 +2951,87 @@ async def test_real_qa_gate_bridge_marshals_evaluator_and_rides_publish(
 @pytest.mark.asyncio
 @patch("pmf_engine.runner.main._upload_logs")
 @patch("pmf_engine.runner.main.publish")
+async def test_evaluator_bridge_timeout_covers_the_finalize(mock_publish, _mock_logs, tmp_path):
+    """FIX 2: the async/sync bridge blocks the gate's worker thread on
+    future.result(timeout=...). The evaluator's own bound is
+    params.timeout_seconds for the primary PLUS _FINALIZE_TIMEOUT_SECONDS for a
+    fresh-query finalize on a turn-ceiling bust. If the bridge timeout only
+    covered the primary (+30), it could cancel the in-flight finalize before it
+    writes its salvaged verdict. The bridge must wait
+    params.timeout_seconds + _FINALIZE_TIMEOUT_SECONDS + 30."""
+    import pmf_engine.runner.qa_gate as qa_gate_mod
+    from pmf_engine.runner.harness.base import EvaluatorResult
+    from pmf_engine.runner.harness.claude_sdk import _FINALIZE_TIMEOUT_SECONDS
+
+    timeout_seconds = 600
+    config = _make_config(
+        timeout_seconds=timeout_seconds,
+        qa_envelope={
+            "manifest": {"blocking": False},
+            "files": {"eval.md": "## Rubric\n\nGrade faithfulness."},
+            "resolved_qa_version_ids": {"eval.md": "ev1"},
+        },
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    class _FakeFuture:
+        def result(self, timeout=None):
+            captured["bridge_timeout"] = timeout
+            params = captured["params"]
+            with open(params.result_file_path, "w", encoding="utf-8") as fh:
+                json.dump([{"name": "faithfulness", "passed": True}], fh)
+            return EvaluatorResult(
+                fragments=[],
+                cost_usd=0.04,
+                duration_ms=900,
+                num_turns=5,
+                session_id="sess-bridge-timeout",
+                status="ok",
+            )
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coro.close()
+        return _FakeFuture()
+
+    real_run_qa_gate = qa_gate_mod.run_qa_gate
+
+    def _capture_params(*args, **kwargs):
+        runner = kwargs["evaluator_runner"]
+
+        def _wrapped(params):
+            captured["params"] = params
+            return runner(params)
+
+        kwargs["evaluator_runner"] = _wrapped
+        return real_run_qa_gate(*args, **kwargs)
+
+    with patch.object(qa_gate_mod, "DEFAULT_QA_GATE_ROOT", str(tmp_path / "qa-gate-root")):
+        with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_params):
+            with patch(
+                "pmf_engine.runner.main.asyncio.run_coroutine_threadsafe",
+                side_effect=fake_run_coroutine_threadsafe,
+            ):
+                with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                    await run_experiment(config, harness=mock_harness)
+
+    assert "bridge_timeout" in captured, "the bridge must have called future.result(timeout=...)"
+    eval_timeout = captured["params"].timeout_seconds
+    assert captured["bridge_timeout"] == eval_timeout + _FINALIZE_TIMEOUT_SECONDS + 30
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
 async def test_qa_gate_hook_passes_run_id_and_experiment_id(mock_publish, _mock_logs):
     """B-interface: the run_qa_gate call site forwards run_id=config.run_id and
     experiment_id=config.experiment_id (the optional correlation params Lane A

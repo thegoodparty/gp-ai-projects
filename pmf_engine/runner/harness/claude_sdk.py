@@ -79,23 +79,24 @@ _RESEARCHER_MAX_TURNS = 20
 # by the SDK at session start (per the SDK's slugified-tool-name convention).
 _BROKER_MCP_SERVER_NAME = "broker"
 
-# QA-gate evaluator finalize-injection (resume-once-to-finalize). When the
+# QA-gate evaluator finalize-injection (fresh-query-to-finalize). When the
 # primary evaluator query hits the turn ceiling without writing a verdict, the
-# harness resumes the SAME SDK session EXACTLY ONCE with Bash ONLY — the proven
-# file-write path, so the judge can write its fragment array to the result file
-# from the evidence already gathered (a tool-free resume cannot write the file at
-# all, and stalls on the primary's dangling tool_use). WebSearch is dropped so it
-# cannot fetch new sources, and re-investigation is bounded by _FINALIZE_MAX_TURNS
-# (re-applied on the second query so the CLI emits a terminal ResultMessage and
-# exits) plus its own asyncio.wait_for. The timeout must be generous: the resume
-# reloads the full investigation as context, so the first completion is slow.
-_FINALIZE_MAX_TURNS = 3
+# harness runs EXACTLY ONE FRESH query (NOT a resume) that re-feeds the rubric +
+# artifact with Bash ONLY — the proven file-write path, so the judge can read the
+# artifact once, score it from its embedded content, and write its fragment array
+# to the result file. A fresh query only makes broker-routed messages-API calls
+# (ANTHROPIC_BASE_URL is the broker), which work on Fargate; a resume makes a
+# non-broker call that the runner's locked egress blackholes, so it reliably
+# hangs there (~120s timeout). WebSearch is dropped so it cannot fetch new
+# sources, and re-investigation is bounded by _FINALIZE_MAX_TURNS plus its own
+# asyncio.wait_for.
+_FINALIZE_MAX_TURNS = 5
 _FINALIZE_TIMEOUT_SECONDS = 120
 # Per-experiment escape hatch: flip to False to disable the finalize entirely if
 # it ever misbehaves in dev (a max_turns cut then degrades to status=error).
 _FINALIZE_ON_MAX_TURNS = True
 # SDK subtype that marks a turn-ceiling cut (vs a genuine agent error). Only this
-# subtype is resume-worthy; a genuine error or the cancelled-mid-stream timeout
+# subtype is finalize-worthy; a genuine error or the cancelled-mid-stream timeout
 # path is NOT.
 _MAX_TURNS_SUBTYPE = "error_max_turns"
 # Max chars of a tool-result content kept per transcript record (bounds a huge
@@ -501,15 +502,22 @@ async def run_agent(
 
 
 async def _finalize(state, params, primary_options, drain) -> None:
-    """Resume the evaluator's SDK session ONCE to give it a tool-free chance to
-    write its verdict after a turn-ceiling cut.
+    """Run ONE FRESH evaluator query (NO resume) to give a clean judge a chance
+    to record its verdict after the primary's turn-ceiling cut.
+
+    A resume reliably hangs on Fargate (its non-broker call is blackholed by the
+    runner's locked egress); a fresh query only makes broker-routed messages-API
+    calls, which work. So the finalize re-feeds the rubric (params.instruction) +
+    artifact (params.workspace_dir) and asks the judge to read once, score from
+    embedded content, and write its fragment array to params.result_file_path.
 
     Mutates ``state`` in place via ``drain`` (the same closure that drained the
     primary): on a clean finalize ResultMessage ``state['result']`` flips to
     'ok' and a SECOND terminal record is appended to ``state['transcript']``.
-    Bounded by allowed_tools=[] (no re-investigation), max_turns and its own
-    wait_for. Best-effort: any failure leaves ``state`` at its post-primary
-    values (status stays 'error'), so a stuck/erroring finalize is fail-open."""
+    Bounded by allowed_tools=["Bash"] (no WebSearch — no new source fetches),
+    max_turns=_FINALIZE_MAX_TURNS and its own wait_for. EXACTLY ONE attempt.
+    Best-effort: any failure leaves ``state`` at its post-primary values (status
+    stays 'error'), so a stuck/erroring finalize is fail-open."""
     finalize_options = ClaudeAgentOptions(
         system_prompt=primary_options.system_prompt,
         allowed_tools=["Bash"],
@@ -519,18 +527,21 @@ async def _finalize(state, params, primary_options, drain) -> None:
         cwd=primary_options.cwd,
         max_turns=_FINALIZE_MAX_TURNS,
         model=primary_options.model,
-        resume=state["session_id"],
         max_buffer_size=100 * 1024 * 1024,
     )
     finalize_prompt = (
-        "Stop investigating. Do NOT run any new queries, web searches, or source "
-        "fetches. Using a single Bash command, write your fragment array now as a "
-        f"JSON array to {params.result_file_path}, based ONLY on the evidence you "
-        "have already gathered."
+        f"{params.instruction}\n\n"
+        f"The workspace at {params.workspace_dir} is READ-ONLY evidence — do not "
+        "modify it. IMPORTANT: A previous evaluation of this same artifact ran out "
+        "of turns before recording a verdict. You have only a few turns now. Read "
+        f"the artifact in {params.workspace_dir} ONCE, score it from its embedded "
+        "content, and do NOT do a deep per-claim re-investigation or re-fetch "
+        "sources. Write your fragment array as a JSON array to this exact path "
+        f"now: {params.result_file_path}"
     )
     finalize_timeout = min(_FINALIZE_TIMEOUT_SECONDS, params.timeout_seconds)
     logger.info(
-        "qa_evaluator_finalize_resume session=%s timeout=%ss max_turns=%d",
+        "qa_evaluator_finalize_fresh session=%s timeout=%ss max_turns=%d",
         state["session_id"], finalize_timeout, _FINALIZE_MAX_TURNS,
     )
     try:
@@ -541,7 +552,7 @@ async def _finalize(state, params, primary_options, drain) -> None:
             state["session_id"], finalize_timeout,
         )
     except Exception as fin_err:
-        logger.warning(
+        logger.exception(
             "qa_evaluator_finalize_raised %s: %s (session=%s) — fail-open, status=error",
             type(fin_err).__name__, fin_err, state["session_id"],
         )
@@ -589,11 +600,15 @@ async def run_evaluator_agent(
         max_buffer_size=100 * 1024 * 1024,  # 100MB
     )
 
+    pivot = max(1, params.max_turns - 2)
     prompt = (
         f"{params.instruction}\n\n"
         f"The workspace at {params.workspace_dir} is READ-ONLY evidence — do not "
         "modify it. When you have finished grading, write your fragment array as a "
-        f"JSON array to this exact path: {params.result_file_path}"
+        f"JSON array to this exact path: {params.result_file_path}\n\n"
+        f"You have {params.max_turns} turns. By turn {pivot}, stop "
+        "investigating and write your fragment array to the result file even if "
+        "your analysis is incomplete — a partial verdict is far better than none."
     )
 
     # Mutable carrier so the inner drain coroutine can surface the
@@ -626,10 +641,10 @@ async def run_evaluator_agent(
         turn = 0
         async for message in query(prompt=drain_prompt, options=drain_options):
             if isinstance(message, ResultMessage):
-                state["cost_usd"] = message.total_cost_usd or 0.0
-                state["num_turns"] = message.num_turns
+                state["cost_usd"] = state["cost_usd"] + (message.total_cost_usd or 0.0)
+                state["num_turns"] = state["num_turns"] + message.num_turns
                 state["session_id"] = message.session_id
-                state["duration_ms"] = message.duration_ms or 0
+                state["duration_ms"] = state["duration_ms"] + (message.duration_ms or 0)
                 state["subtype"] = message.subtype
                 state["result"] = "error" if message.is_error else "ok"
                 transcript.append({
@@ -752,11 +767,12 @@ async def run_evaluator_agent(
         )
         return _build("error")
 
-    # Resume-once-to-finalize: ONLY on a clean turn-ceiling cut (NOT the timeout
+    # Fresh-query-to-finalize: ONLY on a clean turn-ceiling cut (NOT the timeout
     # path, which cancelled the query mid-stream and is tearing the session
-    # down). Tools disabled + a tiny turn cap + its own wait_for bound it so it
-    # can't loop or re-investigate. EXACTLY ONE attempt — a finalize that again
-    # hits the ceiling does NOT recurse.
+    # down). One FRESH query (no resume — a resume hangs on Fargate) re-feeds the
+    # rubric + artifact; Bash-only (no WebSearch) + a tiny turn cap + its own
+    # wait_for bound it so it can't loop or re-investigate. EXACTLY ONE attempt —
+    # a finalize that again hits the ceiling does NOT recurse.
     if (
         not timed_out
         and _FINALIZE_ON_MAX_TURNS
