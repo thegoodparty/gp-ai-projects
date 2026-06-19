@@ -81,13 +81,16 @@ _BROKER_MCP_SERVER_NAME = "broker"
 
 # QA-gate evaluator finalize-injection (resume-once-to-finalize). When the
 # primary evaluator query hits the turn ceiling without writing a verdict, the
-# harness resumes the SAME SDK session EXACTLY ONCE — tools disabled so it can
-# only emit text — and asks the judge to write its fragment array from the
-# evidence already gathered. Bounded three ways: allowed_tools=[] (no
-# re-investigation), _FINALIZE_MAX_TURNS re-applied on the second query (the CLI
-# emits a terminal ResultMessage and exits), and its own asyncio.wait_for.
-_FINALIZE_MAX_TURNS = 2
-_FINALIZE_TIMEOUT_SECONDS = 45
+# harness resumes the SAME SDK session EXACTLY ONCE with Bash ONLY — the proven
+# file-write path, so the judge can write its fragment array to the result file
+# from the evidence already gathered (a tool-free resume cannot write the file at
+# all, and stalls on the primary's dangling tool_use). WebSearch is dropped so it
+# cannot fetch new sources, and re-investigation is bounded by _FINALIZE_MAX_TURNS
+# (re-applied on the second query so the CLI emits a terminal ResultMessage and
+# exits) plus its own asyncio.wait_for. The timeout must be generous: the resume
+# reloads the full investigation as context, so the first completion is slow.
+_FINALIZE_MAX_TURNS = 3
+_FINALIZE_TIMEOUT_SECONDS = 120
 # Per-experiment escape hatch: flip to False to disable the finalize entirely if
 # it ever misbehaves in dev (a max_turns cut then degrades to status=error).
 _FINALIZE_ON_MAX_TURNS = True
@@ -509,7 +512,7 @@ async def _finalize(state, params, primary_options, drain) -> None:
     values (status stays 'error'), so a stuck/erroring finalize is fail-open."""
     finalize_options = ClaudeAgentOptions(
         system_prompt=primary_options.system_prompt,
-        allowed_tools=[],
+        allowed_tools=["Bash"],
         permission_mode=primary_options.permission_mode,
         mcp_servers={},
         agents=None,
@@ -520,9 +523,10 @@ async def _finalize(state, params, primary_options, drain) -> None:
         max_buffer_size=100 * 1024 * 1024,
     )
     finalize_prompt = (
-        "Stop investigating. Based ONLY on the evidence you have already "
-        "gathered, write your fragment array now as a JSON array to "
-        f"{params.result_file_path}. Do not use any tools."
+        "Stop investigating. Do NOT run any new queries, web searches, or source "
+        "fetches. Using a single Bash command, write your fragment array now as a "
+        f"JSON array to {params.result_file_path}, based ONLY on the evidence you "
+        "have already gathered."
     )
     finalize_timeout = min(_FINALIZE_TIMEOUT_SECONDS, params.timeout_seconds)
     logger.info(

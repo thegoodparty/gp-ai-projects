@@ -1739,10 +1739,12 @@ class TestFinalizeInjection:
     @pytest.mark.asyncio
     async def test_resume_on_max_turns_yields_status_ok_and_captures_finalize(self):
         """call#1 hits error_max_turns (no result file). The harness resumes the
-        SAME session ONCE with allowed_tools=[] and max_turns=_FINALIZE_MAX_TURNS,
-        and call#2 returns a clean ResultMessage. Assert: query invoked TWICE, the
-        resume options carried resume=session_id + empty tools + the finalize turn
-        cap, final status='ok', and the transcript carries BOTH terminal records."""
+        SAME session ONCE with allowed_tools=["Bash"] (the proven file-write path —
+        WebSearch is dropped so it cannot fetch new sources; max_turns is the real
+        bound on re-investigation) and max_turns=_FINALIZE_MAX_TURNS, and call#2
+        returns a clean ResultMessage. Assert: query invoked TWICE, the resume
+        options carried resume=session_id + Bash-only tools + the finalize turn cap,
+        final status='ok', and the transcript carries BOTH terminal records."""
         from pmf_engine.runner.harness.claude_sdk import _FINALIZE_MAX_TURNS, run_evaluator_agent
 
         calls: list[dict] = []
@@ -1771,9 +1773,10 @@ class TestFinalizeInjection:
         assert len(calls) == 2, "resume must run exactly one finalize query"
         finalize_opts = calls[1]["options"]
         assert finalize_opts.resume == "sess-x"
-        assert finalize_opts.allowed_tools == []
+        assert finalize_opts.allowed_tools == ["Bash"]
+        assert "WebSearch" not in finalize_opts.allowed_tools
         assert finalize_opts.max_turns == _FINALIZE_MAX_TURNS
-        # The finalize prompt must direct a tool-free write from existing evidence.
+        # The finalize prompt must direct a Bash write from existing evidence.
         assert params.result_file_path in calls[1]["prompt"]
 
         assert result.status == "ok"
