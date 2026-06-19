@@ -26,6 +26,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
@@ -2147,3 +2149,97 @@ def test_agent_max_turns_clamped_to_engine_ceiling_before_evaluator(workspace, g
     assert fake.calls[0].max_turns == qa_gate_mod._MAX_AGENT_TURNS
     # Sanity: the author's raw value was NOT forwarded.
     assert fake.calls[0].max_turns != 999
+
+
+# ==========================================================================
+# FIX A (security: secret-pattern drift): _SECRET_PATTERNS must mask the
+# STANDALONE token shapes (sk-..., ghp_..., xox[bpra]-...) that runner/main.py's
+# redaction already covers. A misbehaving qa/main.py that prints a raw token to
+# stderr NOT wrapped in key=value (e.g. an OpenAI key or GitHub PAT in a
+# traceback) must not leak into the Verdict's main_py_exit fragment. Each
+# standalone pattern has exactly ONE group, so _redact_secrets replaces the WHOLE
+# match with _REDACTED (fully masked, no chars leak).
+# ==========================================================================
+
+
+def test_redact_secrets_masks_standalone_openai_key():
+    """A bare OpenAI key (`sk-` + 40 alnum) printed unwrapped (not key=value) must
+    be fully masked. The whole match is replaced with _REDACTED — no chars leak.
+    Mirrors runner/main.py:268 (`sk-[a-zA-Z0-9]{20,}`)."""
+    # Assembled from parts (low-entropy body) so the committed source carries no
+    # contiguous token-shaped literal that would trip push-protection secret
+    # scanning; the runtime value still matches `sk-[a-zA-Z0-9]{20,}`. Do NOT
+    # inline this back into a single literal.
+    key = "sk-" + ("A" * 40)
+    text = f"Traceback: auth failed with {key} oops"
+    out = qa_gate_mod._redact_secrets(text, broker_env={})
+    assert key not in out
+    assert qa_gate_mod._REDACTED in out
+
+
+def test_redact_secrets_masks_standalone_github_pat():
+    """A bare GitHub PAT (`ghp_` + 36 alnum) printed unwrapped must be fully masked."""
+    # Assembled from parts (see the openai-key test) to avoid a literal PAT in
+    # source; runtime value still matches `ghp_[A-Za-z0-9]{36,}`.
+    pat = "ghp_" + ("B" * 36)
+    text = f"clone failed: remote token {pat} rejected"
+    out = qa_gate_mod._redact_secrets(text, broker_env={})
+    assert pat not in out
+    assert qa_gate_mod._REDACTED in out
+
+
+def test_redact_secrets_masks_standalone_slack_token():
+    """A bare Slack token (`xoxb-...`) printed unwrapped must be fully masked."""
+    # Split prefix + low-entropy body so the committed source has no contiguous
+    # `xoxb-...` literal (push-protection flags it as a real Slack token); the
+    # runtime value still matches `xox[bpra]-[A-Za-z0-9\-]+`.
+    tok = "xox" + "b-" + ("C" * 30)
+    text = f"slack post failed using {tok} in handler"
+    out = qa_gate_mod._redact_secrets(text, broker_env={})
+    assert tok not in out
+    assert qa_gate_mod._REDACTED in out
+
+
+# ==========================================================================
+# FIX B (proc.wait race discards complete output): in _read_bounded, both pipes
+# reach EOF (child finished writing) before proc.wait is called. If the read
+# deadline elapsed during the final drain, the old code passed timeout=0.0 to
+# proc.wait — a child that closed its pipes but hasn't fully exited yet (slow
+# atexit handlers) raised subprocess.TimeoutExpired, which propagated out BEFORE
+# the captured stdout/stderr were returned. The caller then reported a false
+# stage error and DISCARDED a complete, parseable response. The fix gives the
+# finished child a short grace to exit, then kills it but KEEPS the output.
+# ==========================================================================
+
+
+def test_read_bounded_keeps_complete_output_when_child_lingers_after_eof(monkeypatch):
+    """A child that writes a valid JSON array, flushes, closes both fds, then
+    lingers (sleep) is essentially done — its bytes are complete. _read_bounded
+    must RETURN the captured (stdout, stderr, over_cap) rather than raising
+    subprocess.TimeoutExpired and discarding a parseable response."""
+    # Short grace so the test is fast: the child won't exit (it sleeps 30s), so
+    # _read_bounded should kill it after the grace and keep the output.
+    monkeypatch.setattr(qa_gate_mod, "_PROC_EXIT_GRACE_SECONDS", 0.3)
+
+    valid_array = b'[{"name":"x","passed":true}]'
+    src = (
+        "import os, sys, time\n"
+        f"sys.stdout.buffer.write({valid_array!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        "os.close(1)\n"
+        "os.close(2)\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", src],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr, over_cap = qa_gate_mod._read_bounded(proc, timeout_seconds=1)
+        assert stdout == valid_array
+        assert over_cap is False
+    finally:
+        qa_gate_mod._kill_quietly(proc)
+    # The fix killed the lingering child; nothing should be left running.
+    assert proc.poll() is not None

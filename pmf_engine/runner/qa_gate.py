@@ -81,6 +81,9 @@ _EVAL_MD = "eval.md"
 _MAIN_STDOUT_CAP = 1 * 1024 * 1024
 # Last N bytes of stderr folded into the synthetic main_py_exit fragment detail.
 _STDERR_TAIL = 4 * 1024
+# Grace given to an already-finished child (pipes at EOF) to exit cleanly so its
+# returncode populates naturally, before we kill it and keep the captured output.
+_PROC_EXIT_GRACE_SECONDS = 5.0
 
 # A6: marker that replaces a redacted secret in folded stderr.
 _REDACTED = "[REDACTED]"
@@ -99,6 +102,13 @@ _SECRET_PATTERNS = [
         r"(?i)\b([A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key)[A-Za-z0-9_]*)"
         r"\s*[=:]\s*[\"']?([^\s\"']{4,})"
     ),
+    # Standalone token shapes (mirror runner/main.py:268/270/271): a misbehaving
+    # main.py can print these raw (e.g. in a traceback) NOT wrapped in key=value.
+    # Each has exactly ONE group -> .groups == 1 -> the whole match is replaced
+    # with _REDACTED (no chars leak).
+    re.compile(r"(?i)(sk-[a-zA-Z0-9]{20,})"),
+    re.compile(r"(?i)(ghp_[A-Za-z0-9]{36,})"),
+    re.compile(r"(?i)(xox[bpra]-[A-Za-z0-9\-]+)"),
 ]
 
 # Ported from runner/main.py (_BROKER_TOKEN_PATTERN / _BEARER_TOKEN_PATTERN) so
@@ -595,8 +605,15 @@ def _read_bounded(proc: subprocess.Popen, timeout_seconds: int) -> tuple[bytes, 
     finally:
         sel.close()
 
-    # Wait for the child to fully exit so returncode is populated.
-    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    # Pipes are at EOF, so the child finished writing and is essentially done.
+    # Give it a short grace to exit cleanly (e.g. atexit handlers) so returncode
+    # is populated even if the read deadline just elapsed; the captured bytes are
+    # already complete. If it still hasn't exited, kill it but KEEP the output
+    # rather than discarding a complete, parseable response.
+    try:
+        proc.wait(timeout=max(_PROC_EXIT_GRACE_SECONDS, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        _kill_quietly(proc)
     # Pipes hit EOF above; close the file objects so their fds aren't held
     # until GC (single-use task, but keep it tidy).
     for stream in (proc.stdout, proc.stderr):

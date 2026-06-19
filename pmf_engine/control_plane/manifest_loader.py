@@ -136,10 +136,24 @@ class ManifestRoutingLoader:
         # QA gate folder pins (contract F → G). When the index entry carries no
         # qa_manifest_key the experiment publishes no qa/ folder, so the map is
         # {} and the dispatch guard omits QA_VERSION_IDS — byte-identical no-qa.
+        # Defensive: publish_experiments.py always writes qa_keys as a list, but
+        # a malformed/legacy index entry could store it as a string. Passing a
+        # string downstream would let `[qa_manifest_key, *qa_keys]` iterate it
+        # character-by-character, silently dropping the real qa key from
+        # QA_VERSION_IDS. Treat a non-list as empty here too (mirrors the guard
+        # in _fetch_qa_version_ids).
+        qa_keys = entry.get("qa_keys") or []
+        if not isinstance(qa_keys, list):
+            logger.warning(
+                "qa_keys for %s is %s, not a list; ignoring (only qa manifest pinned)",
+                experiment_id,
+                type(qa_keys).__name__,
+            )
+            qa_keys = []
         qa_version_ids = self._fetch_qa_version_ids(
             experiment_id,
             entry.get("qa_manifest_key"),
-            entry.get("qa_keys") or [],
+            qa_keys,
         )
         routing = _project_routing(manifest, experiment_id=experiment_id)
         routing["manifest_version_id"] = manifest_version_id
@@ -386,8 +400,20 @@ class ManifestRoutingLoader:
           the map is empty — manifest.json is never special-cased to fabricate
           a pin.
         """
-        if not qa_manifest_key:
+        if not isinstance(qa_manifest_key, str) or not qa_manifest_key:
             return {}
+        # Defensive: publish_experiments.py always writes qa_keys as a list, but
+        # a malformed/legacy index entry could store it as a string. Splatting a
+        # string into `[qa_manifest_key, *qa_keys]` would iterate it CHARACTER BY
+        # CHARACTER, so the real qa key never gets HEADed and its VersionId
+        # silently drops out of QA_VERSION_IDS. Treat a non-list as empty.
+        if not isinstance(qa_keys, list):
+            logger.warning(
+                "qa_keys for %s is %s, not a list; ignoring (only qa manifest pinned)",
+                experiment_id,
+                type(qa_keys).__name__,
+            )
+            qa_keys = []
         return self._fetch_version_ids(
             experiment_id,
             "qa",

@@ -715,9 +715,15 @@ async def test_main_sends_failed_status_on_timeout():
                 with patch("pmf_engine.runner.main.init_config"):
                     with patch("pmf_engine.runner.main.publish") as mock_publish:
                         with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
-                            with pytest.raises(SystemExit):
-                                await main()
+                            # Timeout path hard-exits (os._exit) so the non-daemon
+                            # qa-gate worker thread can't hold the ECS slot. Patch
+                            # _hard_exit so the path is observable, and guard the
+                            # real os._exit so it never kills the test process.
+                            with patch("pmf_engine.runner.main.os._exit"):
+                                with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                    await main()
 
+    mock_hard_exit.assert_called_once_with(1)
     status_calls = [c for c in mock_publish.report_status.call_args_list]
     statuses = [c[0][0] for c in status_calls]
     assert "failed" in statuses
@@ -727,6 +733,60 @@ async def test_main_sends_failed_status_on_timeout():
     # signal.
     assert failed_call[1]["reason_code"] == "Timeout"
     assert "timed out" in failed_call[1]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_main_hard_exits_on_timeout_after_side_effects():
+    """Operational blocker: run_qa_gate runs in a non-daemon asyncio.to_thread
+    worker that cannot be cancelled. On a timeout, sys.exit would join that
+    thread at interpreter shutdown and hold the ECS task slot for up to
+    ~bridge_timeout (~450s). The timeout path must instead call _hard_exit(1)
+    (os._exit) to terminate the process immediately. The required side effects
+    — the terminal failed-callback and the log upload — must already have run
+    by the time we hard-exit."""
+    config = _make_config(instruction="Do stuff", timeout_seconds=1)
+
+    async def slow_run(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    call_order: list[str] = []
+
+    def track_report(*args, **kwargs):
+        call_order.append("report")
+
+    def track_upload(*args, **kwargs):
+        call_order.append("upload")
+
+    def track_hard_exit(code):
+        call_order.append(f"hard_exit:{code}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
+                            with patch("pmf_engine.runner.main._upload_logs", side_effect=track_upload):
+                                with patch(
+                                    "pmf_engine.runner.main._report_failed_or_fallback",
+                                    side_effect=track_report,
+                                ):
+                                    # Guard: never let the real os._exit kill the test process,
+                                    # even if the fix is wrong and calls it directly.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch(
+                                            "pmf_engine.runner.main._hard_exit",
+                                            side_effect=track_hard_exit,
+                                        ) as mock_hard_exit:
+                                            await main()
+
+    mock_hard_exit.assert_called_once_with(1)
+    # The terminal callback and log upload must both run BEFORE the hard exit.
+    assert "report" in call_order
+    assert "upload" in call_order
+    assert call_order[-1] == "hard_exit:1"
+    assert call_order.index("report") < call_order.index("hard_exit:1")
+    assert call_order.index("upload") < call_order.index("hard_exit:1")
 
 
 @pytest.mark.asyncio
@@ -935,11 +995,24 @@ async def test_main_sends_failed_status_on_signal():
                 with patch("pmf_engine.runner.main.init_config"):
                     with patch("pmf_engine.runner.main.publish") as mock_publish:
                         with patch("pmf_engine.runner.main.run_experiment", side_effect=interrupted_run):
-                            with pytest.raises(SystemExit):
-                                await main()
+                            # Signal path hard-exits (os._exit) so the non-daemon
+                            # qa-gate worker thread can't hold the ECS slot. Patch
+                            # _hard_exit so the path is observable, and guard the
+                            # real os._exit so it never kills the test process.
+                            with patch("pmf_engine.runner.main.os._exit"):
+                                with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                    # In production _hard_exit -> os._exit never
+                                    # returns; the mock does, so the original
+                                    # exception re-raises out of the handler's
+                                    # trailing `raise`. Tolerate that here — the
+                                    # contract under test is that _hard_exit(1)
+                                    # was reached on the signal path.
+                                    with pytest.raises(Exception, match="interrupted"):
+                                        await main()
 
     main_module._shutdown_requested = False
 
+    mock_hard_exit.assert_called_once_with(1)
     status_calls = [c[0][0] for c in mock_publish.report_status.call_args_list]
     assert "failed" in status_calls
     failed_call = next(c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed")
@@ -1249,9 +1322,13 @@ class TestMainErrorPaths:
                         with patch("pmf_engine.runner.main.publish") as mock_publish:
                             with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
                                 with patch("pmf_engine.runner.main._upload_logs") as mock_upload:
-                                    with pytest.raises(SystemExit):
-                                        await main()
+                                    # Timeout path hard-exits; patch _hard_exit so the
+                                    # path is observable and guard the real os._exit.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                            await main()
 
+        mock_hard_exit.assert_called_once_with(1)
         mock_upload.assert_called_once()
         failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
         assert len(failed_calls) >= 1
@@ -1530,14 +1607,21 @@ class TestCallbackLifecycleFix:
                         with patch("pmf_engine.runner.main.publish") as mock_publish:
                             with patch("pmf_engine.runner.main.run_experiment", side_effect=long_running):
                                 with patch("pmf_engine.runner.main._upload_logs"):
-                                    canceller = asyncio.ensure_future(cancel_soon())
-                                    with pytest.raises(SystemExit):
-                                        await main()
-                                    try:
-                                        await canceller
-                                    except Exception:
-                                        pass
+                                    # CancelledError (signal) path hard-exits; patch
+                                    # _hard_exit so the path is observable and guard
+                                    # the real os._exit so it never kills the test.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch(
+                                            "pmf_engine.runner.main._hard_exit"
+                                        ) as mock_hard_exit:
+                                            canceller = asyncio.ensure_future(cancel_soon())
+                                            await main()
+                                            try:
+                                                await canceller
+                                            except Exception:
+                                                pass
 
+        mock_hard_exit.assert_called_once_with(1)
         assert cancelled_from_inside, "run_experiment task was not actually cancelled"
         failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
         assert len(failed_calls) >= 1

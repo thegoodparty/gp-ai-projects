@@ -729,6 +729,103 @@ class TestManifestLoaderQaEnvelope:
             )
 
 
+# ---------------------------------------------------------------------------
+# Control-plane loader: defensive guard against a STRING-shaped `qa_keys`
+# (Cursor Bugbot, MEDIUM). publish_experiments.py always writes qa_keys as a
+# list, but a malformed/legacy index entry could store it as a string. The
+# qa-pin builder does `[qa_manifest_key, *qa_keys]`; splatting a string
+# iterates it CHARACTER BY CHARACTER, so the real qa key is never HEADed and
+# its VersionId silently drops out of QA_VERSION_IDS — drift that's hard to
+# diagnose because the broker still loads the qa folder from a list-shaped
+# index elsewhere. The loader must treat a non-list qa_keys as empty and STILL
+# pin the qa manifest, never iterate per-character.
+# ---------------------------------------------------------------------------
+
+
+class TestControlPlaneQaKeysStringGuard:
+    def _drive(self, qa_keys):
+        """Run the control-plane loader against a fake S3 with the given
+        (possibly malformed) qa_keys value. Returns (routing, fake_s3)."""
+        from pmf_engine.control_plane.manifest_loader import ManifestRoutingLoader
+        from pmf_engine.tests.test_lambda_manifest_loader import (
+            BUCKET,
+            FakeS3,
+            _index_payload,
+            _manifest_payload,
+        )
+
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        index = _index_payload(
+            [
+                {
+                    "id": "smoke_test",
+                    "version": 1,
+                    "mode": "win",
+                    "manifest_key": "smoke_test/manifest.json",
+                    "instruction_key": "smoke_test/instruction.md",
+                    "qa_manifest_key": qa_manifest_key,
+                    "qa_keys": qa_keys,
+                },
+            ]
+        )
+        s3 = FakeS3()
+        s3.set_json(BUCKET, "index.json", index)
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="instr_v")
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        # A real qa entrypoint whose full key equals the malformed string value.
+        s3.set_object(BUCKET, "smoke_test/qa/eval.md", b"# eval", version_id="qa_eval_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+        return loader.routing_for("smoke_test"), s3, BUCKET
+
+    def test_string_qa_keys_is_not_iterated_per_character(self, caplog):
+        """A STRING qa_keys must NOT be splatted into characters. The bug
+        signature: `[qa_manifest_key, *qa_keys]` iterates the string, so the
+        per-key loop processes single-character fragments ('s','m','o','k',
+        'e',...), each tripping the wrong-prefix skip path. The guard must
+        collapse a non-list qa_keys to empty BEFORE the splat, so no single-
+        character key is ever seen by the per-key loop or HEADed."""
+        import logging
+        import re
+
+        with caplog.at_level(logging.WARNING, logger="pmf_engine.control_plane.manifest_loader"):
+            _routing, s3, _bucket = self._drive("smoke_test/qa/eval.md")
+
+        # The per-key loop logs `... key='<k>' ...` when it skips a wrong-prefix
+        # key. Extract every key it actually looped over and assert none is a
+        # single character — that's the per-character iteration signature.
+        looped_keys = re.findall(r"key='([^']*)'", " ".join(r.message for r in caplog.records))
+        single_char_keys = [k for k in looped_keys if len(k) == 1]
+        assert single_char_keys == [], (
+            "string qa_keys was iterated per-character — the loop saw single-"
+            f"character fragments: {single_char_keys!r}. The guard must treat "
+            "a non-list qa_keys as empty before the splat."
+        )
+
+        # And no single-character key may be HEADed.
+        head_keys = [c[2] for c in s3.calls if c[0] == "head_object"]
+        assert [k for k in head_keys if len(k) == 1] == []
+
+    def test_string_qa_keys_still_pins_the_qa_manifest(self):
+        """Even when qa_keys is malformed (string), the qa manifest pin must
+        still be captured — the guard skips the bad qa_keys, not the whole
+        qa folder."""
+        routing, _s3, _bucket = self._drive("smoke_test/qa/eval.md")
+        assert routing["qa_version_ids"] == {"manifest.json": "qa_man_v"}, (
+            "malformed string qa_keys must collapse to empty; only the qa "
+            f"manifest should be pinned, got {routing['qa_version_ids']!r}"
+        )
+
+    def test_list_qa_keys_unchanged_by_guard(self):
+        """Regression guard: a proper list qa_keys (what the publisher always
+        writes) must behave exactly as before — each entry pinned."""
+        routing, _s3, _bucket = self._drive(["smoke_test/qa/eval.md"])
+        assert routing["qa_version_ids"] == {
+            "manifest.json": "qa_man_v",
+            "eval.md": "qa_eval_v",
+        }
+
+
 def test_permission_mode_values_parity_with_control_plane():
     """The runner-side `_PERMISSION_MODE_VALUES` is a deliberate copy of the
     control-plane set (kept inline to avoid a control_plane → runner import

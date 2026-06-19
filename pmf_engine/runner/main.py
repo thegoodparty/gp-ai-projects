@@ -29,6 +29,24 @@ _shutdown_requested = False
 _current_task: asyncio.Task | None = None
 _terminal_callback_sent = False
 
+
+def _hard_exit(code: int) -> None:
+    """Exit NOW without waiting for non-daemon worker threads.
+
+    run_qa_gate runs in an asyncio.to_thread (non-daemon) worker that cannot
+    be cancelled; on a timeout/signal it can keep blocking in future.result
+    for up to bridge_timeout (~450s). sys.exit would join that thread at
+    interpreter shutdown and hold the ECS task slot. The required side
+    effects (terminal callback + log upload) have already run by the time we
+    reach the exit paths, so terminate the process immediately."""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 # Files the runner writes itself during workspace setup. An attachment that
 # matches one of these names would silently clobber the runner's own write.
 # The publisher rejects these at upload time; this set is the runtime
@@ -1068,7 +1086,7 @@ async def main():
             detail=f"Experiment timed out after {config.timeout_seconds}s",
             duration_seconds=time.monotonic() - main_start_time,
         )
-        sys.exit(1)
+        _hard_exit(1)
 
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
@@ -1080,7 +1098,7 @@ async def main():
             detail="Task terminated by signal",
             duration_seconds=time.monotonic() - main_start_time,
         )
-        sys.exit(1)
+        _hard_exit(1)
 
     except SystemExit:
         raise
@@ -1095,7 +1113,7 @@ async def main():
                 detail="Task terminated by signal",
                 duration_seconds=time.monotonic() - main_start_time,
             )
-            sys.exit(1)
+            _hard_exit(1)
 
         logger.exception(f"Unhandled error in main for run {config.run_id}: {e}")
         if not _is_callback_already_sent():
