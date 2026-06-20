@@ -85,20 +85,33 @@ def _s3_body(payload: bytes | str, content_length: int | None = None) -> dict:
 def _default_index(
     experiment_ids: list[str] | None = None,
     attachment_keys: dict[str, list[str]] | None = None,
+    qa_keys: dict[str, list[str]] | None = None,
+    qa_manifest_key: dict[str, str] | None = None,
 ) -> dict:
     """Build a synthetic index.json.
 
     `attachment_keys` maps experiment_id → list of "<id>/attachments/<basename>"
     entries. The broker reads this list to decide which sidecars to fetch.
+
+    `qa_keys` maps experiment_id → list of "<id>/qa/<basename>" entries
+    (EXCLUDING manifest.json, which is carried separately as `qa_manifest_key`
+    per contract F). `qa_manifest_key` maps experiment_id → "<id>/qa/manifest.json".
+    Both are absent from the entry when not provided — that's the byte-identical
+    no-qa shape every existing experiment has today.
     """
     ids = experiment_ids if experiment_ids is not None else ["voter_targeting", "walking_plan"]
-    pins = attachment_keys or {}
-    return {
-        "experiments": [
-            {"id": eid, "attachment_keys": pins.get(eid, [])}
-            for eid in ids
-        ]
-    }
+    att = attachment_keys or {}
+    qak = qa_keys or {}
+    qam = qa_manifest_key or {}
+    experiments = []
+    for eid in ids:
+        entry: dict = {"id": eid, "attachment_keys": att.get(eid, [])}
+        if eid in qak:
+            entry["qa_keys"] = qak[eid]
+        if eid in qam:
+            entry["qa_manifest_key"] = qam[eid]
+        experiments.append(entry)
+    return {"experiments": experiments}
 
 
 def _make_s3_responder(manifest: dict | None = None, instruction: str | None = None,
@@ -112,7 +125,11 @@ def _make_s3_responder(manifest: dict | None = None, instruction: str | None = N
                         attachments: dict[str, bytes | str] | None = None,
                         attachment_version_ids: dict[str, str] | None = None,
                         attachment_errors: dict[str, Exception] | None = None,
-                        attachment_content_lengths: dict[str, int] | None = None):
+                        attachment_content_lengths: dict[str, int] | None = None,
+                        qa_files: dict[str, bytes | str] | None = None,
+                        qa_version_ids: dict[str, str] | None = None,
+                        qa_errors: dict[str, Exception] | None = None,
+                        qa_content_lengths: dict[str, int] | None = None):
     """Returns a side_effect for s3_client.get_object that routes by Key suffix.
 
     If `recorded_calls` is passed, append (Key, kwargs_dict) tuples for tests
@@ -132,6 +149,10 @@ def _make_s3_responder(manifest: dict | None = None, instruction: str | None = N
     att_versions = attachment_version_ids or {}
     att_errors = attachment_errors or {}
     att_lengths = attachment_content_lengths or {}
+    qa_bodies = qa_files or {}
+    qa_versions = qa_version_ids or {}
+    qa_errs = qa_errors or {}
+    qa_lengths = qa_content_lengths or {}
 
     def _get_object(Bucket, Key, **kwargs):
         if recorded_calls is not None:
@@ -140,6 +161,22 @@ def _make_s3_responder(manifest: dict | None = None, instruction: str | None = N
             if index_error:
                 raise index_error
             return _s3_body(json.dumps(index if index is not None else _default_index()))
+        # qa routing comes BEFORE the "/manifest.json" suffix check so a qa
+        # manifest at "<id>/qa/manifest.json" routes here, not to the
+        # experiment-manifest branch.
+        if "/qa/" in Key:
+            basename = Key.split("/qa/", 1)[1]
+            if basename in qa_errs:
+                raise qa_errs[basename]
+            if basename not in qa_bodies:
+                raise AssertionError(f"unexpected qa S3 key: {Key}")
+            response = _s3_body(
+                qa_bodies[basename],
+                content_length=qa_lengths.get(basename),
+            )
+            if basename in qa_versions:
+                response["VersionId"] = qa_versions[basename]
+            return response
         if Key.endswith("/manifest.json"):
             if manifest_error:
                 raise manifest_error
@@ -1383,3 +1420,609 @@ class TestExperimentManifestIdLengthBoundary:
         )
 
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (contract H, v1 observe-only): the broker serves the qa folder
+# under a SEPARATE response envelope key `qa`, NOT merged into `attachments`
+# (decision 4). The qa folder's manifest.json is carried separately (contract
+# F / decision 3) at `<id>/qa/manifest.json`; the other entrypoints
+# (main.py / eval.md) come through `qa_keys`. The runner forwards its
+# QA_VERSION_IDS env var as the request's `qa_version_ids` field, mirroring
+# attachment_version_ids. When the experiment publishes no qa folder, the
+# response omits `qa` entirely so the no-qa path is byte-identical (decision 10).
+# ---------------------------------------------------------------------------
+
+
+class TestExperimentManifestQaNoFolder:
+    def test_no_qa_folder_omits_qa_key_entirely(self):
+        """Every existing experiment has no qa_keys / qa_manifest_key in its
+        index entry. The response must NOT carry a `qa` key at all (not None
+        in the wire either) so the no-qa containerOverrides stay byte-identical
+        to today and older runners parse unchanged."""
+        app = _create_app()  # _default_index has no qa keys
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # `qa` omitted: the route returns a JSONResponse with a manual
+        # payload.pop("qa", None) when no qa folder ran (NOT FastAPI's
+        # response_model_exclude_none), keeping the no-qa wire identical to the
+        # pre-gate shape. Pin the FULL top-level key set so an accidental new
+        # always-serialized field (or a leaked `qa: null`) is caught — not just
+        # that `qa` is absent.
+        assert set(body.keys()) == {
+            "manifest",
+            "instruction",
+            "resolved_manifest_version_id",
+            "resolved_instruction_version_id",
+            "attachments",
+            "resolved_attachment_version_ids",
+        }
+        assert "qa" not in body
+        # And the attachments machinery is untouched.
+        assert body["attachments"] == {}
+        assert body["resolved_attachment_version_ids"] == {}
+
+    def test_qa_folder_does_not_trigger_attachment_fetches(self):
+        """A qa folder must NOT leak into attachment GETs — the two surfaces
+        are disjoint. With only qa keys in the index (no attachment_keys),
+        zero `/attachments/` GETs fire."""
+        recorded: list = []
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/main.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False}), "main.py": "print(1)\n"},
+            recorded_calls=recorded,
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        attachment_gets = [k for k, _ in recorded if "/attachments/" in k]
+        assert attachment_gets == []
+
+
+class TestExperimentManifestQaFetch:
+    def test_qa_folder_packaged_under_separate_envelope_key(self):
+        """When the experiment publishes a qa folder, the response carries a
+        `qa` envelope: {manifest: <decoded json>, files: {basename: body},
+        resolved_qa_version_ids: {basename: vid}}. The qa manifest is parsed
+        JSON; the entrypoints are utf-8 strings keyed by basename."""
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": [
+                "voter_targeting/qa/main.py",
+                "voter_targeting/qa/eval.md",
+            ]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "main.py": "import sys\nprint('[]')\n",
+                "eval.md": "# Evaluator\nGrade faithfulness.\n",
+            },
+            qa_version_ids={
+                "manifest.json": "V-qa-man-1",
+                "main.py": "V-qa-main-1",
+                "eval.md": "V-qa-eval-1",
+            },
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        qa = resp.json()["qa"]
+        # Manifest decoded as JSON (a dict), not a raw string.
+        assert qa["manifest"] == {"blocking": False}
+        # Entrypoints keyed by basename, utf-8 decoded.
+        assert qa["files"] == {
+            "main.py": "import sys\nprint('[]')\n",
+            "eval.md": "# Evaluator\nGrade faithfulness.\n",
+        }
+        # VersionIds for every fetched qa object (manifest + entrypoints).
+        assert qa["resolved_qa_version_ids"] == {
+            "manifest.json": "V-qa-man-1",
+            "main.py": "V-qa-main-1",
+            "eval.md": "V-qa-eval-1",
+        }
+
+    def test_qa_envelope_is_disjoint_from_attachments(self):
+        """qa files live under their own key and never appear in attachments,
+        even when the same experiment ships BOTH attachments and a qa folder
+        (decision 4: separate envelope, never merged)."""
+        index = _default_index(
+            attachment_keys={"voter_targeting": ["voter_targeting/attachments/notes.md"]},
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/main.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            attachments={"notes.md": "attachment body\n"},
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "main.py": "qa body\n",
+            },
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # Attachments only carry the attachment; the qa file is NOT in there.
+        assert body["attachments"] == {"notes.md": "attachment body\n"}
+        assert "main.py" not in body["attachments"]
+        # qa carries only the qa file; the attachment is NOT in there.
+        assert body["qa"]["files"] == {"main.py": "qa body\n"}
+        assert "notes.md" not in body["qa"]["files"]
+
+    def test_qa_keys_excludes_manifest_but_manifest_still_fetched(self):
+        """Contract F: qa_keys excludes manifest.json (carried separately as
+        qa_manifest_key). The broker must still fetch the manifest from
+        qa_manifest_key, decode it, and place it under qa.manifest — even
+        though it never appears in qa_keys."""
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": []},  # no entrypoints, just the manifest
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False, "agent": {"model": "sonnet"}})},
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        qa = resp.json()["qa"]
+        assert qa["manifest"] == {"blocking": False, "agent": {"model": "sonnet"}}
+        assert qa["files"] == {}
+
+    def test_qa_files_fetched_under_qa_prefix(self):
+        """The broker enumerates the qa folder under `<id>/qa/` — never a
+        runner-supplied basename — exactly like attachments use
+        `<id>/attachments/`."""
+        recorded: list = []
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/main.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False}), "main.py": "x\n"},
+            recorded_calls=recorded,
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        qa_gets = {k for k, _ in recorded if "/qa/" in k}
+        assert qa_gets == {
+            "voter_targeting/qa/manifest.json",
+            "voter_targeting/qa/main.py",
+        }
+
+
+class TestExperimentManifestQaVersionPinning:
+    def test_qa_version_ids_forwarded_to_s3(self):
+        """Symmetric with attachment_version_ids: when the runner forwards
+        QA_VERSION_IDS, those VersionIds must reach S3 so the pinned-replay
+        path returns the same bytes Lambda saw."""
+        recorded: list = []
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/main.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False}), "main.py": "x\n"},
+            recorded_calls=recorded,
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={
+                "experiment_id": "voter_targeting",
+                "qa_version_ids": {
+                    "manifest.json": "V-qa-man-pin",
+                    "main.py": "V-qa-main-pin",
+                },
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        man_call = next(c for c in recorded if c[0].endswith("/qa/manifest.json"))
+        main_call = next(c for c in recorded if c[0].endswith("/qa/main.py"))
+        assert man_call[1].get("VersionId") == "V-qa-man-pin"
+        assert main_call[1].get("VersionId") == "V-qa-main-pin"
+
+    def test_unpinned_qa_omits_version_id_to_s3(self):
+        """Without a pin, the broker defaults to 'latest' (no VersionId in
+        the GetObject kwargs) — identical to the attachment fall-through."""
+        recorded: list = []
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/main.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False}), "main.py": "x\n"},
+            recorded_calls=recorded,
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        for key, kwargs in recorded:
+            if "/qa/" in key:
+                assert "VersionId" not in kwargs
+
+
+class TestExperimentManifestQaVersionIdValidation:
+    @pytest.mark.parametrize("bad_key", [
+        "has/slash.py",       # path separator in basename — not safe
+        "..",                 # traversal
+        ".",                  # current-dir
+        "spaces in name.md",  # whitespace not in basename pattern
+        "",                   # empty
+    ])
+    def test_rejects_unsafe_qa_version_id_keys(self, bad_key):
+        """qa_version_ids is validated IDENTICALLY to attachment_version_ids:
+        the key must be a safe basename (defends the `<id>/qa/<basename>` S3
+        key construction against traversal)."""
+        app = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={
+                "experiment_id": "voter_targeting",
+                "qa_version_ids": {bad_key: "V-pinned"},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 422
+
+    def test_rejects_unsafe_qa_version_id_values(self):
+        app = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={
+                "experiment_id": "voter_targeting",
+                "qa_version_ids": {"main.py": "has space"},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 422
+
+    def test_accepts_manifest_json_basename_and_valid_version_id(self):
+        """The qa folder's required file is `manifest.json` — the validator
+        must accept that basename (it matches the basename pattern) paired
+        with a realistic S3 VersionId."""
+        good = "Mxl3K7LqXxL.Rq4yE9P_zN8HtY.Bd2W-"
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": []},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False})},
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={
+                "experiment_id": "voter_targeting",
+                "qa_version_ids": {"manifest.json": good},
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+
+
+class TestExperimentManifestQaSafetyGuards:
+    def test_qa_key_with_wrong_prefix_skipped_and_emits_drift(self):
+        """A qa_keys entry that doesn't start with `<id>/qa/` is index drift —
+        the broker must skip it (never fetch an unrelated S3 key) and emit a
+        drift metric, mirroring the attachment wrong-prefix guard."""
+        index = {
+            "experiments": [{
+                "id": "voter_targeting",
+                "attachment_keys": [],
+                "qa_manifest_key": "voter_targeting/qa/manifest.json",
+                "qa_keys": [
+                    "voter_targeting/qa/legit.py",
+                    "other_experiment/qa/cross.py",  # wrong prefix
+                ],
+            }],
+        }
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={"manifest.json": json.dumps({"blocking": False}), "legit.py": "ok\n"},
+        )
+        app = _create_app(s3_get_object=responder)
+        with patch("broker.endpoints.experiment_manifest._emit_metric") as mock_metric:
+            client = TestClient(app)
+            resp = client.post(
+                "/experiment/manifest",
+                json={"experiment_id": "voter_targeting"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200
+        # Only the legit qa file came back; the cross-prefix one was skipped.
+        assert resp.json()["qa"]["files"] == {"legit.py": "ok\n"}
+        drift_calls = [
+            call for call in mock_metric.call_args_list
+            if call.args[0] == "broker_attachment_index_drift"
+        ]
+        assert drift_calls, "expected a drift metric for the wrong-prefix qa key"
+        # Pin the drift_kind DIMENSION value (like the attachment siblings pin
+        # unsafe_basename / non_string_key / wrong_prefix) so the metric can't
+        # silently mislabel the cause.
+        kinds = {
+            d.get("Value")
+            for call in drift_calls
+            for d in call.args[1]
+            if d.get("Name") == "drift_kind"
+        }
+        assert "qa_wrong_prefix" in kinds
+
+    def test_non_utf8_qa_file_returns_500(self):
+        """Binary qa files are unsupported (utf-8 only, mirroring attachments).
+        A non-utf-8 qa file surfaces as a loud 500, not a silent corruption."""
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/bad.bin"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "bad.bin": b"\xff\xfe\xfd not utf-8",
+            },
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 500
+
+    def test_oversize_qa_file_returns_502(self):
+        """Per-object size cap applies to qa files (separate 1 MiB budget from
+        the 5 MiB attachment cap). An oversize qa file trips the cap with 502,
+        mirroring the attachment size-cap guard."""
+        oversize = b"a" * (em.MAX_QA_BYTES + 1)
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/huge.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "huge.py": oversize,
+            },
+            qa_content_lengths={"huge.py": em.MAX_QA_BYTES + 1},
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 502
+        assert "exceeds size cap" in resp.json()["detail"]
+
+    def test_qa_per_object_cap_is_exactly_1_mib(self):
+        """Pin the per-object qa cap to its ABSOLUTE value (1 MiB), not just to
+        the imported constant. The oversize test above sizes its payload off
+        em.MAX_QA_BYTES, so widening the constant would silently keep it green
+        (just a bigger payload). This catches a cap-widening regression: a qa
+        file one byte over 1 MiB MUST 502, regardless of the constant's value.
+        (Mutant M13: cap-widening.)"""
+        cap = 1 * 1024 * 1024
+        # The constant itself must equal the documented per-object byte budget.
+        assert em.MAX_QA_BYTES == cap
+
+        oversize = b"a" * (cap + 1)
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": ["voter_targeting/qa/huge.py"]},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "huge.py": oversize,
+            },
+            qa_content_lengths={"huge.py": cap + 1},
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 502
+        assert "exceeds size cap" in resp.json()["detail"]
+
+    def test_missing_qa_manifest_returns_404_labeled_qa(self):
+        """If qa_manifest_key points at a manifest that's been deleted from
+        S3, the 404 detail must label it as a qa object, not leak the S3 key."""
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": []},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={},
+            qa_errors={"manifest.json": _no_such_key("voter_targeting/qa/manifest.json")},
+        )
+        app = _create_app(s3_get_object=responder)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/experiment/manifest",
+            json={"experiment_id": "voter_targeting"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert "qa" in detail.lower()
+        assert "voter_targeting" not in detail
+
+
+class TestExperimentManifestQaManifestDedupe:
+    """Contract F: qa_keys EXCLUDES manifest.json (it's carried separately as
+    qa_manifest_key). But a publisher bug / manual S3 edit could list the qa
+    manifest in BOTH qa_manifest_key and qa_keys. The broker must HEAD/fetch it
+    exactly ONCE (mirroring the loader's seen-set) and emit an index-drift
+    metric for the overlap — never fetch the same object twice or place it in
+    both qa.manifest and qa.files."""
+
+    def test_qa_manifest_in_both_keys_fetched_once_and_emits_drift(self):
+        recorded: list = []
+        index = {
+            "experiments": [{
+                "id": "voter_targeting",
+                "attachment_keys": [],
+                "qa_manifest_key": "voter_targeting/qa/manifest.json",
+                # Drift: manifest.json also listed in qa_keys (should be excluded).
+                "qa_keys": [
+                    "voter_targeting/qa/manifest.json",
+                    "voter_targeting/qa/main.py",
+                ],
+            }],
+        }
+        responder = _make_s3_responder(
+            index=index,
+            qa_files={
+                "manifest.json": json.dumps({"blocking": False}),
+                "main.py": "print(1)\n",
+            },
+            recorded_calls=recorded,
+        )
+        app = _create_app(s3_get_object=responder)
+        with patch("broker.endpoints.experiment_manifest._emit_metric") as mock_metric:
+            client = TestClient(app)
+            resp = client.post(
+                "/experiment/manifest",
+                json={"experiment_id": "voter_targeting"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        # The qa manifest object must be fetched exactly ONCE despite appearing
+        # in both qa_manifest_key and qa_keys.
+        man_gets = [k for k, _ in recorded if k == "voter_targeting/qa/manifest.json"]
+        assert man_gets == ["voter_targeting/qa/manifest.json"], (
+            f"qa manifest must be fetched exactly once, got {man_gets}"
+        )
+        qa = resp.json()["qa"]
+        # The manifest stays under qa.manifest (decoded), NOT duplicated into files.
+        assert qa["manifest"] == {"blocking": False}
+        assert "manifest.json" not in qa["files"]
+        assert qa["files"] == {"main.py": "print(1)\n"}
+        # A drift metric fires for the overlap.
+        drift_calls = [
+            call for call in mock_metric.call_args_list
+            if call.args[0] == "broker_attachment_index_drift"
+        ]
+        assert drift_calls, "expected a drift metric for the qa-manifest overlap"
+
+    def test_non_dict_qa_manifest_returns_500_with_decode_metric(self):
+        """The decoded qa manifest must be a JSON OBJECT (dict). A bare JSON
+        scalar/array (e.g. `[]` or `"x"`) is malformed — the engine expects
+        an object with a `blocking` field. Surface a loud 500 reusing the
+        existing qa-manifest decode metric, not a silent shape corruption."""
+        index = _default_index(
+            qa_manifest_key={"voter_targeting": "voter_targeting/qa/manifest.json"},
+            qa_keys={"voter_targeting": []},
+        )
+        responder = _make_s3_responder(
+            index=index,
+            # Valid JSON, but a list — NOT a JSON object.
+            qa_files={"manifest.json": json.dumps([1, 2, 3])},
+        )
+        app = _create_app(s3_get_object=responder)
+        with patch("broker.endpoints.experiment_manifest._emit_metric") as mock_metric:
+            client = TestClient(app)
+            resp = client.post(
+                "/experiment/manifest",
+                json={"experiment_id": "voter_targeting"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 500
+        assert "qa manifest" in resp.json()["detail"].lower()
+        decode_calls = [
+            call for call in mock_metric.call_args_list
+            if call.args[0] == "broker_qa_manifest_decode_error"
+        ]
+        assert decode_calls, "expected the qa-manifest decode metric to fire on a non-dict manifest"

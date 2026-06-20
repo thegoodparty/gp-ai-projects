@@ -588,6 +588,18 @@ def build_container_overrides(
                 "value": json.dumps(experiment["attachment_version_ids"], sort_keys=True),
             }
         )
+    # QA gate version pins (contract G). Mirrors ATTACHMENT_VERSION_IDS exactly:
+    # {basename: VersionId}, sort_keys for byte-deterministic output. Skip when
+    # empty/absent — on an unversioned bucket every pin is None so the map is
+    # empty, the env var is omitted, and the runner fetches qa 'latest'. This
+    # keeps the no-qa containerOverrides byte-identical to a pre-gate dispatch.
+    if experiment.get("qa_version_ids"):
+        env.append(
+            {
+                "name": "QA_VERSION_IDS",
+                "value": json.dumps(experiment["qa_version_ids"], sort_keys=True),
+            }
+        )
     # When the dispatch carries enumerated input-file refs (e.g. user-uploaded
     # agenda PDFs), the runner pre-fetches each via the broker's /inputs/read
     # endpoint before invoking the agent. Refs travel as a JSON-encoded env var

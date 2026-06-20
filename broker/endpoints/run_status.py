@@ -4,10 +4,9 @@ import os
 from typing import Literal
 
 import boto3
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from broker.auth import get_broker_token
 from broker.callback_sender import CallbackSender
 from broker.data_query_tracker import DataQueryTracker
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
@@ -81,6 +80,13 @@ class RunStatusRequest(BaseModel):
     duration_seconds: float | None = None
     cost_usd: float | None = None
     rejected_artifact: dict | None = None
+    # PMF QA gate (eval transcript): declared for forward-compat and to satisfy
+    # the contract's "add to both models" requirement (pydantic's default
+    # extra='ignore' would otherwise silently drop it). run-status is a
+    # FAILURE-only path — there is no verdict to couple a transcript to here, so
+    # NO durable transcript write is performed on this endpoint. The actual
+    # durable eval_transcript.jsonl write happens ONLY in /artifact/publish.
+    qa_eval_transcript: str | None = None
 
 
 class RunStatusResponse(BaseModel):

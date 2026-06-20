@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
@@ -20,7 +21,7 @@ from claude_agent_sdk import (
 from pmf_engine.runner.contract import format_contract_for_prompt
 from shared.logger import get_logger
 
-from .base import HarnessResult
+from .base import EvaluatorHarnessParams, EvaluatorResult, HarnessResult
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,18 @@ class AgentStreamTruncatedError(RuntimeError):
 
 
 ALLOWED_TOOLS = ["Bash", "Write", "Edit", "Glob", "Grep", "WebSearch"]
+
+# QA-gate evaluator tool surface (PMF QA gate, PR-3). A SUBSET of ALLOWED_TOOLS,
+# NOT an extension: the evaluator only inspects evidence (Bash to cat/grep the
+# read-only /workspace via Bash). The evaluator is EDITORIAL, not
+# investigative: it scores the artifact's own embedded content against the
+# rubric and does NOT re-fetch sources or web-search — claim-level grounding is
+# the deterministic gate's job (main.py / source_extract), and re-investigation
+# burns the turn budget. So WebSearch is excluded along with Write/Edit (no
+# workspace mutation) and Glob/Grep (Bash covers traversal). Defined as its own
+# constant so the assertable shape is locked and the evaluator never rides
+# ALLOWED_TOOLS' extend path.
+EVALUATOR_ALLOWED_TOOLS = ["Bash"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
@@ -68,6 +81,32 @@ _RESEARCHER_MAX_TURNS = 20
 # Tools the agent calls through this server are namespaced as "mcp__broker__*"
 # by the SDK at session start (per the SDK's slugified-tool-name convention).
 _BROKER_MCP_SERVER_NAME = "broker"
+
+# QA-gate evaluator finalize-injection (fresh-query-to-finalize). When the
+# primary evaluator query hits the turn ceiling without writing a verdict, the
+# harness runs EXACTLY ONE FRESH query (NOT a resume) that re-feeds the rubric +
+# artifact with Bash ONLY — the proven file-write path, so the judge can read the
+# artifact once, score it from its embedded content, and write its fragment array
+# to the result file. A fresh query only makes broker-routed messages-API calls
+# (ANTHROPIC_BASE_URL is the broker), which work on Fargate; a resume makes a
+# non-broker call that the runner's locked egress blackholes, so it reliably
+# hangs there (~120s timeout). WebSearch is dropped so it cannot fetch new
+# sources, and re-investigation is bounded by _FINALIZE_MAX_TURNS plus its own
+# asyncio.wait_for.
+_FINALIZE_MAX_TURNS = 5
+_FINALIZE_TIMEOUT_SECONDS = 120
+# Per-experiment escape hatch: flip to False to disable the finalize entirely if
+# it ever misbehaves in dev (a max_turns cut then degrades to status=error).
+_FINALIZE_ON_MAX_TURNS = True
+# SDK subtype that marks a turn-ceiling cut (vs a genuine agent error). Only this
+# subtype is finalize-worthy; a genuine error or the cancelled-mid-stream timeout
+# path is NOT.
+_MAX_TURNS_SUBTYPE = "error_max_turns"
+# Max chars of a tool-result content kept per transcript record (bounds a huge
+# re-fetched source so the JSONL can't blow the broker's 1 MiB durable cap).
+_TRANSCRIPT_TOOL_RESULT_CAP = 4000
+# Max chars of a tool-use input kept per transcript record.
+_TRANSCRIPT_TOOL_INPUT_CAP = 2000
 
 
 def _resolve_permission_mode(override: str | None = None) -> str:
@@ -465,6 +504,303 @@ async def run_agent(
     raise AgentStreamTruncatedError("Agent stream ended without result")
 
 
+async def _finalize(state, params, primary_options, drain) -> None:
+    """Run ONE FRESH evaluator query (NO resume) to give a clean judge a chance
+    to record its verdict after the primary's turn-ceiling cut.
+
+    A resume reliably hangs on Fargate (its non-broker call is blackholed by the
+    runner's locked egress); a fresh query only makes broker-routed messages-API
+    calls, which work. So the finalize re-feeds the rubric (params.instruction) +
+    artifact (params.workspace_dir) and asks the judge to read once, score from
+    embedded content, and write its fragment array to params.result_file_path.
+
+    Mutates ``state`` in place via ``drain`` (the same closure that drained the
+    primary): on a clean finalize ResultMessage ``state['result']`` flips to
+    'ok' and a SECOND terminal record is appended to ``state['transcript']``.
+    Bounded by allowed_tools=["Bash"] (no WebSearch — no new source fetches),
+    max_turns=_FINALIZE_MAX_TURNS and its own wait_for. EXACTLY ONE attempt.
+    Best-effort: any failure leaves ``state`` at its post-primary values (status
+    stays 'error'), so a stuck/erroring finalize is fail-open."""
+    finalize_options = ClaudeAgentOptions(
+        system_prompt=primary_options.system_prompt,
+        allowed_tools=["Bash"],
+        permission_mode=primary_options.permission_mode,
+        mcp_servers={},
+        agents=None,
+        cwd=primary_options.cwd,
+        max_turns=_FINALIZE_MAX_TURNS,
+        model=primary_options.model,
+        max_buffer_size=100 * 1024 * 1024,
+    )
+    finalize_prompt = (
+        f"{params.instruction}\n\n"
+        f"The workspace at {params.workspace_dir} is READ-ONLY evidence — do not "
+        "modify it. IMPORTANT: A previous evaluation of this same artifact ran out "
+        "of turns before recording a verdict. You have only a few turns now. Read "
+        f"the artifact in {params.workspace_dir} ONCE, score it from its embedded "
+        "content, and do NOT do a deep per-claim re-investigation or re-fetch "
+        "sources. Write your fragment array as a JSON array to this exact path "
+        f"now: {params.result_file_path}"
+    )
+    finalize_timeout = min(_FINALIZE_TIMEOUT_SECONDS, params.timeout_seconds)
+    logger.info(
+        "qa_evaluator_finalize_fresh session=%s timeout=%ss max_turns=%d",
+        state["session_id"], finalize_timeout, _FINALIZE_MAX_TURNS,
+    )
+    try:
+        await asyncio.wait_for(drain(finalize_prompt, finalize_options), timeout=finalize_timeout)
+    except TimeoutError:
+        logger.warning(
+            "qa_evaluator_finalize_timeout session=%s timeout=%ss — fail-open, status=error",
+            state["session_id"], finalize_timeout,
+        )
+    except Exception as fin_err:
+        logger.exception(
+            "qa_evaluator_finalize_raised %s: %s (session=%s) — fail-open, status=error",
+            type(fin_err).__name__, fin_err, state["session_id"],
+        )
+
+
+async def run_evaluator_agent(
+    params: EvaluatorHarnessParams,
+    parent_span=None,
+) -> EvaluatorResult:
+    """Run the QA-gate evaluator agent (PMF QA gate, PR-3).
+
+    NEW code, deliberately NOT a re-route of run_agent's branches, so the
+    primary path stays byte-identical. The evaluator is the OPPOSITE of the
+    primary agent on every axis:
+
+    - allowed_tools = EVALUATOR_ALLOWED_TOOLS (a SUBSET — Bash only, not the
+      ALLOWED_TOOLS extend path; the evaluator is editorial, not investigative,
+      so no WebSearch);
+    - mcp_servers = {} ALWAYS (it does NOT call _build_broker_mcp_servers): the
+      evaluator reaches the broker over HTTP via Bash + pmf_runtime using the
+      live BROKER_URL/BROKER_TOKEN env, not via an MCP server;
+    - system_prompt = params.system_prompt VERBATIM (build_system_prompt is
+      bypassed: no capability section, no preamble, no instruction concat);
+    - agents = None so the 'Agent' dispatch tool is denied by exclusion;
+    - cwd = params.gate_cwd so /workspace is read-only evidence.
+
+    FAIL-OPEN (v1 observe-only): an SDK error becomes status='error' rather than
+    a raised exception, so the run still publishes. Fragments are read by the
+    gate from params.result_file_path, so this returns fragments=[].
+    """
+    logger.info(
+        f"Starting QA evaluator agent (model: {params.model}, max_turns: {params.max_turns})"
+    )
+
+    resolved_permission_mode = _resolve_permission_mode()
+
+    options = ClaudeAgentOptions(
+        system_prompt=params.system_prompt,
+        allowed_tools=list(EVALUATOR_ALLOWED_TOOLS),
+        permission_mode=resolved_permission_mode,
+        mcp_servers={},
+        agents=None,
+        cwd=params.gate_cwd,
+        max_turns=params.max_turns,
+        model=params.model,
+        max_buffer_size=100 * 1024 * 1024,  # 100MB
+    )
+
+    pivot = max(1, params.max_turns - 2)
+    prompt = (
+        f"{params.instruction}\n\n"
+        f"The workspace at {params.workspace_dir} is READ-ONLY evidence — do not "
+        "modify it. When you have finished grading, write your fragment array as a "
+        f"JSON array to this exact path: {params.result_file_path}\n\n"
+        f"You have {params.max_turns} turns. By turn {pivot}, stop "
+        "investigating and write your fragment array to the result file even if "
+        "your analysis is incomplete — a partial verdict is far better than none."
+    )
+
+    # Mutable carrier so the inner drain coroutine can surface the
+    # ResultMessage metrics to the outer scope even when wait_for cancels it.
+    # `transcript` accumulates one RAW (unredacted) record per evaluator turn
+    # plus a terminal record per query() invocation; it survives wait_for
+    # cancellation exactly like the other metrics because it lives out here.
+    # `subtype` carries the SDK ResultMessage.subtype the finalize gate reads.
+    state: dict[str, object] = {
+        "cost_usd": 0.0,
+        "num_turns": 0,
+        "session_id": None,
+        "duration_ms": 0,
+        "result": None,  # "ok" | "error" | None (stream ended w/o ResultMessage)
+        "subtype": None,
+        "transcript": [],
+    }
+
+    async def _drain(drain_prompt: str, drain_options: ClaudeAgentOptions) -> None:
+        """Consume the SDK stream to its ResultMessage. Bounded by wait_for
+        below — on timeout, wait_for cancels this coroutine, which propagates
+        CancelledError into `query`'s async generator and tears it down (so the
+        underlying SDK session is not abandoned).
+
+        Records every turn into state['transcript'] as a RAW (unredacted) JSON
+        record. Redaction is the GATE's job (the single chokepoint in
+        qa_gate._run_evaluator), so the harness file stays free of the gate's
+        redaction symbols and the two workstreams' files stay disjoint."""
+        transcript: list[dict] = state["transcript"]  # type: ignore[assignment]
+        turn = 0
+        async for message in query(prompt=drain_prompt, options=drain_options):
+            if isinstance(message, ResultMessage):
+                state["cost_usd"] = state["cost_usd"] + (message.total_cost_usd or 0.0)
+                state["num_turns"] = state["num_turns"] + message.num_turns
+                state["session_id"] = message.session_id
+                state["duration_ms"] = state["duration_ms"] + (message.duration_ms or 0)
+                state["subtype"] = message.subtype
+                state["result"] = "error" if message.is_error else "ok"
+                transcript.append({
+                    "turn": 0,
+                    "kind": "result",
+                    "status": "error" if message.is_error else "ok",
+                    "subtype": message.subtype,
+                    "is_error": message.is_error,
+                    "num_turns": message.num_turns,
+                    "session_id": message.session_id,
+                    "cost_usd": message.total_cost_usd or 0.0,
+                    "duration_ms": message.duration_ms or 0,
+                })
+                if message.is_error:
+                    logger.warning(
+                        f"QA evaluator agent errored after {message.num_turns} turns "
+                        f"(session={message.session_id}): {message.result or 'unknown error'}"
+                    )
+                return
+            # Per-turn observability. The SDK reports only the final ResultMessage
+            # (which can be a bare "unknown error" on a max_turns/timeout cut), so
+            # without this the evaluator's turns are invisible — we can't see WHY a
+            # judge ran long (re-fetching sources? flailing?). Log METADATA ONLY
+            # (tool names + truncated inputs + char counts), never raw tool-result
+            # content, so no secret can leak into the logs.
+            if isinstance(message, AssistantMessage):
+                turn += 1
+                tools = [
+                    f"{b.name}:{str(b.input)[:80]}"
+                    for b in message.content
+                    if isinstance(b, ToolUseBlock)
+                ]
+                text_chars = sum(
+                    len(b.text or "")
+                    for b in message.content
+                    if isinstance(b, TextBlock)
+                )
+                logger.info(
+                    "qa_evaluator_turn=%d tools=%s text_chars=%d",
+                    turn, tools or None, text_chars,
+                )
+                text = "".join(
+                    b.text or "" for b in message.content if isinstance(b, TextBlock)
+                )
+                transcript.append({
+                    "turn": turn,
+                    "kind": "assistant",
+                    "text": text,
+                    "tools": [
+                        {"name": b.name, "input": str(b.input)[:_TRANSCRIPT_TOOL_INPUT_CAP]}
+                        for b in message.content
+                        if isinstance(b, ToolUseBlock)
+                    ],
+                })
+            elif isinstance(message, UserMessage):
+                content = getattr(message, "content", None)
+                if isinstance(content, list):
+                    sizes = [
+                        len(b.content)
+                        if isinstance(b.content, str)
+                        else len(json.dumps(b.content, default=str))
+                        for b in content
+                        if isinstance(b, ToolResultBlock)
+                    ]
+                    if sizes:
+                        logger.info(
+                            "qa_evaluator_turn=%d tool_result_chars=%s total=%d",
+                            turn, sizes, sum(sizes),
+                        )
+                    results = []
+                    for b in content:
+                        if not isinstance(b, ToolResultBlock):
+                            continue
+                        raw_content = (
+                            b.content if isinstance(b.content, str)
+                            else json.dumps(b.content, default=str)
+                        )
+                        results.append({
+                            "tool_use_id": b.tool_use_id,
+                            "is_error": b.is_error,
+                            "content": raw_content[:_TRANSCRIPT_TOOL_RESULT_CAP],
+                        })
+                    if results:
+                        transcript.append({
+                            "turn": turn,
+                            "kind": "tool_result",
+                            "results": results,
+                        })
+
+    def _build(status: str) -> EvaluatorResult:
+        records: list[dict] = state["transcript"]  # type: ignore[assignment]
+        eval_transcript = "\n".join(json.dumps(r, default=str) for r in records)
+        return EvaluatorResult(
+            fragments=[],
+            cost_usd=state["cost_usd"],  # type: ignore[arg-type]
+            duration_ms=state["duration_ms"],  # type: ignore[arg-type]
+            num_turns=state["num_turns"],  # type: ignore[arg-type]
+            session_id=state["session_id"],  # type: ignore[arg-type]
+            status=status,  # type: ignore[arg-type]
+            eval_transcript=eval_transcript,
+        )
+
+    timed_out = False
+    try:
+        # B1: enforce the evaluator's own timeout. Without this bound a stuck
+        # evaluator (a query that never reaches a ResultMessage) would consume
+        # the ENTIRE outer run budget. wait_for cancels the drain — and thus the
+        # underlying query — at params.timeout_seconds.
+        await asyncio.wait_for(_drain(prompt, options), timeout=params.timeout_seconds)
+    except TimeoutError:
+        logger.warning(
+            f"QA evaluator agent timed out after {params.timeout_seconds}s "
+            f"(session={state['session_id']}) — cancelled, fail-open, status=error"
+        )
+        timed_out = True
+    except Exception as eval_err:
+        logger.warning(
+            f"QA evaluator agent raised {type(eval_err).__name__}: {eval_err} "
+            f"(session={state['session_id']}) — fail-open, status=error"
+        )
+        return _build("error")
+
+    # Fresh-query-to-finalize: ONLY on a clean turn-ceiling cut (NOT the timeout
+    # path, which cancelled the query mid-stream and is tearing the session
+    # down). One FRESH query (no resume — a resume hangs on Fargate) re-feeds the
+    # rubric + artifact; Bash-only (no WebSearch) + a tiny turn cap + its own
+    # wait_for bound it so it can't loop or re-investigate. EXACTLY ONE attempt —
+    # a finalize that again hits the ceiling does NOT recurse.
+    if (
+        not timed_out
+        and _FINALIZE_ON_MAX_TURNS
+        and state["result"] == "error"
+        and state["subtype"] == _MAX_TURNS_SUBTYPE
+        and state["session_id"]
+    ):
+        await _finalize(state, params, options, _drain)
+
+    if timed_out:
+        return _build("error")
+    if state["result"] == "ok":
+        logger.info(
+            f"QA evaluator completed: {state['num_turns']} turns. "
+            f"Cost: ${state['cost_usd']:.4f}. Session: {state['session_id']}"
+        )
+        return _build("ok")
+    if state["result"] == "error":
+        return _build("error")
+
+    logger.warning("QA evaluator stream ended without a ResultMessage — fail-open, status=error")
+    return _build("error")
+
+
 def collect_output_artifact(workspace_dir: str, experiment_id: str | None = None) -> tuple[bytes, str]:
     output_dir = os.path.join(workspace_dir, "output")
     files = [f for f in glob.glob(os.path.join(output_dir, "*")) if os.path.isfile(f)]
@@ -553,3 +889,6 @@ class ClaudeSdkHarness:
             num_turns=result["num_turns"],
             session_id=result["session_id"],
         )
+
+    async def run_evaluator(self, params: EvaluatorHarnessParams) -> EvaluatorResult:
+        return await run_evaluator_agent(params)
