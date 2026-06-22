@@ -218,7 +218,7 @@ Note: runner → broker traffic inside the VPC is HTTP (no TLS). Not a leak — 
 ## Open items for QA/prod rollout
 
 1. **Image tagging for CI.** Current manual `docker build && docker push` is fine for dev iteration. QA/prod need CI-driven tagging (e.g. `broker-{env}-{commit_sha}` with service redeployment).
-2. **Braintrust tracing.** Stripped from runner (required IAM the quarantine doesn't allow). If we want per-run Claude API traces visible in Braintrust, route via broker — broker's Anthropic proxy can forward headers / tag requests.
+2. **Braintrust tracing.** Done (PR #119): per-run traces route through the broker's `/braintrust` proxy (two legs — `app`→www.braintrust.dev, `api`→api.braintrust.dev). The broker swaps the run scope-ticket for the real Braintrust key and tags requests to per-env `pmf-engine-{env}` projects, so the runner never holds Braintrust creds and the quarantine is preserved.
 3. **gp-api integration.** Done: dispatch-error callbacks now route to the gp-api results queue (`{branch}-Queue.fifo`) and the standalone `agent-results-{env}.fifo` has been retired. Remaining experiment endpoint schema work is tracked separately.
 4. **Dedicated PMF VPC (Phase 3 hardening).** Move PMF to its own VPC so Route53 DNS Firewall can attach with a block-all-except-broker rule. Not blocking for dev/qa/prod MVP.
 5. **SSRF hardening (batch 1b).** `broker/endpoints/http_fetch.py` does SSRF URL validation via `getaddrinfo` then lets httpx re-resolve — DNS rebinding window. Pending: resolve once, pin to safe IP via custom httpx resolver. Also: IPv4-mapped IPv6 (`::ffff:169.254.169.254`) bypasses the private-range check because Python's `is_private` returns False for v6-mapped; need explicit `ip.ipv4_mapped` handling.

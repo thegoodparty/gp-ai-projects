@@ -280,8 +280,10 @@ def _launch_one(store, job) -> bool:
         # the SQS send fails, do NOT leave the job LAUNCHING (the sweep would then
         # send a `failed` callback and FAIL a live task, dropping its real result
         # when the terminal callback lands). gp-api instead reconciles via the
-        # task's terminal callback (its relaxed guard accepts QUEUED -> terminal)
-        # or the 6h QUEUED backstop if the task dies silently.
+        # task's terminal callback (its relaxed guard accepts QUEUED -> terminal),
+        # or, if the task dies silently, the ECS task-reaper Lambda sends a
+        # `failed` callback keyed on startedBy=run_id (there is no longer a
+        # time-based QUEUED backstop in gp-api).
         store.mark_dispatched(job.run_id)
         sent = _send_callback(
             job.run_id,
