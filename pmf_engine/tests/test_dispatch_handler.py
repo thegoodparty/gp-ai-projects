@@ -334,6 +334,40 @@ class TestBuildContainerOverrides:
         assert json.loads(env_map["PARAMS_JSON"]) == {"district": "CA-12"}
         assert env_map["TIMEOUT_SECONDS"] == "600"
 
+    def test_experiment_id_is_first_env_var(self):
+        # CONTRACT: EXPERIMENT_ID MUST be the first entry of the container
+        # environment array. The pmf-engine-fargate EventBridge rule extracts
+        # the experiment id for failure Slack alerts via the positional path
+        # `$.detail.overrides.containerOverrides[0].environment[0].value`
+        # (EventBridge input transformers cannot filter an array by key name).
+        # Reordering this array would silently surface the WRONG value in the
+        # alert — and because BROKER_TOKEN / ANTHROPIC_API_KEY / BRAINTRUST_API_KEY
+        # live later in the same array, a reorder that pushed a secret to index 0
+        # would leak it into SNS and the notifier's CloudWatch logs. This test
+        # pins the ordering so any such regression breaks CI loudly instead.
+        experiment = {
+            "harness": "claude_sdk",
+            "model": "sonnet",
+            "contract": {"type": "json", "s3_key_template": "t"},
+        }
+        message = {
+            "experiment_type": "smoke_test",
+            "organization_slug": "org-123",
+            "run_id": "run-abc",
+            "clerk_user_id": "user_test_dispatch",
+            "params": {},
+        }
+        overrides = build_container_overrides(
+            experiment=experiment,
+            message=message,
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+        env = overrides["containerOverrides"][0]["environment"]
+        assert env[0]["name"] == "EXPERIMENT_ID"
+        assert env[0]["value"] == "smoke_test"
+
     def test_no_artifact_bucket_or_callback_queue_in_overrides(self):
         experiment = {
             "harness": "claude_sdk",
@@ -740,13 +774,13 @@ class TestHandler:
         )
 
         warning_records = [r for r in records if r.levelno == logging.WARNING and "nonexistent" in r.getMessage()]
-        assert (
-            warning_records == []
-        ), f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
+        assert warning_records == [], (
+            f"Expected no WARNING-level log for unknown experiment, got: {[r.getMessage() for r in warning_records]}"
+        )
 
-        assert any(
-            "smoke_test" in r.getMessage() for r in error_records
-        ), "Expected error log to include known experiment IDs for operator triage"
+        assert any("smoke_test" in r.getMessage() for r in error_records), (
+            "Expected error log to include known experiment IDs for operator triage"
+        )
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
@@ -1799,9 +1833,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
         assert result["status"] == "failed"
         error_str = result["error"]
         assert "arn:aws:iam" not in error_str, f"Expected sanitized error, got ARN-leaking message: {error_str!r}"
-        assert (
-            "333022194791" not in error_str
-        ), f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
+        assert "333022194791" not in error_str, (
+            f"Expected sanitized error, got account-id-leaking message: {error_str!r}"
+        )
         assert "ECS RunTask failed" in error_str
 
     @patch("pmf_engine.control_plane.dispatch_handler.BrokerClient")
@@ -1875,9 +1909,9 @@ class TestEcsErrorCallbackDoesNotLeakRawDetail:
             dh.logger.setLevel(original_level)
 
         combined = " ".join(r.getMessage() for r in records if r.levelno >= logging.ERROR)
-        assert (
-            "arn:aws:iam::333022194791" in combined
-        ), f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
+        assert "arn:aws:iam::333022194791" in combined, (
+            f"Operator diagnostic log must retain full ARN detail; got: {combined!r}"
+        )
 
 
 class TestRunTaskFailureCleansUpMintedTicket:
@@ -2149,9 +2183,9 @@ class TestResolveRoutingFailures:
         assert routing["model"] == "sonnet"
         # known is only populated on the unknown-experiment branch (routing is None).
         assert known == []
-        assert not any(
-            call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list
-        ), "happy path must not emit fallback metric"
+        assert not any(call.args[0] == "manifest_loader_fallback" for call in mock_metric.call_args_list), (
+            "happy path must not emit fallback metric"
+        )
 
     def test_loader_transient_error_raises_and_emits_metric(self, monkeypatch):
         """S3 outage / IAM throttle → re-raise ManifestLoaderTransientError so
