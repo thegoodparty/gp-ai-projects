@@ -355,6 +355,15 @@ resource "aws_cloudwatch_event_target" "send_to_sns" {
       exitCode      = "$.detail.containers[0].exitCode"
       clusterArn    = "$.detail.clusterArn"
       time          = "$.time"
+      # The ECS Task State Change event echoes the RunTask overrides. The
+      # experiment id is the FIRST entry of the container's environment array
+      # (control_plane/dispatch_handler.py:build_container_overrides emits
+      # EXPERIMENT_ID first and keeps the array byte-deterministic). We pull
+      # only this one value on purpose — the same array holds BROKER_TOKEN /
+      # ANTHROPIC_API_KEY / BRAINTRUST_API_KEY, which must not reach SNS or the
+      # notifier's CloudWatch logs. If that env ordering ever changes, this
+      # path must change with it.
+      experimentId = "$.detail.overrides.containerOverrides[0].environment[0].value"
     }
 
     input_template = <<EOF
@@ -363,6 +372,7 @@ resource "aws_cloudwatch_event_target" "send_to_sns" {
   "environment": "${var.environment}",
   "cluster": <clusterArn>,
   "taskArn": <taskArn>,
+  "experimentId": <experimentId>,
   "stoppedReason": <stoppedReason>,
   "exitCode": <exitCode>,
   "time": <time>,
