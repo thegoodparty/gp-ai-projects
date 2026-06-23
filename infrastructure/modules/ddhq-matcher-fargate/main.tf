@@ -403,6 +403,15 @@ resource "aws_iam_role_policy" "lambda_ecs_run_task" {
       {
         Effect = "Allow"
         Action = [
+          "ecs:TagResource"
+        ]
+        Resource = [
+          "${replace(aws_ecs_cluster.matcher.arn, ":cluster/", ":task/")}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "iam:PassRole"
         ]
         Resource = [
