@@ -14,7 +14,7 @@ def fake_scope_ticket() -> ScopeTicket:
         run_id="run-20260415-001",
         organization_slug="org-42",
         experiment_id="voter_targeting",
-        scope={"databricks": ["SELECT"], "tavily": True, "s3": ["PutObject"]},
+        scope={"databricks": ["SELECT"], "s3": ["PutObject"]},
         params={"state": "CA", "district": "SD-15", "election_type": "general"},
         exp=now + 3600,
         issued_at=now,
@@ -26,7 +26,6 @@ def fake_scope_ticket() -> ScopeTicket:
 def fake_secrets() -> BrokerSecrets:
     return BrokerSecrets(
         anthropic_api_key="sk-ant-fake-key-for-testing",
-        tavily_api_key="tvly-fake-key-for-testing",
         databricks_server_hostname="test-workspace.cloud.databricks.com",
         databricks_http_path="/sql/1.0/warehouses/test123",
         databricks_api_key="dapi-fake-key-for-testing",

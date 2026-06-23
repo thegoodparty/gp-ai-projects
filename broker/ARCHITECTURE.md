@@ -191,7 +191,7 @@ Full spec: see `broker/endpoints/*.py`.
 | Scope-aware SQL rewriter (broker) | Runner's Databricks queries auto-scoped to its own candidate's state/city; cross-scope access denied |
 | Contract validation (broker) | Malformed artifact rejected; never lands in S3 or results queue |
 | Broker task IAM (limited) | Broker can write only to the specific S3 prefix + SQS queue; cannot invoke Lambdas or read other secrets |
-| TLS (broker → upstream APIs) | In transit to Anthropic / Databricks / Tavily (via NAT) |
+| TLS (broker → upstream APIs) | In transit to Anthropic / Databricks (via NAT) |
 
 Note: runner → broker traffic inside the VPC is HTTP (no TLS). Not a leak — `awsvpc` network mode gives each task its own ENI, no shared wire with other tenants, and no traffic mirroring enabled in the VPC.
 

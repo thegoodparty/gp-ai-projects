@@ -72,7 +72,7 @@ New agent tasks automatically pull the latest image with the same tag. No ECS se
 
 After Terraform creates `broker-{env}` and `broker-service-tokens-{env}` they are empty (both use `ignore_changes = [secret_string]`). Populate them before the broker can do work.
 
-Prerequisites: `AI_SECRETS_{ENV_UPPER}` already holds `PMF_ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `TAVILY_API_KEY`, `BRAINTRUST_API_KEY`, `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_API_KEY`.
+Prerequisites: `AI_SECRETS_{ENV_UPPER}` already holds `PMF_ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `BRAINTRUST_API_KEY`, `DATABRICKS_SERVER_HOSTNAME`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_API_KEY`.
 
 > **WARNING:** `BRAINTRUST_API_KEY` MUST be present in the `broker-{env}` secret BEFORE running `terraform apply` on the broker module. The ECS task definition injects it via a Secrets Manager `valueFrom` entry, and ECS fails the entire task at launch with `ResourceInitializationError` if the JSON key is absent — the broker will not start in any env whose secret lacks the key. Dev was already backfilled; qa and prod MUST be backfilled before promoting.
 
@@ -94,13 +94,12 @@ aws secretsmanager put-secret-value \
   --secret-string "$(jq -n \
     --arg a "$(jq -r .PMF_ANTHROPIC_API_KEY   <<<"$AI")" \
     --arg g "$(jq -r .GEMINI_API_KEY          <<<"$AI")" \
-    --arg t "$(jq -r .TAVILY_API_KEY          <<<"$AI")" \
     --arg bt "$(jq -r .BRAINTRUST_API_KEY     <<<"$AI")" \
     --arg h "$(jq -r .DATABRICKS_SERVER_HOSTNAME <<<"$AI")" \
     --arg p "$(jq -r .DATABRICKS_HTTP_PATH    <<<"$AI")" \
     --arg k "$(jq -r .DATABRICKS_API_KEY      <<<"$AI")" \
     --arg s "$HASH" \
-    '{ANTHROPIC_API_KEY:$a, GEMINI_API_KEY:$g, TAVILY_API_KEY:$t, BRAINTRUST_API_KEY:$bt, DATABRICKS_SERVER_HOSTNAME:$h, DATABRICKS_HTTP_PATH:$p, DATABRICKS_API_KEY:$k, SERVICE_TOKEN_HASH:$s}')"
+    '{ANTHROPIC_API_KEY:$a, GEMINI_API_KEY:$g, BRAINTRUST_API_KEY:$bt, DATABRICKS_SERVER_HOSTNAME:$h, DATABRICKS_HTTP_PATH:$p, DATABRICKS_API_KEY:$k, SERVICE_TOKEN_HASH:$s}')"
 
 # 2. Force-redeploy broker so it reads the new hash. Wait stable.
 aws ecs update-service \
@@ -137,7 +136,7 @@ Notes:
 
 ## 3. Rotating Secrets
 
-### API Keys (Anthropic, Gemini, Tavily, Databricks)
+### API Keys (Anthropic, Gemini, Databricks)
 
 ```bash
 export ENV=dev
@@ -152,7 +151,6 @@ aws secretsmanager put-secret-value \
   --secret-string "$(jq -n \
     --arg anthropic "NEW_KEY" \
     --arg gemini "NEW_KEY" \
-    --arg tavily "NEW_KEY" \
     --arg braintrust "NEW_KEY" \
     --arg db_host "HOSTNAME" \
     --arg db_path "HTTP_PATH" \
@@ -161,7 +159,6 @@ aws secretsmanager put-secret-value \
     '{
       ANTHROPIC_API_KEY: $anthropic,
       GEMINI_API_KEY: $gemini,
-      TAVILY_API_KEY: $tavily,
       BRAINTRUST_API_KEY: $braintrust,
       DATABRICKS_SERVER_HOSTNAME: $db_host,
       DATABRICKS_HTTP_PATH: $db_path,

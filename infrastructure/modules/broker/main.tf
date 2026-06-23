@@ -124,7 +124,7 @@ resource "aws_cloudwatch_log_group" "broker" {
 
 resource "aws_secretsmanager_secret" "broker" {
   name        = "broker-${var.environment}"
-  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET, BRAINTRUST_API_KEY"
+  description = "Secrets for PMF broker service. Operator populates: ANTHROPIC_API_KEY, GEMINI_API_KEY, DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, DATABRICKS_API_KEY, SERVICE_TOKEN_HASH, CLERK_SECRET_KEY, CLERK_FRONTEND_API_BASE, GP_API_BASE_URL, AGENT_FLEET_CLERK_ID, AGENT_MCP_TOKEN_SECRET, BRAINTRUST_API_KEY"
 
   tags = {
     Environment = var.environment
@@ -424,7 +424,7 @@ resource "aws_security_group_rule" "broker_egress_https" {
   from_port         = 443
   to_port           = 443
   protocol          = "tcp"
-  description       = "HTTPS for Anthropic, Databricks, Tavily, Gemini APIs via NAT"
+  description       = "HTTPS for Anthropic, Databricks, Gemini APIs via NAT"
   security_group_id = aws_security_group.broker.id
   cidr_blocks       = ["0.0.0.0/0"]
 }
@@ -670,10 +670,6 @@ resource "aws_ecs_task_definition" "broker" {
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:GEMINI_API_KEY::"
         },
         {
-          name      = "TAVILY_API_KEY"
-          valueFrom = "${aws_secretsmanager_secret.broker.arn}:TAVILY_API_KEY::"
-        },
-        {
           name      = "DATABRICKS_SERVER_HOSTNAME"
           valueFrom = "${aws_secretsmanager_secret.broker.arn}:DATABRICKS_SERVER_HOSTNAME::"
         },
@@ -898,7 +894,6 @@ resource "aws_route53_resolver_firewall_domain_list" "broker_allow" {
   domains = [
     "api.anthropic.com.",
     "*.databricks.com.",
-    "api.tavily.com.",
     "generativelanguage.googleapis.com.",
     "s3.us-west-2.amazonaws.com.",
     "sqs.us-west-2.amazonaws.com.",
