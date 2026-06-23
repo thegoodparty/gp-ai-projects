@@ -19,6 +19,12 @@ terraform {
 
 provider "aws" {
   region = "us-west-2"
+
+  default_tags {
+    tags = {
+      Project = "clickup-bot"
+    }
+  }
 }
 
 variable "enable_fargate_trigger" {

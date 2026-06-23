@@ -674,6 +674,7 @@ def launch_run(
             cluster=ECS_CLUSTER_ARN,
             taskDefinition=ECS_TASK_DEFINITION,
             launchType="FARGATE",
+            tags=[{"key": "Project", "value": "pmf-engine"}],
             # Tag the task with the run_id (uuid7, 36 chars — within the 36-char
             # startedBy limit) so the stuck-LAUNCHING sweep can tell whether a
             # LAUNCHING job has a live task before it fails the row.
