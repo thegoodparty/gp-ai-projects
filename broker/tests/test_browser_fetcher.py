@@ -608,6 +608,134 @@ class TestPageResponsePath:
         assert exc.value.status_code == 413
 
 
+class TestResponseBodyUnavailableFallback:
+    """After the post-nav networkidle settle, Chromium often evicts the main
+    document's network resource, so response.body() raises 'No resource with
+    given identifier found'. For HTML we must fall back to the rendered DOM via
+    page.content() (200 OK); for non-HTML there's no equivalent fallback so we
+    return a clean 502 instead of letting the Playwright error bubble to a 500.
+    Reproduces the Ballotpedia /http/fetch 500 (ClickUp 86aj864zq)."""
+
+    @pytest.mark.asyncio
+    async def test_html_body_failure_falls_back_to_page_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        from playwright.async_api import Error as PlaywrightError
+
+        rendered = "<html><body>rendered ballotpedia DOM</body></html>"
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://ballotpedia.org/Some_Race",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"raw network body that will be evicted",
+            ),
+            url="https://ballotpedia.org/Some_Race",
+        )
+
+        async def body_evicted() -> bytes:
+            raise PlaywrightError(
+                "Response.body: Protocol error (Network.getResponseBody): No resource with given identifier found"
+            )
+
+        page._response.body = body_evicted  # type: ignore[method-assign]
+
+        async def content() -> str:
+            return rendered
+
+        page.content = content  # type: ignore[method-assign,attr-defined]
+
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        result = await fetcher.fetch("https://ballotpedia.org/Some_Race")
+
+        assert result.status == 200
+        assert result.content_type == "text/html"
+        assert result.body == rendered.encode("utf-8")
+        assert result.body_path is None
+        assert result.byte_size == len(rendered.encode("utf-8"))
+        assert result.final_url == "https://ballotpedia.org/Some_Race"
+
+    @pytest.mark.asyncio
+    async def test_non_html_body_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        from playwright.async_api import Error as PlaywrightError
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://example.com/data.json",
+                status=200,
+                headers={"content-type": "application/json"},
+                body=b'{"ok":true}',
+            ),
+            url="https://example.com/data.json",
+        )
+
+        async def body_evicted() -> bytes:
+            raise PlaywrightError(
+                "Response.body: Protocol error (Network.getResponseBody): No resource with given identifier found"
+            )
+
+        page._response.body = body_evicted  # type: ignore[method-assign]
+
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch("https://example.com/data.json")
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "upstream response body unavailable"
+
+    @pytest.mark.asyncio
+    async def test_html_double_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """For text/html, if BOTH response.body() and the page.content()
+        fallback raise PlaywrightError (page/context torn down under memory
+        pressure), the fetcher must return a clean 502 — not let the second
+        Playwright error escape to an unhandled 500."""
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        from playwright.async_api import Error as PlaywrightError
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://ballotpedia.org/Some_Race",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"raw network body that will be evicted",
+            ),
+            url="https://ballotpedia.org/Some_Race",
+        )
+
+        async def body_evicted() -> bytes:
+            raise PlaywrightError(
+                "Response.body: Protocol error (Network.getResponseBody): No resource with given identifier found"
+            )
+
+        page._response.body = body_evicted  # type: ignore[method-assign]
+
+        async def content_torn_down() -> str:
+            raise PlaywrightError("Page.content: Target page, context or browser has been closed")
+
+        page.content = content_torn_down  # type: ignore[method-assign,attr-defined]
+
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch("https://ballotpedia.org/Some_Race")
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "upstream response body unavailable"
+
+
 class TestNavigationFailure:
     @pytest.mark.asyncio
     async def test_nav_error_with_no_download_raises_generic_502(

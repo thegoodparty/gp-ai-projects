@@ -425,7 +425,45 @@ class PlaywrightBrowserFetcher:
                         body_path=body_path,
                     )
 
-            body = await response.body()
+            try:
+                body = await response.body()
+            except PlaywrightError as e:
+                # After the networkidle settle above, Chromium frequently evicts
+                # the main document's network resource, so response.body() raises
+                # "No resource with given identifier found". For HTML, the
+                # rendered DOM is an equivalent-or-better source for scraping and
+                # is reliably available; for anything else there's no fallback.
+                if content_type.startswith("text/html"):
+                    logger.warning(
+                        "response.body() unavailable, falling back to page.content() url=%s error=%s",
+                        url,
+                        e,
+                    )
+                    try:
+                        body = (await page.content()).encode("utf-8")
+                    except PlaywrightError as page_err:
+                        # The same eviction class can tear down the page/context
+                        # itself under Fargate memory pressure; no fallback left.
+                        logger.warning(
+                            "page.content() also unavailable url=%s error=%s",
+                            url,
+                            page_err,
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail="upstream response body unavailable",
+                        ) from page_err
+                else:
+                    logger.warning(
+                        "response.body() unavailable for non-HTML content-type=%s url=%s error=%s",
+                        content_type,
+                        url,
+                        e,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="upstream response body unavailable",
+                    ) from e
             _raise_if_violation()
             if len(body) > PAGE_RESPONSE_MAX_BYTES:
                 raise HTTPException(
