@@ -425,37 +425,29 @@ class PlaywrightBrowserFetcher:
                         body_path=body_path,
                     )
 
-            try:
-                body = await response.body()
-            except PlaywrightError as e:
-                # After the networkidle settle above, Chromium frequently evicts
-                # the main document's network resource, so response.body() raises
-                # "No resource with given identifier found". For HTML, the
-                # rendered DOM is an equivalent-or-better source for scraping and
-                # is reliably available; for anything else there's no fallback.
-                if content_type.startswith("text/html"):
+            if content_type.startswith("text/html"):
+                # Return the rendered VISIBLE TEXT, not raw HTML: the publish
+                # gate rejects raw HTML, and every consumer reads the body as
+                # text. Reading the DOM also sidesteps the getResponseBody
+                # eviction that response.body() hits after the networkidle settle.
+                try:
+                    body = (await page.inner_text("body")).encode("utf-8")
+                except PlaywrightError as e:
                     logger.warning(
-                        "response.body() unavailable, falling back to page.content() url=%s error=%s",
+                        "page.inner_text('body') unavailable url=%s error=%s",
                         url,
                         e,
                     )
-                    try:
-                        body = (await page.content()).encode("utf-8")
-                    except PlaywrightError as page_err:
-                        # The same eviction class can tear down the page/context
-                        # itself under Fargate memory pressure; no fallback left.
-                        logger.warning(
-                            "page.content() also unavailable url=%s error=%s",
-                            url,
-                            page_err,
-                        )
-                        raise HTTPException(
-                            status_code=502,
-                            detail="upstream response body unavailable",
-                        ) from page_err
-                else:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="upstream response body unavailable",
+                    ) from e
+            else:
+                try:
+                    body = await response.body()
+                except PlaywrightError as e:
                     logger.warning(
-                        "response.body() unavailable for non-HTML content-type=%s url=%s error=%s",
+                        "response.body() unavailable for content-type=%s url=%s error=%s",
                         content_type,
                         url,
                         e,

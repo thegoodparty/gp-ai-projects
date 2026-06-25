@@ -89,6 +89,7 @@ class _FakePage:
         url: str = "https://example.com/",
         on_settle: Any = None,
         responses_to_emit: list[_FakeResponse] | None = None,
+        inner_text_value: str | None = None,
     ) -> None:
         self._response = response
         self.url = url
@@ -98,6 +99,15 @@ class _FakePage:
         self._responses_to_emit = responses_to_emit or []
         self._wait_calls = 0
         self._load_state_calls = 0
+        # text/html now reads rendered visible text via inner_text("body"),
+        # not raw response.body(). Default to the response body decoded as text
+        # so existing HTML tests (which pass HTML-as-text bodies) round-trip.
+        if inner_text_value is not None:
+            self._inner_text_value = inner_text_value
+        elif response is not None:
+            self._inner_text_value = response._body.decode("utf-8", "replace")
+        else:
+            self._inner_text_value = ""
 
     def on(self, event: str, handler: Any) -> None:
         if event == "download":
@@ -120,6 +130,9 @@ class _FakePage:
         self._load_state_calls += 1
         if self._on_settle is not None:
             await self._on_settle()
+
+    async def inner_text(self, selector: str) -> str:
+        return self._inner_text_value
 
     def emit_download(self, download: _FakeDownload) -> None:
         for handler in self._download_listeners:
@@ -608,44 +621,30 @@ class TestPageResponsePath:
         assert exc.value.status_code == 413
 
 
-class TestResponseBodyUnavailableFallback:
-    """After the post-nav networkidle settle, Chromium often evicts the main
-    document's network resource, so response.body() raises 'No resource with
-    given identifier found'. For HTML we must fall back to the rendered DOM via
-    page.content() (200 OK); for non-HTML there's no equivalent fallback so we
-    return a clean 502 instead of letting the Playwright error bubble to a 500.
-    Reproduces the Ballotpedia /http/fetch 500 (ClickUp 86aj864zq)."""
+class TestHtmlBodyIsRenderedVisibleText:
+    """For text/html, /http/fetch returns the rendered VISIBLE TEXT via
+    page.inner_text('body'), not raw HTML: the artifact-publish gate rejects raw
+    HTML and every consumer reads the body as text. Reading the DOM also
+    sidesteps the getResponseBody eviction response.body() hits after the
+    networkidle settle (ClickUp 86aj864zq follow-up)."""
 
     @pytest.mark.asyncio
-    async def test_html_body_failure_falls_back_to_page_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_html_body_is_inner_text_not_raw_html(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_async_api(monkeypatch)
         _patch_playwright_types(monkeypatch)
 
-        from playwright.async_api import Error as PlaywrightError
-
-        rendered = "<html><body>rendered ballotpedia DOM</body></html>"
+        visible_text = "Some Race\nCandidate A\nCandidate B"
 
         page = _FakePage(
             response=_FakeResponse(
                 url="https://ballotpedia.org/Some_Race",
                 status=200,
                 headers={"content-type": "text/html; charset=utf-8"},
-                body=b"raw network body that will be evicted",
+                body=b"<html><body><h1>Some Race</h1><p>Candidate A</p></body></html>",
             ),
             url="https://ballotpedia.org/Some_Race",
+            inner_text_value=visible_text,
         )
-
-        async def body_evicted() -> bytes:
-            raise PlaywrightError(
-                "Response.body: Protocol error (Network.getResponseBody): No resource with given identifier found"
-            )
-
-        page._response.body = body_evicted  # type: ignore[method-assign]
-
-        async def content() -> str:
-            return rendered
-
-        page.content = content  # type: ignore[method-assign,attr-defined]
 
         fetcher = PlaywrightBrowserFetcher()
         fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
@@ -655,13 +654,48 @@ class TestResponseBodyUnavailableFallback:
 
         assert result.status == 200
         assert result.content_type == "text/html"
-        assert result.body == rendered.encode("utf-8")
+        assert result.body == visible_text.encode("utf-8")
         assert result.body_path is None
-        assert result.byte_size == len(rendered.encode("utf-8"))
+        assert result.byte_size == len(visible_text.encode("utf-8"))
         assert result.final_url == "https://ballotpedia.org/Some_Race"
 
     @pytest.mark.asyncio
+    async def test_html_inner_text_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If page.inner_text('body') raises PlaywrightError (page/context torn
+        down under memory pressure), return a clean 502 — not an unhandled 500."""
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        from playwright.async_api import Error as PlaywrightError
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://ballotpedia.org/Some_Race",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"<html><body>ok</body></html>",
+            ),
+            url="https://ballotpedia.org/Some_Race",
+        )
+
+        async def inner_text_torn_down(selector: str) -> str:
+            raise PlaywrightError("Page.inner_text: Target page, context or browser has been closed")
+
+        page.inner_text = inner_text_torn_down  # type: ignore[method-assign]
+
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch("https://ballotpedia.org/Some_Race")
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "upstream response body unavailable"
+
+    @pytest.mark.asyncio
     async def test_non_html_body_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-HTML still reads response.body(); if it raises PlaywrightError,
+        return a clean 502 instead of letting the error bubble to a 500."""
         _patch_playwright_async_api(monkeypatch)
         _patch_playwright_types(monkeypatch)
 
@@ -690,48 +724,6 @@ class TestResponseBodyUnavailableFallback:
 
         with pytest.raises(HTTPException) as exc:
             await fetcher.fetch("https://example.com/data.json")
-        assert exc.value.status_code == 502
-        assert exc.value.detail == "upstream response body unavailable"
-
-    @pytest.mark.asyncio
-    async def test_html_double_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """For text/html, if BOTH response.body() and the page.content()
-        fallback raise PlaywrightError (page/context torn down under memory
-        pressure), the fetcher must return a clean 502 — not let the second
-        Playwright error escape to an unhandled 500."""
-        _patch_playwright_async_api(monkeypatch)
-        _patch_playwright_types(monkeypatch)
-
-        from playwright.async_api import Error as PlaywrightError
-
-        page = _FakePage(
-            response=_FakeResponse(
-                url="https://ballotpedia.org/Some_Race",
-                status=200,
-                headers={"content-type": "text/html; charset=utf-8"},
-                body=b"raw network body that will be evicted",
-            ),
-            url="https://ballotpedia.org/Some_Race",
-        )
-
-        async def body_evicted() -> bytes:
-            raise PlaywrightError(
-                "Response.body: Protocol error (Network.getResponseBody): No resource with given identifier found"
-            )
-
-        page._response.body = body_evicted  # type: ignore[method-assign]
-
-        async def content_torn_down() -> str:
-            raise PlaywrightError("Page.content: Target page, context or browser has been closed")
-
-        page.content = content_torn_down  # type: ignore[method-assign,attr-defined]
-
-        fetcher = PlaywrightBrowserFetcher()
-        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
-        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
-
-        with pytest.raises(HTTPException) as exc:
-            await fetcher.fetch("https://ballotpedia.org/Some_Race")
         assert exc.value.status_code == 502
         assert exc.value.detail == "upstream response body unavailable"
 
