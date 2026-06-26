@@ -584,7 +584,7 @@ resource "aws_sns_topic_subscription" "shared_slack_notifier" {
 
 resource "aws_lambda_permission" "allow_sns_invoke_slack" {
   count         = var.shared_slack_notifier_lambda_arn != "" ? 1 : 0
-  statement_id  = "AllowSNSInvokeFromMatcherFailures"
+  statement_id  = "AllowSNSInvokeFromMatcherFailures-${var.environment}"
   action        = "lambda:InvokeFunction"
   function_name = var.shared_slack_notifier_lambda_arn
   principal     = "sns.amazonaws.com"
