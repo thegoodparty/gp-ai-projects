@@ -2,7 +2,6 @@ import json
 import time
 from unittest.mock import MagicMock
 
-import pytest
 from botocore.exceptions import ClientError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -10,13 +9,13 @@ from fastapi.testclient import TestClient
 from broker.callback_sender import CallbackSender
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.run_status import (
-    router,
-    get_scope_ticket,
-    get_s3_client,
-    get_callback_sender,
-    get_ticket_store,
-    get_broker_token_raw,
     get_artifact_bucket,
+    get_broker_token_raw,
+    get_callback_sender,
+    get_s3_client,
+    get_scope_ticket,
+    get_ticket_store,
+    router,
 )
 
 BROKER_TOKEN = "broker-token-test-abc123"
@@ -372,8 +371,8 @@ class TestRunStatusTerminalFailureAlerting:
     """
 
     def _post(self, status: str, reason_code: str | None = None, ticket=None):
-        import logging
         from unittest.mock import patch
+
         from broker.endpoints.run_status import _reset_cw_client_for_tests
 
         _reset_cw_client_for_tests()
@@ -455,6 +454,7 @@ class TestRunStatusTerminalFailureAlerting:
     def test_metric_emission_failure_does_not_break_response(self):
         """CloudWatch hiccup must never fail the broker response."""
         from unittest.mock import patch
+
         from broker.endpoints.run_status import _reset_cw_client_for_tests
         _reset_cw_client_for_tests()
         app, _, mock_sender, _ = _create_app()
@@ -469,4 +469,37 @@ class TestRunStatusTerminalFailureAlerting:
                 headers={"X-Broker-Token": BROKER_TOKEN},
             )
         assert resp.status_code == 200
+        mock_sender.send_result.assert_called_once()
+
+
+class TestRunStatusQaEvalTranscriptField:
+    def test_run_status_accepts_qa_eval_transcript_field_without_durable_write(self):
+        """run-status is the FAILURE-only path: it declares qa_eval_transcript
+        for forward-compat (so pydantic's extra='ignore' doesn't trip a future
+        sender) but performs NO durable QA write — there is no verdict to couple
+        a transcript to here. Pin that posting the field succeeds (200,
+        callback_sent=True) and that NO eval_transcript.jsonl is written."""
+        app, mock_s3, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/internal/run-status",
+            json={
+                "status": "failed",
+                "reason_code": "agent_error",
+                "qa_eval_transcript": '{"turn":1,"kind":"assistant"}\n{"turn":0,"kind":"result"}',
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["callback_sent"] is True
+        transcript_puts = [
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs.get("Key", "").endswith("eval_transcript.jsonl")
+        ]
+        assert not transcript_puts, (
+            "run-status must not perform a durable transcript write — it is a "
+            "failure-only path with no verdict to couple to"
+        )
         mock_sender.send_result.assert_called_once()

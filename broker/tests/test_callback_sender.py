@@ -264,3 +264,62 @@ class TestCallbackSenderSqsFailureLogging:
         assert "failed" in message
         assert queue_url in message or "SendMessage" in message
         assert record.exc_info is not None
+
+
+class TestCallbackSenderNoQaVerdictOnCallback:
+    """gp-api is DROPPED as a consumer of the QA verdict — its SQS callback
+    schema strips qaVerdict, so forwarding it on the callback is dead weight.
+    The verdict's system of record is now (a) the broker's durable S3 write
+    (`<exp>/<run>/qa/verdict.json`) and (b) the runner's Braintrust span. The
+    callback must NEVER carry a `qaVerdict` key, and `send_result` must no
+    longer accept a `qa_verdict` parameter at all.
+    """
+
+    def test_success_callback_never_carries_qa_verdict_key(self):
+        """Even on a fully-populated success callback, the SQS `data` envelope
+        carries no `qaVerdict` key — the verdict does not ride the callback."""
+        sqs = MagicMock()
+        sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
+
+        sender.send_result(
+            run_id="run-qa-1",
+            organization_slug="org-7",
+            experiment_id="voter_targeting",
+            status="success",
+            artifact_key="voter_targeting/run-qa-1/artifact.json",
+            artifact_bucket="gp-agent-artifacts-dev",
+        )
+
+        body = json.loads(sqs.send_message.call_args[1]["MessageBody"])
+        assert "qaVerdict" not in body["data"]
+        # Pin the FULL data envelope key set — exactly these 11 keys, with no
+        # qaVerdict and no accidental new key.
+        assert set(body["data"].keys()) == {
+            "experimentId",
+            "runId",
+            "organizationSlug",
+            "status",
+            "artifactKey",
+            "artifactBucket",
+            "durationSeconds",
+            "costUsd",
+            "reasonCode",
+            "detail",
+            "error",
+        }
+
+    def test_send_result_does_not_accept_qa_verdict_parameter(self):
+        """The qa_verdict parameter is REMOVED. Passing it must raise a
+        TypeError — there is no longer any path for the verdict onto the
+        callback."""
+        sqs = MagicMock()
+        sender = CallbackSender(sqs_client=sqs, queue_url="https://sqs.example.com/queue.fifo")
+
+        with pytest.raises(TypeError):
+            sender.send_result(
+                run_id="run-qa-reject",
+                organization_slug="org-7",
+                experiment_id="voter_targeting",
+                status="success",
+                qa_verdict={"pass": False},
+            )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import json
 import os
 import re
@@ -11,19 +13,39 @@ import time
 
 from shared.braintrust import BraintrustClient
 from shared.logger import get_logger
-from .config import RunnerConfig, BrokerUrlSchemeError, validate_broker_url_scheme
-from .contract import validate_artifact_contract, ContractViolation
+
+from .config import BrokerUrlSchemeError, RunnerConfig, validate_broker_url_scheme
+from .contract import ContractViolation, validate_artifact_contract
 from .harness.base import AgentHarness
 from .input_files import prefetch_input_files
 from .pmf_runtime import publish
 from .pmf_runtime.config import init_config
 from .pmf_runtime.egress_guard import MESSAGE as EGRESS_MESSAGE
+from .qa_gate import run_qa_gate
 
 logger = get_logger(__name__)
 
 _shutdown_requested = False
-_current_task: "asyncio.Task | None" = None
+_current_task: asyncio.Task | None = None
 _terminal_callback_sent = False
+
+
+def _hard_exit(code: int) -> None:
+    """Exit NOW without waiting for non-daemon worker threads.
+
+    run_qa_gate runs in an asyncio.to_thread (non-daemon) worker that cannot
+    be cancelled; on a timeout/signal it can keep blocking in future.result
+    for up to bridge_timeout (~450s). sys.exit would join that thread at
+    interpreter shutdown and hold the ECS task slot. The required side
+    effects (terminal callback + log upload) have already run by the time we
+    reach the exit paths, so terminate the process immediately."""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
 
 # Files the runner writes itself during workspace setup. An attachment that
 # matches one of these names would silently clobber the runner's own write.
@@ -299,7 +321,7 @@ def _redact_line(line: str) -> str:
 def _redact_session_jsonl(source_path: str) -> str | None:
     try:
         fd, redacted_path = tempfile.mkstemp(suffix=".jsonl", prefix="session_redacted_")
-        with open(source_path, "r", errors="replace") as src, os.fdopen(fd, "w") as dst:
+        with open(source_path, errors="replace") as src, os.fdopen(fd, "w") as dst:
             for line in src:
                 dst.write(_redact_line(line))
         return redacted_path
@@ -416,6 +438,142 @@ def _upload_logs(workspace_dir: str, *, run_id: str, experiment_id: str) -> None
             run_id, experiment_id, type(e).__name__, e,
             exc_info=True,
         )
+
+
+def _qa_gate_correlation_kwargs(config: RunnerConfig) -> dict[str, str]:
+    """Forward run_id/experiment_id to run_qa_gate for its correlation logs
+    (B-interface: Lane A owns adding these as optional params on run_qa_gate).
+
+    Signature-gated so this composes with BOTH the pre-interface signature
+    (params absent → forward nothing, no TypeError) and Lane A's updated
+    signature (params present → forward them). Keeps the lanes independently
+    landable without breaking the runner's real bridge."""
+    try:
+        accepted = inspect.signature(run_qa_gate).parameters
+    except (TypeError, ValueError):
+        return {}
+    has_var_keyword = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()
+    )
+    out: dict[str, str] = {}
+    if has_var_keyword or "run_id" in accepted:
+        out["run_id"] = config.run_id
+    if has_var_keyword or "experiment_id" in accepted:
+        out["experiment_id"] = config.experiment_id
+    return out
+
+
+async def _run_qa_gate_hook(
+    *,
+    config: RunnerConfig,
+    artifact_bytes: bytes,
+    workspace_dir: str,
+    remaining_budget_seconds: float,
+):
+    """Run the PMF QA gate (v1 observe-only) and return
+    ``(verdict, raw_output, eval_transcript)``, or None.
+
+    Returns None when no qa folder was published (config.qa_envelope is None) —
+    the caller stays byte-identical to a pre-gate run. Otherwise returns a
+    ``(Verdict, raw_output, eval_transcript)`` tuple whose verdict ALWAYS rides
+    the publish path; raw_output (the raw main.py stdout, or None) and
+    eval_transcript (the evaluator's redacted JSONL, or None) the broker writes
+    to S3. FAIL-OPEN: this never raises. run_qa_gate is already fail-open
+    internally, but the spawn/adapter wiring here is wrapped too so any
+    unexpected error becomes an `error` verdict and the run still publishes.
+
+    The no-qa decision lives in the gate engine itself (run_qa_gate returns
+    None when config.qa_envelope is None), so this hook always delegates — one
+    decision point, no drift.
+
+    The gate engine is synchronous (a deterministic main.py subprocess plus a
+    sync evaluator_runner). We run it in a worker thread so it can't block this
+    event loop, and the injected evaluator_runner marshals the async
+    `run_evaluator_agent` coroutine back onto this loop via
+    run_coroutine_threadsafe.
+    """
+    from .harness.base import EvaluatorHarnessParams, EvaluatorResult
+    from .harness.claude_sdk import _FINALIZE_TIMEOUT_SECONDS, run_evaluator_agent
+    from .qa_gate import Verdict, _redact_secrets
+
+    started = time.monotonic()
+    try:
+        # B3: only override BROKER_URL/BROKER_TOKEN in the gate subprocess env
+        # when they are actually set. Injecting empty-string values would mask
+        # an inherited env var with "" inside the deterministic stage's
+        # subprocess (pmf_runtime.http would then 401/misbehave) — worse than
+        # leaving the key absent. Omit unset keys; the gate's _run_deterministic
+        # only overrides os.environ for keys present and non-None.
+        broker_env: dict[str, str | None] = {}
+        for key in ("BROKER_URL", "BROKER_TOKEN"):
+            raw = os.environ.get(key, "").strip()
+            if raw:
+                broker_env[key] = raw
+        loop = asyncio.get_running_loop()
+
+        def _evaluator_runner(params: EvaluatorHarnessParams) -> EvaluatorResult:
+            # Called from the gate's worker thread; bounce the coroutine back
+            # to the runner's event loop and block this thread until it
+            # resolves.
+            future = asyncio.run_coroutine_threadsafe(
+                run_evaluator_agent(params), loop
+            )
+            bridge_timeout = params.timeout_seconds + _FINALIZE_TIMEOUT_SECONDS + 30
+            try:
+                return future.result(timeout=bridge_timeout)
+            except concurrent.futures.TimeoutError:
+                # The coroutine outlived even run_evaluator_agent's own bound
+                # (primary timeout PLUS a fresh-query finalize) — cancel it
+                # (best-effort; it may already be past a cancellation point) and
+                # surface a stage error so observe still publishes.
+                future.cancel()
+                logger.warning(
+                    "qa_gate_evaluator_bridge_timeout run_id=%s experiment_id=%s timeout=%ss",
+                    config.run_id, config.experiment_id, bridge_timeout,
+                )
+                return EvaluatorResult(status="error")
+
+        return await asyncio.to_thread(
+            run_qa_gate,
+            artifact_bytes,
+            config.qa_envelope,
+            workspace_dir,
+            broker_env,
+            remaining_budget_seconds,
+            evaluator_runner=_evaluator_runner,
+            **_qa_gate_correlation_kwargs(config),
+        )
+    except Exception as e:
+        # Defense-in-depth: run_qa_gate is fail-open, but the spawn/adapter
+        # plumbing around it is not. This branch ONLY fires on a real
+        # bridge/marshaling defect (the gate engine itself never raises), so
+        # log at ERROR with a stack trace — it is actionable, not routine.
+        logger.exception(
+            "qa_gate_hook_failed run_id=%s experiment_id=%s exc_type=%s: %s",
+            config.run_id, config.experiment_id, type(e).__name__, e,
+        )
+        resolved = {}
+        if isinstance(config.qa_envelope, dict):
+            resolved = config.qa_envelope.get("resolved_qa_version_ids") or {}
+        # The violation is built from arbitrary exception text, which can carry a
+        # leaked BROKER_TOKEN; redact it before it enters the Verdict (egress to
+        # Braintrust + the durable verdict.json). Rebuild broker_env from os.environ
+        # here so the live token is masked even if the try failed before broker_env
+        # was bound above.
+        redact_env: dict[str, str] = {}
+        for key in ("BROKER_URL", "BROKER_TOKEN"):
+            raw = os.environ.get(key, "").strip()
+            if raw:
+                redact_env[key] = raw
+        violation = _redact_secrets(f"qa_gate_hook_error: {type(e).__name__}: {e}", redact_env)
+        verdict = Verdict(
+            status="error",
+            qa_version_ids=resolved,
+            pass_=None,
+            violations=[violation],
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return verdict, None, None
 
 
 async def run_experiment(
@@ -574,6 +732,32 @@ async def run_experiment(
 
             _upload_logs(workspace_dir, run_id=config.run_id, experiment_id=config.experiment_id)
 
+            # PMF QA gate (v1 OBSERVE-ONLY). Runs AFTER the primary logs upload
+            # (so gate evidence can never shadow them) and BEFORE the success
+            # span.log + flush (so the verdict is flushed to Braintrust before
+            # the publish call deletes the broker scope ticket). The verdict
+            # ALWAYS rides the publish/success path — never blocks, never
+            # quarantines, fail-OPEN on a gate error (decisions 5, 6, 8, 10).
+            elapsed = time.monotonic() - start_time
+            remaining_budget = config.timeout_seconds - elapsed
+            qa_gate_result = await _run_qa_gate_hook(
+                config=config,
+                artifact_bytes=result.artifact_bytes,
+                workspace_dir=workspace_dir,
+                remaining_budget_seconds=remaining_budget,
+            )
+            # The gate returns (verdict, raw_output, eval_transcript) when a qa
+            # folder ran, else None (no qa folder — byte-identical to a pre-gate
+            # run). raw_output is the raw main.py stdout; eval_transcript is the
+            # evaluator's redacted JSONL transcript — both written durably to S3
+            # by the broker. eval_transcript is None for a main.py-only folder.
+            qa_verdict_dict = None
+            qa_raw_output = None
+            qa_eval_transcript = None
+            if qa_gate_result is not None:
+                qa_verdict, qa_raw_output, qa_eval_transcript = qa_gate_result
+                qa_verdict_dict = qa_verdict.to_dict()
+
             duration = time.monotonic() - start_time
             # Intentional trace/status divergence: the trace records "success"
             # and flushes HERE, before publish runs. Because publish deletes the
@@ -585,20 +769,39 @@ async def run_experiment(
             # run's broker scope ticket (anti-replay), which invalidates the
             # token the Braintrust proxy authenticates with. Flushing after
             # publish drops the run-level rollup with a 401.
-            span.log(output={
+            success_output = {
                 "status": "success",
                 "artifact": artifact,
                 "cost_usd": result.cost_usd,
                 "num_turns": result.num_turns,
                 "duration_seconds": duration,
-            })
+            }
+            # Only add the qa_verdict key when a gate actually ran — the no-qa
+            # path keeps the success trace output byte-identical to today.
+            if qa_verdict_dict is not None:
+                success_output["qa_verdict"] = qa_verdict_dict
+            span.log(output=success_output)
             bt.flush()
             try:
-                publish.publish(
-                    artifact,
-                    duration_seconds=duration,
-                    cost_usd=result.cost_usd,
-                )
+                # No-qa path: omit qa_verdict/qa_raw_output entirely so the
+                # publish call is byte-identical to a pre-gate run. Present-verdict
+                # path: forward the contract-C dict and the raw main.py stdout
+                # (for the broker's durable S3 verdict.json write) as the additive
+                # optional fields.
+                publish_kwargs: dict = {
+                    "duration_seconds": duration,
+                    "cost_usd": result.cost_usd,
+                }
+                if qa_verdict_dict is not None:
+                    publish_kwargs["qa_verdict"] = qa_verdict_dict
+                    publish_kwargs["qa_raw_output"] = qa_raw_output
+                    # Additive, byte-identical no-qa path: only forward the
+                    # transcript when an evaluator actually ran (None for a
+                    # main.py-only folder). The broker omits the durable
+                    # eval_transcript.jsonl write when the field is absent.
+                    if qa_eval_transcript is not None:
+                        publish_kwargs["qa_eval_transcript"] = qa_eval_transcript
+                publish.publish(artifact, **publish_kwargs)
                 _mark_callback_sent()
                 logger.info(f"Published artifact via broker for run {config.run_id}")
             except Exception as e:
@@ -861,7 +1064,7 @@ async def main():
         _current_task = asyncio.ensure_future(run_experiment(config))
         await asyncio.wait_for(_current_task, timeout=timeout)
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.error(f"Experiment timed out after {timeout}s for run {config.run_id}")
         if _current_task is not None and not _current_task.done():
             _current_task.cancel()
@@ -883,7 +1086,7 @@ async def main():
             detail=f"Experiment timed out after {config.timeout_seconds}s",
             duration_seconds=time.monotonic() - main_start_time,
         )
-        sys.exit(1)
+        _hard_exit(1)
 
     except asyncio.CancelledError:
         logger.warning(f"Experiment task cancelled by signal for run {config.run_id}")
@@ -895,7 +1098,7 @@ async def main():
             detail="Task terminated by signal",
             duration_seconds=time.monotonic() - main_start_time,
         )
-        sys.exit(1)
+        _hard_exit(1)
 
     except SystemExit:
         raise
@@ -910,7 +1113,7 @@ async def main():
                 detail="Task terminated by signal",
                 duration_seconds=time.monotonic() - main_start_time,
             )
-            sys.exit(1)
+            _hard_exit(1)
 
         logger.exception(f"Unhandled error in main for run {config.run_id}: {e}")
         if not _is_callback_already_sent():

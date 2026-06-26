@@ -12,15 +12,45 @@ interface SNSEvent {
   }>;
 }
 
-interface TaskFailureMessage {
+export interface TaskFailureMessage {
   alarm: string;
   environment: string;
   cluster: string;
   taskArn: string;
+  // Present for PMF Engine task failures (the experiment that was running).
+  // Absent for other producers on this shared topic, so treat as optional.
+  experimentId?: string;
   stoppedReason: string;
   exitCode: number;
   time: string;
   logs: string;
+}
+
+interface SlackField {
+  title: string;
+  value: string;
+  short: boolean;
+}
+
+export interface SlackMessage {
+  username: string;
+  icon_emoji: string;
+  attachments: Array<{
+    color: string;
+    title: string;
+    title_link?: string;
+    text?: string;
+    fields?: SlackField[];
+    footer: string;
+    footer_icon?: string;
+    ts: number;
+    actions?: Array<{
+      type: string;
+      text: string;
+      url: string;
+      style: string;
+    }>;
+  }>;
 }
 
 interface AISecrets {
@@ -66,21 +96,71 @@ async function getSlackWebhookUrl(): Promise<string> {
   }
 }
 
-function extractTaskId(taskArn: string): string {
+export function extractTaskId(taskArn: string): string {
   const parts = taskArn.split('/');
   return parts[parts.length - 1].substring(0, 8);
 }
 
-function getColorForExitCode(exitCode: number): string {
+export function getColorForExitCode(exitCode: number): string {
   if (exitCode === 1) return '#FF0000';
   if (exitCode === 137) return '#FF6600';
   if (exitCode === 143) return '#FF9900';
   return '#CC0000';
 }
 
-function formatSlackMessage(message: TaskFailureMessage): any {
+export function formatSlackMessage(message: TaskFailureMessage): SlackMessage {
   const taskId = extractTaskId(message.taskArn);
   const color = getColorForExitCode(message.exitCode);
+  // When the experimentId path doesn't resolve (a non-PMF producer on this
+  // shared topic, or a task with no container overrides), EventBridge
+  // substitutes a placeholder into the template — empty string in the normal
+  // case, but the literal string "null" for an unmatched input path. Treat all
+  // of those as "no experiment" so they never render as a field or title.
+  const raw = message.experimentId?.trim();
+  const experimentId = raw && raw !== 'null' ? raw : undefined;
+
+  // Lead with the experiment so PMF experiment owners can triage at a glance.
+  const base = `:x: ${message.alarm || 'ECS Task Failed'}`;
+  const title = experimentId ? `${base} — ${experimentId}` : base;
+
+  const fields: SlackField[] = [
+    {
+      title: 'Environment',
+      value: message.environment,
+      short: true,
+    },
+  ];
+
+  if (experimentId) {
+    fields.push({
+      title: 'Experiment',
+      value: experimentId,
+      short: true,
+    });
+  }
+
+  fields.push(
+    {
+      title: 'Task ID',
+      value: taskId,
+      short: true,
+    },
+    {
+      title: 'Exit Code',
+      value: String(message.exitCode),
+      short: true,
+    },
+    {
+      title: 'Time',
+      value: new Date(message.time).toLocaleString(),
+      short: true,
+    },
+    {
+      title: 'Stopped Reason',
+      value: message.stoppedReason,
+      short: false,
+    }
+  );
 
   return {
     username: 'ECS Pipeline Monitor',
@@ -88,35 +168,9 @@ function formatSlackMessage(message: TaskFailureMessage): any {
     attachments: [
       {
         color: color,
-        title: ':x: ECS Task Failed',
+        title: title,
         title_link: message.logs,
-        fields: [
-          {
-            title: 'Environment',
-            value: message.environment,
-            short: true,
-          },
-          {
-            title: 'Task ID',
-            value: taskId,
-            short: true,
-          },
-          {
-            title: 'Exit Code',
-            value: String(message.exitCode),
-            short: true,
-          },
-          {
-            title: 'Time',
-            value: new Date(message.time).toLocaleString(),
-            short: true,
-          },
-          {
-            title: 'Stopped Reason',
-            value: message.stoppedReason,
-            short: false,
-          },
-        ],
+        fields: fields,
         footer: 'ECS Task Failure Monitor',
         footer_icon: 'https://a0.awsstatic.com/libra-css/images/logos/aws_logo_smile_1200x630.png',
         ts: Math.floor(new Date(message.time).getTime() / 1000),

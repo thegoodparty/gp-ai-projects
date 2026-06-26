@@ -2,8 +2,9 @@ import json
 import logging
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -11,13 +12,13 @@ from fastapi.testclient import TestClient
 from broker.callback_sender import CallbackSender
 from broker.dynamodb_client import ScopeTicket, ScopeTicketStore
 from broker.endpoints.artifact_publish import (
-    router,
-    get_scope_ticket,
-    get_s3_client,
-    get_callback_sender,
-    get_ticket_store,
-    get_broker_token_raw,
     get_artifact_bucket,
+    get_broker_token_raw,
+    get_callback_sender,
+    get_s3_client,
+    get_scope_ticket,
+    get_ticket_store,
+    router,
 )
 
 BROKER_TOKEN = "broker-token-test-abc123"
@@ -415,6 +416,8 @@ class TestArtifactPublishVoterTargeting:
             assert kw["ContentType"] == "application/json"
             assert json.loads(kw["Body"]) == artifact
 
+        # The verdict does NOT ride the callback (gp-api was dropped as a
+        # consumer); send_result is called with NO qa_verdict argument.
         mock_sender.send_result.assert_called_once_with(
             run_id="331e5b56-e316-45a3-bdb3-08f81c7fad00",
             organization_slug="4",
@@ -1034,3 +1037,1449 @@ class TestArtifactPublishDataRequiredUnlessCarveOut:
         )
         assert "NoDataQueriesSucceeded" in resp.json()["detail"]
         mock_s3.put_object.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (contract D, v1 observe-only): /artifact/publish accepts an
+# optional `qa_verdict` and writes it DURABLY to S3 (`<exp>/<run>/qa/
+# verdict.json`). The verdict does NOT ride the SQS callback — gp-api was
+# dropped as a verdict consumer (its callback schema strips qaVerdict), so the
+# verdict's system of record is the durable S3 write plus the runner's
+# Braintrust span.
+#
+# The broker treats the verdict as an OPAQUE passthrough: it validates only
+# `req.artifact` (the existing HTML/fence/anti-fabrication gates), never the
+# verdict shape. The only verdict-specific check is a size cap on the
+# serialized JSON — a generous 1 MiB S3-sanity bound (no callback budget to
+# protect anymore). `qa_verdict` MUST be a DECLARED field on PublishRequest —
+# pydantic's default extra='ignore' would silently drop an undeclared field,
+# so "not validated" must not be read as "leave it off the model."
+# ---------------------------------------------------------------------------
+
+
+def _qa_verdict() -> dict:
+    """Contract-C deterministic-only verdict (v1 scope). qa_version_ids carries
+    the three qa files (manifest.json, main.py, qa_checks.py) — NO eval.md.
+    Every check is type: "deterministic" with passed/score/threshold — NO
+    type: "agent", model, or min_score. cost_usd is 0.0 (a deterministic gate
+    spends nothing)."""
+    return {
+        "verdict_version": 1,
+        "qa_version_ids": {
+            "manifest.json": "V-man-1",
+            "main.py": "V-main-1",
+            "qa_checks.py": "V-checks-1",
+        },
+        "status": "evaluated",
+        "pass": False,
+        "checks": [
+            {"name": "grounding_coverage", "type": "deterministic",
+             "passed": False, "score": 0.62, "threshold": 0.8,
+             "detail": "62% of claims grounded", "duration_ms": 412},
+            {"name": "citation_resolves", "type": "deterministic",
+             "passed": True, "score": 1.0, "threshold": 1.0,
+             "detail": "all citations resolve", "duration_ms": 88},
+        ],
+        "violations": ["one human-readable string"],
+        "duration_ms": 9300,
+        "cost_usd": 0.0,
+    }
+
+
+class TestArtifactPublishQaVerdictPassthrough:
+    def test_qa_verdict_written_durably_not_forwarded_to_callback(self):
+        """An arbitrary opaque verdict dict is written durably to S3 exactly as
+        received — no shape validation, no key transformation. It is NOT passed
+        to send_result: gp-api was dropped as a callback consumer, so the
+        verdict no longer rides the callback at all."""
+        ticket = _make_ticket(
+            experiment_id="district_intel", organization_slug="42", run_id="di-verbatim",
+        )
+        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        # The verdict is written durably, verbatim.
+        verdict_call = next(
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-verbatim/qa/verdict.json"
+        )
+        assert json.loads(verdict_call.kwargs["Body"]) == verdict
+        # The callback fired but carries NO verdict.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+
+    def test_arbitrary_opaque_verdict_shape_is_not_rejected(self):
+        """The broker does NOT re-run jsonschema or any shape check on the
+        verdict. A verdict with keys the broker has never heard of — even an
+        empty dict — publishes fine and is written durably as-is."""
+        ticket = _make_ticket(
+            experiment_id="district_intel", organization_slug="42", run_id="di-weird",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        weird = {"totally": "unexpected", "nested": {"x": [1, 2, 3]}, "n": 42}
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": weird},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        verdict_call = next(
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-weird/qa/verdict.json"
+        )
+        assert json.loads(verdict_call.kwargs["Body"]) == weird
+
+    def test_qa_verdict_is_a_declared_field_that_survives_pydantic(self):
+        """If qa_verdict were undeclared, pydantic's extra='ignore' would
+        silently drop it and no durable verdict.json would be written — a
+        regression that's invisible at the HTTP layer. Pin that the declared
+        field reaches the handler and drives the durable S3 write."""
+        ticket = _make_ticket(
+            experiment_id="district_intel", organization_slug="42", run_id="di-declared",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        verdict_bodies = [
+            json.loads(c.kwargs["Body"]) for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-declared/qa/verdict.json"
+        ]
+        assert verdict_bodies, "declared qa_verdict was dropped by pydantic"
+        assert verdict_bodies[0] == verdict
+
+    def test_publish_without_verdict_passes_no_verdict_to_callback(self):
+        """Byte-identical no-qa path: omitting qa_verdict writes no qa key and
+        the callback carries no verdict argument. The success path stays
+        unchanged for every existing experiment."""
+        app, _, mock_sender, _ = _create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+
+    def test_oversized_qa_verdict_is_fail_open_skips_durable_write_but_still_publishes(self):
+        """v1 is observe-only / fail-open: an oversize verdict must NOT 400.
+        A 400 would turn the run FAILED in the runner, breaking observe-only.
+        Instead the broker LOGS + emits the metric + SKIPS the durable
+        verdict.json S3 write, but STILL writes artifact.json + latest.json,
+        STILL fires the callback (which carries NO verdict — gp-api was dropped
+        as a consumer), and STILL deletes the ticket.
+
+        The skip path is observable: an ERROR log (run_id in CloudWatch) AND a
+        CloudWatch metric, so an operator can alert on a runaway verdict."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        # Build a verdict whose json.dumps length exceeds the cap.
+        oversized = {"blob": "x" * (MAX_QA_VERDICT_BYTES + 1)}
+        assert len(json.dumps(oversized)) > MAX_QA_VERDICT_BYTES
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="run-oversize-verdict",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with patch("broker.endpoints.artifact_publish._emit_metric") as mock_metric:
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact(), "qa_verdict": oversized},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        # Fail-open: publish succeeds, NOT 400.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        # artifact.json + latest.json still written; the oversize verdict.json
+        # durable write was SKIPPED.
+        assert keys_written == {
+            "district_intel/run-oversize-verdict/artifact.json",
+            "district_intel/42/latest.json",
+        }
+        assert not any("/qa/" in k for k in keys_written)
+
+        # Callback still fired, carrying NO verdict.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        # Ticket still cleaned up.
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "run-oversize-verdict"
+        )
+
+        # A CloudWatch metric fired for the skip (operator-alertable).
+        skip_calls = [
+            c for c in mock_metric.call_args_list
+            if c.args[0] == "broker_qa_verdict_size_cap_exceeded"
+        ]
+        assert skip_calls, "expected broker_qa_verdict_size_cap_exceeded metric on oversize skip"
+
+    def test_oversized_qa_verdict_logs_error_with_run_id(self, caplog):
+        """The oversize skip must log an ERROR carrying the run_id and the
+        observed/cap byte counts, so the skipped durable write is diagnosable
+        from logs even though the publish itself succeeds."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        oversized = {"blob": "x" * (MAX_QA_VERDICT_BYTES + 1)}
+        ticket = _make_ticket(run_id="run-oversize-log")
+        app, _, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with caplog.at_level(logging.ERROR, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact(), "qa_verdict": oversized},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and r.name == "broker.endpoints.artifact_publish"
+        ]
+        assert error_records, "expected an ERROR log for the oversize verdict skip"
+        msg = error_records[0].getMessage()
+        assert "run-oversize-log" in msg
+        assert str(MAX_QA_VERDICT_BYTES) in msg
+
+    def test_verdict_at_cap_is_written_durably(self):
+        """Pin the boundary: a verdict whose serialized length is exactly at
+        (not over) the cap publishes AND its durable verdict.json write happens
+        (the cap only governs the durable S3 write, fail-open)."""
+        from broker.endpoints.artifact_publish import MAX_QA_VERDICT_BYTES
+
+        # Construct a dict that serializes to exactly MAX_QA_VERDICT_BYTES.
+        envelope = json.dumps({"blob": ""})  # {"blob": ""}
+        filler = MAX_QA_VERDICT_BYTES - len(envelope)
+        assert filler > 0
+        at_cap = {"blob": "x" * filler}
+        assert len(json.dumps(at_cap)) == MAX_QA_VERDICT_BYTES
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="at-cap-verdict",
+        )
+        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": at_cap},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        mock_sender.send_result.assert_called_once()
+        # The verdict does not ride the callback.
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        # At-cap verdict is durably written.
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        assert "district_intel/at-cap-verdict/qa/verdict.json" in keys_written
+
+    def test_verdict_cap_is_exactly_1_mib(self):
+        """Pin the verdict cap to its ABSOLUTE value (1 MiB), not just to
+        whatever the imported constant happens to be. The verdict now goes only
+        to S3 (gp-api was dropped as a callback consumer), so the cap is a
+        generous S3-sanity bound mirroring MAX_QA_RAW_OUTPUT_BYTES. A verdict
+        one byte over 1 MiB MUST skip its durable write (no qa/verdict.json),
+        and one exactly at 1 MiB MUST write durably — regardless of the
+        constant's value. Both still publish 200 (fail-open). (Mutant M5:
+        cap-narrowing back to the old 64 KiB callback budget.)"""
+        from broker.endpoints.artifact_publish import (
+            MAX_QA_RAW_OUTPUT_BYTES,
+            MAX_QA_VERDICT_BYTES,
+        )
+
+        cap = 1024 * 1024
+        # The constant itself must equal the documented byte budget, and match
+        # the raw-output cap (both are the same generous S3-sanity bound).
+        assert MAX_QA_VERDICT_BYTES == cap
+        assert MAX_QA_VERDICT_BYTES == MAX_QA_RAW_OUTPUT_BYTES
+
+        over_envelope = len(json.dumps({"blob": ""}))
+
+        # One byte over the absolute 64 KiB cap → durable write SKIPPED, still 200.
+        over = {"blob": "x" * (cap - over_envelope + 1)}
+        assert len(json.dumps(over)) == cap + 1
+        ticket_over = _make_ticket(
+            experiment_id="district_intel", organization_slug="42", run_id="over-cap",
+        )
+        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket_over)
+        client = TestClient(app)
+        resp_over = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": over},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp_over.status_code == 200, resp_over.text
+        over_keys = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        assert "district_intel/over-cap/qa/verdict.json" not in over_keys
+        assert not any("/qa/" in k for k in over_keys)
+
+        # Exactly at the absolute 64 KiB cap → durable write happens.
+        at = {"blob": "x" * (cap - over_envelope)}
+        assert len(json.dumps(at)) == cap
+        ticket_at = _make_ticket(
+            experiment_id="district_intel", organization_slug="42", run_id="at-cap",
+        )
+        app2, mock_s3_2, mock_sender2, _ = _create_app(ticket=ticket_at)
+        client2 = TestClient(app2)
+        resp_at = client2.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": at},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp_at.status_code == 200, resp_at.text
+        mock_sender2.send_result.assert_called_once()
+        at_keys = {c.kwargs["Key"] for c in mock_s3_2.put_object.call_args_list}
+        assert "district_intel/at-cap/qa/verdict.json" in at_keys
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (contract D / decision 13): durable S3 verdict capture.
+#
+# When a verdict is present, the broker performs ONE additional S3 write to
+# `<exp>/<run>/qa/verdict.json` under the same run prefix where it already
+# writes `artifact.json`. This is the durable, observe-only capture,
+# INDEPENDENT of Braintrust and the SQS callback — the verdict survives even
+# if the callback or a Braintrust write is lost. The runner is sandboxed (the
+# broker is its only egress), so the broker performs the write.
+#
+# The write is BEST-EFFORT and ADDITIVE: it happens AFTER artifact.json
+# succeeds, a failure is logged (with run_id) but does NOT fail the publish.
+# The verdict does NOT ride the callback (gp-api was dropped as a consumer) —
+# this durable S3 write plus the runner's Braintrust span are its system of
+# record. When the runner includes the raw main.py stdout (`qa_raw_output`),
+# the broker also writes it durably so the raw fragment output is recoverable
+# alongside the aggregated verdict.
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactPublishDurableQaVerdictS3Capture:
+    def test_qa_verdict_written_to_run_prefix_qa_key(self):
+        """A present verdict is written to `<exp>/<run>/qa/verdict.json` under
+        the same run prefix as artifact.json, with the verdict JSON as the
+        body."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-capture",
+        )
+        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+
+        verdict_calls = [
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-qa-capture/qa/verdict.json"
+        ]
+        assert len(verdict_calls) == 1, (
+            f"expected one write to the qa verdict key, got keys: "
+            f"{[c.kwargs['Key'] for c in mock_s3.put_object.call_args_list]}"
+        )
+        vc = verdict_calls[0]
+        assert vc.kwargs["Bucket"] == "gp-agent-artifacts-dev"
+        # verdict.json is structured JSON.
+        assert vc.kwargs["ContentType"] == "application/json"
+        # Write-once: a duplicate publish must not silently overwrite the
+        # per-run qa record (mirrors the artifact.json write-once guard).
+        assert vc.kwargs.get("IfNoneMatch") == "*"
+        assert json.loads(vc.kwargs["Body"]) == verdict
+
+    def test_qa_verdict_written_after_artifact_json(self):
+        """The qa write happens AFTER artifact.json succeeds — the immutable
+        per-run archive must land first so the durable qa capture is keyed off
+        a real, written artifact."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-order",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": _qa_verdict()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        keys_in_order = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        artifact_idx = keys_in_order.index("district_intel/di-qa-order/artifact.json")
+        verdict_idx = keys_in_order.index("district_intel/di-qa-order/qa/verdict.json")
+        assert artifact_idx < verdict_idx, (
+            f"qa verdict must be written after artifact.json; order was {keys_in_order}"
+        )
+
+    def test_qa_raw_output_written_to_run_prefix(self):
+        """When the runner includes `qa_raw_output` (the raw main.py stdout),
+        the broker writes it durably under the run's qa prefix so the raw
+        fragment output is recoverable alongside the aggregated verdict."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-raw",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        raw = '[{"name": "grounding_coverage", "passed": false, "score": 0.62}]'
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": verdict,
+                "qa_raw_output": raw,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        # The aggregated verdict is always written.
+        assert "district_intel/di-qa-raw/qa/verdict.json" in keys_written
+        # The raw main.py output is written under the EXACT main_output.json key
+        # (not a startswith match — pin the literal filename).
+        raw_calls = [
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-qa-raw/qa/main_output.json"
+        ]
+        assert len(raw_calls) == 1, (
+            f"expected one main_output.json write under the qa prefix, got keys: "
+            f"{sorted(keys_written)}"
+        )
+        rc = raw_calls[0]
+        assert rc.kwargs["Body"] == raw
+        # Raw stdout is NOT guaranteed JSON (esp. on stage-error paths) — it is
+        # written as text/plain, distinct from the structured verdict.json.
+        assert rc.kwargs["ContentType"] == "text/plain; charset=utf-8"
+        # Write-once, mirroring the verdict.json + artifact.json guards.
+        assert rc.kwargs.get("IfNoneMatch") == "*"
+
+    def test_qa_write_failure_does_not_fail_publish(self):
+        """The durable qa write is best-effort: an S3 failure on the qa write
+        must NOT fail the publish. The artifact write, the callback, and the
+        ticket delete all still happen (the callback no longer carries the
+        verdict — gp-api was dropped as a consumer)."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-write-flake",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        from botocore.exceptions import ClientError
+
+        qa_key = "district_intel/di-qa-write-flake/qa/verdict.json"
+        qa_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == qa_key:
+                raise qa_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Publish succeeds despite the qa write failing.
+        assert resp.status_code == 200, resp.text
+        # The artifact write happened.
+        artifact_keys = {
+            c.kwargs["Key"] for c in mock_s3.put_object.call_args_list
+        }
+        assert "district_intel/di-qa-write-flake/artifact.json" in artifact_keys
+        # The callback fired, carrying NO verdict.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        # The ticket was still cleaned up.
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-qa-write-flake"
+        )
+
+    def test_qa_write_failure_logs_with_run_id(self, caplog):
+        """A failed qa write logs (with the run_id) so the lost durable capture
+        is diagnosable, even though the publish itself succeeds.
+
+        The run_id deliberately contains NO 'qa' substring, and the assertion
+        drops the redundant 'qa' message clause — so matching on the run_id
+        alone is discriminating: it can only be the qa-write log, not some
+        unrelated record that happens to mention the same run."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-write-log",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+
+        from botocore.exceptions import ClientError
+
+        qa_key = "district_intel/di-verdict-write-log/qa/verdict.json"
+        qa_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == qa_key:
+                raise qa_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        with caplog.at_level(logging.WARNING, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={"artifact": _valid_artifact(), "qa_verdict": _qa_verdict()},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        qa_log_records = [
+            r for r in caplog.records
+            if r.name == "broker.endpoints.artifact_publish"
+            and "di-verdict-write-log" in r.getMessage()
+        ]
+        assert qa_log_records, (
+            f"expected a log mentioning the run_id for the failed qa write, got: "
+            f"{[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    def test_no_qa_verdict_writes_no_qa_key(self):
+        """Byte-identical no-qa path: when no verdict is present, the broker
+        writes ONLY artifact.json + latest.json — no qa/ key appears, and the
+        uploaded key set is identical to a pre-gate publish."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-no-qa",
+        )
+        app, mock_s3, mock_sender, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        assert keys_written == {
+            "district_intel/42/latest.json",
+            "district_intel/di-no-qa/artifact.json",
+        }
+        assert not any("/qa/" in k for k in keys_written)
+        assert mock_s3.put_object.call_count == 2
+
+    def test_qa_raw_output_is_declared_field_surviving_pydantic(self):
+        """If qa_raw_output were undeclared, pydantic's extra='ignore' would
+        silently drop it and the durable raw write would never happen. Pin that
+        the declared field reaches the handler and drives a raw-output write."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-raw-declared",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        raw = "RAW-MAIN-PY-OUTPUT-MARKER"
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_raw_output": raw,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        raw_bodies = [
+            c.kwargs["Body"] for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-qa-raw-declared/qa/main_output.json"
+            and c.kwargs["Body"] == raw
+        ]
+        assert raw_bodies, (
+            "declared qa_raw_output was dropped by pydantic — no raw-output write"
+        )
+
+    def test_verdict_present_raw_absent_writes_only_verdict_json(self):
+        """The COMMON skipped/error path: the gate produced a verdict but no raw
+        main.py stdout (e.g. status=skipped/error, or a verdict-only runner).
+        EXACTLY one qa key is written — verdict.json — and NO main_output.json.
+        The callback still fires with the verdict."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-only",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": verdict},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        # EXACT qa key set: verdict.json present, main_output.json ABSENT.
+        qa_keys = {
+            c.kwargs["Key"] for c in mock_s3.put_object.call_args_list
+            if "/qa/" in c.kwargs["Key"]
+        }
+        assert qa_keys == {"district_intel/di-verdict-only/qa/verdict.json"}
+        assert "district_intel/di-verdict-only/qa/main_output.json" not in qa_keys
+
+        # Callback fired with the verdict.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-verdict-only"
+        )
+
+    def test_qa_verdict_and_raw_write_exact_basenames(self):
+        """Pin the EXACT qa key basenames — 'verdict.json' and
+        'main_output.json' — not a startswith/prefix match. A rename of either
+        durable key would break the per-run qa record contract; assert the
+        literal filenames."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-exact-keys",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_raw_output": "raw stdout, not json",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        qa_keys = {
+            c.kwargs["Key"] for c in mock_s3.put_object.call_args_list
+            if "/qa/" in c.kwargs["Key"]
+        }
+        assert qa_keys == {
+            "district_intel/di-exact-keys/qa/verdict.json",
+            "district_intel/di-exact-keys/qa/main_output.json",
+        }
+
+    def test_oversize_raw_output_is_fail_open_skips_main_output_but_publishes(self):
+        """v1 fail-open: an oversize qa_raw_output must NOT 400 (a 400 would turn
+        the run FAILED, breaking observe-only). The broker LOGS + emits the
+        metric + SKIPS the durable main_output.json write, but STILL writes
+        artifact.json + verdict.json, STILL fires the callback, and STILL
+        deletes the ticket."""
+        from broker.endpoints.artifact_publish import MAX_QA_RAW_OUTPUT_BYTES
+
+        oversize_raw = "x" * (MAX_QA_RAW_OUTPUT_BYTES + 1)
+        assert len(oversize_raw.encode("utf-8")) > MAX_QA_RAW_OUTPUT_BYTES
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-oversize-raw",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with patch("broker.endpoints.artifact_publish._emit_metric") as mock_metric:
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_raw_output": oversize_raw,
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        # Fail-open: 200, NOT 400.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        # artifact.json + verdict.json STILL written.
+        assert "district_intel/di-oversize-raw/artifact.json" in keys_written
+        assert "district_intel/di-oversize-raw/qa/verdict.json" in keys_written
+        # The oversize main_output.json write was SKIPPED.
+        assert "district_intel/di-oversize-raw/qa/main_output.json" not in keys_written
+
+        # Callback still fired with the verdict; ticket cleaned up.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-oversize-raw"
+        )
+
+        # Observable: a CloudWatch metric fired for the raw-output skip.
+        skip_calls = [
+            c for c in mock_metric.call_args_list
+            if c.args[0] == "broker_qa_raw_output_size_cap_exceeded"
+        ]
+        assert skip_calls, (
+            "expected broker_qa_raw_output_size_cap_exceeded metric on oversize raw skip"
+        )
+
+    def test_oversize_raw_output_logs_error_with_run_id(self, caplog):
+        """The oversize raw skip logs an ERROR carrying the run_id and byte
+        counts (the run_id has NO 'qa' substring so the match is discriminating),
+        even though the publish succeeds."""
+        from broker.endpoints.artifact_publish import MAX_QA_RAW_OUTPUT_BYTES
+
+        oversize_raw = "x" * (MAX_QA_RAW_OUTPUT_BYTES + 1)
+        ticket = _make_ticket(run_id="di-oversize-raw-log")
+        app, _, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with caplog.at_level(logging.ERROR, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_raw_output": oversize_raw,
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and r.name == "broker.endpoints.artifact_publish"
+            and "di-oversize-raw-log" in r.getMessage()
+        ]
+        assert error_records, "expected an ERROR log for the oversize raw-output skip"
+        assert str(MAX_QA_RAW_OUTPUT_BYTES) in error_records[0].getMessage()
+
+    def test_qa_main_output_put_includes_if_none_match_star(self):
+        """Write-once on the raw main.py output: a duplicate publish must not
+        silently overwrite the per-run qa record, mirroring artifact.json."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-raw-write-once",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_raw_output": "raw stdout",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        raw_call = next(
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-raw-write-once/qa/main_output.json"
+        )
+        assert raw_call.kwargs.get("IfNoneMatch") == "*"
+
+    def test_qa_duplicate_write_is_swallowed_and_publish_succeeds(self):
+        """Write-once is best-effort/observe-only: when a duplicate publish hits
+        the write-once guard on the qa keys (PreconditionFailed / 412), the
+        broker logs INFO and continues — it does NOT fail the publish and does
+        NOT raise. The callback still fires."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-dup",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        precondition_error = ClientError(
+            error_response={
+                "Error": {"Code": "PreconditionFailed", "Message": "exists"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"].startswith("district_intel/di-qa-dup/qa/"):
+                raise precondition_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": verdict,
+                "qa_raw_output": "raw stdout",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Duplicate qa write does not fail the publish.
+        assert resp.status_code == 200, resp.text
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-qa-dup"
+        )
+
+    def test_failed_verdict_write_skips_main_output_no_orphan(self):
+        """Write-level coupling: main_output.json is the verdict's raw fragment
+        output, so it must never be written when the sibling verdict.json write
+        FAILED. Today the two writes are coupled only at REQUEST level (both fire
+        whenever req.qa_verdict and req.qa_raw_output are present), independent of
+        whether the verdict.json PUT actually succeeded. So a transiently failed
+        verdict.json write (caught, logged, fail-open) could still be followed by
+        a successful main_output.json write → an orphan main_output.json with no
+        sibling verdict.json under the run's qa prefix.
+
+        Fix: gate the main_output.json write on the verdict.json write having
+        actually landed. Stays fail-open — the skipped write must NOT fail the
+        publish."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-fail-orphan",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-verdict-fail-orphan/qa/verdict.json"
+        main_output_key = "district_intel/di-verdict-fail-orphan/qa/main_output.json"
+
+        # A real (non-precondition) failure on the verdict.json write — caught,
+        # logged, fail-open. The sibling verdict does NOT exist afterward.
+        verdict_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise verdict_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        verdict = _qa_verdict()
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": verdict,
+                "qa_raw_output": "raw stdout that would orphan",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Fail-open: the failed verdict.json write must NOT fail the publish.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict.json write was attempted (and failed).
+        assert verdict_key in keys_written
+        # CRITICAL: main_output.json must NOT be written — it would be an orphan
+        # with no sibling verdict.json.
+        assert main_output_key not in keys_written, (
+            f"orphan main_output.json written without a sibling verdict.json; "
+            f"keys written: {keys_written}"
+        )
+
+        # The callback still fired (carrying NO verdict), and the ticket was
+        # still cleaned up.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-verdict-fail-orphan"
+        )
+
+    def test_verdict_412_already_exists_still_writes_main_output(self):
+        """The 412 (PreconditionFailed) branch on verdict.json means the sibling
+        verdict.json ALREADY exists from a prior publish — so main_output.json is
+        NOT an orphan and the raw write must still proceed. This pins that the
+        write-level coupling treats 'already captured' as 'sibling present', not
+        as a failed write."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-verdict-412-raw",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-verdict-412-raw/qa/verdict.json"
+        main_output_key = "district_intel/di-verdict-412-raw/qa/main_output.json"
+
+        precondition_error = ClientError(
+            error_response={
+                "Error": {"Code": "PreconditionFailed", "Message": "exists"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise precondition_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_raw_output": "raw stdout",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict sibling already exists (412), so main_output.json is NOT an
+        # orphan — the raw write MUST still happen.
+        assert main_output_key in keys_written, (
+            f"main_output.json was skipped even though the sibling verdict.json "
+            f"already exists (412 already-captured); keys written: {keys_written}"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-verdict-412-raw"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate (eval transcript): durable S3 eval_transcript.jsonl capture.
+#
+# When the evaluator AGENT ran (eval.md present), the runner forwards the
+# per-turn JSONL transcript as `qa_eval_transcript` (already redacted
+# runner-side in qa_gate._run_evaluator). The broker writes it durably to
+# `<exp>/<run>/qa/eval_transcript.jsonl`, mirroring main_output.json EXACTLY:
+# opaque passthrough (NO broker redaction), its own 1 MiB size cap (measured in
+# true UTF-8 bytes, fail-open), write-once (IfNoneMatch=*), and gated on the
+# sibling verdict.json having actually landed (no orphan transcript).
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactPublishDurableQaEvalTranscriptS3Capture:
+    def test_qa_eval_transcript_written_to_run_prefix_jsonl_key(self):
+        """A present qa_eval_transcript is written verbatim to
+        `<exp>/<run>/qa/eval_transcript.jsonl` as application/x-ndjson,
+        write-once. The body is the EXACT transcript string the runner forwarded
+        (broker is an opaque passthrough — no redaction, no transformation)."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-qa-transcript",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        transcript = '{"turn":1,"kind":"assistant"}\n{"turn":0,"kind":"result"}'
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": transcript,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        transcript_calls = [
+            c for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-qa-transcript/qa/eval_transcript.jsonl"
+        ]
+        assert len(transcript_calls) == 1, (
+            f"expected one eval_transcript.jsonl write under the qa prefix, got keys: "
+            f"{[c.kwargs['Key'] for c in mock_s3.put_object.call_args_list]}"
+        )
+        tc = transcript_calls[0]
+        assert tc.kwargs["Bucket"] == "gp-agent-artifacts-dev"
+        assert tc.kwargs["Body"] == transcript
+        assert tc.kwargs["ContentType"] == "application/x-ndjson"
+        assert tc.kwargs.get("IfNoneMatch") == "*"
+
+    def test_qa_eval_transcript_is_declared_field_surviving_pydantic(self):
+        """If qa_eval_transcript were undeclared, pydantic's extra='ignore'
+        would silently drop it and the durable transcript write would never
+        happen. Pin that the declared field reaches the handler and drives a
+        transcript write."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-declared",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        transcript = "EVAL-TRANSCRIPT-MARKER"
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": transcript,
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        transcript_bodies = [
+            c.kwargs["Body"] for c in mock_s3.put_object.call_args_list
+            if c.kwargs["Key"] == "district_intel/di-transcript-declared/qa/eval_transcript.jsonl"
+            and c.kwargs["Body"] == transcript
+        ]
+        assert transcript_bodies, (
+            "declared qa_eval_transcript was dropped by pydantic — no transcript write"
+        )
+
+    def test_oversize_qa_eval_transcript_is_fail_open_skips_write_but_publishes(self):
+        """v1 fail-open: an oversize qa_eval_transcript must NOT 400. The broker
+        LOGS + emits the metric + SKIPS the durable eval_transcript.jsonl write,
+        but STILL writes artifact.json + verdict.json + main_output.json, STILL
+        fires the callback, and STILL deletes the ticket."""
+        from broker.endpoints.artifact_publish import MAX_QA_EVAL_TRANSCRIPT_BYTES
+
+        oversize = "x" * (MAX_QA_EVAL_TRANSCRIPT_BYTES + 1)
+        assert len(oversize.encode("utf-8")) > MAX_QA_EVAL_TRANSCRIPT_BYTES
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-oversize-transcript",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        with patch("broker.endpoints.artifact_publish._emit_metric") as mock_metric:
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_raw_output": "raw stdout",
+                    "qa_eval_transcript": oversize,
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        # Fail-open: 200, NOT 400.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        # verdict.json + main_output.json STILL written.
+        assert "district_intel/di-oversize-transcript/qa/verdict.json" in keys_written
+        assert "district_intel/di-oversize-transcript/qa/main_output.json" in keys_written
+        # The oversize eval_transcript.jsonl write was SKIPPED.
+        assert "district_intel/di-oversize-transcript/qa/eval_transcript.jsonl" not in keys_written
+
+        # Callback still fired with the verdict; ticket cleaned up.
+        mock_sender.send_result.assert_called_once()
+        assert "qa_verdict" not in mock_sender.send_result.call_args.kwargs
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-oversize-transcript"
+        )
+
+        # Observable: a CloudWatch metric fired for the transcript skip.
+        skip_calls = [
+            c for c in mock_metric.call_args_list
+            if c.args[0] == "broker_qa_eval_transcript_size_cap_exceeded"
+        ]
+        assert skip_calls, (
+            "expected broker_qa_eval_transcript_size_cap_exceeded metric on oversize skip"
+        )
+
+    def test_qa_eval_transcript_write_gated_on_verdict_written_no_orphan(self):
+        """Write-level coupling: eval_transcript.jsonl must never be written when
+        the sibling verdict.json write FAILED (no orphan transcript). When the
+        verdict write hits a NON-412 error (verdict_written stays False), the
+        transcript write is SKIPPED. Stays fail-open."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-orphan",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-transcript-orphan/qa/verdict.json"
+        transcript_key = "district_intel/di-transcript-orphan/qa/eval_transcript.jsonl"
+
+        verdict_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise verdict_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": "transcript that would orphan",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        # Fail-open: the failed verdict.json write must NOT fail the publish.
+        assert resp.status_code == 200, resp.text
+
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        # The verdict.json write was attempted (and failed).
+        assert verdict_key in keys_written
+        # CRITICAL: eval_transcript.jsonl must NOT be written — it would be an
+        # orphan with no sibling verdict.json.
+        assert transcript_key not in keys_written, (
+            f"orphan eval_transcript.jsonl written without a sibling verdict.json; "
+            f"keys written: {keys_written}"
+        )
+
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-orphan"
+        )
+
+    def test_verdict_412_already_exists_still_writes_eval_transcript(self):
+        """The 412 (PreconditionFailed) branch on verdict.json means the sibling
+        ALREADY exists from a prior publish — so eval_transcript.jsonl is NOT an
+        orphan and the transcript write MUST still proceed."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-412",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        verdict_key = "district_intel/di-transcript-412/qa/verdict.json"
+        transcript_key = "district_intel/di-transcript-412/qa/eval_transcript.jsonl"
+
+        precondition_error = ClientError(
+            error_response={
+                "Error": {"Code": "PreconditionFailed", "Message": "exists"},
+                "ResponseMetadata": {"HTTPStatusCode": 412},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == verdict_key:
+                raise precondition_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        resp = client.post(
+            "/artifact/publish",
+            json={
+                "artifact": _valid_artifact(),
+                "qa_verdict": _qa_verdict(),
+                "qa_eval_transcript": "transcript line",
+            },
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+
+        assert resp.status_code == 200, resp.text
+        keys_written = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+        assert transcript_key in keys_written, (
+            f"eval_transcript.jsonl was skipped even though the sibling verdict.json "
+            f"already exists (412 already-captured); keys written: {keys_written}"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-412"
+        )
+
+    def test_qa_eval_transcript_write_failure_does_not_fail_publish(self, caplog):
+        """The durable transcript write is best-effort: a generic S3 failure on
+        ONLY the eval_transcript.jsonl write must NOT fail the publish (others
+        succeed). The broker logs a WARNING and returns 200."""
+        from botocore.exceptions import ClientError
+
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-transcript-write-flake",
+        )
+        app, mock_s3, mock_sender, mock_store = _create_app(ticket=ticket)
+
+        transcript_key = "district_intel/di-transcript-write-flake/qa/eval_transcript.jsonl"
+        transcript_error = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError", "Message": "S3 flaked"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="PutObject",
+        )
+
+        def side_effect(**kwargs):
+            if kwargs["Key"] == transcript_key:
+                raise transcript_error
+            return {}
+
+        mock_s3.put_object.side_effect = side_effect
+
+        client = TestClient(app)
+        with caplog.at_level(logging.WARNING, logger="broker.endpoints.artifact_publish"):
+            resp = client.post(
+                "/artifact/publish",
+                json={
+                    "artifact": _valid_artifact(),
+                    "qa_verdict": _qa_verdict(),
+                    "qa_eval_transcript": "transcript line",
+                },
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+
+        assert resp.status_code == 200, resp.text
+        warning_records = [
+            r for r in caplog.records
+            if r.name == "broker.endpoints.artifact_publish"
+            and r.levelno == logging.WARNING
+            and "di-transcript-write-flake" in r.getMessage()
+        ]
+        assert warning_records, (
+            "expected a WARNING log mentioning the run_id for the failed transcript write"
+        )
+        mock_sender.send_result.assert_called_once()
+        mock_store.delete_ticket_and_run_lock.assert_called_once_with(
+            BROKER_TOKEN, "di-transcript-write-flake"
+        )
+
+    def test_eval_transcript_cap_equals_one_mib(self):
+        """Pin the transcript cap to its ABSOLUTE value (1 MiB) and to the
+        raw-output cap (both are the same generous S3-sanity bound)."""
+        from broker.endpoints.artifact_publish import (
+            MAX_QA_EVAL_TRANSCRIPT_BYTES,
+            MAX_QA_RAW_OUTPUT_BYTES,
+        )
+
+        assert MAX_QA_EVAL_TRANSCRIPT_BYTES == 1024 * 1024
+        assert MAX_QA_EVAL_TRANSCRIPT_BYTES == MAX_QA_RAW_OUTPUT_BYTES
+
+    def test_no_eval_transcript_writes_no_transcript_key(self):
+        """Byte-identical no-transcript path: when qa_eval_transcript is absent,
+        no eval_transcript.jsonl key is written (verdict.json still written)."""
+        ticket = _make_ticket(
+            experiment_id="district_intel",
+            organization_slug="42",
+            run_id="di-no-transcript",
+        )
+        app, mock_s3, _, _ = _create_app(ticket=ticket)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/artifact/publish",
+            json={"artifact": _valid_artifact(), "qa_verdict": _qa_verdict()},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200, resp.text
+
+        keys_written = {c.kwargs["Key"] for c in mock_s3.put_object.call_args_list}
+        assert not any(k.endswith("eval_transcript.jsonl") for k in keys_written)
+
+
+class TestQaPublishCrossSurfaceContract:
+    """Meet-in-the-middle contract test crossing the runner-producer ->
+    broker-consumer boundary for the qa publish fields.
+
+    The qa_verdict / qa_raw_output / qa_eval_transcript field names are bare
+    string literals duplicated on both sides (the runner's publish() request
+    body and the broker's PublishRequest model). There is no shared schema, so
+    a producer-side rename ships green and silently disables the durable S3
+    write — pydantic's extra='ignore' drops the now-unknown key before the
+    handler ever sees it. This test builds the REAL producer body and feeds it
+    into the REAL consumer model so a rename on either side fails it.
+    """
+
+    def _capture_producer_body(
+        self,
+        verdict: dict,
+        qa_raw_output: str,
+        qa_eval_transcript: str,
+    ) -> dict:
+        """Drive the runner's publish client against an in-process MockTransport
+        and return the exact JSON body it POSTs to /artifact/publish. No AWS, no
+        network."""
+        from pmf_engine.runner.pmf_runtime import config as runtime_config
+        from pmf_engine.runner.pmf_runtime.publish import publish as runner_publish
+
+        captured: dict = {}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "artifact_key": "exp/run/artifact.json",
+                    "artifact_bucket": "gp-agent-artifacts-test",
+                    "callback_sent": True,
+                },
+            )
+
+        cfg = runtime_config.init_config(
+            broker_url="http://broker.test",
+            broker_token=BROKER_TOKEN,
+        )
+        cfg._client = httpx.Client(
+            base_url="http://broker.test",
+            headers={"X-Broker-Token": BROKER_TOKEN},
+            transport=httpx.MockTransport(_handler),
+        )
+        try:
+            runner_publish(
+                artifact=_valid_artifact(),
+                qa_verdict=verdict,
+                qa_raw_output=qa_raw_output,
+                qa_eval_transcript=qa_eval_transcript,
+            )
+        finally:
+            cfg.close()
+            runtime_config._config = None
+
+        assert "body" in captured, "producer never POSTed a body to /artifact/publish"
+        return captured["body"]
+
+    def test_qa_fields_round_trip_producer_body_into_consumer_model(self):
+        """The runner's publish() emits qa_verdict / qa_raw_output /
+        qa_eval_transcript under keys the broker's PublishRequest reads back
+        VERBATIM. PublishRequest(**body) is the load-bearing assertion: a rename
+        on either side leaves the corresponding field at its None default and
+        the equality checks below fail."""
+        from broker.endpoints.artifact_publish import PublishRequest
+        from pmf_engine.runner.qa_gate import Verdict
+
+        verdict = Verdict(
+            status="evaluated",
+            pass_=False,
+            checks=[{"name": "sources_resolve", "passed": False, "detail": "404 on src-2"}],
+            violations=["source src-2 is unreachable"],
+            duration_ms=4200,
+            cost_usd=0.0731,
+        ).to_dict()
+        qa_raw_output = "[{\"name\": \"sources_resolve\", \"passed\": false}]"
+        qa_eval_transcript = '{"turn":1}'
+
+        body = self._capture_producer_body(
+            verdict=verdict,
+            qa_raw_output=qa_raw_output,
+            qa_eval_transcript=qa_eval_transcript,
+        )
+
+        req = PublishRequest(**body)
+
+        assert req.qa_verdict == verdict
+        assert req.qa_raw_output == qa_raw_output
+        assert req.qa_eval_transcript == qa_eval_transcript
+
+    def test_producer_qa_keys_exactly_match_consumer_model_fields(self):
+        """Pin the wire-key contract directly: every qa_* key the producer emits
+        is a declared field on the consumer model (not silently dropped by
+        extra='ignore'), and every qa_* model field has a producer key feeding
+        it. A rename on either side breaks this set equality."""
+        from broker.endpoints.artifact_publish import PublishRequest
+        from pmf_engine.runner.qa_gate import Verdict
+
+        body = self._capture_producer_body(
+            verdict=Verdict(status="evaluated", pass_=True).to_dict(),
+            qa_raw_output="[]",
+            qa_eval_transcript='{"turn":1}',
+        )
+
+        producer_qa_keys = {k for k in body if k.startswith("qa_")}
+        consumer_qa_fields = {f for f in PublishRequest.model_fields if f.startswith("qa_")}
+
+        assert producer_qa_keys == {"qa_verdict", "qa_raw_output", "qa_eval_transcript"}
+        assert producer_qa_keys == consumer_qa_fields

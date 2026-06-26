@@ -19,6 +19,12 @@ terraform {
 
 provider "aws" {
   region = "us-west-2"
+
+  default_tags {
+    tags = {
+      Project = "pmf-engine"
+    }
+  }
 }
 
 # gp-api's results queue — the same queue the broker sends success results to

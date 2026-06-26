@@ -13,6 +13,23 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _default_environment_to_test(monkeypatch):
+    """Default ENVIRONMENT to a non-deployment value ('test') for every test.
+
+    ``RunnerConfig.from_env`` / ``main`` default ENVIRONMENT to 'dev' when unset,
+    and 'dev' is an AWS deployment env (config._AWS_DEPLOYMENT_ENVS), so
+    ``validate_broker_url_scheme`` raises ``BrokerUrlSchemeError`` whenever
+    BROKER_URL is unset. Tests that don't care about env then crash on init
+    before exercising the behavior under test. Pinning 'test' (not in
+    _AWS_DEPLOYMENT_ENVS) takes the local/in-process path. Env-validation tests
+    that explicitly set ENVIRONMENT to dev/qa/prod via monkeypatch.setenv still
+    override this (later setenv wins)."""
+    monkeypatch.setenv("ENVIRONMENT", "test")
+
 # Synthetic manifest — minimal but realistic shape that satisfies the meta
 # schema at `~/work/runbooks/experiments/_schema/manifest.schema.json`. Used
 # by every engine test that needs a manifest. The id `smoke_test` does NOT

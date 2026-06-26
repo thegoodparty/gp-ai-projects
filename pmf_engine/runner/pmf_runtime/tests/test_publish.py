@@ -1,4 +1,5 @@
 import json
+
 import httpx
 import pytest
 
@@ -69,6 +70,192 @@ class TestPublish:
         assert captured["body"]["artifact"] == {"score": 0.95}
         assert captured["body"]["duration_seconds"] == 42.5
         assert captured["body"]["cost_usd"] == 0.37
+
+    def test_publish_omits_qa_verdict_when_not_passed(self):
+        """The no-qa golden path is byte-identical to today: a publish call
+        without a qa_verdict must NOT add the key to the POST body, so a
+        pre-gate broker sees exactly the same payload it always has."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0)
+        assert "qa_verdict" not in captured["body"]
+
+    def test_publish_includes_qa_verdict_when_passed(self):
+        """When the QA gate produced a verdict (observe-only), publish forwards
+        it verbatim under the additive optional `qa_verdict` key (contract D).
+        The verdict body keeps its snake_case contract-C shape — the broker
+        treats it as an opaque passthrough."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {
+            "verdict_version": 1,
+            "qa_version_ids": {"manifest.json": "v1"},
+            "status": "evaluated",
+            "pass": False,
+            "checks": [{"name": "grounding", "passed": False}],
+            "violations": ["grounding: 0.6 < 0.8"],
+            "duration_ms": 9300,
+            "cost_usd": 0.05,
+        }
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0, qa_verdict=verdict)
+        assert captured["body"]["artifact"] == {"score": 0.95}
+        assert captured["body"]["qa_verdict"] == verdict
+
+    def test_publish_qa_verdict_none_omits_key(self):
+        """Explicit qa_verdict=None (the default the runner passes when the
+        gate did not run) is treated the same as omitted — no key in body."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0, qa_verdict=None)
+        assert "qa_verdict" not in captured["body"]
+
+    def test_publish_includes_qa_raw_output_when_passed(self):
+        """The raw main.py stdout (contract D) carries to the broker for the
+        durable S3 capture. When present, publish forwards it under the additive
+        optional `qa_raw_output` key alongside the aggregated verdict."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {
+            "verdict_version": 1,
+            "qa_version_ids": {"main.py": "v1"},
+            "status": "evaluated",
+            "pass": True,
+            "checks": [{"name": "grounding", "passed": True}],
+            "violations": [],
+            "duration_ms": 120,
+            "cost_usd": 0.0,
+        }
+        raw = '[{"name": "grounding", "passed": true, "detail": "1.0 >= 0.8"}]'
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_raw_output=raw,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert captured["body"]["qa_raw_output"] == raw
+
+    def test_publish_omits_qa_raw_output_when_none(self):
+        """Absent qa_raw_output (the default) must NOT add the key to the body.
+        A verdict-only publish (no raw output) carries exactly the verdict."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert "qa_raw_output" not in captured["body"]
+
+    def test_publish_no_qa_raw_output_body_byte_identical(self):
+        """A no-qa publish (neither verdict nor raw output) must be byte-identical
+        to today: the body carries only artifact/duration/cost, no qa keys."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        publish({"score": 0.95}, duration_seconds=1.0, cost_usd=0.0)
+        assert captured["body"] == {
+            "artifact": {"score": 0.95},
+            "duration_seconds": 1.0,
+            "cost_usd": 0.0,
+        }
+
+    def test_publish_includes_qa_eval_transcript_when_passed(self):
+        """The evaluator's redacted JSONL transcript (contract D) carries to the
+        broker for the durable S3 eval_transcript.jsonl write. When present,
+        publish forwards it under the additive optional `qa_eval_transcript`
+        key — mirroring qa_raw_output exactly."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        transcript = '{"turn": 1, "kind": "assistant"}\n{"turn": 0, "kind": "result"}'
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_eval_transcript=transcript,
+        )
+        assert captured["body"]["qa_verdict"] == verdict
+        assert captured["body"]["qa_eval_transcript"] == transcript
+
+    def test_publish_omits_qa_eval_transcript_when_none(self):
+        """Absent qa_eval_transcript (the default) must NOT add the key to the
+        body — a verdict-only / main-only publish carries no transcript key."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+        )
+        assert "qa_eval_transcript" not in captured["body"]
+
+    def test_publish_empty_qa_eval_transcript_is_forwarded(self):
+        """An empty-string transcript ('' = evaluator ran but produced nothing)
+        is DISTINCT from None (no evaluator). The empty string is forwarded so
+        the broker can record that the evaluator ran with an empty transcript."""
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"id": "art-1"})
+
+        _inject_client(handler)
+        verdict = {"verdict_version": 1, "status": "evaluated", "pass": True}
+        publish(
+            {"score": 0.95},
+            duration_seconds=1.0,
+            cost_usd=0.0,
+            qa_verdict=verdict,
+            qa_eval_transcript="",
+        )
+        assert captured["body"]["qa_eval_transcript"] == ""
 
 
 class TestReportStatus:

@@ -242,6 +242,7 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
             cluster=cluster_arn,
             taskDefinition=task_definition,
             launchType="FARGATE",
+            tags=[{"key": "Project", "value": "clickup-bot"}],
             networkConfiguration={
                 "awsvpcConfiguration": {
                     "subnets": subnet_ids,

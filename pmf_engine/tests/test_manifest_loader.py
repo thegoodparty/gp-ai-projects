@@ -566,6 +566,266 @@ class TestRunnerWriteActionValidation:
             )
 
 
+# ---------------------------------------------------------------------------
+# qa_version_ids forwarding + qa envelope parsing (PMF QA gate, contracts G/H).
+#
+# The qa folder is served under a SEPARATE broker envelope key from attachments
+# and never written to /workspace — the runner holds it in memory and hands it
+# to the gate engine. The runner forwards QA_VERSION_IDS into the POST body
+# (mirroring attachment_version_ids) so the broker pins the qa S3 fetch.
+# ---------------------------------------------------------------------------
+
+
+class TestManifestLoaderQaVersionIds:
+    def test_qa_version_ids_included_in_broker_request_body(self):
+        """When the caller passes qa_version_ids, it MUST appear in the POST
+        body so the broker pins its qa S3 GetObject calls (contract H)."""
+        envelope = _good_envelope()
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json=envelope)
+
+        pin = {"manifest.json": "Vqa1", "eval.md": "Vqa2"}
+        load_from_broker(
+            "smoke_test",
+            BROKER_URL,
+            BROKER_TOKEN,
+            qa_version_ids=pin,
+            client=_client_returning(handler),
+        )
+
+        assert captured["body"]["qa_version_ids"] == pin
+
+    def test_qa_version_ids_omitted_when_none(self):
+        """qa_version_ids=None (default, unversioned dev/local bucket) must NOT
+        add the key to the request body — mirrors attachment_version_ids."""
+        envelope = _good_envelope()
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json=envelope)
+
+        load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+
+        assert "qa_version_ids" not in captured["body"]
+
+
+class TestManifestLoaderQaEnvelope:
+    def test_envelope_parses_qa_block(self):
+        """The optional `qa` envelope key (contract H) carries the qa manifest,
+        the qa entrypoint file bodies, and the resolved VersionIds. The loader
+        surfaces it verbatim on the returned envelope; it is NEVER written to
+        disk here (the gate's private dir is the only place these bytes land)."""
+        envelope = _good_envelope()
+        envelope["qa"] = {
+            "manifest": {"blocking": False},
+            "files": {
+                "main.py": "import sys\nprint('[]')\n",
+                "eval.md": "# Evaluate faithfulness\n",
+            },
+            "resolved_qa_version_ids": {
+                "manifest.json": "Vm1",
+                "main.py": "Vp1",
+                "eval.md": "Ve1",
+            },
+        }
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+
+        assert result["qa"] == {
+            "manifest": {"blocking": False},
+            "files": {
+                "main.py": "import sys\nprint('[]')\n",
+                "eval.md": "# Evaluate faithfulness\n",
+            },
+            "resolved_qa_version_ids": {
+                "manifest.json": "Vm1",
+                "main.py": "Vp1",
+                "eval.md": "Ve1",
+            },
+        }
+
+    def test_envelope_omits_qa_key_when_absent(self):
+        """No qa folder published (or older broker): the `qa` key is absent
+        from the result so the runner takes the byte-identical no-qa path."""
+        envelope = _good_envelope()
+        assert "qa" not in envelope
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        result = load_from_broker(
+            "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+        )
+
+        assert "qa" not in result
+
+    def test_envelope_rejects_non_dict_qa(self):
+        """A malformed `qa` value (e.g. a list) must reject loudly rather than
+        carrying garbage into the gate engine."""
+        envelope = _good_envelope()
+        envelope["qa"] = ["not", "a", "dict"]
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="qa"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_envelope_rejects_non_dict_qa_manifest(self):
+        envelope = _good_envelope()
+        envelope["qa"] = {"manifest": "not-a-dict", "files": {}, "resolved_qa_version_ids": {}}
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="qa.manifest"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_envelope_rejects_non_string_qa_file_body(self):
+        envelope = _good_envelope()
+        envelope["qa"] = {
+            "manifest": {"blocking": False},
+            "files": {"main.py": 123},
+            "resolved_qa_version_ids": {},
+        }
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="qa.files"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+    def test_envelope_rejects_non_string_qa_version_id(self):
+        envelope = _good_envelope()
+        envelope["qa"] = {
+            "manifest": {"blocking": False},
+            "files": {"main.py": "print('[]')\n"},
+            "resolved_qa_version_ids": {"main.py": 5},
+        }
+
+        def handler(request):
+            return httpx.Response(200, json=envelope)
+
+        with pytest.raises(ManifestLoadError, match="resolved_qa_version_ids"):
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, client=_client_returning(handler)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Control-plane loader: defensive guard against a STRING-shaped `qa_keys`
+# (Cursor Bugbot, MEDIUM). publish_experiments.py always writes qa_keys as a
+# list, but a malformed/legacy index entry could store it as a string. The
+# qa-pin builder does `[qa_manifest_key, *qa_keys]`; splatting a string
+# iterates it CHARACTER BY CHARACTER, so the real qa key is never HEADed and
+# its VersionId silently drops out of QA_VERSION_IDS — drift that's hard to
+# diagnose because the broker still loads the qa folder from a list-shaped
+# index elsewhere. The loader must treat a non-list qa_keys as empty and STILL
+# pin the qa manifest, never iterate per-character.
+# ---------------------------------------------------------------------------
+
+
+class TestControlPlaneQaKeysStringGuard:
+    def _drive(self, qa_keys):
+        """Run the control-plane loader against a fake S3 with the given
+        (possibly malformed) qa_keys value. Returns (routing, fake_s3)."""
+        from pmf_engine.control_plane.manifest_loader import ManifestRoutingLoader
+        from pmf_engine.tests.test_lambda_manifest_loader import (
+            BUCKET,
+            FakeS3,
+            _index_payload,
+            _manifest_payload,
+        )
+
+        qa_manifest_key = "smoke_test/qa/manifest.json"
+        index = _index_payload(
+            [
+                {
+                    "id": "smoke_test",
+                    "version": 1,
+                    "mode": "win",
+                    "manifest_key": "smoke_test/manifest.json",
+                    "instruction_key": "smoke_test/instruction.md",
+                    "qa_manifest_key": qa_manifest_key,
+                    "qa_keys": qa_keys,
+                },
+            ]
+        )
+        s3 = FakeS3()
+        s3.set_json(BUCKET, "index.json", index)
+        s3.set_json(BUCKET, "smoke_test/manifest.json", _manifest_payload("smoke_test"))
+        s3.set_object(BUCKET, "smoke_test/instruction.md", b"# instr", version_id="instr_v")
+        s3.set_object(BUCKET, qa_manifest_key, b'{"blocking": false}', version_id="qa_man_v")
+        # A real qa entrypoint whose full key equals the malformed string value.
+        s3.set_object(BUCKET, "smoke_test/qa/eval.md", b"# eval", version_id="qa_eval_v")
+        loader = ManifestRoutingLoader(bucket=BUCKET, s3_client=s3)
+        return loader.routing_for("smoke_test"), s3, BUCKET
+
+    def test_string_qa_keys_is_not_iterated_per_character(self, caplog):
+        """A STRING qa_keys must NOT be splatted into characters. The bug
+        signature: `[qa_manifest_key, *qa_keys]` iterates the string, so the
+        per-key loop processes single-character fragments ('s','m','o','k',
+        'e',...), each tripping the wrong-prefix skip path. The guard must
+        collapse a non-list qa_keys to empty BEFORE the splat, so no single-
+        character key is ever seen by the per-key loop or HEADed."""
+        import logging
+        import re
+
+        with caplog.at_level(logging.WARNING, logger="pmf_engine.control_plane.manifest_loader"):
+            _routing, s3, _bucket = self._drive("smoke_test/qa/eval.md")
+
+        # The per-key loop logs `... key='<k>' ...` when it skips a wrong-prefix
+        # key. Extract every key it actually looped over and assert none is a
+        # single character — that's the per-character iteration signature.
+        looped_keys = re.findall(r"key='([^']*)'", " ".join(r.message for r in caplog.records))
+        single_char_keys = [k for k in looped_keys if len(k) == 1]
+        assert single_char_keys == [], (
+            "string qa_keys was iterated per-character — the loop saw single-"
+            f"character fragments: {single_char_keys!r}. The guard must treat "
+            "a non-list qa_keys as empty before the splat."
+        )
+
+        # And no single-character key may be HEADed.
+        head_keys = [c[2] for c in s3.calls if c[0] == "head_object"]
+        assert [k for k in head_keys if len(k) == 1] == []
+
+    def test_string_qa_keys_still_pins_the_qa_manifest(self):
+        """Even when qa_keys is malformed (string), the qa manifest pin must
+        still be captured — the guard skips the bad qa_keys, not the whole
+        qa folder."""
+        routing, _s3, _bucket = self._drive("smoke_test/qa/eval.md")
+        assert routing["qa_version_ids"] == {"manifest.json": "qa_man_v"}, (
+            "malformed string qa_keys must collapse to empty; only the qa "
+            f"manifest should be pinned, got {routing['qa_version_ids']!r}"
+        )
+
+    def test_list_qa_keys_unchanged_by_guard(self):
+        """Regression guard: a proper list qa_keys (what the publisher always
+        writes) must behave exactly as before — each entry pinned."""
+        routing, _s3, _bucket = self._drive(["smoke_test/qa/eval.md"])
+        assert routing["qa_version_ids"] == {
+            "manifest.json": "qa_man_v",
+            "eval.md": "qa_eval_v",
+        }
+
+
 def test_permission_mode_values_parity_with_control_plane():
     """The runner-side `_PERMISSION_MODE_VALUES` is a deliberate copy of the
     control-plane set (kept inline to avoid a control_plane → runner import
@@ -589,3 +849,74 @@ def test_permission_mode_values_parity_with_control_plane():
         f"the same set (the harness allowlists are reviewed alongside the "
         f"validator rules)."
     )
+
+
+# ---------------------------------------------------------------------------
+# B6 (MEDIUM dup + LOW position):
+#   - _require_str_str_map(raw, label): one validator for both
+#     resolved_attachment_version_ids and qa.resolved_qa_version_ids.
+#   - client / timeout_seconds are keyword-only so adding qa_version_ids (or
+#     any future param) can never shift an existing positional arg.
+# ---------------------------------------------------------------------------
+
+
+class TestRequireStrStrMap:
+    def _validate(self, raw, label):
+        from pmf_engine.runner.manifest_loader import _require_str_str_map
+
+        return _require_str_str_map(raw, label)
+
+    def test_accepts_str_str_map_and_returns_it(self):
+        out = self._validate({"a.md": "V1", "b.csv": "V2"}, "envelope.x")
+        assert out == {"a.md": "V1", "b.csv": "V2"}
+
+    def test_rejects_non_dict_with_label_in_message(self):
+        with pytest.raises(ManifestLoadError) as exc:
+            self._validate(["not", "a", "dict"], "envelope.resolved_attachment_version_ids")
+        msg = str(exc.value)
+        assert "envelope.resolved_attachment_version_ids" in msg
+        assert "must be an object" in msg
+
+    def test_rejects_non_string_value_with_label_and_key(self):
+        with pytest.raises(ManifestLoadError) as exc:
+            self._validate({"main.py": 5}, "envelope.qa.resolved_qa_version_ids")
+        msg = str(exc.value)
+        assert "envelope.qa.resolved_qa_version_ids" in msg
+        assert "main.py" in msg
+        assert "string" in msg
+
+    def test_rejects_non_string_key(self):
+        with pytest.raises(ManifestLoadError):
+            self._validate({5: "V1"}, "envelope.x")
+
+
+class TestLoadFromBrokerKeywordOnlyTail:
+    """client / timeout_seconds must be keyword-only — passing them positionally
+    raises TypeError, which is the mechanical guard that a future param insert
+    (e.g. qa_version_ids) can never silently shift them."""
+
+    def test_client_is_keyword_only(self):
+        import inspect
+
+        sig = inspect.signature(load_from_broker)
+        client_param = sig.parameters["client"]
+        timeout_param = sig.parameters["timeout_seconds"]
+        assert client_param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            "client must be keyword-only so positional args can't shift onto it"
+        )
+        assert timeout_param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_passing_client_positionally_raises_type_error(self):
+        # 4 leading positionals are fine (experiment_id, broker_url,
+        # broker_token, manifest_version_id), but the client/timeout tail can't
+        # be reached positionally.
+        def handler(request):
+            return httpx.Response(200, json=_good_envelope())
+
+        client = _client_returning(handler)
+        with pytest.raises(TypeError):
+            # Attempt to pass too many positionals — would land on a
+            # keyword-only slot.
+            load_from_broker(
+                "smoke_test", BROKER_URL, BROKER_TOKEN, None, None, None, None, 30.0, client
+            )

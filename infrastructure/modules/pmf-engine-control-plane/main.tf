@@ -483,6 +483,11 @@ resource "aws_iam_role_policy" "scheduler_lambda_permissions" {
       },
       {
         Effect   = "Allow"
+        Action   = "ecs:TagResource"
+        Resource = "arn:aws:ecs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:task/${element(split("/", var.ecs_cluster_arn), 1)}/*"
+      },
+      {
+        Effect   = "Allow"
         Action   = "iam:PassRole"
         Resource = [var.ecs_task_execution_role_arn, var.ecs_task_role_arn]
       },

@@ -38,6 +38,7 @@ def handler(event, context):
             cluster=os.environ['ECS_CLUSTER_NAME'],
             taskDefinition=os.environ['TASK_DEFINITION_ARN'],
             launchType='FARGATE',
+            tags=[{'key': 'Project', 'value': 'ddhq-matcher'}],
             networkConfiguration={
                 'awsvpcConfiguration': {
                     'subnets': os.environ['SUBNET_IDS'].split(','),

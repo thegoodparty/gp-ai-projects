@@ -21,7 +21,6 @@ class _NoopFetcher:
 def _fake_secrets() -> BrokerSecrets:
     return BrokerSecrets(
         anthropic_api_key="sk-ant-fake",
-        tavily_api_key="tvly-fake",
         databricks_server_hostname="test.databricks.com",
         databricks_http_path="/sql/test",
         databricks_api_key="dapi-fake",

@@ -17,6 +17,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from broker.dynamodb_client import ScopeTicket
@@ -40,6 +41,16 @@ S3_VERSION_ID_PATTERN = r"^[A-Za-z0-9._\-]{1,1024}$"
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENTS_PER_EXPERIMENT = 32
 MAX_FETCH_WORKERS = 16
+
+# PMF QA gate (contract H / contract A). Per-object size cap for qa folder
+# files. Contract A caps TOTAL qa bytes at 1 MiB — a separate budget from the
+# 5 MiB attachment cap — and the same flat-layout / UTF-8-only / no-symlink
+# rules apply. We enforce 1 MiB per object here (the publisher also enforces
+# the 1 MiB folder total upstream); a single qa entrypoint over 1 MiB is itself
+# a publisher accident worth refusing. The qa folder's file count reuses
+# MAX_ATTACHMENTS_PER_EXPERIMENT: a well-behaved qa folder ships
+# manifest.json + main.py + eval.md (3 files), far under 32.
+MAX_QA_BYTES = 1 * 1024 * 1024
 
 # Module-level shared executor. Bound to MAX_FETCH_WORKERS so concurrent
 # requests share a fixed thread budget instead of each request spawning its
@@ -190,6 +201,11 @@ class ExperimentManifestRequest(BaseModel):
     # attachments dict); values are S3 VersionIds. Unset basenames fall
     # through to "latest" per the same rules as the other two fields.
     attachment_version_ids: dict[str, str] | None = None
+    # PMF QA gate (contract H): the runner forwards its QA_VERSION_IDS env var
+    # here, mirroring attachment_version_ids exactly. Keys are basenames within
+    # the qa folder (including the required `manifest.json`); values are S3
+    # VersionIds. Unset basenames fall through to "latest" per the same rules.
+    qa_version_ids: dict[str, str] | None = None
 
     @field_validator("attachment_version_ids")
     @classmethod
@@ -217,6 +233,28 @@ class ExperimentManifestRequest(BaseModel):
                 raise ValueError(f"attachment_version_ids value for {name!r} is not a valid S3 VersionId")
         return v
 
+    @field_validator("qa_version_ids")
+    @classmethod
+    def _validate_qa_version_ids(
+        cls, v: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        """Validate qa_version_ids IDENTICALLY to attachment_version_ids.
+        Keys map to `<experiment_id>/qa/<basename>`, so the same basename
+        safety guard defends against traversal. `manifest.json` is a normal
+        safe basename (dots are allowed by the basename pattern), so it
+        passes without special-casing — the qa folder's required file pins
+        like any other qa file.
+        """
+        if v is None:
+            return v
+        version_re = re.compile(S3_VERSION_ID_PATTERN)
+        for name, version in v.items():
+            if not _is_safe_attachment_basename(name):
+                raise ValueError(f"qa_version_ids key {name!r} is not a safe basename")
+            if not isinstance(version, str) or not version_re.match(version):
+                raise ValueError(f"qa_version_ids value for {name!r} is not a valid S3 VersionId")
+        return v
+
 
 class ExperimentManifestResponse(BaseModel):
     manifest: dict
@@ -233,6 +271,17 @@ class ExperimentManifestResponse(BaseModel):
     # `attachments_binary: dict[str, str]` (base64) rather than coercing.
     attachments: dict[str, str] = Field(default_factory=dict)
     resolved_attachment_version_ids: dict[str, str] = Field(default_factory=dict)
+    # PMF QA gate (contract H, v1 observe-only). SEPARATE envelope key from
+    # `attachments` (decision 4) — qa bytes are NEVER merged into attachments
+    # and the runner never materializes them under /workspace. Shape:
+    #   {"manifest": <decoded qa/manifest.json>,
+    #    "files": {basename: utf8_body},          # entrypoints (main.py/eval.md)
+    #    "resolved_qa_version_ids": {basename: s3_version_id}}
+    # Set ONLY when the experiment publishes a qa folder; omitted from the wire
+    # otherwise (decision 10) so the no-qa response is byte-identical to a
+    # pre-gate run. The route drops this key when None rather than serializing
+    # `qa: null` — see `experiment_manifest`'s JSONResponse handling.
+    qa: dict | None = None
 
 
 def get_scope_ticket() -> ScopeTicket:  # pragma: no cover
@@ -426,6 +475,88 @@ def _emit_index_drift(experiment_id: str, run_id: str, drift_kind: str, detail: 
     ])
 
 
+def _build_fetch_specs(
+    raw_keys: object,
+    *,
+    experiment_id: str,
+    run_id: str,
+    prefix: str,
+    subdir: str,
+    requested_pins: dict[str, str],
+    drift_non_list: str,
+    drift_non_string: str,
+    drift_wrong_prefix: str,
+    drift_unsafe_basename: str,
+    drift_duplicate: str,
+    count_cap_log_prefix: str,
+    count_cap_metric: str,
+    initial_specs: list[tuple[str, str, str | None]] | None = None,
+    seen: set[str] | None = None,
+) -> list[tuple[str, str, str | None]]:
+    """Build the `(basename, s3_key, version_pin)` fetch-spec list from an
+    index entry's canonical key list. Shared by the attachment-spec block
+    (subdir="attachments") and the qa-spec block (subdir="qa") so a future
+    change to the drift / safe-basename / count-cap handling lands on both
+    surfaces at once.
+
+    Behavior (identical for both subdirs):
+    - `raw_keys` not a list (and not None) → emit `drift_non_list` + treat as
+      empty (a string would otherwise iterate char-by-char into nonsense GETs).
+    - per key: non-string → `drift_non_string`; already-seen → `drift_duplicate`
+      (dedupes a key that appears more than once); wrong-prefix →
+      `drift_wrong_prefix`; unsafe basename → `drift_unsafe_basename`. Each
+      drifted key is skipped (continue).
+    - safe keys append `(basename, key, requested_pins.get(basename))`.
+    - count cap at MAX_ATTACHMENTS_PER_EXPERIMENT: log + emit `count_cap_metric`
+      + truncate.
+
+    `initial_specs` seeds the list (the qa caller pre-adds the manifest spec);
+    `seen` is the shared dedupe set (pre-seeded with the qa manifest key so a
+    qa key duplicating the manifest is caught). Both default to fresh empties.
+    """
+    specs: list[tuple[str, str, str | None]] = list(initial_specs or [])
+    seen_keys: set[str] = seen if seen is not None else set()
+
+    if raw_keys is None:
+        keys: list = []
+    elif isinstance(raw_keys, list):
+        keys = raw_keys
+    else:
+        _emit_index_drift(experiment_id, run_id, drift_non_list, f"type={type(raw_keys).__name__}")
+        keys = []
+
+    for k in keys:
+        if not isinstance(k, str):
+            _emit_index_drift(experiment_id, run_id, drift_non_string, f"type={type(k).__name__}")
+            continue
+        if k in seen_keys:
+            _emit_index_drift(experiment_id, run_id, drift_duplicate, f"key={k}")
+            continue
+        if not k.startswith(prefix):
+            _emit_index_drift(experiment_id, run_id, drift_wrong_prefix, f"key={k}")
+            continue
+        basename = k[len(prefix):]
+        if not _is_safe_attachment_basename(basename):
+            _emit_index_drift(experiment_id, run_id, drift_unsafe_basename, f"basename={basename!r}")
+            continue
+        seen_keys.add(k)
+        specs.append((basename, k, requested_pins.get(basename)))
+
+    if len(specs) > MAX_ATTACHMENTS_PER_EXPERIMENT:
+        logger.error(
+            "%s experiment_id=%s run_id=%s declared=%d cap=%d",
+            count_cap_log_prefix, experiment_id, run_id,
+            len(specs), MAX_ATTACHMENTS_PER_EXPERIMENT,
+        )
+        _emit_metric(count_cap_metric, [
+            {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+            {"Name": "experiment_id", "Value": experiment_id},
+        ])
+        specs = specs[:MAX_ATTACHMENTS_PER_EXPERIMENT]
+
+    return specs
+
+
 @router.post("/manifest", response_model=ExperimentManifestResponse)
 def experiment_manifest(
     req: ExperimentManifestRequest,
@@ -477,64 +608,100 @@ def experiment_manifest(
     # only those — never trust a runner-supplied basename to map into an S3
     # key. attachment_version_ids in the request acts as a per-basename pin
     # override; absent entries fall through to "latest".
-    raw = index_entry.get("attachment_keys")
-    if raw is None:
-        raw_attachment_keys: list = []
-    elif isinstance(raw, list):
-        raw_attachment_keys = raw
-    else:
-        # Drift: a string here would have iterated character-by-character
-        # in the old code, producing nonsense S3 GETs per character.
-        _emit_index_drift(
-            ticket.experiment_id, ticket.run_id,
-            "non_list_attachment_keys", f"type={type(raw).__name__}",
-        )
-        raw_attachment_keys = []
+    # Build the attachment fetch specs via the shared spec-builder (it reads
+    # the canonical key list, emits drift on non-list / non-string / wrong-
+    # prefix / unsafe-basename, appends safe specs, and applies the count cap).
+    # attachment_version_ids in the request acts as a per-basename pin override;
+    # absent entries fall through to "latest".
+    attachment_specs = _build_fetch_specs(
+        index_entry.get("attachment_keys"),
+        experiment_id=ticket.experiment_id,
+        run_id=ticket.run_id,
+        prefix=f"{ticket.experiment_id}/attachments/",
+        subdir="attachments",
+        requested_pins=req.attachment_version_ids or {},
+        drift_non_list="non_list_attachment_keys",
+        drift_non_string="non_string_key",
+        drift_wrong_prefix="wrong_prefix",
+        drift_unsafe_basename="unsafe_basename",
+        drift_duplicate="duplicate_attachment_key",
+        count_cap_log_prefix="attachment_count_exceeded",
+        count_cap_metric="broker_attachment_count_exceeded",
+    )
 
-    attachment_specs: list[tuple[str, str, str | None]] = []  # (basename, s3_key, version_id)
-    requested_version_pins = req.attachment_version_ids or {}
-    prefix = f"{ticket.experiment_id}/attachments/"
-    for ak in raw_attachment_keys:
-        if not isinstance(ak, str):
+    # PMF QA gate (contract H): build the qa fetch specs the SAME way as
+    # attachments — read the canonical key list from the index entry
+    # (qa_manifest_key + qa_keys, contract F), never trust a runner basename,
+    # apply the same prefix / safe-basename / drift-emit / count-cap guards,
+    # and pin per-basename via the request's qa_version_ids. The qa folder is
+    # present iff the index entry carries `qa_manifest_key`; qa_keys excludes
+    # manifest.json (carried separately) and the dispatch version-pinner
+    # dedupes any overlap. `has_qa_folder` decides whether the response carries
+    # a `qa` envelope at all (decision 10: no qa folder = byte-identical no-qa).
+    qa_manifest_key_raw = index_entry.get("qa_manifest_key")
+    # Narrow to a real str up front so the prefix/slice ops below type-check
+    # (index_entry.get returns Any | None). A non-str / empty value = no qa.
+    qa_manifest_key: str | None = (
+        qa_manifest_key_raw
+        if isinstance(qa_manifest_key_raw, str) and qa_manifest_key_raw
+        else None
+    )
+    has_qa_folder = qa_manifest_key is not None
+    qa_specs: list[tuple[str, str, str | None]] = []  # (basename, s3_key, version_id)
+    qa_manifest_basename: str | None = None  # which qa basename is the manifest
+    qa_prefix = f"{ticket.experiment_id}/qa/"
+    requested_qa_pins = req.qa_version_ids or {}
+    # Mirror the loader's seen-set so a qa key that appears in BOTH
+    # qa_manifest_key and qa_keys (publisher bug / manual S3 edit — qa_keys is
+    # supposed to EXCLUDE manifest.json, contract F) is fetched exactly once.
+    seen_qa_keys: set[str] = set()
+    if qa_manifest_key is not None:
+        # The manifest is always the first qa spec. It must live under the
+        # qa prefix; a hand-edited index that points it elsewhere is drift.
+        if qa_manifest_key.startswith(qa_prefix):
+            man_basename = qa_manifest_key[len(qa_prefix):]
+            if _is_safe_attachment_basename(man_basename):
+                qa_manifest_basename = man_basename
+                qa_specs.append(
+                    (man_basename, qa_manifest_key, requested_qa_pins.get(man_basename))
+                )
+                seen_qa_keys.add(qa_manifest_key)
+            else:
+                _emit_index_drift(
+                    ticket.experiment_id, ticket.run_id,
+                    "qa_unsafe_basename", f"basename={man_basename!r}",
+                )
+                has_qa_folder = False
+        else:
             _emit_index_drift(
                 ticket.experiment_id, ticket.run_id,
-                "non_string_key", f"type={type(ak).__name__}",
+                "qa_wrong_prefix", f"key={qa_manifest_key}",
             )
-            continue
-        # ak must be "<experiment_id>/attachments/<basename>". The publisher
-        # enforces this shape; this is defense-in-depth against a malformed
-        # index.json. Skip anything that doesn't match.
-        if not ak.startswith(prefix):
-            _emit_index_drift(
-                ticket.experiment_id, ticket.run_id,
-                "wrong_prefix", f"key={ak}",
-            )
-            continue
-        basename = ak[len(prefix):]
-        # Use the unified safe-basename rule — same check the request
-        # validator applies. Keeps the two surfaces in sync.
-        if not _is_safe_attachment_basename(basename):
-            _emit_index_drift(
-                ticket.experiment_id, ticket.run_id,
-                "unsafe_basename", f"basename={basename!r}",
-            )
-            continue
-        attachment_specs.append((basename, ak, requested_version_pins.get(basename)))
+            has_qa_folder = False
 
-    # Cap attachment count per experiment. A malformed index with thousands
-    # of keys would otherwise spawn thousands of futures on the shared
-    # executor. Truncate + alert; never silently grow.
-    if len(attachment_specs) > MAX_ATTACHMENTS_PER_EXPERIMENT:
-        logger.error(
-            "attachment_count_exceeded experiment_id=%s run_id=%s declared=%d cap=%d",
-            ticket.experiment_id, ticket.run_id,
-            len(attachment_specs), MAX_ATTACHMENTS_PER_EXPERIMENT,
+    if has_qa_folder:
+        # Build the qa entrypoint specs via the SAME shared spec-builder as
+        # attachments. The manifest spec is seeded via initial_specs (handled
+        # above with its has_qa_folder side-effects), and seen_qa_keys is
+        # pre-seeded with the manifest key so a qa_keys entry duplicating it is
+        # caught as drift and deduped (contract F: qa_keys excludes manifest).
+        qa_specs = _build_fetch_specs(
+            index_entry.get("qa_keys"),
+            experiment_id=ticket.experiment_id,
+            run_id=ticket.run_id,
+            prefix=qa_prefix,
+            subdir="qa",
+            requested_pins=requested_qa_pins,
+            drift_non_list="non_list_qa_keys",
+            drift_non_string="qa_non_string_key",
+            drift_wrong_prefix="qa_wrong_prefix",
+            drift_unsafe_basename="qa_unsafe_basename",
+            drift_duplicate="qa_duplicate_key",
+            count_cap_log_prefix="qa_file_count_exceeded",
+            count_cap_metric="broker_qa_file_count_exceeded",
+            initial_specs=qa_specs,
+            seen=seen_qa_keys,
         )
-        _emit_metric("broker_attachment_count_exceeded", [
-            {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
-            {"Name": "experiment_id", "Value": ticket.experiment_id},
-        ])
-        attachment_specs = attachment_specs[:MAX_ATTACHMENTS_PER_EXPERIMENT]
 
     # Parallelize manifest + instruction + every attachment GET via the
     # shared, bounded fetch executor. Replaces per-request executors
@@ -563,11 +730,26 @@ def experiment_manifest(
         )
         for basename, s3_key, version_id in attachment_specs
     ]
+    qa_futures = [
+        (
+            basename,
+            ex.submit(
+                _fetch_object_cached,
+                s3_client, bucket, s3_key, ticket.run_id, version_id,
+                "qa", MAX_QA_BYTES,
+            ),
+        )
+        for basename, s3_key, version_id in qa_specs
+    ]
     manifest_bytes, manifest_resolved_version = fut_m.result()
     instruction_bytes, instruction_resolved_version = fut_i.result()
     attachment_results: list[tuple[str, bytes, str | None]] = [
         (basename, *fut.result())
         for basename, fut in attachment_futures
+    ]
+    qa_results: list[tuple[str, bytes, str | None]] = [
+        (basename, *fut.result())
+        for basename, fut in qa_futures
     ]
 
     try:
@@ -625,11 +807,88 @@ def experiment_manifest(
         if resolved_version is not None:
             resolved_attachment_versions[basename] = resolved_version
 
-    return ExperimentManifestResponse(
+    # PMF QA gate (contract H): assemble the qa envelope. utf-8-decode every
+    # qa object (binary qa files are unsupported, mirroring attachments — fail
+    # loud with a 500). Parse the qa manifest as JSON into `qa.manifest`; every
+    # other qa object goes into `qa.files` keyed by basename. VersionIds for
+    # every fetched qa object land in `qa.resolved_qa_version_ids` (backtest
+    # provenance, contract C). `qa` stays None when no qa folder exists so the
+    # route omits the key (byte-identical no-qa, decision 10).
+    qa_envelope: dict | None = None
+    if has_qa_folder:
+        qa_files: dict[str, str] = {}
+        qa_manifest_obj: dict = {}
+        resolved_qa_versions: dict[str, str] = {}
+        for basename, body, resolved_version in qa_results:
+            try:
+                decoded = body.decode("utf-8")
+            except UnicodeDecodeError as decode_err:
+                logger.error(
+                    "qa_decode_error errorType=qa_decode "
+                    "experiment_id=%s run_id=%s basename=%s",
+                    req.experiment_id, ticket.run_id, basename,
+                    exc_info=True,
+                )
+                _emit_metric("broker_qa_decode_error", [
+                    {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                    {"Name": "experiment_id", "Value": req.experiment_id},
+                ])
+                raise HTTPException(status_code=500, detail="qa file decode error") from decode_err
+            if basename == qa_manifest_basename:
+                try:
+                    decoded_manifest = json.loads(decoded)
+                except (json.JSONDecodeError, ValueError) as decode_err:
+                    logger.error(
+                        "qa_manifest_decode_error errorType=qa_manifest_decode "
+                        "experiment_id=%s run_id=%s basename=%s",
+                        req.experiment_id, ticket.run_id, basename,
+                        exc_info=True,
+                    )
+                    _emit_metric("broker_qa_manifest_decode_error", [
+                        {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                        {"Name": "experiment_id", "Value": req.experiment_id},
+                    ])
+                    raise HTTPException(status_code=500, detail="qa manifest decode error") from decode_err
+                # The qa manifest must be a JSON OBJECT (the engine reads a
+                # `blocking` field off it). A bare scalar/array is malformed —
+                # surface it the same way as undecodable JSON, reusing the
+                # decode metric, rather than placing a non-dict under qa.manifest.
+                if not isinstance(decoded_manifest, dict):
+                    logger.error(
+                        "qa_manifest_decode_error errorType=qa_manifest_not_object "
+                        "experiment_id=%s run_id=%s basename=%s json_type=%s",
+                        req.experiment_id, ticket.run_id, basename, type(decoded_manifest).__name__,
+                    )
+                    _emit_metric("broker_qa_manifest_decode_error", [
+                        {"Name": "Environment", "Value": os.environ.get("ENVIRONMENT", "unknown")},
+                        {"Name": "experiment_id", "Value": req.experiment_id},
+                    ])
+                    raise HTTPException(status_code=500, detail="qa manifest decode error")
+                qa_manifest_obj = decoded_manifest
+            else:
+                qa_files[basename] = decoded
+            if resolved_version is not None:
+                resolved_qa_versions[basename] = resolved_version
+        qa_envelope = {
+            "manifest": qa_manifest_obj,
+            "files": qa_files,
+            "resolved_qa_version_ids": resolved_qa_versions,
+        }
+
+    response = ExperimentManifestResponse(
         manifest=manifest,
         instruction=instruction_text,
         resolved_manifest_version_id=manifest_resolved_version,
         resolved_instruction_version_id=instruction_resolved_version,
         attachments=attachments,
         resolved_attachment_version_ids=resolved_attachment_versions,
+        qa=qa_envelope,
     )
+    # Drop the `qa` key from the wire when no qa folder ran — serializing
+    # `qa: null` would change the no-qa response shape (decision 10 requires
+    # byte-identical). All other fields serialize exactly as before, so
+    # existing runners parse unchanged.
+    payload = response.model_dump(mode="json")
+    if qa_envelope is None:
+        payload.pop("qa", None)
+    return JSONResponse(content=payload)
