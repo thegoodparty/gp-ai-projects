@@ -9,11 +9,11 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "goodparty-terraform-state-us-west-2"
-    key            = "ddhq-matcher-fargate/dev/terraform.tfstate"
-    region         = "us-west-2"
-    dynamodb_table = "terraform-state-lock"
-    encrypt        = true
+    bucket       = "goodparty-terraform-state-us-west-2"
+    key          = "ddhq-matcher-fargate/dev/terraform.tfstate"
+    region       = "us-west-2"
+    use_lockfile = true
+    encrypt      = true
   }
 }
 
