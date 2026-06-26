@@ -23,28 +23,30 @@ except (ImportError, OSError):
 
 try:
     from .broker_client import BrokerClient, BrokerError
-    from .scope_derivation import derive_scope
     from .jsonschema_errors import format_validation_errors
     from .manifest_loader import (
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from .scope_derivation import derive_scope
 except ImportError:
     from broker_client import BrokerClient, BrokerError
-    from scope_derivation import derive_scope  # type: ignore[no-redef]
     from jsonschema_errors import format_validation_errors  # type: ignore[no-redef]
     from manifest_loader import (  # type: ignore[no-redef]
-        ManifestRoutingLoader,
         ManifestLoaderError,
         ManifestLoaderMalformedError,
         ManifestLoaderTransientError,
+        ManifestRoutingLoader,
     )
+    from scope_derivation import derive_scope  # type: ignore[no-redef]
 
 _ecs_client = None
 _sqs_client = None
 _cw_client = None
+_secrets_client = None
+_service_token: str | None = None
 _manifest_loader: ManifestRoutingLoader | None = None
 _broker_client: BrokerClient | None = None
 _validator_cache: dict[str, Draft7Validator] = {}
@@ -62,13 +64,38 @@ def _is_write_action(experiment: dict) -> bool:
     return any(experiment.get(f) is not None for f in _WRITE_ACTION_DISCRIMINATORS)
 
 
+def _get_secrets_client():
+    global _secrets_client
+    if _secrets_client is None:
+        _secrets_client = boto3.client("secretsmanager")
+    return _secrets_client
+
+
+def get_service_token() -> str:
+    """Fetch the broker service token from Secrets Manager, cached per warm
+    container. Reading at runtime keeps the secret out of Terraform state and
+    out of lambda:GetFunctionConfiguration, unlike a plaintext env var. A
+    fetch failure propagates so the launch/mint path treats it as transient."""
+    global _service_token
+    if _service_token is None:
+        resp = _get_secrets_client().get_secret_value(SecretId=SERVICE_TOKENS_SECRET_ARN)
+        _service_token = json.loads(resp["SecretString"])["SERVICE_TOKEN"]
+    return _service_token
+
+
+def reset_service_token_for_tests() -> None:
+    global _service_token, _secrets_client
+    _service_token = None
+    _secrets_client = None
+
+
 def get_broker_client() -> BrokerClient:
     """Process-cached BrokerClient. Safe across threads — BrokerClient holds
     only the URL + service token; httpx is invoked at module-level per call.
     """
     global _broker_client
     if _broker_client is None:
-        _broker_client = BrokerClient(BROKER_URL, SERVICE_TOKEN)
+        _broker_client = BrokerClient(BROKER_URL, get_service_token())
     return _broker_client
 
 
@@ -182,6 +209,27 @@ def get_ecs_client():
     return _ecs_client
 
 
+JOB_TABLE_NAME = os.environ.get("JOB_TABLE_NAME", "")
+
+_job_store = None
+
+
+def get_job_store():
+    global _job_store
+    if _job_store is None:
+        try:
+            from .job_store import JobStore  # local import keeps cold-start lean
+        except ImportError:
+            from job_store import JobStore  # type: ignore[no-redef]
+        _job_store = JobStore(JOB_TABLE_NAME)
+    return _job_store
+
+
+def reset_job_store_for_tests() -> None:
+    global _job_store
+    _job_store = None
+
+
 def get_sqs_client():
     global _sqs_client
     if _sqs_client is None:
@@ -288,7 +336,7 @@ ECS_SUBNET_IDS = [s for s in os.environ.get("ECS_SUBNET_IDS", "").split(",") if 
 ECS_SECURITY_GROUP_ID = os.environ.get("ECS_SECURITY_GROUP_ID", "")
 RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
 BROKER_URL = os.environ.get("BROKER_URL", "")
-SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+SERVICE_TOKENS_SECRET_ARN = os.environ.get("SERVICE_TOKENS_SECRET_ARN", "")
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "pmf-engine")
 
 
@@ -306,10 +354,12 @@ def _missing_critical_config() -> list[str]:
         missing.append("RESULTS_QUEUE_URL")
     if not BROKER_URL:
         missing.append("BROKER_URL")
-    if not SERVICE_TOKEN:
-        missing.append("SERVICE_TOKEN")
+    if not SERVICE_TOKENS_SECRET_ARN:
+        missing.append("SERVICE_TOKENS_SECRET_ARN")
     if not os.environ.get("EXPERIMENT_METADATA_BUCKET", "").strip():
         missing.append("EXPERIMENT_METADATA_BUCKET")
+    if not JOB_TABLE_NAME:
+        missing.append("JOB_TABLE_NAME")
     # ENVIRONMENT drives the expected `_input_files` bucket name. Without it,
     # _validate_input_files raises ValueError on any dispatch carrying user
     # uploads — surface the misconfig via the standard
@@ -407,9 +457,7 @@ def _validate_input_files(value) -> None:
             raise ValueError(f"_input_files[{i}] missing required keys: {sorted(missing)}")
         bucket, key, dest = entry["bucket"], entry["key"], entry["dest"]
         if not isinstance(bucket, str) or bucket != expected_bucket:
-            raise ValueError(
-                f"_input_files[{i}].bucket must be {expected_bucket!r}: got {bucket!r}"
-            )
+            raise ValueError(f"_input_files[{i}].bucket must be {expected_bucket!r}: got {bucket!r}")
         if not isinstance(key, str) or not (0 < len(key) <= 1024):
             raise ValueError(f"_input_files[{i}].key must be a 1-1024 char string: got {key!r}")
         if not isinstance(dest, str) or not _INPUT_FILE_DEST_RE.fullmatch(dest):
@@ -431,7 +479,7 @@ def parse_dispatch_message(body: str) -> dict:
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, TypeError) as e:
-        raise ValueError(f"Invalid message body: {e}")
+        raise ValueError(f"Invalid message body: {e}") from e
 
     for field in ("experiment_type", "organization_slug", "run_id"):
         if not data.get(field):
@@ -449,6 +497,11 @@ def parse_dispatch_message(body: str) -> dict:
     if "clerk_user_id" in data and data["clerk_user_id"] is not None and not isinstance(data["clerk_user_id"], str):
         raise ValueError("clerk_user_id must be a string when provided")
 
+    priority = data.get("priority", "DEFAULT")
+    if priority not in ("HIGH", "DEFAULT"):
+        raise ValueError("priority must be 'HIGH' or 'DEFAULT'")
+    data["priority"] = priority
+
     if data.get("params") is None:
         data["params"] = {}
 
@@ -460,10 +513,7 @@ def parse_dispatch_message(body: str) -> dict:
     # so we just skip stripping when params isn't a dict.
     if isinstance(data["params"], dict):
         unknown_envelope_keys = [
-            k for k in data["params"]
-            if isinstance(k, str)
-            and k.startswith("_")
-            and k not in _RESERVED_ENVELOPE_KEYS
+            k for k in data["params"] if isinstance(k, str) and k.startswith("_") and k not in _RESERVED_ENVELOPE_KEYS
         ]
         if unknown_envelope_keys:
             raise ValueError(
@@ -538,6 +588,18 @@ def build_container_overrides(
                 "value": json.dumps(experiment["attachment_version_ids"], sort_keys=True),
             }
         )
+    # QA gate version pins (contract G). Mirrors ATTACHMENT_VERSION_IDS exactly:
+    # {basename: VersionId}, sort_keys for byte-deterministic output. Skip when
+    # empty/absent — on an unversioned bucket every pin is None so the map is
+    # empty, the env var is omitted, and the runner fetches qa 'latest'. This
+    # keeps the no-qa containerOverrides byte-identical to a pre-gate dispatch.
+    if experiment.get("qa_version_ids"):
+        env.append(
+            {
+                "name": "QA_VERSION_IDS",
+                "value": json.dumps(experiment["qa_version_ids"], sort_keys=True),
+            }
+        )
     # When the dispatch carries enumerated input-file refs (e.g. user-uploaded
     # agenda PDFs), the runner pre-fetches each via the broker's /inputs/read
     # endpoint before invoking the agent. Refs travel as a JSON-encoded env var
@@ -556,6 +618,115 @@ def build_container_overrides(
     # above) and reads them directly. Duplicating them here would create a
     # second source of truth and risk env-var size limits for system_prompt.
     return {"containerOverrides": [{"name": container_name, "environment": env}]}
+
+
+def launch_run(
+    *,
+    experiment: dict,
+    message: dict,
+    scope: dict,
+    params_json: str,
+) -> dict:
+    """Mint a broker token and launch the Fargate task. Returns
+    {"status": "launched", "task_arn": ...} on success, or
+    {"status": "failed", "error": <user-safe>} when the run could not be
+    launched (broker rejection, ECS RunTask failure). Raises on transient
+    errors the caller should retry (httpx during mint, ECS RunTask exception).
+    """
+    experiment_id = message["experiment_type"]
+    prior_artifact_versions = message.get("prior_artifact_versions")
+    # User-input prefetch (develop): the scheduler threads `_input_files` from
+    # the QueuedJob into this message; mint's MintRequest field is `input_files`
+    # (no leading underscore at the API boundary).
+    input_files = message.get("_input_files")
+    try:
+        broker = get_broker_client()
+        mint_result = broker.mint_run_token(
+            run_id=message["run_id"],
+            organization_slug=message["organization_slug"],
+            experiment_id=experiment_id,
+            scope=scope,
+            params=message["params"],
+            clerk_user_id=message.get("clerk_user_id"),
+            exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
+            prior_artifact_versions=prior_artifact_versions,
+            input_files=input_files,
+        )
+    except BrokerError as e:
+        logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
+        emit_dispatch_metric("BrokerRejected", experiment_id)
+        return {"status": "failed", "error": e.user_safe_message or "Broker rejected the request"}
+    except httpx.HTTPError as e:
+        logger.warning(f"Transient network error during mint for run {message.get('run_id')}: {e}")
+        emit_dispatch_metric("MintTransient", experiment_id)
+        raise
+    except Exception as e:
+        logger.exception(f"Unexpected error during mint for run {message.get('run_id')}: {e}")
+        emit_dispatch_metric("MintUnexpected", experiment_id)
+        return {"status": "failed", "error": f"Unexpected dispatch error: {type(e).__name__}"}
+
+    overrides = build_container_overrides(
+        experiment=experiment,
+        message=message,
+        broker_token=mint_result["broker_token"],
+        broker_url=BROKER_URL,
+        container_name=CONTAINER_NAME,
+        params_json=params_json,
+    )
+
+    logger.info(
+        f"Dispatching experiment '{experiment_id}' for organization "
+        f"'{message['organization_slug']}' (run: {message['run_id']})"
+    )
+
+    minted_broker_token = mint_result["broker_token"]
+
+    try:
+        response = get_ecs_client().run_task(
+            cluster=ECS_CLUSTER_ARN,
+            taskDefinition=ECS_TASK_DEFINITION,
+            launchType="FARGATE",
+            tags=[{"key": "Project", "value": "pmf-engine"}],
+            # Tag the task with the run_id (uuid7, 36 chars — within the 36-char
+            # startedBy limit) so the stuck-LAUNCHING sweep can tell whether a
+            # LAUNCHING job has a live task before it fails the row.
+            startedBy=message["run_id"],
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": ECS_SUBNET_IDS,
+                    "securityGroups": [ECS_SECURITY_GROUP_ID],
+                    "assignPublicIp": "DISABLED",
+                }
+            },
+            overrides=overrides,
+        )
+
+        failures = response.get("failures", [])
+        tasks = response.get("tasks", [])
+
+        if failures or not tasks:
+            failure_reasons = [f.get("reason", "unknown") for f in failures]
+            logger.error(
+                f"ECS RunTask failed (experiment={experiment_id}, " f"run={message['run_id']}): {failure_reasons}"
+            )
+            _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+            safe_summary = _classify_ecs_failure_reasons(failure_reasons)
+            kind = _classify_ecs_failure_kind(failure_reasons)
+            emit_dispatch_metric(f"ECSRunTaskFailed_{kind}", experiment_id)
+            return {"status": "failed", "error": f"ECS RunTask failed: {safe_summary}"}
+
+        task_arn = tasks[0]["taskArn"]
+        logger.info(f"Started Fargate task: {task_arn}")
+        return {"status": "launched", "task_arn": task_arn}
+
+    except Exception as e:
+        logger.exception(
+            f"ECS RunTask exception (experiment={experiment_id}, "
+            f"run={message['run_id']}, exception_type={type(e).__name__}): {e}"
+        )
+        emit_dispatch_metric("ECSRunTaskException", experiment_id)
+        _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
+        raise
 
 
 def handler(event: dict, context) -> dict:
@@ -601,7 +772,31 @@ def handler(event: dict, context) -> dict:
         except ValueError as e:
             logger.error(f"Invalid message {message_id}: {e}")
             emit_dispatch_metric("InvalidDispatchPayload", "_unknown")
-            batch_item_failures.append({"itemIdentifier": message_id})
+            # gp-api creates the run row as QUEUED and its stale sweep is
+            # RUNNING-only, so a malformed message orphans that row until the
+            # slow 6h backstop. Best-effort recover run_id and notify so gp-api
+            # can fail the row now. Mirror the dispatch-misconfig callback path.
+            try:
+                partial = json.loads(body) if isinstance(body, str) else {}
+            except Exception:
+                partial = {}
+            if partial.get("run_id") and RESULTS_QUEUE_URL:
+                # Same pattern as the other permanent-fault paths: only retry the
+                # SQS message (toward the DLQ) if the callback did NOT reach gp-api.
+                # Retrying after a successful callback is pointless churn, and a
+                # later retry whose callback fails would re-orphan the QUEUED row.
+                sent = send_error_callback(
+                    partial,
+                    f"Malformed dispatch message: {e}",
+                    RESULTS_QUEUE_URL,
+                    dedup_id=f"invalid-payload-{partial['run_id']}",
+                )
+                if not sent:
+                    batch_item_failures.append({"itemIdentifier": message_id})
+            else:
+                # No run_id or no queue URL — can't notify gp-api; send to the DLQ
+                # for operator alarms.
+                batch_item_failures.append({"itemIdentifier": message_id})
             continue
 
         experiment_id = message["experiment_type"]
@@ -787,124 +982,48 @@ def handler(event: dict, context) -> dict:
             if not sent:
                 batch_item_failures.append({"itemIdentifier": message_id})
             continue
-        prior_artifact_versions = message.get("prior_artifact_versions")
-        # Reads the envelope key parse_dispatch_message extracted out of
-        # params; renamed to `input_files` here to match the broker's
-        # MintRequest field name (no leading underscore at the API boundary).
-        input_files = message.get("_input_files")
-        try:
-            broker = get_broker_client()
-            mint_result = broker.mint_run_token(
-                run_id=message["run_id"],
-                organization_slug=message["organization_slug"],
-                experiment_id=experiment_id,
-                scope=scope,
-                params=message["params"],
-                clerk_user_id=message.get("clerk_user_id"),
-                exp_ttl_seconds=experiment.get("timeout_seconds", 3600) + 300,
-                prior_artifact_versions=prior_artifact_versions,
-                input_files=input_files,
-            )
-        except BrokerError as e:
-            logger.warning(f"Broker rejected {experiment_id} (run={message['run_id']}): {e.status_code} {e.detail}")
-            emit_dispatch_metric("BrokerRejected", experiment_id)
-            sent = send_error_callback(
-                message,
-                e.user_safe_message or "Broker rejected the request",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"broker-rejected-{message['run_id']}",
-            )
-            if not sent:
-                batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-        except httpx.HTTPError as e:
-            logger.warning(f"Transient network error during mint for run {message.get('run_id')}: {e}")
-            emit_dispatch_metric("MintTransient", experiment_id)
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-        except Exception as e:
-            logger.exception(f"Unexpected error during mint for run {message.get('run_id')}: {e}")
-            emit_dispatch_metric("MintUnexpected", experiment_id)
-            send_error_callback(
-                message,
-                f"Unexpected dispatch error: {type(e).__name__}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"mint-exception-{message.get('run_id', 'unknown')}",
-            )
-            batch_item_failures.append({"itemIdentifier": message_id})
-            continue
-
-        overrides = build_container_overrides(
-            experiment=experiment,
-            message=message,
-            broker_token=mint_result["broker_token"],
-            broker_url=BROKER_URL,
-            container_name=CONTAINER_NAME,
-            params_json=params_json,
-        )
-
-        logger.info(
-            f"Dispatching experiment '{experiment_id}' for organization '{message['organization_slug']}' (run: {message['run_id']})"
-        )
-
-        minted_broker_token = mint_result["broker_token"]
+        import time as _time
 
         try:
-            response = get_ecs_client().run_task(
-                cluster=ECS_CLUSTER_ARN,
-                taskDefinition=ECS_TASK_DEFINITION,
-                launchType="FARGATE",
-                networkConfiguration={
-                    "awsvpcConfiguration": {
-                        "subnets": ECS_SUBNET_IDS,
-                        "securityGroups": [ECS_SECURITY_GROUP_ID],
-                        "assignPublicIp": "DISABLED",
-                    }
-                },
-                overrides=overrides,
+            from .job_store import QueuedJob
+        except ImportError:
+            from job_store import QueuedJob  # type: ignore[no-redef]
+
+        routing = {
+            "model": experiment["model"],
+            "timeout_seconds": experiment.get("timeout_seconds", 600),
+            "manifest_version_id": experiment.get("manifest_version_id"),
+            "instruction_version_id": experiment.get("instruction_version_id"),
+            "attachment_version_ids": experiment.get("attachment_version_ids"),
+            "scope": scope,
+        }
+        try:
+            get_job_store().put_queued_job(
+                QueuedJob(
+                    run_id=message["run_id"],
+                    experiment_type=experiment_id,
+                    organization_slug=message["organization_slug"],
+                    clerk_user_id=message.get("clerk_user_id"),
+                    priority=message["priority"],
+                    params=message["params"],
+                    routing=routing,
+                    prior_artifact_versions=message.get("prior_artifact_versions"),
+                    # User-input prefetch (develop): the broker MintRequest field
+                    # is `input_files`; the dispatch envelope carries it as
+                    # `_input_files` (extracted out of params). Persist it on the
+                    # job so the scheduler can thread it into launch_run's mint.
+                    input_files=message.get("_input_files"),
+                    created_at_ms=int(_time.time() * 1000),
+                )
             )
-
-            failures = response.get("failures", [])
-            tasks = response.get("tasks", [])
-
-            if failures or not tasks:
-                failure_reasons = [f.get("reason", "unknown") for f in failures]
-                logger.error(
-                    f"ECS RunTask failed for {message_id} "
-                    f"(experiment={experiment_id}, run={message['run_id']}): "
-                    f"{failure_reasons}"
-                )
-                _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
-                safe_summary = _classify_ecs_failure_reasons(failure_reasons)
-                kind = _classify_ecs_failure_kind(failure_reasons)
-                emit_dispatch_metric(f"ECSRunTaskFailed_{kind}", experiment_id)
-                send_error_callback(
-                    message,
-                    f"ECS RunTask failed: {safe_summary}",
-                    RESULTS_QUEUE_URL,
-                    dedup_id=f"runtask-failed-{message['run_id']}",
-                )
-                batch_item_failures.append({"itemIdentifier": message_id})
-                continue
-
-            task_arn = tasks[0]["taskArn"]
-            logger.info(f"Started Fargate task: {task_arn}")
-
         except Exception as e:
-            logger.exception(
-                f"ECS RunTask exception for {message_id} "
-                f"(experiment={experiment_id}, run={message['run_id']}, "
-                f"exception_type={type(e).__name__}): {e}"
-            )
-            emit_dispatch_metric("ECSRunTaskException", experiment_id)
-            _cleanup_minted_token(broker, minted_broker_token, message["run_id"])
-            send_error_callback(
-                message,
-                f"ECS RunTask exception: {type(e).__name__}",
-                RESULTS_QUEUE_URL,
-                dedup_id=f"runtask-exception-{message['run_id']}",
-            )
+            logger.exception(f"Failed to enqueue job for run {message['run_id']}: {e}")
+            emit_dispatch_metric("JobEnqueueFailed", experiment_id)
             batch_item_failures.append({"itemIdentifier": message_id})
+            continue
+        emit_dispatch_metric("JobEnqueued", experiment_id)
+        # Arrival is picked up by the scheduler via the table's DynamoDB stream;
+        # no explicit invoke needed here.
 
     return {"batchItemFailures": batch_item_failures}
 

@@ -80,6 +80,33 @@ def _is_draft7_object_schema(schema: object, _depth: int = 0) -> bool:
     return False
 
 
+def _parse_version_ids_env(var_name: str) -> dict[str, str] | None:
+    """Parse a ``{basename: VersionId}`` pinning env var (ATTACHMENT_VERSION_IDS
+    / QA_VERSION_IDS) the dispatch Lambda serialized (sort_keys=True for
+    byte-determinism).
+
+    Empty/whitespace == unset → None (the POST body omits the key; the broker
+    falls through to 'latest'). Malformed JSON or a non-object value raises a
+    ValueError early — before the broker call — rather than producing a
+    confusing broker-side rejection. Keys/values are coerced to str to narrow
+    types and defend against env-var tampering across the process boundary.
+
+    The two callers differ ONLY by ``var_name``; behavior and error-message
+    shape are identical, so this is the single source of truth for both."""
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid {var_name}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"{var_name} must decode to an object, got {type(parsed).__name__}"
+        )
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
 def validate_broker_url_scheme(broker_url: str, environment: str) -> None:
     """Raise BrokerUrlSchemeError if broker_url scheme is plaintext in a deployment env.
 
@@ -142,6 +169,15 @@ class RunnerConfig:
     # Extended-thinking control (manifest.runtime.max_thinking_tokens). None =
     # CLI default (thinking on); 0 = disabled; >0 = enabled with that budget.
     max_thinking_tokens: int | None = None
+    # PMF QA gate (contracts G/H). `qa_envelope` is the broker's `qa` block
+    # (manifest + entrypoint file bodies + resolved VersionIds), held in memory
+    # and handed to the gate engine — NEVER written to /workspace. None = no qa
+    # folder, so the gate does not run and the run is byte-identical to a
+    # pre-gate run. `qa_version_ids` is the QA_VERSION_IDS pin dict forwarded to
+    # the broker (mirrors attachment_version_ids); None on an unversioned
+    # (dev/local) bucket.
+    qa_envelope: dict | None = None
+    qa_version_ids: dict[str, str] | None = None
 
     @classmethod
     def from_env(cls) -> RunnerConfig:
@@ -188,6 +224,8 @@ class RunnerConfig:
         allowed_external_tools: list[str] | None = None
         max_parallel_subagents: int = 0
         max_thinking_tokens: int | None = None
+        qa_envelope: dict | None = None
+        qa_version_ids: dict[str, str] | None = None
         if experiment_id:
             # The broker is the only source for manifest+instruction. The
             # broker reads s3://agent-experiment-metadata-{env}/<id>/* and
@@ -202,30 +240,15 @@ class RunnerConfig:
                     "BROKER_URL and BROKER_TOKEN must both be set. "
                     "Local-dev runs must point at scripts/local_runtime.py."
                 )
-            # ATTACHMENT_VERSION_IDS is the per-attachment pinning dict the
-            # dispatch Lambda serialized (sort_keys=True for byte-determinism).
-            # Parsing/validating here means a malformed env value raises early
-            # — before the broker call — rather than producing a confusing
-            # broker-side rejection. Empty/whitespace string is treated the
-            # same as unset, mirroring the MANIFEST_VERSION_ID convention.
-            attachment_version_ids_raw = os.environ.get("ATTACHMENT_VERSION_IDS", "").strip()
-            attachment_version_ids: dict[str, str] | None = None
-            if attachment_version_ids_raw:
-                try:
-                    parsed_avi = json.loads(attachment_version_ids_raw)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"Invalid ATTACHMENT_VERSION_IDS: {exc}"
-                    ) from exc
-                if not isinstance(parsed_avi, dict):
-                    raise ValueError(
-                        f"ATTACHMENT_VERSION_IDS must decode to an object, "
-                        f"got {type(parsed_avi).__name__}"
-                    )
-                # Defend against env-var tampering and narrow types for the
-                # type checker — dispatch is trusted but we cross a process
-                # boundary so this is cheap insurance.
-                attachment_version_ids = {str(k): str(v) for k, v in parsed_avi.items()}
+            # Per-file pinning dicts the dispatch Lambda serialized. Both are
+            # parsed by the one helper: empty/whitespace == unset → None;
+            # malformed JSON / non-object raises early (before the broker call)
+            # with a name-parameterized message. ATTACHMENT_VERSION_IDS pins
+            # attachments; QA_VERSION_IDS pins the qa folder (contract G). On an
+            # unversioned (dev/local) bucket the env var is omitted and the
+            # broker falls through to 'latest'.
+            attachment_version_ids = _parse_version_ids_env("ATTACHMENT_VERSION_IDS")
+            qa_version_ids = _parse_version_ids_env("QA_VERSION_IDS")
 
             from pmf_engine.runner.manifest_loader import load_from_broker
             envelope = load_from_broker(
@@ -235,10 +258,16 @@ class RunnerConfig:
                 manifest_version_id=os.environ.get("MANIFEST_VERSION_ID", "").strip() or None,
                 instruction_version_id=os.environ.get("INSTRUCTION_VERSION_ID", "").strip() or None,
                 attachment_version_ids=attachment_version_ids,
+                qa_version_ids=qa_version_ids,
             )
             manifest = envelope["manifest"]
             instruction = envelope["instruction"]
             attachments = dict(envelope.get("attachments") or {})
+            # QA-gate envelope (contract H). Projected straight onto the config
+            # field the runner hands to the gate engine — deliberately NOT
+            # merged into `attachments`, so it never rides the /workspace write
+            # loop. None when the experiment publishes no qa folder.
+            qa_envelope = envelope.get("qa")
             model = manifest.get("model", model)
             max_turns = manifest.get("max_turns", max_turns)
             timeout_seconds = manifest.get("timeout_seconds", timeout_seconds)
@@ -294,4 +323,6 @@ class RunnerConfig:
             allowed_external_tools=allowed_external_tools,
             max_parallel_subagents=max_parallel_subagents,
             max_thinking_tokens=max_thinking_tokens,
+            qa_envelope=qa_envelope,
+            qa_version_ids=qa_version_ids,
         )

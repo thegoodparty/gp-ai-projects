@@ -39,6 +39,13 @@ class ManifestEnvelope(TypedDict):
     # cross-check what the runner saw against what dispatch HEADed at routing
     # time. Older brokers (or experiments with no attachments) omit this key.
     resolved_attachment_version_ids: NotRequired[dict[str, str]]
+    # QA-gate folder envelope (PMF QA gate, contract H). Served under a SEPARATE
+    # key from `attachments` and held in memory only — the runner NEVER writes
+    # these bytes into /workspace (the gate's private dir is the only place they
+    # touch disk). Shape: {"manifest": {...}, "files": {basename: body},
+    # "resolved_qa_version_ids": {basename: version_id}}. Absent when the
+    # experiment publishes no qa folder, or on a pre-gate broker.
+    qa: NotRequired[dict]
 
 
 class ManifestLoadError(RuntimeError):
@@ -108,6 +115,69 @@ def _validate_write_action_fields(manifest: dict) -> None:
             )
 
 
+def _require_str_str_map(raw: object, label: str) -> dict[str, str]:
+    """Validate that ``raw`` is a ``{str: str}`` object and return a coerced
+    copy, or raise ``ManifestLoadError`` naming ``label``.
+
+    Shared by the two basename→version_id maps the broker echoes back
+    (``resolved_attachment_version_ids`` and ``qa.resolved_qa_version_ids``);
+    both had byte-identical validation differing only by the label string."""
+    if not isinstance(raw, dict):
+        raise ManifestLoadError(f"{label} must be an object (basename → version_id)")
+    out: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise ManifestLoadError(
+                f"{label}['{name}'] must map a string basename to a string version_id"
+            )
+        out[name] = value
+    return out
+
+
+def _validate_qa_envelope(raw_qa: object) -> dict | None:
+    """Validate the optional `qa` envelope key (contract H) and return it, or
+    None when absent.
+
+    Shape: ``{"manifest": dict, "files": {basename: body},
+    "resolved_qa_version_ids": {basename: version_id}}``. Validated for shape
+    only — the gate engine applies the qa meta-schema and execution semantics.
+    A malformed envelope rejects loudly here rather than letting garbage reach
+    the gate. The bytes are held in memory by the caller and never written to
+    disk in the runner."""
+    if raw_qa is None:
+        return None
+    if not isinstance(raw_qa, dict):
+        raise ManifestLoadError("envelope.qa must be an object")
+
+    manifest = raw_qa.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ManifestLoadError("envelope.qa.manifest must be an object")
+
+    raw_files = raw_qa.get("files")
+    if raw_files is None:
+        raw_files = {}
+    if not isinstance(raw_files, dict):
+        raise ManifestLoadError("envelope.qa.files must be an object (basename → body)")
+    files: dict[str, str] = {}
+    for name, body in raw_files.items():
+        if not isinstance(name, str) or not isinstance(body, str):
+            raise ManifestLoadError(
+                f"envelope.qa.files['{name}'] must map a string basename to a string body"
+            )
+        files[name] = body
+
+    raw_resolved = raw_qa.get("resolved_qa_version_ids")
+    if raw_resolved is None:
+        raw_resolved = {}
+    resolved = _require_str_str_map(raw_resolved, "envelope.qa.resolved_qa_version_ids")
+
+    return {
+        "manifest": manifest,
+        "files": files,
+        "resolved_qa_version_ids": resolved,
+    }
+
+
 def load_from_broker(
     experiment_id: str,
     broker_url: str,
@@ -115,6 +185,8 @@ def load_from_broker(
     manifest_version_id: str | None = None,
     instruction_version_id: str | None = None,
     attachment_version_ids: dict[str, str] | None = None,
+    qa_version_ids: dict[str, str] | None = None,
+    *,
     timeout_seconds: float = 30.0,
     client: httpx.Client | None = None,
 ) -> ManifestEnvelope:
@@ -150,6 +222,8 @@ def load_from_broker(
         request_body["instruction_version_id"] = instruction_version_id
     if attachment_version_ids:
         request_body["attachment_version_ids"] = attachment_version_ids
+    if qa_version_ids:
+        request_body["qa_version_ids"] = qa_version_ids
 
     try:
         try:
@@ -228,19 +302,15 @@ def load_from_broker(
         raw_resolved = envelope.get("resolved_attachment_version_ids")
         resolved_attachment_version_ids: dict[str, str] | None = None
         if raw_resolved is not None:
-            if not isinstance(raw_resolved, dict):
-                raise ManifestLoadError(
-                    "envelope.resolved_attachment_version_ids must be an object "
-                    "(basename → version_id)"
-                )
-            resolved_attachment_version_ids = {}
-            for name, vid in raw_resolved.items():
-                if not isinstance(name, str) or not isinstance(vid, str):
-                    raise ManifestLoadError(
-                        f"envelope.resolved_attachment_version_ids['{name}'] must map "
-                        f"a string basename to a string version_id"
-                    )
-                resolved_attachment_version_ids[name] = vid
+            resolved_attachment_version_ids = _require_str_str_map(
+                raw_resolved, "envelope.resolved_attachment_version_ids"
+            )
+
+        # QA-gate envelope (contract H). Optional, separate from attachments,
+        # validated for shape but HELD IN MEMORY — never written to disk here.
+        # The gate engine is the only consumer; the gate's private dir is the
+        # only place these bytes land on a filesystem.
+        qa = _validate_qa_envelope(envelope.get("qa"))
 
         result: ManifestEnvelope = {
             "manifest": manifest,
@@ -249,6 +319,8 @@ def load_from_broker(
         }
         if resolved_attachment_version_ids is not None:
             result["resolved_attachment_version_ids"] = resolved_attachment_version_ids
+        if qa is not None:
+            result["qa"] = qa
         return result
     finally:
         if owns_client and client is not None:

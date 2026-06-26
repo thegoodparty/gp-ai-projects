@@ -20,6 +20,12 @@ terraform {
 
 provider "aws" {
   region = "us-west-2"
+
+  default_tags {
+    tags = {
+      Project = "campaign-plan"
+    }
+  }
 }
 
 data "terraform_remote_state" "shared_slack_notifier" {

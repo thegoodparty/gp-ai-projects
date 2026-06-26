@@ -12,7 +12,7 @@ import pytest
 
 from pmf_engine.runner.config import RunnerConfig
 from pmf_engine.runner.harness.base import HarnessResult
-from pmf_engine.runner.main import run_experiment, get_harness, main
+from pmf_engine.runner.main import get_harness, main, run_experiment
 
 
 class Clock:
@@ -81,8 +81,9 @@ class TestUploadLogsObservability:
         BufferingHandler to the specific logger instead.
         """
         import logging
-        from pmf_engine.runner.main import _upload_logs
+
         import pmf_engine.runner.main as _main_mod
+        from pmf_engine.runner.main import _upload_logs
 
         workspace = tmp_path
         (workspace / "conversation.jsonl").write_text('{"type":"assistant"}\n')
@@ -554,6 +555,7 @@ async def test_attachment_safety_violation_log_includes_error_type(tmp_path):
     structured log with errorType=reserved_basename so ops can grep
     CloudWatch for the specific cause without parsing free-form messages."""
     import logging
+
     import pmf_engine.runner.main as _main_mod
 
     config = _make_config(
@@ -713,9 +715,15 @@ async def test_main_sends_failed_status_on_timeout():
                 with patch("pmf_engine.runner.main.init_config"):
                     with patch("pmf_engine.runner.main.publish") as mock_publish:
                         with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
-                            with pytest.raises(SystemExit):
-                                await main()
+                            # Timeout path hard-exits (os._exit) so the non-daemon
+                            # qa-gate worker thread can't hold the ECS slot. Patch
+                            # _hard_exit so the path is observable, and guard the
+                            # real os._exit so it never kills the test process.
+                            with patch("pmf_engine.runner.main.os._exit"):
+                                with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                    await main()
 
+    mock_hard_exit.assert_called_once_with(1)
     status_calls = [c for c in mock_publish.report_status.call_args_list]
     statuses = [c[0][0] for c in status_calls]
     assert "failed" in statuses
@@ -725,6 +733,60 @@ async def test_main_sends_failed_status_on_timeout():
     # signal.
     assert failed_call[1]["reason_code"] == "Timeout"
     assert "timed out" in failed_call[1]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_main_hard_exits_on_timeout_after_side_effects():
+    """Operational blocker: run_qa_gate runs in a non-daemon asyncio.to_thread
+    worker that cannot be cancelled. On a timeout, sys.exit would join that
+    thread at interpreter shutdown and hold the ECS task slot for up to
+    ~bridge_timeout (~450s). The timeout path must instead call _hard_exit(1)
+    (os._exit) to terminate the process immediately. The required side effects
+    — the terminal failed-callback and the log upload — must already have run
+    by the time we hard-exit."""
+    config = _make_config(instruction="Do stuff", timeout_seconds=1)
+
+    async def slow_run(*args, **kwargs):
+        await asyncio.sleep(10)
+
+    call_order: list[str] = []
+
+    def track_report(*args, **kwargs):
+        call_order.append("report")
+
+    def track_upload(*args, **kwargs):
+        call_order.append("upload")
+
+    def track_hard_exit(code):
+        call_order.append(f"hard_exit:{code}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"WORKSPACE_DIR": tmpdir}):
+            with patch("pmf_engine.runner.main.RunnerConfig.from_env", return_value=config):
+                with patch("pmf_engine.runner.main.init_config"):
+                    with patch("pmf_engine.runner.main.publish"):
+                        with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
+                            with patch("pmf_engine.runner.main._upload_logs", side_effect=track_upload):
+                                with patch(
+                                    "pmf_engine.runner.main._report_failed_or_fallback",
+                                    side_effect=track_report,
+                                ):
+                                    # Guard: never let the real os._exit kill the test process,
+                                    # even if the fix is wrong and calls it directly.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch(
+                                            "pmf_engine.runner.main._hard_exit",
+                                            side_effect=track_hard_exit,
+                                        ) as mock_hard_exit:
+                                            await main()
+
+    mock_hard_exit.assert_called_once_with(1)
+    # The terminal callback and log upload must both run BEFORE the hard exit.
+    assert "report" in call_order
+    assert "upload" in call_order
+    assert call_order[-1] == "hard_exit:1"
+    assert call_order.index("report") < call_order.index("hard_exit:1")
+    assert call_order.index("upload") < call_order.index("hard_exit:1")
 
 
 @pytest.mark.asyncio
@@ -933,11 +995,24 @@ async def test_main_sends_failed_status_on_signal():
                 with patch("pmf_engine.runner.main.init_config"):
                     with patch("pmf_engine.runner.main.publish") as mock_publish:
                         with patch("pmf_engine.runner.main.run_experiment", side_effect=interrupted_run):
-                            with pytest.raises(SystemExit):
-                                await main()
+                            # Signal path hard-exits (os._exit) so the non-daemon
+                            # qa-gate worker thread can't hold the ECS slot. Patch
+                            # _hard_exit so the path is observable, and guard the
+                            # real os._exit so it never kills the test process.
+                            with patch("pmf_engine.runner.main.os._exit"):
+                                with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                    # In production _hard_exit -> os._exit never
+                                    # returns; the mock does, so the original
+                                    # exception re-raises out of the handler's
+                                    # trailing `raise`. Tolerate that here — the
+                                    # contract under test is that _hard_exit(1)
+                                    # was reached on the signal path.
+                                    with pytest.raises(Exception, match="interrupted"):
+                                        await main()
 
     main_module._shutdown_requested = False
 
+    mock_hard_exit.assert_called_once_with(1)
     status_calls = [c[0][0] for c in mock_publish.report_status.call_args_list]
     assert "failed" in status_calls
     failed_call = next(c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed")
@@ -1247,9 +1322,13 @@ class TestMainErrorPaths:
                         with patch("pmf_engine.runner.main.publish") as mock_publish:
                             with patch("pmf_engine.runner.main.run_experiment", side_effect=slow_run):
                                 with patch("pmf_engine.runner.main._upload_logs") as mock_upload:
-                                    with pytest.raises(SystemExit):
-                                        await main()
+                                    # Timeout path hard-exits; patch _hard_exit so the
+                                    # path is observable and guard the real os._exit.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch("pmf_engine.runner.main._hard_exit") as mock_hard_exit:
+                                            await main()
 
+        mock_hard_exit.assert_called_once_with(1)
         mock_upload.assert_called_once()
         failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
         assert len(failed_calls) >= 1
@@ -1468,8 +1547,9 @@ class TestCallbackLifecycleFix:
 
     @pytest.mark.asyncio
     async def test_sigterm_handler_cancels_current_task(self):
-        import pmf_engine.runner.main as main_module
         import signal as signal_module
+
+        import pmf_engine.runner.main as main_module
 
         main_module._shutdown_requested = False
 
@@ -1515,8 +1595,9 @@ class TestCallbackLifecycleFix:
 
         async def cancel_soon():
             await asyncio.sleep(0.05)
-            import pmf_engine.runner.main as main_module
             import signal as signal_module
+
+            import pmf_engine.runner.main as main_module
             main_module._handle_signal(signal_module.SIGTERM)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1526,14 +1607,21 @@ class TestCallbackLifecycleFix:
                         with patch("pmf_engine.runner.main.publish") as mock_publish:
                             with patch("pmf_engine.runner.main.run_experiment", side_effect=long_running):
                                 with patch("pmf_engine.runner.main._upload_logs"):
-                                    canceller = asyncio.ensure_future(cancel_soon())
-                                    with pytest.raises(SystemExit):
-                                        await main()
-                                    try:
-                                        await canceller
-                                    except Exception:
-                                        pass
+                                    # CancelledError (signal) path hard-exits; patch
+                                    # _hard_exit so the path is observable and guard
+                                    # the real os._exit so it never kills the test.
+                                    with patch("pmf_engine.runner.main.os._exit"):
+                                        with patch(
+                                            "pmf_engine.runner.main._hard_exit"
+                                        ) as mock_hard_exit:
+                                            canceller = asyncio.ensure_future(cancel_soon())
+                                            await main()
+                                            try:
+                                                await canceller
+                                            except Exception:
+                                                pass
 
+        mock_hard_exit.assert_called_once_with(1)
         assert cancelled_from_inside, "run_experiment task was not actually cancelled"
         failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
         assert len(failed_calls) >= 1
@@ -1757,8 +1845,8 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
 
     def test_credentials_json_excluded_despite_json_allowlist(self, tmp_path):
         from pmf_engine.runner.main import (
-            _collect_workspace_files,
             _SAFE_TMP_EXTENSIONS,
+            _collect_workspace_files,
         )
 
         (tmp_path / "credentials.json").write_text('{"api_key": "secret"}')
@@ -1778,8 +1866,8 @@ class TestCollectWorkspaceFilesSensitiveWithAllowedExtensions:
 
     def test_env_pattern_excluded_despite_yaml_allowlist(self, tmp_path):
         from pmf_engine.runner.main import (
-            _collect_workspace_files,
             _SAFE_TMP_EXTENSIONS,
+            _collect_workspace_files,
         )
 
         (tmp_path / "config.env.yaml").write_text("key: value\n")
@@ -2282,6 +2370,7 @@ class TestBearerTokenRedaction:
         diffing / cwltail-style tools that consume the redacted file still
         work."""
         import json as _json
+
         from pmf_engine.runner.main import _redact_line
 
         original = '{"event": "session_start", "headers": {"Authorization": "Bearer tok-12345678"}}'
@@ -2355,6 +2444,7 @@ class TestBrokerTokenRedaction:
         """The substitution must leave surrounding JSON parseable — the
         value's closing `"` is outside the captured token, so it stays."""
         import json as _json
+
         from pmf_engine.runner.main import _redact_line
 
         original = (
@@ -2367,3 +2457,842 @@ class TestBrokerTokenRedaction:
         assert parsed["event"] == "session_start"
         assert "tok-broker-abc-12345" not in parsed["headers"]["X-Broker-Token"]
 
+
+
+
+# ---------------------------------------------------------------------------
+# PMF QA gate hook (v1 DETERMINISTIC-ONLY, OBSERVE-ONLY). The gate runs in
+# run_experiment's success path, BETWEEN _upload_logs and the success span.log.
+# The verdict ALWAYS rides the publish path — never quarantine, never a failure
+# report, fail-OPEN on a gate error. There is no AI evaluator: the gate runs one
+# deterministic qa/main.py subprocess.
+#
+# run_qa_gate now returns a (verdict, raw_output) tuple (or None for no-qa). The
+# hook captures both: the verdict folds onto span.log + publish.publish(
+# qa_verdict=...), and raw_output rides publish.publish(qa_raw_output=...) for
+# the broker's durable S3 verdict.json write.
+#
+# Locked contracts (contracts D/G/H runner side, decisions 10, 13):
+#   - no qa folder (config.qa_envelope is None) -> byte-identical to today:
+#     publish called with the SAME args, NO qa_verdict / qa_raw_output, span.log
+#     success has no qa_verdict key.
+#   - gate hook runs AFTER _upload_logs and BEFORE publish; order is
+#     ['upload_logs','qa_gate','bt_flush','publish'].
+#   - a failing verdict (pass False) under observe STILL publishes and carries
+#     qa_verdict + qa_raw_output; no failure report.
+#   - a gate exception is swallowed to status 'error' and STILL publishes.
+# ---------------------------------------------------------------------------
+
+
+def _make_verdict(**overrides):
+    """Build a real qa_gate.Verdict so tests exercise the actual to_dict()
+    serialization the runner folds onto the wire."""
+    from pmf_engine.runner.qa_gate import Verdict
+
+    defaults = dict(
+        status="evaluated",
+        pass_=True,
+        qa_version_ids={"manifest.json": "v1"},
+        checks=[{"name": "grounding", "type": "deterministic", "passed": True}],
+        violations=[],
+        duration_ms=1234,
+        cost_usd=0.0,
+    )
+    defaults.update(overrides)
+    return Verdict(**defaults)
+
+
+def _gate_returns(
+    verdict,
+    raw_output='[{"name": "grounding", "passed": true}]',
+    eval_transcript=None,
+):
+    """Build the (verdict, raw_output, eval_transcript) tuple run_qa_gate returns
+    so a patched run_qa_gate matches the real engine's contract."""
+    return verdict, raw_output, eval_transcript
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_no_qa_folder_publish_is_byte_identical(mock_publish, _mock_logs):
+    """When config.qa_envelope is None (no qa folder), the publish call is
+    byte-identical to a pre-gate run: SAME positional artifact + duration/cost
+    kwargs, and NO qa_verdict / qa_raw_output key anywhere."""
+    config = _make_config()  # qa_envelope defaults to None
+    assert config.qa_envelope is None
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    with patch("pmf_engine.runner.main.run_qa_gate", return_value=None) as mock_gate:
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    # The gate is still invoked (it returns None for no-qa), but contributes
+    # nothing to the wire.
+    mock_gate.assert_called_once()
+
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    assert call_args.kwargs.get("cost_usd") == pytest.approx(0.05)
+    assert "duration_seconds" in call_args.kwargs
+    assert "qa_verdict" not in call_args.kwargs, (
+        "no-qa path must not pass qa_verdict to publish"
+    )
+    assert "qa_raw_output" not in call_args.kwargs, (
+        "no-qa path must not pass qa_raw_output to publish"
+    )
+    assert "qa_eval_transcript" not in call_args.kwargs, (
+        "no-qa path must not pass qa_eval_transcript to publish"
+    )
+
+    # span.log success output carries no qa_verdict key.
+    log_kwargs = mock_span.log.call_args[1]
+    assert log_kwargs["output"]["status"] == "success"
+    assert "qa_verdict" not in log_kwargs["output"]
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_runs_after_upload_logs_before_publish(mock_publish, _mock_logs):
+    """Lock the call order: _upload_logs, then the gate, then bt.flush, then
+    publish. The gate grades the uploaded artifact and the verdict must be
+    span.log'd + flushed before publish deletes the broker scope ticket."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    manager = MagicMock()
+    manager.attach_mock(_mock_logs, "upload_logs")
+    manager.attach_mock(mock_bt.flush, "bt_flush")
+    manager.attach_mock(mock_publish.publish, "publish")
+
+    def _gate(*args, **kwargs):
+        manager.qa_gate()
+        return _gate_returns(_make_verdict())
+
+    manager.attach_mock(MagicMock(side_effect=_gate), "qa_gate")
+
+    with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_gate):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    order = [c[0] for c in manager.mock_calls if c[0] in {"upload_logs", "qa_gate", "bt_flush", "publish"}]
+    # First occurrence of each landmark, in order.
+    seen: list[str] = []
+    for name in order:
+        if name not in seen:
+            seen.append(name)
+    assert seen == ["upload_logs", "qa_gate", "bt_flush", "publish"], (
+        f"expected upload_logs -> qa_gate -> bt_flush -> publish; got {seen!r}"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_observe_mode_failing_verdict_still_publishes_with_qa_verdict(mock_publish, _mock_logs):
+    """Observe-only: a verdict with pass=False STILL publishes (never
+    quarantines), and the verdict rides the publish call as qa_verdict
+    (the contract-C dict). No failure status is reported."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {"manifest.json": "v9"}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    failing = _make_verdict(
+        status="evaluated",
+        pass_=False,
+        qa_version_ids={"manifest.json": "v9"},
+        checks=[{"name": "grounding", "type": "deterministic", "passed": False, "score": 0.6}],
+        violations=["grounding: 0.6 < 0.8"],
+    )
+
+    with patch("pmf_engine.runner.main.run_qa_gate", return_value=_gate_returns(failing)):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    # Still publishes — observe-only never blocks.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None, "failing verdict must ride publish as qa_verdict"
+    assert qa_dict["pass"] is False
+    assert qa_dict["status"] == "evaluated"
+    assert qa_dict["qa_version_ids"] == {"manifest.json": "v9"}
+
+    # NO failure report — the run is a success regardless of the verdict.
+    failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
+    assert not failed_calls, f"observe-mode failing verdict must not report failed; got {failed_calls!r}"
+
+    # span.log success carries the verdict under qa_verdict, logged before flush.
+    log_kwargs = mock_span.log.call_args[1]
+    assert log_kwargs["output"]["status"] == "success"
+    assert log_kwargs["output"]["qa_verdict"]["pass"] is False
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_receives_qa_verdict_and_qa_raw_output(mock_publish, _mock_logs):
+    """The runner forwards the aggregated verdict dict (qa_verdict), the raw
+    main.py stdout (qa_raw_output), AND the evaluator's redacted JSONL transcript
+    (qa_eval_transcript) to publish.publish, so the broker can do the durable S3
+    writes (decision 13, contract D)."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    raw = '[{"name": "grounding", "passed": true, "score": 0.91}]'
+    transcript = '{"turn": 1, "kind": "assistant"}\n{"turn": 0, "kind": "result"}'
+
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), raw, transcript),
+    ):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None and qa_dict["status"] == "evaluated"
+    # The exact raw main.py stdout is forwarded verbatim for the S3 write.
+    assert call_args.kwargs.get("qa_raw_output") == raw
+    # The evaluator's redacted transcript rides for the durable eval_transcript.jsonl.
+    assert call_args.kwargs.get("qa_eval_transcript") == transcript
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_omits_qa_eval_transcript_when_gate_returns_none(mock_publish, _mock_logs):
+    """A main.py-only gate run returns eval_transcript=None (no evaluator). The
+    runner must NOT pass qa_eval_transcript to publish (so the broker omits the
+    durable write), while still forwarding the verdict + raw output."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {"main.py": "x"}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    raw = '[{"name": "grounding", "passed": true}]'
+
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), raw, None),
+    ):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    call_args = mock_publish.publish.call_args
+    assert call_args.kwargs.get("qa_verdict") is not None
+    assert call_args.kwargs.get("qa_raw_output") == raw
+    assert "qa_eval_transcript" not in call_args.kwargs, (
+        "a main-only gate run (eval_transcript None) must omit the publish field"
+    )
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_publish_forwards_empty_qa_eval_transcript(mock_publish, _mock_logs):
+    """An eval.md run whose evaluator produced an EMPTY transcript ('') forwards
+    that empty string (distinct from None=no-evaluator), so the broker records
+    the evaluator ran."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {"eval.md": "judge"}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    with patch(
+        "pmf_engine.runner.main.run_qa_gate",
+        return_value=(_make_verdict(), None, ""),
+    ):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    call_args = mock_publish.publish.call_args
+    assert call_args.kwargs.get("qa_eval_transcript") == ""
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_gate_exception_swallowed_to_error_verdict_and_still_publishes(mock_publish, _mock_logs):
+    """Fail-OPEN: even if the gate call itself raises (run_qa_gate is supposed
+    to never raise, but defense-in-depth), the runner swallows it into a
+    status='error' verdict and STILL publishes. The run is never failed by a
+    gate error in observe mode."""
+    config = _make_config(qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}})
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    with patch("pmf_engine.runner.main.run_qa_gate", side_effect=RuntimeError("gate blew up")):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            # MUST NOT raise — gate failure is fail-open in observe mode.
+            await run_experiment(config, harness=mock_harness)
+
+    # Still publishes.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None, "a swallowed gate error must still ride publish as an error verdict"
+    assert qa_dict["status"] == "error"
+    assert qa_dict["pass"] is None
+    # No raw output to forward when the gate never produced main.py stdout.
+    assert call_args.kwargs.get("qa_raw_output") is None
+
+    # No failure report.
+    failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
+    assert not failed_calls, f"gate error must not fail the run in observe mode; got {failed_calls!r}"
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_receives_artifact_bytes_envelope_and_remaining_budget(mock_publish, _mock_logs):
+    """The gate is handed the EXACT artifact bytes the run produced, the qa
+    envelope, the workspace dir, and a positive remaining-budget computed from
+    the run timeout minus elapsed. Pin the inputs so the wiring can't drift.
+    There is NO evaluator_runner anymore (deterministic-only)."""
+    config = _make_config(
+        timeout_seconds=600,
+        qa_envelope={"manifest": {"blocking": False}, "files": {"main.py": "x"}, "resolved_qa_version_ids": {}},
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    def _capture_gate(artifact_bytes, qa_envelope, workspace_dir, broker_env, remaining_budget, **kwargs):
+        captured["artifact_bytes"] = artifact_bytes
+        captured["qa_envelope"] = qa_envelope
+        captured["workspace_dir"] = workspace_dir
+        captured["remaining_budget"] = remaining_budget
+        captured["kwargs"] = kwargs
+        return _gate_returns(_make_verdict())
+
+    with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_gate):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    assert captured["artifact_bytes"] == b'{"greeting": "hello"}'
+    assert captured["qa_envelope"] == config.qa_envelope
+    # remaining_budget = timeout - elapsed; elapsed is small but positive.
+    assert captured["remaining_budget"] <= 600
+    assert captured["remaining_budget"] > 0
+    # The hook injects the evaluator_runner adapter so the gate can run the
+    # eval.md stage when present (it is harmless on a main.py-only folder).
+    assert "evaluator_runner" in captured["kwargs"]
+    assert callable(captured["kwargs"]["evaluator_runner"])
+
+
+# ---------------------------------------------------------------------------
+# REAL bridge integration. The other QA-gate tests above patch run_qa_gate
+# wholesale, so the async/sync marshaling in _run_qa_gate_hook
+# (asyncio.to_thread -> sync run_qa_gate) is never actually exercised. This test
+# runs the REAL _run_qa_gate_hook and the REAL run_qa_gate engine against a real
+# deterministic qa/main.py. It proves the to_thread bridge works end-to-end and
+# the (verdict, raw_output) tuple flows to publish.publish(qa_verdict=...,
+# qa_raw_output=...).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_real_qa_gate_bridge_runs_deterministic_main_and_rides_publish(
+    mock_publish, _mock_logs, tmp_path
+):
+    """End-to-end of the real to_thread bridge. With a main.py-only qa folder,
+    the REAL run_qa_gate engine runs the deterministic subprocess on a worker
+    thread (asyncio.to_thread). The fixture main.py emits one failing + one
+    passing fragment, so the engine derives pass=False. The verdict AND the raw
+    main.py stdout ride publish — proving the bridge and tuple return work."""
+    import pmf_engine.runner.qa_gate as qa_gate_mod
+
+    main_src = (
+        "import json\n"
+        "print(json.dumps(["
+        '{"name": "faithfulness", "passed": False, "score": 2, "min_score": 4}, '
+        '{"name": "completeness", "passed": True}'
+        "]))\n"
+    )
+    config = _make_config(
+        timeout_seconds=600,
+        qa_envelope={
+            "manifest": {"blocking": False},
+            "files": {"main.py": main_src},
+            "resolved_qa_version_ids": {"main.py": "m1"},
+        },
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    # Redirect the gate's materialization root to a writable tmp dir (the
+    # default "/qa-gate" is not creatable on the test host).
+    with patch.object(qa_gate_mod, "DEFAULT_QA_GATE_ROOT", str(tmp_path / "qa-gate-root")):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    # The verdict rode publish, derived from the fragments main.py emitted.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None, "the real-bridge verdict must ride publish as qa_verdict"
+    # Engine ran to completion (NOT a gate error) and produced a real verdict.
+    assert qa_dict["status"] == "evaluated"
+    assert qa_dict["pass"] is False, "one failing fragment -> pass=False"
+    names = {c["name"] for c in qa_dict["checks"]}
+    assert {"faithfulness", "completeness"} <= names
+    # Deterministic-only gate cost is 0.
+    assert qa_dict["cost_usd"] == pytest.approx(0.0)
+    # The raw main.py stdout is forwarded for the durable S3 write.
+    raw = call_args.kwargs.get("qa_raw_output")
+    assert raw is not None
+    parsed = json.loads(raw)
+    assert {f["name"] for f in parsed} == {"faithfulness", "completeness"}
+
+    # Observe-only: no failure report despite pass=False.
+    failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
+    assert not failed_calls
+
+
+# ---------------------------------------------------------------------------
+# B2 (HIGH): REAL async/sync bridge integration for the EVALUATOR stage. The
+# deterministic bridge test above only exercises asyncio.to_thread; this one
+# exercises the FULL marshaling the hook restores: asyncio.to_thread -> sync
+# run_qa_gate -> the injected _evaluator_runner -> run_coroutine_threadsafe back
+# onto the loop -> async run_evaluator_agent. It runs the REAL _run_qa_gate_hook
+# and the REAL run_qa_gate engine against an eval.md-only folder, patching ONLY
+# run_evaluator_agent. It proves the marshaling works end-to-end and the verdict
+# (whose pass is derived from the fragments the fake evaluator writes) rides
+# publish.publish(qa_verdict=...).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_real_qa_gate_bridge_marshals_evaluator_and_rides_publish(
+    mock_publish, _mock_logs, tmp_path
+):
+    """End-to-end of the real async/sync bridge. With an eval.md-only qa folder,
+    the REAL run_qa_gate engine runs on a worker thread (asyncio.to_thread),
+    injects an evaluator_runner that bounces back onto the event loop
+    (run_coroutine_threadsafe) to call our fake run_evaluator_agent. The fake
+    WRITES a fragment array to the injected result_file_path and returns
+    status='ok'. The engine reads those fragments, derives pass, and the verdict
+    rides publish as qa_verdict — proving the marshaling actually ran. eval.md
+    only -> no deterministic stdout, so qa_raw_output is None."""
+    import pmf_engine.runner.qa_gate as qa_gate_mod
+
+    config = _make_config(
+        timeout_seconds=600,
+        qa_envelope={
+            "manifest": {"blocking": False},
+            "files": {"eval.md": "## Rubric\n\nGrade faithfulness."},
+            "resolved_qa_version_ids": {"eval.md": "ev1"},
+        },
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, mock_span = _make_mock_bt()
+
+    captured_params = {}
+
+    async def fake_run_evaluator_agent(params, parent_span=None):
+        from pmf_engine.runner.harness.base import EvaluatorResult
+
+        captured_params["result_file_path"] = params.result_file_path
+        captured_params["gate_cwd"] = params.gate_cwd
+        captured_params["workspace_dir"] = params.workspace_dir
+        # The evaluator's job: write its fragment array to the injected path.
+        # One failing + one passing fragment → engine derives pass=False.
+        with open(params.result_file_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                [
+                    {"name": "faithfulness", "passed": False, "score": 2, "min_score": 4},
+                    {"name": "completeness", "passed": True},
+                ],
+                fh,
+            )
+        return EvaluatorResult(
+            fragments=[],
+            cost_usd=0.04,
+            duration_ms=900,
+            num_turns=5,
+            session_id="sess-real-bridge",
+            status="ok",
+        )
+
+    # Redirect the gate's materialization root to a writable tmp dir (the
+    # default "/qa-gate" is not creatable on the test host).
+    with patch.object(qa_gate_mod, "DEFAULT_QA_GATE_ROOT", str(tmp_path / "qa-gate-root")):
+        with patch(
+            "pmf_engine.runner.harness.claude_sdk.run_evaluator_agent",
+            side_effect=fake_run_evaluator_agent,
+        ):
+            with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                await run_experiment(config, harness=mock_harness)
+
+    # The real bridge invoked the (patched) evaluator with engine-built params.
+    assert captured_params, "the real bridge must have reached run_evaluator_agent"
+    assert captured_params["result_file_path"].endswith("evaluator_fragments.json")
+
+    # The verdict rode publish, derived from the fragments the evaluator wrote.
+    mock_publish.publish.assert_called_once()
+    call_args = mock_publish.publish.call_args
+    assert call_args[0] == ({"greeting": "hello"},)
+    qa_dict = call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None, "the real-bridge verdict must ride publish as qa_verdict"
+    # Engine ran to completion (NOT a gate error) and produced a real verdict.
+    assert qa_dict["status"] == "evaluated"
+    assert qa_dict["pass"] is False, "one failing fragment → pass=False"
+    names = {c["name"] for c in qa_dict["checks"]}
+    assert {"faithfulness", "completeness"} <= names
+    # Gate cost accounting flowed through from the evaluator result.
+    assert qa_dict["cost_usd"] == pytest.approx(0.04)
+    # eval.md only: no deterministic main.py stdout to forward for the S3 write.
+    assert call_args.kwargs.get("qa_raw_output") is None
+
+    # Observe-only: no failure report despite pass=False.
+    failed_calls = [c for c in mock_publish.report_status.call_args_list if c[0][0] == "failed"]
+    assert not failed_calls
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_evaluator_bridge_timeout_covers_the_finalize(mock_publish, _mock_logs, tmp_path):
+    """FIX 2: the async/sync bridge blocks the gate's worker thread on
+    future.result(timeout=...). The evaluator's own bound is
+    params.timeout_seconds for the primary PLUS _FINALIZE_TIMEOUT_SECONDS for a
+    fresh-query finalize on a turn-ceiling bust. If the bridge timeout only
+    covered the primary (+30), it could cancel the in-flight finalize before it
+    writes its salvaged verdict. The bridge must wait
+    params.timeout_seconds + _FINALIZE_TIMEOUT_SECONDS + 30."""
+    import pmf_engine.runner.qa_gate as qa_gate_mod
+    from pmf_engine.runner.harness.base import EvaluatorResult
+    from pmf_engine.runner.harness.claude_sdk import _FINALIZE_TIMEOUT_SECONDS
+
+    timeout_seconds = 600
+    config = _make_config(
+        timeout_seconds=timeout_seconds,
+        qa_envelope={
+            "manifest": {"blocking": False},
+            "files": {"eval.md": "## Rubric\n\nGrade faithfulness."},
+            "resolved_qa_version_ids": {"eval.md": "ev1"},
+        },
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    class _FakeFuture:
+        def result(self, timeout=None):
+            captured["bridge_timeout"] = timeout
+            params = captured["params"]
+            with open(params.result_file_path, "w", encoding="utf-8") as fh:
+                json.dump([{"name": "faithfulness", "passed": True}], fh)
+            return EvaluatorResult(
+                fragments=[],
+                cost_usd=0.04,
+                duration_ms=900,
+                num_turns=5,
+                session_id="sess-bridge-timeout",
+                status="ok",
+            )
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coro.close()
+        return _FakeFuture()
+
+    real_run_qa_gate = qa_gate_mod.run_qa_gate
+
+    def _capture_params(*args, **kwargs):
+        runner = kwargs["evaluator_runner"]
+
+        def _wrapped(params):
+            captured["params"] = params
+            return runner(params)
+
+        kwargs["evaluator_runner"] = _wrapped
+        return real_run_qa_gate(*args, **kwargs)
+
+    with patch.object(qa_gate_mod, "DEFAULT_QA_GATE_ROOT", str(tmp_path / "qa-gate-root")):
+        with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_params):
+            with patch(
+                "pmf_engine.runner.main.asyncio.run_coroutine_threadsafe",
+                side_effect=fake_run_coroutine_threadsafe,
+            ):
+                with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                    await run_experiment(config, harness=mock_harness)
+
+    assert "bridge_timeout" in captured, "the bridge must have called future.result(timeout=...)"
+    eval_timeout = captured["params"].timeout_seconds
+    assert captured["bridge_timeout"] == eval_timeout + _FINALIZE_TIMEOUT_SECONDS + 30
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_hook_passes_run_id_and_experiment_id(mock_publish, _mock_logs):
+    """B-interface: the run_qa_gate call site forwards run_id=config.run_id and
+    experiment_id=config.experiment_id (the optional correlation params Lane A
+    adds to run_qa_gate for its gate logs). Capture the kwargs the gate received
+    to lock the wiring so the lanes compose."""
+    config = _make_config(
+        run_id="run-corr-42",
+        experiment_id="exp-corr-99",
+        qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}},
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    def _capture_gate(*args, **kwargs):
+        captured.update(kwargs)
+        return _gate_returns(_make_verdict())
+
+    with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_gate):
+        with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+            await run_experiment(config, harness=mock_harness)
+
+    assert captured.get("run_id") == "run-corr-42", (
+        f"hook must forward run_id; got kwargs {sorted(captured)!r}"
+    )
+    assert captured.get("experiment_id") == "exp-corr-99"
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_broker_env_omits_unset_keys(mock_publish, _mock_logs):
+    """B3 (LOW): when BROKER_URL/BROKER_TOKEN are UNSET, the broker_env handed
+    to the gate must OMIT them rather than inject empty-string overrides — an
+    empty-string override would mask an inherited env var inside the gate's
+    deterministic subprocess. Capture broker_env (the 4th positional arg)."""
+    config = _make_config(
+        qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}},
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    def _capture_gate(artifact_bytes, qa_envelope, workspace_dir, broker_env, *args, **kwargs):
+        captured["broker_env"] = broker_env
+        return _gate_returns(_make_verdict())
+
+    # Ensure the keys are truly unset in the process env for this test.
+    saved = {k: os.environ.pop(k, None) for k in ("BROKER_URL", "BROKER_TOKEN")}
+    try:
+        with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_gate):
+            with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                await run_experiment(config, harness=mock_harness)
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+    broker_env = captured["broker_env"]
+    # Neither key present at all — NOT mapped to "".
+    assert "BROKER_URL" not in broker_env, (
+        f"unset BROKER_URL must be omitted, not empty-string; got {broker_env!r}"
+    )
+    assert "BROKER_TOKEN" not in broker_env, (
+        f"unset BROKER_TOKEN must be omitted, not empty-string; got {broker_env!r}"
+    )
+    assert "" not in broker_env.values()
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_broker_env_passes_through_set_keys(mock_publish, _mock_logs):
+    """B3 corollary: when BROKER_URL/BROKER_TOKEN ARE set, they pass through to
+    the gate so the deterministic stage can reach the broker for citation
+    checks."""
+    config = _make_config(
+        qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}},
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured = {}
+
+    def _capture_gate(artifact_bytes, qa_envelope, workspace_dir, broker_env, *args, **kwargs):
+        captured["broker_env"] = broker_env
+        return _gate_returns(_make_verdict())
+
+    with patch.dict(os.environ, {"BROKER_URL": "https://broker-dev.test", "BROKER_TOKEN": "tok-b3"}):
+        with patch("pmf_engine.runner.main.run_qa_gate", side_effect=_capture_gate):
+            with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                await run_experiment(config, harness=mock_harness)
+
+    broker_env = captured["broker_env"]
+    assert broker_env.get("BROKER_URL") == "https://broker-dev.test"
+    assert broker_env.get("BROKER_TOKEN") == "tok-b3"
+
+
+@pytest.mark.asyncio
+@patch("pmf_engine.runner.main._upload_logs")
+@patch("pmf_engine.runner.main.publish")
+async def test_qa_gate_hook_defense_in_depth_catch_logs_at_error(mock_publish, _mock_logs):
+    """B4 (MEDIUM): the _run_qa_gate_hook defense-in-depth catch fires ONLY on a
+    real bridge/marshaling defect (the gate engine itself is fail-open and never
+    raises). That is actionable, so it must log at ERROR with a stack trace
+    (logger.exception), NOT a WARNING. Capture the record's level + exc_info."""
+    import logging
+
+    import pmf_engine.runner.main as _main_mod
+
+    config = _make_config(
+        run_id="run-b4",
+        experiment_id="exp-b4",
+        qa_envelope={"manifest": {"blocking": False}, "files": {}, "resolved_qa_version_ids": {}},
+    )
+    fake_result = HarnessResult(
+        artifact_bytes=b'{"greeting": "hello"}',
+        content_type="application/json",
+        cost_usd=0.05,
+        num_turns=3,
+    )
+    mock_harness = AsyncMock()
+    mock_harness.run.return_value = fake_result
+    mock_bt, _mock_span = _make_mock_bt()
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    _main_mod.logger.addHandler(handler)
+    try:
+        with patch("pmf_engine.runner.main.run_qa_gate", side_effect=RuntimeError("bridge defect")):
+            with patch("pmf_engine.runner.main.BraintrustClient.get_instance", return_value=mock_bt):
+                # Fail-open: still publishes despite the hook catch firing.
+                await run_experiment(config, harness=mock_harness)
+    finally:
+        _main_mod.logger.removeHandler(handler)
+
+    hook_records = [r for r in captured if "qa_gate_hook_failed" in r.getMessage()]
+    assert hook_records, (
+        f"expected a qa_gate_hook_failed log; got {[r.getMessage() for r in captured]!r}"
+    )
+    rec = hook_records[0]
+    assert rec.levelno == logging.ERROR, (
+        f"qa_gate_hook_failed must log at ERROR (logger.exception), got {rec.levelname}"
+    )
+    assert rec.exc_info is not None, "logger.exception must attach exc_info for the stack trace"
+    assert "run-b4" in rec.getMessage()
+    assert "exp-b4" in rec.getMessage()
+
+    # Still publishes with an error verdict (observe-only).
+    mock_publish.publish.assert_called_once()
+    qa_dict = mock_publish.publish.call_args.kwargs.get("qa_verdict")
+    assert qa_dict is not None and qa_dict["status"] == "error"

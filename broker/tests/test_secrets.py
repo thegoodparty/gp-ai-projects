@@ -5,10 +5,8 @@ import pytest
 
 from broker.secrets import BrokerSecrets, load_secrets, load_secrets_from_env
 
-
 FULL_SECRET = {
     "ANTHROPIC_API_KEY": "sk-ant-test",
-    "TAVILY_API_KEY": "tavily-test",
     "DATABRICKS_SERVER_HOSTNAME": "db-host.cloud.databricks.com",
     "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/abc",
     "DATABRICKS_API_KEY": "dapi-test",
@@ -37,7 +35,6 @@ class TestLoadSecrets:
         mock_client.get_secret_value.assert_called_once_with(SecretId="AI_SECRETS_DEV")
         assert isinstance(result, BrokerSecrets)
         assert result.anthropic_api_key == "sk-ant-test"
-        assert result.tavily_api_key == "tavily-test"
         assert result.databricks_server_hostname == "db-host.cloud.databricks.com"
         assert result.databricks_http_path == "/sql/1.0/warehouses/abc"
         assert result.databricks_api_key == "dapi-test"

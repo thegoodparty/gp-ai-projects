@@ -1,5 +1,6 @@
-import os
+import asyncio
 import json
+import os
 import tempfile
 from contextlib import contextmanager
 from datetime import date
@@ -23,10 +24,12 @@ def _make_result_message(
     num_turns: int = 3,
     session_id: str = "sess-123",
     is_error: bool = False,
+    subtype: str = "result",
+    duration_ms: int = 1000,
 ) -> ResultMessage:
     return ResultMessage(
-        subtype="result",
-        duration_ms=1000,
+        subtype=subtype,
+        duration_ms=duration_ms,
         duration_api_ms=900,
         is_error=is_error,
         num_turns=num_turns,
@@ -313,7 +316,7 @@ class FakeParentSpan:
 
 @pytest.mark.asyncio
 async def test_run_creates_child_spans_for_tool_calls():
-    from claude_agent_sdk import AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock, TextBlock
+    from claude_agent_sdk import AssistantMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 
     parent_span = FakeParentSpan()
 
@@ -383,7 +386,8 @@ async def test_tool_spans_paired_by_tool_use_id_not_fifo():
     the tool_uses, the FIFO pop(0) logic logs outputs against the wrong spans
     and corrupts Braintrust traces silently."""
     from unittest.mock import MagicMock
-    from claude_agent_sdk import AssistantMessage, UserMessage, ToolUseBlock, ToolResultBlock
+
+    from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
 
     created_spans: dict[str, MagicMock] = {}
 
@@ -565,7 +569,9 @@ async def test_system_prompt_contains_injection_warning():
 @pytest.mark.asyncio
 async def test_log_jsonl_does_not_crash_agent_on_disk_failure():
     import logging
+
     from claude_agent_sdk import AssistantMessage, TextBlock
+
     from pmf_engine.runner.harness import claude_sdk as claude_sdk_module
 
     async def fake_query(prompt, options):
@@ -664,19 +670,33 @@ async def test_params_wrapped_in_untrusted_data_delimiter():
 # ---------------------------------------------------------------------------
 
 
+def _snapshot_options(options):
+    """Sever list-field aliasing on a captured ClaudeAgentOptions.
+
+    ClaudeAgentOptions stores allowed_tools (and other list fields) BY REFERENCE
+    (field(default_factory=list), no copy). A capture fake that stashes the live
+    options and asserts on it later can read a list the harness mutated after the
+    query call — an intermittent flake. Snapshot the list contents AT CAPTURE
+    TIME so assertions see exactly what was passed to query()."""
+    if isinstance(getattr(options, "allowed_tools", None), list):
+        options.allowed_tools = list(options.allowed_tools)
+    return options
+
+
 def _make_options_capture():
     """Fake `query` that snapshots the ClaudeAgentOptions it receives.
 
     Returns (capture_dict, fake_query). After `await harness.run(...)`,
     `capture_dict["options"]` is the actual ClaudeAgentOptions the harness
     built — exposes allowed_tools / permission_mode / system_prompt /
-    mcp_servers for direct assertion.
+    mcp_servers for direct assertion. List fields are snapshotted at capture
+    time so a later harness mutation can't leak into the assertion.
     """
     captured: dict = {}
 
     async def fake_query(prompt, options):
         captured["prompt"] = prompt
-        captured["options"] = options
+        captured["options"] = _snapshot_options(options)
         yield _make_result_message(
             result="Done", total_cost_usd=0.01, num_turns=1, session_id="sess-capture"
         )
@@ -1073,3 +1093,1073 @@ class TestSubagentFanout:
         assert f"batches of {MAX_PARALLEL_SUBAGENTS}" in options.system_prompt
         assert str(requested) not in options.system_prompt
         assert "subagent" in options.system_prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Evaluator harness (PMF QA gate, PR-3)
+#
+# The QA gate spawns a NEW evaluator agent that is the OPPOSITE of the primary
+# agent on every axis: allowed tools are a SUBSET (Bash + WebSearch only, NOT
+# an extension of ALLOWED_TOOLS), NO broker MCP server is wired (the evaluator
+# reaches the broker over HTTP via Bash + pmf_runtime, not via an MCP server),
+# the system prompt is supplied VERBATIM (no capability section built), the
+# Agent dispatch tool is denied by exclusion (agents=None), and cwd is the
+# gate's private dir (so /workspace is read-only evidence). run_evaluator_agent
+# is NEW code so the primary path stays byte-identical.
+# ---------------------------------------------------------------------------
+
+EVALUATOR_PROMPT = (
+    "You are a quality evaluator. Grade the artifact at /workspace/output/ "
+    "against the rubric below and write your fragment array as JSON to the "
+    "result file. The workspace is read-only evidence."
+)
+
+EVALUATOR_INSTRUCTION = (
+    "## Rubric\n\nFaithfulness: every claim must trace to a cited source. "
+    "Score 1-5. Write your fragments to the result file path given to you."
+)
+
+
+def _make_evaluator_params(
+    *,
+    gate_cwd: str,
+    workspace_dir: str,
+    result_file_path: str,
+    model: str = "sonnet",
+    max_turns: int = 12,
+    timeout_seconds: int = 300,
+    instruction: str = EVALUATOR_INSTRUCTION,
+    system_prompt: str = EVALUATOR_PROMPT,
+):
+    from pmf_engine.runner.harness.base import EvaluatorHarnessParams
+
+    return EvaluatorHarnessParams(
+        model=model,
+        max_turns=max_turns,
+        timeout_seconds=timeout_seconds,
+        instruction=instruction,
+        system_prompt=system_prompt,
+        result_file_path=result_file_path,
+        gate_cwd=gate_cwd,
+        workspace_dir=workspace_dir,
+    )
+
+
+async def _run_evaluator_capture_options(
+    *,
+    model: str = "sonnet",
+    max_turns: int = 12,
+    instruction: str = EVALUATOR_INSTRUCTION,
+    system_prompt: str = EVALUATOR_PROMPT,
+    monkey_env: dict[str, str] | None = None,
+):
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    captured, fake_query = _make_options_capture()
+    with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+        result_file_path = os.path.join(gate_cwd, "fragments.json")
+        params = _make_evaluator_params(
+            gate_cwd=gate_cwd,
+            workspace_dir=workspace_dir,
+            result_file_path=result_file_path,
+            model=model,
+            max_turns=max_turns,
+            instruction=instruction,
+            system_prompt=system_prompt,
+        )
+        with _isolated_runner_env(monkey_env):
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                await run_evaluator_agent(params)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_evaluator_logs_each_turn():
+    """Per-turn observability: the evaluator drain loop must log each turn's
+    tool(s) and the tool-result sizes, so CloudWatch shows WHERE a long judge
+    (e.g. the 41-turn full-briefing run) spends its budget. Without this we
+    only get the bookends (start + final ResultMessage) and fly blind on the
+    most expensive, most-in-need-of-tuning stage. Metadata only (tool names +
+    char counts), never raw content, so no secret can leak into the logs.
+
+    The module logger has propagate=False (shared.logger), so caplog can't see
+    it — assert on the logger's own info() calls instead."""
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    big = "S" * 5000  # a large tool result (e.g. a big artifact read) — its size must surface
+
+    async def fake_query(prompt, options):
+        yield AssistantMessage(model="sonnet", content=[
+            TextBlock(text="Checking grounding."),
+            ToolUseBlock(id="t1", name="Bash",
+                         input={"command": "python3 -c \"from pmf_runtime import http\""}),
+        ])
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="t1", content=big, is_error=False)])
+        yield AssistantMessage(model="sonnet", content=[
+            ToolUseBlock(id="t2", name="Bash",
+                         input={"command": "cat /workspace/artifact.json"})])
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="t2", content="results", is_error=False)])
+        yield _make_result_message(
+            result="Done", total_cost_usd=0.1, num_turns=2, session_id="sess-turns")
+
+    with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+        rf = os.path.join(gc, "fragments.json")
+        params = _make_evaluator_params(
+            gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+        with patch("pmf_engine.runner.harness.claude_sdk.logger") as mock_logger:
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+    # Each info() call rendered with its %-args, so we can search for tool names/sizes.
+    rendered = [
+        " ".join(str(a) for a in call.args) for call in mock_logger.info.call_args_list
+    ]
+    blob = "\n".join(rendered)
+    # one per-turn line per assistant turn (two turns here), each naming its tool(s)
+    turn_lines = [r for r in rendered if "qa_evaluator_turn=%d tools=%s" in r]
+    assert len(turn_lines) == 2, turn_lines
+    assert all("Bash" in r for r in turn_lines), turn_lines
+    # tool-result sizes are logged so a large artifact read (5000 chars) is visible
+    assert any("tool_result_chars" in r and "5000" in r for r in rendered), blob
+
+
+def _parse_jsonl(blob: str) -> list[dict]:
+    """Parse a JSONL transcript string into a list of records, asserting every
+    non-empty line is a JSON object."""
+    records = []
+    for line in blob.splitlines():
+        if not line.strip():
+            continue
+        records.append(json.loads(line))
+    return records
+
+
+@pytest.mark.asyncio
+async def test_evaluator_transcript_captures_assistant_text_tools_and_tool_results():
+    """The evaluator harness accumulates a per-turn JSONL transcript on
+    EvaluatorResult.eval_transcript: one assistant record (text + tools), one
+    tool_result record, and a terminal result record. This is the v1
+    observe-only diagnostic — it lets us SEE what the judge did, turn by turn."""
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    async def fake_query(prompt, options):
+        yield AssistantMessage(model="sonnet", content=[
+            TextBlock(text="grading now"),
+            ToolUseBlock(id="t1", name="Bash", input={"command": "curl broker"}),
+        ])
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="t1", content="S" * 200, is_error=False)])
+        yield _make_result_message(
+            is_error=False, session_id="sess-x", num_turns=2, subtype="result")
+
+    with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+        rf = os.path.join(gc, "fragments.json")
+        params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+        with _isolated_runner_env(None):
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                result = await run_evaluator_agent(params)
+
+    records = _parse_jsonl(result.eval_transcript)
+    assert len(records) == 3, records
+
+    assert records[0] == {
+        "turn": 1,
+        "kind": "assistant",
+        "text": "grading now",
+        "tools": [{"name": "Bash", "input": str({"command": "curl broker"})[:2000]}],
+    }
+
+    assert records[1]["turn"] == 1
+    assert records[1]["kind"] == "tool_result"
+    assert records[1]["results"][0]["tool_use_id"] == "t1"
+    assert records[1]["results"][0]["is_error"] is False
+    assert records[1]["results"][0]["content"] == "S" * 200
+
+    assert records[2]["turn"] == 0
+    assert records[2]["kind"] == "result"
+    assert records[2]["status"] == "ok"
+    assert records[2]["subtype"] == "result"
+    assert records[2]["session_id"] == "sess-x"
+    assert records[2]["num_turns"] == 2
+    assert records[2]["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_evaluator_transcript_tool_result_content_truncated_to_4000():
+    """Tool-result content in a transcript record is truncated to 4000 chars so
+    a huge re-fetched source can't blow the transcript past the broker's cap."""
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    huge = "Z" * 10000
+
+    async def fake_query(prompt, options):
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="t9", content=huge, is_error=False)])
+        yield _make_result_message(is_error=False, session_id="sess-trunc")
+
+    with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+        rf = os.path.join(gc, "fragments.json")
+        params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+        with _isolated_runner_env(None):
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                result = await run_evaluator_agent(params)
+
+    records = _parse_jsonl(result.eval_transcript)
+    tool_result = next(r for r in records if r["kind"] == "tool_result")
+    assert len(tool_result["results"][0]["content"]) == 4000
+
+
+@pytest.mark.asyncio
+async def test_evaluator_transcript_records_redact_broker_token():
+    """REDACTION-CHOKEPOINT BOUNDARY: the harness emits RAW records — it does
+    NOT redact. A BROKER_TOKEN that appears in a tool_result content STILL
+    appears verbatim in the harness's EvaluatorResult.eval_transcript. Redaction
+    is the gate's job (qa_gate._run_evaluator), not the harness's, so the two
+    files stay disjoint. The companion gate test pins that the gate redacts."""
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    secret = "tok-harness-raw-7q6r5s4t"
+
+    async def fake_query(prompt, options):
+        yield UserMessage(content=[
+            ToolResultBlock(tool_use_id="t1", content=f"saw BROKER_TOKEN={secret}", is_error=False)])
+        yield _make_result_message(is_error=False, session_id="sess-raw")
+
+    with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+        rf = os.path.join(gc, "fragments.json")
+        params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+        with _isolated_runner_env({"BROKER_TOKEN": secret}):
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                result = await run_evaluator_agent(params)
+
+    # The harness must NOT redact — the raw token survives in its output.
+    assert secret in result.eval_transcript
+
+
+@pytest.mark.asyncio
+async def test_evaluator_transcript_terminal_record_marks_error_subtype():
+    """A genuine error surfaces in the terminal record: status='error',
+    is_error=True, and subtype carrying the SDK's reason (here a non-max_turns
+    error so the finalize-resume does not fire and a single terminal is emitted)."""
+    from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+    async def fake_query(prompt, options):
+        yield _make_result_message(
+            is_error=True, subtype="error_during_execution", num_turns=4, session_id="sess-err")
+
+    with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+        rf = os.path.join(gc, "fragments.json")
+        params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+        with _isolated_runner_env(None):
+            with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                result = await run_evaluator_agent(params)
+
+    records = _parse_jsonl(result.eval_transcript)
+    terminal = [r for r in records if r["kind"] == "result"]
+    assert len(terminal) == 1
+    assert terminal[0]["status"] == "error"
+    assert terminal[0]["is_error"] is True
+    assert terminal[0]["subtype"] == "error_during_execution"
+
+
+class TestEvaluatorResultDataclass:
+    def test_evaluator_result_has_expected_fields_and_defaults(self):
+        """EvaluatorResult is the shared return shape both Core lanes compose
+        against — fragments/cost/duration/turns/session/status."""
+        from pmf_engine.runner.harness.base import EvaluatorResult
+
+        r = EvaluatorResult(
+            fragments=[{"name": "faithfulness", "passed": True}],
+            cost_usd=0.04,
+            duration_ms=1234,
+            num_turns=5,
+            session_id="sess-eval",
+            status="ok",
+        )
+        assert r.fragments == [{"name": "faithfulness", "passed": True}]
+        assert r.cost_usd == 0.04
+        assert r.duration_ms == 1234
+        assert r.num_turns == 5
+        assert r.session_id == "sess-eval"
+        assert r.status == "ok"
+        # eval_transcript defaults to "" so the no-transcript path (e.g. a fake
+        # evaluator that doesn't set it) stays well-formed.
+        assert r.eval_transcript == ""
+
+    def test_evaluator_harness_params_is_frozen(self):
+        """EvaluatorHarnessParams is a frozen dataclass — the gate engine must
+        not be able to mutate it after construction."""
+        import dataclasses
+
+        from pmf_engine.runner.harness.base import EvaluatorHarnessParams
+
+        params = EvaluatorHarnessParams(
+            model="sonnet",
+            max_turns=10,
+            timeout_seconds=300,
+            instruction="rubric",
+            system_prompt="you are an evaluator",
+            result_file_path="/qa-gate/x/fragments.json",
+            gate_cwd="/qa-gate/x",
+            workspace_dir="/workspace",
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            params.model = "opus"  # type: ignore[misc]
+
+
+class TestEvaluatorHarness:
+    @pytest.mark.asyncio
+    async def test_allowed_tools_is_exactly_bash(self):
+        """The evaluator's tool surface is a SUBSET — exactly Bash, NOT an
+        extension of ALLOWED_TOOLS. No WebSearch (the evaluator is editorial,
+        not investigative — grounding is the deterministic gate's job), no
+        Write/Edit/Glob/Grep."""
+        from pmf_engine.runner.harness.claude_sdk import EVALUATOR_ALLOWED_TOOLS
+
+        captured = await _run_evaluator_capture_options()
+        options = captured["options"]
+
+        assert options.allowed_tools == ["Bash"]
+        assert options.allowed_tools == EVALUATOR_ALLOWED_TOOLS
+        for excluded in ("WebSearch", "Write", "Edit", "Glob", "Grep"):
+            assert excluded not in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_servers_even_with_broker_env_set(self):
+        """The evaluator reaches the broker over HTTP via Bash + pmf_runtime,
+        NOT via an MCP server. Even with BROKER_URL/BROKER_TOKEN set,
+        mcp_servers must be empty (it must NOT call _build_broker_mcp_servers)."""
+        captured = await _run_evaluator_capture_options(
+            monkey_env={"BROKER_URL": "https://broker-dev.test", "BROKER_TOKEN": "tok-eval"},
+        )
+        options = captured["options"]
+
+        assert options.mcp_servers == {}
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_is_verbatim_evaluator_prompt(self):
+        """system_prompt is the evaluator prompt VERBATIM — build_system_prompt
+        is bypassed entirely. No capability markers, no experiment instruction
+        concatenated in."""
+        captured = await _run_evaluator_capture_options()
+        options = captured["options"]
+
+        assert options.system_prompt == EVALUATOR_PROMPT
+        for marker in ("TURN BUDGET", "TOOLS AVAILABLE", "Today's date is"):
+            assert marker not in options.system_prompt
+        assert EVALUATOR_INSTRUCTION not in options.system_prompt
+
+    @pytest.mark.asyncio
+    async def test_agent_dispatch_tool_denied_by_exclusion(self):
+        """No subagent fan-out for the evaluator — agents is None and 'Agent'
+        is absent from allowed_tools (denied by exclusion)."""
+        captured = await _run_evaluator_capture_options()
+        options = captured["options"]
+
+        assert options.agents is None
+        assert "Agent" not in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_cwd_equals_gate_cwd(self):
+        """cwd is the gate's private dir so /workspace is read-only evidence."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        captured, fake_query = _make_options_capture()
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+            options = captured["options"]
+            assert options.cwd == gate_cwd
+            assert options.cwd != workspace_dir
+
+    @pytest.mark.asyncio
+    async def test_model_and_max_turns_reflect_params(self):
+        captured = await _run_evaluator_capture_options(model="opus", max_turns=7)
+        options = captured["options"]
+
+        assert options.model == "opus"
+        assert options.max_turns == 7
+
+    @pytest.mark.asyncio
+    async def test_prompt_injects_instruction_and_result_file_path(self):
+        """The eval.md instruction body and the result file path must reach the
+        evaluator: instruction concatenated into the prompt, and the path
+        present so the evaluator knows where to write its fragment array."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        captured, fake_query = _make_options_capture()
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+            prompt = captured["prompt"]
+            assert EVALUATOR_INSTRUCTION in prompt
+            assert result_file_path in prompt
+
+    @pytest.mark.asyncio
+    async def test_primary_prompt_states_turn_budget_so_agent_self_paces(self):
+        """The primary evaluator prompt must tell the judge its turn budget so it
+        self-paces and writes a partial verdict before busting the ceiling. The
+        budget number (params.max_turns) and the 'even if your analysis is
+        incomplete' guidance must both be present, plus a self-pace pivot turn
+        two before the ceiling so the judge stops investigating in time. For
+        max_turns=9 the pivot is turn 7 (kills a -2->-1 off-by-one mutant)."""
+        captured = await _run_evaluator_capture_options(max_turns=9)
+        prompt = captured["prompt"]
+
+        assert "9 turns" in prompt
+        assert "By turn 7" in prompt
+        assert "even if your analysis is incomplete" in prompt
+
+    @pytest.mark.asyncio
+    async def test_primary_prompt_pivot_floored_at_one_for_tiny_budgets(self):
+        """FIX 3: the self-pace pivot (max_turns - 2) is FLOORED at 1, so a tiny
+        budget can't produce 'By turn 0' or a negative pivot. For max_turns=2 the
+        pivot is turn 1, not turn 0."""
+        captured = await _run_evaluator_capture_options(max_turns=2)
+        prompt = captured["prompt"]
+
+        assert "2 turns" in prompt
+        assert "By turn 1" in prompt
+        assert "By turn 0" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_returns_evaluator_result_with_metrics_from_query(self):
+        """run_evaluator_agent returns an EvaluatorResult populated from the
+        query ResultMessage — cost/turns/session — status 'ok' on clean exit.
+        fragments is [] here (the gate reads fragments from the result file)."""
+        from pmf_engine.runner.harness.base import EvaluatorResult
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        async def fake_query(prompt, options):
+            yield _make_result_message(
+                result="Done", total_cost_usd=0.04, num_turns=6, session_id="sess-eval-ok"
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "ok"
+        assert result.cost_usd == 0.04
+        assert result.num_turns == 6
+        assert result.session_id == "sess-eval-ok"
+        assert result.fragments == []
+
+    @pytest.mark.asyncio
+    async def test_status_error_when_sdk_errors(self):
+        """A gate error is FAIL-OPEN: the SDK erroring surfaces as
+        EvaluatorResult(status='error'), NOT a raised exception — the run still
+        publishes (observe-only, v1 scope)."""
+        from pmf_engine.runner.harness.base import EvaluatorResult
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        async def fake_query_error(prompt, options):
+            yield _make_result_message(
+                result="Evaluator blew up", is_error=True, num_turns=2, session_id="sess-eval-err"
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_error):
+                    result = await run_evaluator_agent(params)
+
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_status_error_when_evaluator_hangs_past_timeout(self):
+        """B1 (HIGH): the evaluator's own timeout MUST be enforced. A query that
+        never yields a ResultMessage (a hung/stuck evaluator) must NOT consume the
+        whole outer run budget — `run_evaluator_agent` bounds the SDK consumption
+        with `asyncio.wait_for(..., timeout=params.timeout_seconds)` and on timeout
+        returns EvaluatorResult(status='error') (fail-open). Use a tiny timeout so
+        the test resolves fast; assert it returns within a small margin of it."""
+        import time as _time
+
+        from pmf_engine.runner.harness.base import EvaluatorResult
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        started_query = {"entered": False}
+        cancelled = {"was_cancelled": False}
+
+        async def fake_query_hangs(prompt, options):
+            started_query["entered"] = True
+            try:
+                # Never yields a ResultMessage — sleeps far longer than the
+                # evaluator timeout. wait_for must cancel this.
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled["was_cancelled"] = True
+                raise
+            yield _make_result_message()  # pragma: no cover
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+                timeout_seconds=1,  # tiny — the gate would otherwise burn 300s
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_hangs):
+                    t0 = _time.monotonic()
+                    result = await run_evaluator_agent(params)
+                    elapsed = _time.monotonic() - t0
+
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "error", "a hung evaluator must surface status='error'"
+        # Bounded by ~timeout_seconds, NOT the 30s sleep. Allow generous slack
+        # for scheduler jitter but prove it didn't run to completion.
+        assert elapsed < 10, f"evaluator must be bounded by its timeout; took {elapsed:.1f}s"
+        assert started_query["entered"], "the query coroutine should have started"
+        assert cancelled["was_cancelled"], (
+            "the underlying query must be cancelled on timeout, not abandoned"
+        )
+
+
+class TestEvaluatorAdapter:
+    """B7: ClaudeSdkHarness().run_evaluator(params) is the adapter the wiring
+    uses. It must delegate to run_evaluator_agent and surface the same result."""
+
+    @pytest.mark.asyncio
+    async def test_run_evaluator_delegates_to_run_evaluator_agent(self):
+        from pmf_engine.runner.harness.base import EvaluatorResult
+
+        async def fake_query(prompt, options):
+            yield _make_result_message(
+                result="Done", total_cost_usd=0.09, num_turns=8, session_id="sess-adapter"
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    harness = ClaudeSdkHarness()
+                    result = await harness.run_evaluator(params)
+
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "ok"
+        assert result.cost_usd == 0.09
+        assert result.num_turns == 8
+        assert result.session_id == "sess-adapter"
+
+
+class TestEvaluatorWorkspacePath:
+    """B8: the evaluator must be pointed at params.workspace_dir, not a
+    hardcoded '/workspace' — otherwise a runner whose workspace lives elsewhere
+    (WORKSPACE_DIR override, tests) tells the evaluator to read a path that
+    doesn't exist."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_points_evaluator_at_params_workspace_dir(self):
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        captured, fake_query = _make_options_capture()
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as gate_cwd:
+            result_file_path = os.path.join(gate_cwd, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gate_cwd,
+                workspace_dir=workspace_dir,
+                result_file_path=result_file_path,
+            )
+            with _isolated_runner_env():
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+            prompt = captured["prompt"]
+            # The evidence path the evaluator is told to read is the real
+            # workspace_dir from params — not a hardcoded literal.
+            assert workspace_dir in prompt, (
+                f"evaluator prompt must reference params.workspace_dir ({workspace_dir!r})"
+            )
+
+
+class TestPrimaryPathRegressionAfterEvaluator:
+    """MANDATORY regression lock: adding run_evaluator_agent must NOT change the
+    primary path. A normal harness.run()/run_agent (no evaluator) STILL produces
+    ALLOWED_TOOLS, the broker MCP attached when env set, agents None at
+    max_parallel_subagents=0, and a capability-header system prompt."""
+
+    @pytest.mark.asyncio
+    async def test_primary_allowed_tools_unchanged(self):
+        options = await _run_harness_capture_options()
+        assert options.allowed_tools == ALLOWED_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_primary_broker_mcp_attached_when_env_set(self):
+        options = await _run_harness_capture_options(
+            monkey_env={"BROKER_URL": "https://broker-dev.test", "BROKER_TOKEN": "tok"},
+        )
+        assert options.mcp_servers["broker"]["url"] == "https://broker-dev.test/agent/mcp"
+        assert options.mcp_servers["broker"]["headers"]["X-Broker-Token"] == "tok"
+
+    @pytest.mark.asyncio
+    async def test_primary_agents_none_at_zero_subagents(self):
+        options = await _run_harness_capture_options(max_parallel_subagents=0)
+        assert options.agents is None
+
+    @pytest.mark.asyncio
+    async def test_primary_permission_mode_default(self):
+        options = await _run_harness_capture_options()
+        assert options.permission_mode == "bypassPermissions"
+
+    @pytest.mark.asyncio
+    async def test_primary_system_prompt_starts_with_capability_header(self):
+        options = await _run_harness_capture_options()
+        assert options.system_prompt.startswith(f"Today's date is {date.today().isoformat()}")
+
+
+# ---------------------------------------------------------------------------
+# Finalize-injection (fresh-query-to-finalize)
+#
+# When the primary evaluator query hits the turn ceiling (subtype
+# 'error_max_turns') without writing a verdict, the harness runs EXACTLY ONE
+# FRESH query (no resume) that re-feeds the rubric + artifact and asks the judge
+# to read the artifact once, score it, and write its fragment array. A fresh
+# query only makes broker-routed messages-API calls (which work on Fargate),
+# whereas a resume reliably hangs there. It is bounded three ways
+# (allowed_tools=["Bash"], max_turns=_FINALIZE_MAX_TURNS, its own wait_for) and
+# triggers ONLY on the clean error_max_turns path — never on a genuine error or
+# the cancelled-mid-stream timeout path.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeInjection:
+    @pytest.mark.asyncio
+    async def test_fresh_query_on_max_turns_yields_status_ok_and_captures_finalize(self):
+        """call#1 hits error_max_turns (no result file). The harness runs ONE
+        FRESH query (NOT a resume — a resume reliably hangs on Fargate) with
+        allowed_tools=["Bash"] (the proven file-write path; WebSearch is dropped
+        so it cannot fetch new sources; max_turns is the real bound on
+        re-investigation) and max_turns=_FINALIZE_MAX_TURNS, and call#2 returns a
+        clean ResultMessage. Assert: query invoked TWICE, the finalize options
+        carry NO resume + Bash-only tools + the finalize turn cap, the finalize
+        prompt re-feeds the rubric (params.instruction) and the result file path,
+        final status='ok', and the transcript carries BOTH terminal records."""
+        from pmf_engine.runner.harness.claude_sdk import _FINALIZE_MAX_TURNS, run_evaluator_agent
+
+        calls: list[dict] = []
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-x")
+
+        async def gen_finalize():
+            yield _make_result_message(
+                is_error=False, subtype="result", num_turns=1, session_id="sess-x")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert len(calls) == 2, "fresh finalize must run exactly one query"
+        finalize_opts = calls[1]["options"]
+        assert finalize_opts.resume is None, "finalize must be a FRESH query, not a resume"
+        assert finalize_opts.allowed_tools == ["Bash"]
+        assert "WebSearch" not in finalize_opts.allowed_tools
+        assert finalize_opts.max_turns == _FINALIZE_MAX_TURNS
+        # The fresh finalize prompt must re-feed the rubric and the result file path.
+        assert params.instruction in calls[1]["prompt"]
+        assert params.result_file_path in calls[1]["prompt"]
+
+        assert result.status == "ok"
+        records = _parse_jsonl(result.eval_transcript)
+        terminals = [r for r in records if r["kind"] == "result"]
+        assert len(terminals) == 2, terminals
+        assert terminals[0]["subtype"] == "error_max_turns"
+        assert terminals[1]["subtype"] == "result"
+
+    @pytest.mark.asyncio
+    async def test_finalize_accumulates_cost_and_turns_across_primary_and_finalize(self):
+        """FIX 1: the EvaluatorResult cost/turns/duration must SUM the primary's
+        spend with the finalize's, not be clobbered by the finalize's lone
+        ResultMessage. The primary bursts the ceiling having burned $0.10 / 20
+        turns / 9000ms; the finalize cleanly resolves at $0.03 / 2 turns /
+        1500ms. The aggregate the gate accounts against is $0.13 / 22 turns /
+        10500ms — anything less under-counts the finalize-salvaged run's true
+        spend. duration_ms in particular is wall-clock the gate bills against, so
+        it must accumulate exactly like cost and turns, not reflect only the
+        finalize.
+
+        The PER-TERMINAL transcript records, by contrast, must still carry each
+        message's OWN cost/turns/duration ([0.10/20/9000] and [0.03/2/1500]) —
+        the transcript is a ledger of what each query did, not a running total."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls: list[dict] = []
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", total_cost_usd=0.10,
+                num_turns=20, duration_ms=9000, session_id="sess-acc")
+
+        async def gen_finalize():
+            yield _make_result_message(
+                is_error=False, subtype="result", total_cost_usd=0.03,
+                num_turns=2, duration_ms=1500, session_id="sess-acc")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert len(calls) == 2
+        assert result.status == "ok"
+        assert result.cost_usd == pytest.approx(0.13), "cost must SUM primary + finalize"
+        assert result.num_turns == 22, "turns must SUM primary + finalize"
+        assert result.duration_ms == 10500, "duration_ms must SUM primary + finalize"
+
+        records = _parse_jsonl(result.eval_transcript)
+        terminals = [r for r in records if r["kind"] == "result"]
+        assert len(terminals) == 2, terminals
+        assert terminals[0]["cost_usd"] == pytest.approx(0.10)
+        assert terminals[0]["num_turns"] == 20
+        assert terminals[0]["duration_ms"] == 9000
+        assert terminals[1]["cost_usd"] == pytest.approx(0.03)
+        assert terminals[1]["num_turns"] == 2
+        assert terminals[1]["duration_ms"] == 1500
+
+    @pytest.mark.asyncio
+    async def test_finalize_prompt_points_at_readonly_artifact(self):
+        """FIX 4 + FIX 6: the finalize prompt must (a) re-feed the artifact
+        LOCATION (params.workspace_dir) so the fresh judge knows where to read,
+        and (b) carry the same READ-ONLY / do-not-modify warning the primary
+        prompt does — the finalize has Bash and could otherwise mutate the
+        evidence it is meant to grade."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls: list[dict] = []
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-ro")
+
+        async def gen_finalize():
+            yield _make_result_message(
+                is_error=False, subtype="result", num_turns=1, session_id="sess-ro")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    await run_evaluator_agent(params)
+
+        assert len(calls) == 2
+        finalize_prompt = calls[1]["prompt"]
+        assert params.workspace_dir in finalize_prompt
+        lowered = finalize_prompt.lower()
+        assert "read-only" in lowered
+        assert "do not modify" in lowered or "do not change" in lowered
+
+    @pytest.mark.asyncio
+    async def test_no_finalize_on_genuine_error(self):
+        """A non-max_turns error (error_during_execution) must NOT trigger a
+        finalize — re-running a genuinely-failed evaluation double-bills for
+        nothing."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls = {"n": 0}
+
+        async def gen():
+            yield _make_result_message(
+                is_error=True, subtype="error_during_execution", num_turns=4, session_id="sess-e")
+
+        def fake_query(prompt, options):
+            calls["n"] += 1
+            return gen()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert calls["n"] == 1, "genuine error must not finalize"
+        assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_no_finalize_when_evaluator_times_out(self):
+        """A timed-out evaluator must NOT finalize. The fake never yields a
+        ResultMessage — it hangs past the (tiny) timeout, so wait_for cancels the
+        first query mid-stream (the session is being torn down) and the
+        `not timed_out` guard short-circuits the finalize. Exactly one query,
+        fast, status='error'."""
+        import time as _time
+
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls = {"n": 0}
+
+        async def fake_query_hangs(prompt, options):
+            calls["n"] += 1
+            await asyncio.sleep(30)
+            yield _make_result_message()  # pragma: no cover
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gc, workspace_dir=ws, result_file_path=rf, timeout_seconds=1)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query_hangs):
+                    t0 = _time.monotonic()
+                    result = await run_evaluator_agent(params)
+                    elapsed = _time.monotonic() - t0
+
+        assert calls["n"] == 1, "timeout path must not finalize"
+        assert result.status == "error"
+        assert elapsed < 10, f"must be bounded by the timeout; took {elapsed:.1f}s"
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_bounded_to_one_attempt(self):
+        """Both the primary AND the finalize hit error_max_turns -> the finalize
+        is attempted ONCE and does NOT recurse into a third query. status='error'
+        (fail-open). Proves no runaway loop."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls = {"n": 0}
+
+        async def gen():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-loop")
+
+        def fake_query(prompt, options):
+            calls["n"] += 1
+            return gen()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+        assert calls["n"] == 2, "finalize attempted exactly once, no third query"
+        assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_finalize_can_be_disabled_by_flag(self):
+        """The finalize is behind a module constant (_FINALIZE_ON_MAX_TURNS) so it
+        can be turned off if a finalize ever misbehaves in dev. With it False, a
+        max_turns cut does NOT resume — exactly one query, status='error'."""
+        from pmf_engine.runner.harness import claude_sdk as claude_sdk_module
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        calls = {"n": 0}
+
+        async def gen():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-off")
+
+        def fake_query(prompt, options):
+            calls["n"] += 1
+            return gen()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+            with _isolated_runner_env(None):
+                with patch.object(claude_sdk_module, "_FINALIZE_ON_MAX_TURNS", False):
+                    with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                        result = await run_evaluator_agent(params)
+
+        assert calls["n"] == 1
+        assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_finalize_agent_write_of_result_file_yields_status_ok(self):
+        """FIX 5(a): a finalize whose agent ACTUALLY WRITES the result file is a
+        success. The primary hits error_max_turns having written nothing; the
+        finalize fake mirrors the real Bash write — it dumps a valid fragment
+        array to params.result_file_path — and yields a clean ResultMessage.
+        Assert: exactly two queries, the file exists with the expected fragments
+        on disk, and status='ok'. The old finalize test asserted status without
+        any fake ever writing a file, so a live finalize that emitted a clean
+        ResultMessage but failed to write the verdict still 'passed'. This locks
+        the file-write half of the contract."""
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        expected_fragments = [
+            {"check": "faithfulness", "score": 4, "evidence": "every claim cited"},
+            {"check": "completeness", "score": 5, "evidence": "all sections present"},
+        ]
+
+        calls: list[dict] = []
+        result_file_path_holder: dict[str, str] = {}
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-write")
+
+        async def gen_finalize():
+            with open(result_file_path_holder["path"], "w") as f:
+                json.dump(expected_fragments, f)
+            yield _make_result_message(
+                is_error=False, subtype="result", num_turns=1, session_id="sess-write")
+
+        def fake_query(prompt, options):
+            calls.append({"prompt": prompt, "options": _snapshot_options(options)})
+            if len(calls) == 1:
+                return gen_primary()
+            return gen_finalize()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            result_file_path_holder["path"] = rf
+            params = _make_evaluator_params(gate_cwd=gc, workspace_dir=ws, result_file_path=rf)
+
+            assert not os.path.exists(rf), "result file must not exist before the finalize writes it"
+
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    result = await run_evaluator_agent(params)
+
+            assert len(calls) == 2, "primary + exactly one finalize query"
+            assert os.path.exists(rf), "the finalize agent must have written the result file"
+            with open(rf) as f:
+                on_disk = json.load(f)
+            assert on_disk == expected_fragments
+
+        assert result.status == "ok", "a finalize that writes the verdict is treated as a success"
+
+    @pytest.mark.asyncio
+    async def test_finalize_is_bounded_by_its_own_timeout(self):
+        """FIX 5(b): the finalize resume MUST be bounded by its own wait_for. The
+        primary cuts on error_max_turns instantly (so the primary timeout does
+        not fire and the finalize is reached), then the finalize query HANGS far
+        longer than the budget. With params.timeout_seconds tiny, the finalize
+        timeout is min(_FINALIZE_TIMEOUT_SECONDS, timeout_seconds) = tiny, so the
+        finalize's wait_for cancels the hung query and run_evaluator_agent returns
+        status='error' (fail-open) in well under the sleep duration.
+
+        Non-vacuous: this test currently PASSES. If the finalize's
+        `asyncio.wait_for(drain(...), timeout=finalize_timeout)` in _finalize were
+        removed, the finalize drain would await the hung query directly, the 30s
+        sleep would run to completion, the test would block ~30s, and the
+        `elapsed < 10` assertion (plus the cancellation flag) would fail."""
+        import time as _time
+
+        from pmf_engine.runner.harness.base import EvaluatorResult
+        from pmf_engine.runner.harness.claude_sdk import run_evaluator_agent
+
+        finalize_cancelled = {"was_cancelled": False}
+        calls = {"n": 0}
+
+        async def gen_primary():
+            yield _make_result_message(
+                is_error=True, subtype="error_max_turns", num_turns=20, session_id="sess-fin-hang")
+
+        async def gen_finalize_hangs():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                finalize_cancelled["was_cancelled"] = True
+                raise
+            yield _make_result_message()  # pragma: no cover
+
+        def fake_query(prompt, options):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return gen_primary()
+            return gen_finalize_hangs()
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as gc:
+            rf = os.path.join(gc, "fragments.json")
+            params = _make_evaluator_params(
+                gate_cwd=gc, workspace_dir=ws, result_file_path=rf, timeout_seconds=1)
+            with _isolated_runner_env(None):
+                with patch("pmf_engine.runner.harness.claude_sdk.query", side_effect=fake_query):
+                    t0 = _time.monotonic()
+                    result = await run_evaluator_agent(params)
+                    elapsed = _time.monotonic() - t0
+
+        assert calls["n"] == 2, "primary cut, then exactly one finalize attempt"
+        assert isinstance(result, EvaluatorResult)
+        assert result.status == "error", "a hung finalize must surface status='error' (fail-open)"
+        assert elapsed < 10, f"finalize must be bounded by its own timeout; took {elapsed:.1f}s"
+        assert finalize_cancelled["was_cancelled"], (
+            "the hung finalize query must be cancelled by its wait_for, not abandoned"
+        )

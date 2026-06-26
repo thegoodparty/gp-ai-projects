@@ -425,7 +425,37 @@ class PlaywrightBrowserFetcher:
                         body_path=body_path,
                     )
 
-            body = await response.body()
+            if content_type.startswith("text/html"):
+                # Return the rendered VISIBLE TEXT, not raw HTML: the publish
+                # gate rejects raw HTML, and every consumer reads the body as
+                # text. Reading the DOM also sidesteps the getResponseBody
+                # eviction that response.body() hits after the networkidle settle.
+                try:
+                    body = (await page.inner_text("body")).encode("utf-8")
+                except PlaywrightError as e:
+                    logger.warning(
+                        "page.inner_text('body') unavailable url=%s error=%s",
+                        url,
+                        e,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="upstream response body unavailable",
+                    ) from e
+            else:
+                try:
+                    body = await response.body()
+                except PlaywrightError as e:
+                    logger.warning(
+                        "response.body() unavailable for content-type=%s url=%s error=%s",
+                        content_type,
+                        url,
+                        e,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="upstream response body unavailable",
+                    ) from e
             _raise_if_violation()
             if len(body) > PAGE_RESPONSE_MAX_BYTES:
                 raise HTTPException(

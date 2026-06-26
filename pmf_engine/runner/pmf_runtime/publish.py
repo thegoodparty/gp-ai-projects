@@ -47,6 +47,9 @@ def publish(
     artifact: dict,
     duration_seconds: float = 0,
     cost_usd: float = 0,
+    qa_verdict: dict | None = None,
+    qa_raw_output: str | None = None,
+    qa_eval_transcript: str | None = None,
 ) -> dict:
     from .config import get_config
 
@@ -55,6 +58,25 @@ def publish(
         "duration_seconds": duration_seconds,
         "cost_usd": cost_usd,
     }
+    # PMF QA gate (contract D): additive optional field. Omit the key entirely
+    # when no gate ran (no qa folder / pre-gate runner) so the payload is
+    # byte-identical to today; the broker forwards a present verdict verbatim
+    # as an opaque, size-capped passthrough.
+    if qa_verdict is not None:
+        body["qa_verdict"] = qa_verdict
+    # PMF QA gate (contract D / decision 13): the raw main.py stdout, carried
+    # so the broker can write it durably to S3 alongside the aggregated verdict
+    # (the runner is sandboxed — the broker is its only egress). Omit the key
+    # when absent so a verdict-only / no-qa publish stays byte-identical.
+    if qa_raw_output is not None:
+        body["qa_raw_output"] = qa_raw_output
+    # PMF QA gate (contract D): the evaluator's redacted per-turn JSONL
+    # transcript, carried so the broker can write it durably to S3 alongside the
+    # verdict. Omit the key when absent (no evaluator ran / no-qa) so the payload
+    # stays byte-identical; an empty string ('' = evaluator ran but empty) is
+    # DISTINCT from None and IS forwarded.
+    if qa_eval_transcript is not None:
+        body["qa_eval_transcript"] = qa_eval_transcript
 
     def _call() -> dict:
         response = get_config().client.post("/artifact/publish", json=body)

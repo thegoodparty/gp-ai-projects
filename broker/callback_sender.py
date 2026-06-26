@@ -22,27 +22,25 @@ class CallbackSender:
         reason_code: str = "",
         detail: str = "",
     ):
-        body = {
-            "type": "agentExperimentResult",
-            "data": {
-                "experimentId": experiment_id,
-                "runId": run_id,
-                "organizationSlug": organization_slug,
-                "status": status,
-                "artifactKey": artifact_key,
-                "artifactBucket": artifact_bucket,
-                "durationSeconds": duration_seconds,
-                "costUsd": cost_usd,
-                "reasonCode": reason_code,
-                "detail": detail,
-                # gp-api's queue consumer reads data.error to populate
-                # ExperimentRun.error (the user-visible failure text). Keep
-                # populated with detail; gp-api's new schema ignores the
-                # structured detail/reasonCode/costUsd fields but they stay
-                # on the wire for future gp-api consumption.
-                "error": detail,
-            },
+        data: dict[str, object] = {
+            "experimentId": experiment_id,
+            "runId": run_id,
+            "organizationSlug": organization_slug,
+            "status": status,
+            "artifactKey": artifact_key,
+            "artifactBucket": artifact_bucket,
+            "durationSeconds": duration_seconds,
+            "costUsd": cost_usd,
+            "reasonCode": reason_code,
+            "detail": detail,
+            # gp-api's queue consumer reads data.error to populate
+            # ExperimentRun.error (the user-visible failure text). Keep
+            # populated with detail; gp-api's new schema ignores the
+            # structured detail/reasonCode/costUsd fields but they stay
+            # on the wire for future gp-api consumption.
+            "error": detail,
         }
+        body = {"type": "agentExperimentResult", "data": data}
         if not self.queue_url:
             logger.info("callback skipped (no queue_url): %s %s", run_id, status)
             return

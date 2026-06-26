@@ -44,7 +44,7 @@ def _mint_payload(**overrides) -> dict:
         "run_id": "run-20260415-001",
         "organization_slug": "org-42",
         "experiment_id": "voter_targeting",
-        "scope": {"databricks": ["SELECT"], "tavily": True},
+        "scope": {"databricks": ["SELECT"]},
         "params": {"state": "CA", "district": "SD-15"},
         "clerk_user_id": DEFAULT_CLERK_USER_ID,
     }
@@ -550,9 +550,9 @@ class TestFailureLogging:
             headers={"Authorization": "Bearer wrong-token"},
         )
         assert resp.status_code == 401
-        assert any("invalid_service_token" in r.message for r in caplog.records if r.name == self.LOGGER_NAME), (
-            f"missing invalid_service_token warning; got: {[r.message for r in caplog.records]}"
-        )
+        assert any(
+            "invalid_service_token" in r.message for r in caplog.records if r.name == self.LOGGER_NAME
+        ), f"missing invalid_service_token warning; got: {[r.message for r in caplog.records]}"
 
     def test_logs_warning_on_ttl_above_cap(self, caplog):
         caplog.set_level(logging.WARNING, logger=self.LOGGER_NAME)

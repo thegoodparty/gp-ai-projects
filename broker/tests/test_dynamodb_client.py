@@ -37,7 +37,7 @@ def _make_ticket(
         "run_id": "run-001",
         "organization_slug": "org-42",
         "experiment_id": "voter_targeting",
-        "scope": {"databricks": ["SELECT"], "tavily": True},
+        "scope": {"databricks": ["SELECT"]},
         "params": {"state": "CA", "district": "SD-15"},
         "exp": now + exp_offset,
         "issued_at": now,

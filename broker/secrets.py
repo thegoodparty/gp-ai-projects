@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import boto3
 
-
 _REQUIRED_FIELDS = {
     "ANTHROPIC_API_KEY": "anthropic_api_key",
     "SERVICE_TOKEN_HASH": "service_token_hash",
@@ -16,7 +15,6 @@ _REQUIRED_FIELDS = {
 }
 
 _OPTIONAL_FIELDS = {
-    "TAVILY_API_KEY": "tavily_api_key",
     "DATABRICKS_SERVER_HOSTNAME": "databricks_server_hostname",
     "DATABRICKS_HTTP_PATH": "databricks_http_path",
     "DATABRICKS_API_KEY": "databricks_api_key",
@@ -36,7 +34,6 @@ class BrokerSecrets:
     gp_api_base_url: str
     agent_fleet_clerk_id: str
     agent_mcp_token_secret: str
-    tavily_api_key: str = ""
     databricks_server_hostname: str = ""
     databricks_http_path: str = ""
     databricks_api_key: str = ""
