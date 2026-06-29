@@ -370,14 +370,16 @@ def _missing_critical_config() -> list[str]:
     return missing
 
 
-# Hard upper bound on a dispatch's serialized params. Params no longer have to
-# fit the ECS RunTask containerOverrides budget: anything over
-# INLINE_PARAMS_BUDGET is routed off the env var and the runner pulls it from
-# the broker (which already holds it in the run's scope ticket). This cap is now
-# a product/cost sanity bound on agent input, well under the broker ticket's
-# DynamoDB item ceiling (400 KB). Oversize dispatches still get a clean
-# dispatch-time error rather than failing deep in the run.
-MAX_PARAMS_JSON_BYTES = 20000
+# Hard upper bound on a dispatch's serialized params. Params no longer ride the
+# ECS RunTask containerOverrides budget (anything over INLINE_PARAMS_BUDGET is
+# pulled from the broker ticket instead), so the binding limit is now the SQS
+# message that carries the dispatch gp-api -> this Lambda: SQS caps a message at
+# 262144 bytes (params + the small run_id/slugs/type envelope). This cap is
+# measured on Python's spaced json.dumps, which is always >= gp-api's compact
+# JSON.stringify, so a payload that passes here is guaranteed to fit the compact
+# SQS body (+ ~300-byte envelope) under 262144. 260000 leaves that headroom;
+# going higher needs an SQS extended client / S3 offload on the gp-api side.
+MAX_PARAMS_JSON_BYTES = 260000
 
 # At or under this serialized size, params ride the PARAMS_JSON env var inline
 # (byte-identical to the pre-broker dispatch). AWS ECS RunTask caps the total
