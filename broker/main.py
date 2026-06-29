@@ -46,6 +46,10 @@ from broker.endpoints.artifact_read import (
     get_scope_ticket as read_get_scope_ticket,
     router as read_router,
 )
+from broker.endpoints.params_read import (
+    get_scope_ticket as params_get_scope_ticket,
+    router as params_router,
+)
 from broker.endpoints.inputs_read import (
     get_s3_client as inputs_get_s3_client,
     get_scope_ticket as inputs_get_scope_ticket,
@@ -198,6 +202,7 @@ async def lifespan(app: FastAPI):
 
     app.dependency_overrides[inputs_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[inputs_get_s3_client] = lambda: s3_client
+    app.dependency_overrides[params_get_scope_ticket] = _resolve_ticket_from_request
 
     app.dependency_overrides[status_get_scope_ticket] = _resolve_ticket_from_request
     app.dependency_overrides[status_get_s3_client] = lambda: s3_client
@@ -267,6 +272,7 @@ app.include_router(braintrust_router)
 app.include_router(publish_router)
 app.include_router(read_router)
 app.include_router(inputs_router)
+app.include_router(params_router)
 app.include_router(status_router)
 app.include_router(databricks_router)
 app.include_router(upload_router)

@@ -217,6 +217,25 @@ class RunnerConfig:
         # RunnerConfig directly (tests, future CLI, etc.).
         validate_broker_url_scheme(broker_url, environment_raw)
 
+        # Large params don't fit the ECS RunTask containerOverrides budget, so
+        # dispatch ships them off the env var (PARAMS_VIA_BROKER) and the runner
+        # pulls them from the broker, which holds them in this run's scope ticket
+        # from launch. Done AFTER scheme validation (like the manifest fetch
+        # below) so the broker token never crosses a plaintext connection.
+        if os.environ.get("PARAMS_VIA_BROKER", "").strip() == "1":
+            broker_token_for_params = os.environ.get("BROKER_TOKEN", "").strip()
+            if not (broker_url and broker_token_for_params):
+                raise RuntimeError(
+                    "Cannot fetch params via broker: "
+                    "BROKER_URL and BROKER_TOKEN must both be set."
+                )
+            from pmf_engine.runner.params import fetch_params_from_broker
+
+            params = fetch_params_from_broker(
+                broker_url=broker_url,
+                broker_token=broker_token_for_params,
+            )
+
         contract_schema = None
         attachments: dict[str, str] = {}
         system_prompt: str | None = None
