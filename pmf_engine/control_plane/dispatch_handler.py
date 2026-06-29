@@ -370,7 +370,21 @@ def _missing_critical_config() -> list[str]:
     return missing
 
 
-MAX_PARAMS_JSON_BYTES = 6000
+# Hard upper bound on a dispatch's serialized params. Params no longer have to
+# fit the ECS RunTask containerOverrides budget: anything over
+# INLINE_PARAMS_BUDGET is routed off the env var and the runner pulls it from
+# the broker (which already holds it in the run's scope ticket). This cap is now
+# a product/cost sanity bound on agent input, well under the broker ticket's
+# DynamoDB item ceiling (400 KB). Oversize dispatches still get a clean
+# dispatch-time error rather than failing deep in the run.
+MAX_PARAMS_JSON_BYTES = 20000
+
+# At or under this serialized size, params ride the PARAMS_JSON env var inline
+# (byte-identical to the pre-broker dispatch). AWS ECS RunTask caps the total
+# `containerOverrides[]` env payload (~8 KB), shared with INPUT_FILES_JSON and
+# ~15 fixed env vars, so the inline budget stays at the old params cap; larger
+# params are delivered out-of-band via the broker instead (PARAMS_VIA_BROKER).
+INLINE_PARAMS_BUDGET = 6000
 
 # Cap on the serialized INPUT_FILES_JSON env var the dispatch sets on the
 # Fargate task. AWS ECS RunTask limits the total `containerOverrides[]`
@@ -542,6 +556,15 @@ def build_container_overrides(
 ) -> dict:
     if params_json is None:
         params_json = json.dumps(message["params"])
+    # Small params ride PARAMS_JSON inline (byte-identical to the pre-broker
+    # dispatch). Larger params would blow the ECS RunTask containerOverrides
+    # budget, so route them off the env var: set PARAMS_VIA_BROKER and let the
+    # runner fetch them from the broker's /params/read, which serves them from
+    # this run's scope ticket (minted with the full params at launch).
+    if len(params_json.encode("utf-8")) <= INLINE_PARAMS_BUDGET:
+        params_env = {"name": "PARAMS_JSON", "value": params_json}
+    else:
+        params_env = {"name": "PARAMS_VIA_BROKER", "value": "1"}
     env = [
         {"name": "EXPERIMENT_ID", "value": message["experiment_type"]},
         {"name": "RUN_ID", "value": message["run_id"]},
@@ -559,7 +582,7 @@ def build_container_overrides(
         {"name": "BRAINTRUST_API_KEY", "value": broker_token},
         {"name": "BRAINTRUST_APP_URL", "value": f"{broker_url}/braintrust/app"},
         {"name": "BRAINTRUST_API_URL", "value": f"{broker_url}/braintrust/api"},
-        {"name": "PARAMS_JSON", "value": params_json},
+        params_env,
         {"name": "TIMEOUT_SECONDS", "value": str(experiment.get("timeout_seconds", 600))},
         # QA_JUDGES configures the runbooks qa-spine pluggable LLM judge registry
         # (format: name:provider:model,...). Routes through the same broker proxy
