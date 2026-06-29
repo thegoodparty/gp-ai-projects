@@ -1345,12 +1345,59 @@ class TestMissingCriticalEnvVars:
         assert result["batchItemFailures"] == [{"itemIdentifier": "msg-001"}]
 
 
+class TestParamsInlineVsBroker:
+    """Small params ride PARAMS_JSON inline; params over INLINE_PARAMS_BUDGET are
+    routed off the env var (PARAMS_VIA_BROKER) so the override stays within the
+    ECS RunTask budget and the runner fetches them from the broker."""
+
+    def _overrides_for(self, params: dict) -> dict:
+        return build_container_overrides(
+            experiment={
+                "harness": "claude_sdk",
+                "model": "sonnet",
+                "contract": {"type": "json", "s3_key_template": "t"},
+            },
+            message={
+                "experiment_type": "opponent_research",
+                "organization_slug": "org-123",
+                "run_id": "run-abc",
+                "clerk_user_id": "user_test_dispatch",
+                "params": params,
+            },
+            broker_token="tok",
+            broker_url="https://broker.example.com",
+            container_name="pmf-engine",
+        )
+
+    def test_small_params_ride_inline(self):
+        env_map = {
+            e["name"]: e["value"]
+            for e in self._overrides_for({"district": "CA-12"})[
+                "containerOverrides"
+            ][0]["environment"]
+        }
+        assert json.loads(env_map["PARAMS_JSON"]) == {"district": "CA-12"}
+        assert "PARAMS_VIA_BROKER" not in env_map
+
+    def test_large_params_routed_to_broker(self):
+        # ~18 KB: over the 6000-byte inline budget, under the 20000 hard cap.
+        env_map = {
+            e["name"]: e["value"]
+            for e in self._overrides_for({"issues": "x" * 18000})[
+                "containerOverrides"
+            ][0]["environment"]
+        }
+        assert env_map["PARAMS_VIA_BROKER"] == "1"
+        assert "PARAMS_JSON" not in env_map
+
+
 class TestParamsSizeLimit:
     @patch("pmf_engine.control_plane.dispatch_handler.send_error_callback")
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_oversized_params_rejected_before_ecs(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
-        oversized = {f"key_{i}": "x" * 900 for i in range(12)}
+        # Over the 20000-byte hard cap (~25 KB serialized).
+        oversized = {f"key_{i}": "x" * 1000 for i in range(25)}
 
         event = _make_sqs_event(
             {

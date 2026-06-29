@@ -160,9 +160,14 @@ Full spec: see `broker/endpoints/*.py`.
          BROKER_TOKEN=<uuid>
          ANTHROPIC_API_KEY=<uuid>  (same token; SDK uses it as auth header)
          RUN_ID, EXPERIMENT_ID, ORGANIZATION_SLUG, PARAMS_JSON, ...
+       (small params ride PARAMS_JSON inline; params over the inline budget are
+        sent as PARAMS_VIA_BROKER=1 instead and the runner fetches them from
+        GET /params/read, served from the ticket — keeps the overrides under the
+        ECS RunTask size limit)
 
   3. Runner Fargate task:
      - Pulls image via ECR endpoints + S3 prefix list
+     - If PARAMS_VIA_BROKER is set: GET /params/read (token auth) → ticket params
      - Starts Claude Agent SDK (passes ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY as env)
      - Every API call: Claude SDK → broker /anthropic/v1/messages (token auth)
      - Every DB query: pmf_runtime.databricks → broker /databricks/query
