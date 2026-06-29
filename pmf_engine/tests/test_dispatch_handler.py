@@ -1396,8 +1396,8 @@ class TestParamsSizeLimit:
     @patch("pmf_engine.control_plane.dispatch_handler.emit_dispatch_metric")
     @patch("pmf_engine.control_plane.dispatch_handler.get_ecs_client")
     def test_oversized_params_rejected_before_ecs(self, mock_get_ecs, mock_emit_metric, mock_send_error_callback):
-        # Over the 20000-byte hard cap (~25 KB serialized).
-        oversized = {f"key_{i}": "x" * 1000 for i in range(25)}
+        # Over the 260000-byte hard cap (~280 KB serialized).
+        oversized = {f"key_{i}": "x" * 1000 for i in range(280)}
 
         event = _make_sqs_event(
             {
