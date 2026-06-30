@@ -26,7 +26,7 @@ def milestone(name: str) -> None:
     failure (bad name, unwritable workspace, full disk) is swallowed and logged.
     """
     try:
-        workspace = os.environ.get("PMF_WORKSPACE", "/workspace")
+        workspace = os.environ.get("WORKSPACE_DIR") or os.environ.get("PMF_WORKSPACE", "/workspace")
         logs_dir = os.path.join(workspace, "logs")
         os.makedirs(logs_dir, exist_ok=True)
         record = {

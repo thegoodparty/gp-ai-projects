@@ -430,6 +430,7 @@ def _collect_log_files(workspace_dir: str) -> dict[str, bytes]:
         try:
             with open(milestones_path, "rb") as f:
                 files["milestones.jsonl"] = f.read()
+            files.pop("workspace/logs/milestones.jsonl", None)
         except OSError:
             pass
 
