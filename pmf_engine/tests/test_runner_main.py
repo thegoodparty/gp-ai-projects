@@ -1936,6 +1936,59 @@ class TestCollectWorkspaceFilesSkipsUserInputs:
         )
 
 
+class TestCollectLogFilesMilestonesPromotion:
+    """The agent writes its milestone markers to
+    <workspace>/logs/milestones.jsonl. The generic workspace walk collects that
+    under the nested key "workspace/logs/milestones.jsonl", but cost analysis
+    reads the marker log as a bare sibling of session.jsonl
+    (<exp>/<runId>/logs/milestones.jsonl). _collect_log_files promotes the
+    already-collected bytes to the bare "milestones.jsonl" key and drops the
+    nested one — no second disk read, no double-upload.
+    """
+
+    def test_milestones_promoted_to_bare_key(self, tmp_path):
+        from pmf_engine.runner.main import _collect_log_files
+
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "milestones.jsonl").write_text(
+            '{"ts":"2026-01-01T00:00:00+00:00","name":"gather"}\n'
+        )
+
+        files = _collect_log_files(str(tmp_path))
+
+        assert "milestones.jsonl" in files, (
+            f"milestones must be promoted to the bare key, got: {sorted(files)}"
+        )
+        assert files["milestones.jsonl"] == (
+            b'{"ts":"2026-01-01T00:00:00+00:00","name":"gather"}\n'
+        )
+
+    def test_nested_milestones_key_removed_after_promotion(self, tmp_path):
+        from pmf_engine.runner.main import _collect_log_files
+
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "milestones.jsonl").write_text('{"name":"x"}\n')
+
+        files = _collect_log_files(str(tmp_path))
+
+        assert "workspace/logs/milestones.jsonl" not in files, (
+            f"nested walk key must be dropped after promotion, got: {sorted(files)}"
+        )
+
+    def test_no_milestones_file_leaves_neither_key(self, tmp_path):
+        from pmf_engine.runner.main import _collect_log_files
+
+        (tmp_path / "output").mkdir()
+        (tmp_path / "output" / "result.json").write_text('{"ok": true}')
+
+        files = _collect_log_files(str(tmp_path))
+
+        assert "milestones.jsonl" not in files
+        assert "workspace/logs/milestones.jsonl" not in files
+
+
 class TestBrokerInitLastResortSqsFallback:
     """C2: When BOTH init_config AND the subsequent RunnerConfig.from_env
     broker fetch fail, the runner has no broker channel to send a failed
