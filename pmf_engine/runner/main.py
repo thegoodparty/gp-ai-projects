@@ -417,6 +417,14 @@ def _collect_log_files(workspace_dir: str) -> dict[str, bytes]:
         else:
             logger.warning("Skipping session JSONL upload — redaction failed")
 
+    # Promote the agent-written milestones log from its nested walk key to a
+    # bare sibling of session.jsonl (<exp>/<runId>/logs/milestones.jsonl), which
+    # is where cost analysis reads it. Rename the already-collected bytes rather
+    # than re-reading from disk. Markers are timestamps + phase names — no PII.
+    nested = files.pop("workspace/logs/milestones.jsonl", None)
+    if nested is not None:
+        files["milestones.jsonl"] = nested
+
     return files
 
 
