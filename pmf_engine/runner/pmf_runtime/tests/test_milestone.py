@@ -26,6 +26,15 @@ class TestMilestone:
         markers = _read_markers(tmp_path)
         assert [m["name"] for m in markers] == ["step_one", "step_two"]
 
+    def test_prefers_workspace_dir_over_pmf_workspace(self, tmp_path, monkeypatch):
+        workspace_dir = tmp_path / "wsdir"
+        monkeypatch.setenv("WORKSPACE_DIR", str(workspace_dir))
+        monkeypatch.delenv("PMF_WORKSPACE", raising=False)
+        milestone("from_workspace_dir")
+        markers = _read_markers(workspace_dir)
+        assert len(markers) == 1
+        assert markers[0]["name"] == "from_workspace_dir"
+
     def test_creates_logs_dir_if_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PMF_WORKSPACE", str(tmp_path))
         assert not (tmp_path / "logs").exists()

@@ -417,22 +417,13 @@ def _collect_log_files(workspace_dir: str) -> dict[str, bytes]:
         else:
             logger.warning("Skipping session JSONL upload — redaction failed")
 
-    # Promote the agent's milestone markers to a bare sibling of session.jsonl.
-    # The generic workspace walk above already collected the file under
-    # "workspace/logs/milestones.jsonl", but the broker keys every uploaded
-    # name at <exp>/<runId>/logs/<name>, so that would land nested at
-    # .../logs/workspace/logs/milestones.jsonl. Cost analysis reads the marker
-    # log as a sibling of session.jsonl (.../logs/milestones.jsonl), so copy it
-    # to the bare basename here. Markers are timestamps + phase names the agent
-    # writes itself — no PII, no redaction needed.
-    milestones_path = os.path.join(workspace_dir, "logs", "milestones.jsonl")
-    if os.path.isfile(milestones_path):
-        try:
-            with open(milestones_path, "rb") as f:
-                files["milestones.jsonl"] = f.read()
-            files.pop("workspace/logs/milestones.jsonl", None)
-        except OSError:
-            pass
+    # Promote the agent-written milestones log from its nested walk key to a
+    # bare sibling of session.jsonl (<exp>/<runId>/logs/milestones.jsonl), which
+    # is where cost analysis reads it. Rename the already-collected bytes rather
+    # than re-reading from disk. Markers are timestamps + phase names — no PII.
+    nested = files.pop("workspace/logs/milestones.jsonl", None)
+    if nested is not None:
+        files["milestones.jsonl"] = nested
 
     return files
 
