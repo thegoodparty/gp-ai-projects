@@ -729,6 +729,12 @@ resource "aws_ecs_service" "broker" {
   enable_execute_command            = true
   health_check_grace_period_seconds = 60
 
+  # Propagate the task-definition's Project tag (set via provider default_tags)
+  # onto the running tasks so Fargate compute is attributed in Cost Explorer;
+  # tasks don't inherit task-def tags otherwise.
+  propagate_tags          = "TASK_DEFINITION"
+  enable_ecs_managed_tags = true
+
   network_configuration {
     subnets          = var.private_subnet_ids
     security_groups  = [aws_security_group.broker.id]
