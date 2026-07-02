@@ -89,11 +89,22 @@ def _raise_from_error(resp, operation: str) -> None:
     raise ValueError(f"{operation} failed: {detail}")
 
 
-def get(url: str, purpose: str = "") -> dict:
+def get(url: str, purpose: str = "", render: str | None = None) -> dict:
+    """Fetch a URL through the broker and return its body as text.
+
+    render: optional broker render mode for text/html pages — "text" (default,
+    rendered visible text), "html" (full DOM markup), or "links" (JSON list of
+    {href, text} from the page's anchors, hrefs absolute). None omits the param
+    so the broker default ("text") applies. Ignored by the broker for non-HTML
+    content. "links" returns an application/json body you can json.loads.
+    """
     from .config import get_config
 
     client = get_config().client
-    with client.stream("POST", "/http/fetch", json={"url": url, "purpose": purpose}) as resp:
+    payload: dict = {"url": url, "purpose": purpose}
+    if render is not None:
+        payload["render"] = render
+    with client.stream("POST", "/http/fetch", json=payload) as resp:
         if resp.status_code >= 400:
             _raise_from_error(resp, "http.get")
 
@@ -106,10 +117,7 @@ def get(url: str, purpose: str = "") -> dict:
             upstream_status = resp.status_code
 
         if not _is_textual(content_type):
-            raise ValueError(
-                f"http.get cannot decode binary content-type {content_type!r}; "
-                "use http.download instead"
-            )
+            raise ValueError(f"http.get cannot decode binary content-type {content_type!r}; use http.download instead")
 
         chunks: list[bytes] = []
         byte_size = 0
@@ -151,11 +159,21 @@ def head(url: str, purpose: str = "") -> dict:
     return {"status": int(data["status"]), "final_url": data.get("final_url", url)}
 
 
-def download(url: str, dest: str | None = None, purpose: str = "") -> dict:
+def download(url: str, dest: str | None = None, purpose: str = "", render: str | None = None) -> dict:
+    """Download a URL through the broker to disk and return metadata.
+
+    render: optional broker render mode, passed through in the POST body; None
+    omits it (broker default). Downloads are binary, so the broker ignores
+    render for the download path — this kwarg exists for call-site symmetry
+    with get().
+    """
     from .config import get_config
 
     client = get_config().client
-    with client.stream("POST", "/http/fetch", json={"url": url, "purpose": purpose}) as resp:
+    payload: dict = {"url": url, "purpose": purpose}
+    if render is not None:
+        payload["render"] = render
+    with client.stream("POST", "/http/fetch", json=payload) as resp:
         if resp.status_code >= 400:
             _raise_from_error(resp, "http.download")
 

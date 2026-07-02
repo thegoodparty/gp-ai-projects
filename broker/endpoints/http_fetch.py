@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,16 @@ __all__ = ["router", "get_scope_ticket", "get_browser_fetcher", "MAX_BYTES"]
 class HttpFetchRequest(BaseModel):
     url: str
     purpose: str = ""
+
+
+class HttpFetchRenderRequest(HttpFetchRequest):
+    # How to return a text/html page. "text" (default) is the publish-gate-safe
+    # rendered visible text — unchanged legacy behavior. "html" returns the full
+    # serialized DOM; "links" returns JSON {"links": [{href, text}]} from a[href]
+    # (absolute hrefs) — explicit opt-ins for consumers that can handle raw
+    # markup. Non-HTML content types ignore this. Pydantic rejects other values
+    # with 422 before the fetcher runs. Scoped to /fetch — /head is unaffected.
+    render: Literal["text", "html", "links"] = "text"
 
 
 def get_scope_ticket() -> ScopeTicket:  # pragma: no cover
@@ -74,6 +85,7 @@ async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
     missing-Location -> 502, hop bound) is delegated to the canonical
     `resolve_redirects` loop in `ssrf_guard` — never re-implemented here.
     """
+
     async def _run() -> tuple[int, str]:
         head_client = _HeaderInjectingClient(client, {"user-agent": USER_AGENT})
         try:
@@ -81,9 +93,7 @@ async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
                 head_client, "HEAD", url, timeout=_HEAD_TIMEOUT_S, max_redirects=_HEAD_MAX_REDIRECTS
             )
             if resp.status_code in (403, 405, 501):
-                get_client = _HeaderInjectingClient(
-                    client, {"user-agent": USER_AGENT, "range": "bytes=0-0"}
-                )
+                get_client = _HeaderInjectingClient(client, {"user-agent": USER_AGENT, "range": "bytes=0-0"})
                 resp, final_url = await resolve_redirects(
                     get_client,
                     "GET",
@@ -95,17 +105,13 @@ async def _status_check(client: httpx.AsyncClient, url: str) -> tuple[int, str]:
         except HTTPException:
             raise
         except httpx.TimeoutException as e:
-            raise HTTPException(
-                status_code=504, detail=f"timeout after {_HEAD_TIMEOUT_S}s: {url}"
-            ) from e
+            raise HTTPException(status_code=504, detail=f"timeout after {_HEAD_TIMEOUT_S}s: {url}") from e
         except httpx.HTTPError as e:
-            raise HTTPException(
-                status_code=502, detail=f"connection failed: {type(e).__name__}: {e}"
-            ) from e
+            raise HTTPException(status_code=502, detail=f"connection failed: {type(e).__name__}: {e}") from e
 
     try:
         return await asyncio.wait_for(_run(), timeout=_HEAD_TOTAL_TIMEOUT_S)
-    except asyncio.TimeoutError as e:
+    except TimeoutError as e:
         raise HTTPException(
             status_code=504,
             detail=f"head check exceeded {_HEAD_TOTAL_TIMEOUT_S}s total: {url}",
@@ -133,14 +139,14 @@ async def _stream_file(path: str):
 
 @router.post("/fetch")
 async def http_fetch(
-    req: HttpFetchRequest,
+    req: HttpFetchRenderRequest,
     ticket: ScopeTicket = Depends(get_scope_ticket),
     fetcher: BrowserFetcher = Depends(get_browser_fetcher),
 ):
     try:
         await validate_url(req.url)
 
-        result = await fetcher.fetch(req.url)
+        result = await fetcher.fetch(req.url, render=req.render)
 
         try:
             await validate_url(result.final_url)
@@ -221,12 +227,19 @@ async def http_head(
     except HTTPException as e:
         logger.warning(
             "http_head failed run_id=%s status=%d purpose=%s url=%s detail=%s",
-            ticket.run_id, e.status_code, req.purpose or "", req.url, e.detail,
+            ticket.run_id,
+            e.status_code,
+            req.purpose or "",
+            req.url,
+            e.detail,
         )
         raise
     logger.info(
         "http_head ok run_id=%s status=%d purpose=%s url=%s",
-        ticket.run_id, status, req.purpose or "", req.url,
+        ticket.run_id,
+        status,
+        req.purpose or "",
+        req.url,
     )
     return {"status": status, "final_url": final_url}
 

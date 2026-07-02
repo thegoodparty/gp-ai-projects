@@ -84,9 +84,11 @@ class _FakeFetcher:
     result: BrowserFetchResult | None = None
     raise_exc: Exception | None = None
     calls: list[str] = field(default_factory=list)
+    render_calls: list[str] = field(default_factory=list)
 
-    async def fetch(self, url: str) -> BrowserFetchResult:
+    async def fetch(self, url: str, *, render: str = "text") -> BrowserFetchResult:
         self.calls.append(url)
+        self.render_calls.append(render)
         if self.raise_exc is not None:
             raise self.raise_exc
         assert self.result is not None, "test must configure result or raise_exc"
@@ -241,9 +243,9 @@ class TestResponseShape:
             assert resp.headers["x-source-url"] == "https://legistar.granicus.com/x.pdf"
             assert resp.headers["x-byte-size"] == str(len(pdf_bytes))
             # BackgroundTask should have unlinked the temp file after response.
-            assert not os.path.exists(tmp_path), (
-                "download temp file must be unlinked via BackgroundTask after the response is sent"
-            )
+            assert not os.path.exists(
+                tmp_path
+            ), "download temp file must be unlinked via BackgroundTask after the response is sent"
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -346,10 +348,7 @@ class TestFailureLogging:
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
         assert resp.status_code == 400
-        warnings = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
-        ]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()]
         assert len(warnings) == 1, f"expected one warning, got {[r.getMessage() for r in caplog.records]}"
         msg = warnings[0].getMessage()
         assert "run_id=run-http-001" in msg
@@ -368,10 +367,7 @@ class TestFailureLogging:
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
         assert resp.status_code == 502
-        warnings = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
-        ]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()]
         assert len(warnings) == 1
         msg = warnings[0].getMessage()
         assert "status=502" in msg
@@ -388,10 +384,7 @@ class TestFailureLogging:
             headers={"X-Broker-Token": BROKER_TOKEN},
         )
         assert resp.status_code == 413
-        warnings = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()
-        ]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "http_fetch failed" in r.getMessage()]
         assert len(warnings) == 1
         assert "status=413" in warnings[0].getMessage()
 
@@ -415,6 +408,98 @@ class TestFetcherCallShape:
         assert fetcher.calls == ["https://example.com/"]
 
 
+class TestRenderParam:
+    """The optional `render` body param is threaded to the fetcher. Default is
+    "text" (publish-gate-safe legacy behavior — the publish gate rejects raw
+    HTML). "html"/"links" are explicit opt-ins. Invalid values are rejected by
+    the route's Pydantic validation (422) before the fetcher is called."""
+
+    def test_default_render_is_text_and_body_unchanged(self):
+        body = b"visible rendered text"
+        fetcher = _FakeFetcher(
+            result=_page_result(body, content_type="text/html", final_url="https://example.com/p"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/p"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200
+        assert resp.content == body
+        # Starlette appends "; charset=utf-8" to text/* media types.
+        assert resp.headers["content-type"].startswith("text/html")
+        assert fetcher.render_calls == ["text"]
+
+    def test_render_html_threaded_to_fetcher(self):
+        markup = b'<html><body><a href="https://town.gov/DocumentCenter/View/431">Doc</a></body></html>'
+        fetcher = _FakeFetcher(
+            result=_page_result(markup, content_type="text/html", final_url="https://example.com/p"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/p", "render": "html"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200
+        assert fetcher.render_calls == ["html"]
+        assert resp.content == markup
+        assert resp.headers["content-type"].startswith("text/html")
+
+    def test_render_links_threaded_and_json_returned(self):
+        links_json = b'{"links": [{"href": "https://town.gov/DocumentCenter/View/431", "text": "By-Laws"}]}'
+        fetcher = _FakeFetcher(
+            result=_page_result(links_json, content_type="application/json", final_url="https://example.com/p"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/p", "render": "links"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 200
+        assert fetcher.render_calls == ["links"]
+        assert resp.content == links_json
+        assert resp.headers["content-type"] == "application/json"
+
+    def test_invalid_render_value_returns_422_and_skips_fetch(self):
+        fetcher = _FakeFetcher(
+            result=_page_result(b"unused", content_type="text/html"),
+        )
+        client = TestClient(_create_app(fetcher))
+        resp = client.post(
+            "/http/fetch",
+            json={"url": "https://example.com/p", "render": "raw"},
+            headers={"X-Broker-Token": BROKER_TOKEN},
+        )
+        assert resp.status_code == 422
+        assert fetcher.calls == [], "fetcher must not be invoked when render is invalid"
+
+    def test_render_links_on_pdf_download_is_unaffected(self):
+        """Render param is threaded, but a PDF (download path) is returned
+        unchanged — the fetcher ignores render for non-HTML content."""
+        pdf_bytes = b"%PDF-1.7 fake"
+        result, tmp_path = _download_result(
+            pdf_bytes, content_type="application/pdf", final_url="https://example.com/doc.pdf"
+        )
+        try:
+            fetcher = _FakeFetcher(result=result)
+            client = TestClient(_create_app(fetcher))
+            resp = client.post(
+                "/http/fetch",
+                json={"url": "https://example.com/doc.pdf", "render": "links"},
+                headers={"X-Broker-Token": BROKER_TOKEN},
+            )
+            assert resp.status_code == 200
+            assert resp.content == pdf_bytes
+            assert resp.headers["content-type"] == "application/pdf"
+            assert fetcher.render_calls == ["links"]
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+
 class TestDownloadStreaming:
     """Download path streams from disk and cleans up the temp file."""
 
@@ -431,9 +516,9 @@ class TestDownloadStreaming:
             )
             assert resp.status_code == 200
             assert resp.content == payload
-            assert not os.path.exists(tmp_path), (
-                "BackgroundTask must unlink the temp file after the response is fully sent"
-            )
+            assert not os.path.exists(
+                tmp_path
+            ), "BackgroundTask must unlink the temp file after the response is fully sent"
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -463,6 +548,7 @@ def _head_app(handler, monkeypatch, *, allow=lambda u: True):
     async def _validate(url: str) -> None:
         if not allow(url):
             raise HTTPException(status_code=400, detail="SSRF blocked")
+
     monkeypatch.setattr("broker.endpoints.http_fetch.validate_url", _validate)
     monkeypatch.setattr("broker.ssrf_guard.validate_url", _validate)
     app = FastAPI()
@@ -478,6 +564,7 @@ class TestHttpHead:
         def handler(req: httpx.Request) -> httpx.Response:
             assert req.method == "HEAD"  # no browser, no GET body
             return httpx.Response(200)
+
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/page"})
         assert r.status_code == 200
@@ -490,6 +577,7 @@ class TestHttpHead:
         def handler(req: httpx.Request) -> httpx.Response:
             seen[req.method] = req.headers
             return httpx.Response(405) if req.method == "HEAD" else httpx.Response(200)
+
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/p"})
         assert r.json()["status"] == 200
@@ -501,6 +589,7 @@ class TestHttpHead:
             if req.url.path == "/old":
                 return httpx.Response(301, headers={"location": "https://example.gov/new"})
             return httpx.Response(200)
+
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/old"})
         assert r.json()["status"] == 200
@@ -511,6 +600,7 @@ class TestHttpHead:
             if "10.0.0.5" in str(req.url):
                 return httpx.Response(200)
             return httpx.Response(302, headers={"location": "http://10.0.0.5/internal"})
+
         # allow the public origin, block the private redirect target. If per-hop
         # validation were dropped, the 10.0.0.5 hop would return a clean 200
         # instead of a 400 — so a passing 400 here proves the guard fired on the
@@ -523,6 +613,7 @@ class TestHttpHead:
     def test_blocks_ssrf_on_initial_url(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
             return httpx.Response(200)
+
         app = _head_app(handler, monkeypatch, allow=lambda u: False)
         r = TestClient(app).post("/http/head", json={"url": "http://169.254.169.254/"})
         assert r.status_code == 400
@@ -531,6 +622,7 @@ class TestHttpHead:
     def test_transport_connect_error_maps_to_502(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("boom")
+
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/down"})
         assert r.status_code == 502
@@ -540,6 +632,7 @@ class TestHttpHead:
     def test_transport_timeout_maps_to_504(self, monkeypatch):
         def handler(req: httpx.Request) -> httpx.Response:
             raise httpx.ConnectTimeout("slow")
+
         app = _head_app(handler, monkeypatch)
         r = TestClient(app).post("/http/head", json={"url": "https://example.gov/slow"})
         assert r.status_code == 504

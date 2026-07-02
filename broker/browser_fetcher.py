@@ -24,6 +24,7 @@ Memory model:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -33,6 +34,18 @@ from typing import Protocol
 from fastapi import HTTPException
 
 from broker.ssrf_guard import validate_url
+
+# Render modes for text/html responses (selected by the /http/fetch `render`
+# param). Non-HTML content types ignore these entirely.
+RENDER_TEXT = "text"  # rendered visible text via inner_text('body') — the default
+RENDER_HTML = "html"  # full serialized rendered DOM via page.content()
+RENDER_LINKS = "links"  # JSON {"links": [{href, text}]} from a[href], hrefs absolute
+
+# a.href is the DOM IDL property, which resolves relative hrefs against the
+# document base URL — so extracted hrefs are absolute WITHOUT any extra network
+# fetch (unlike getAttribute('href'), which returns the raw, possibly-relative
+# attribute). textContent.trim() gives the trimmed anchor text.
+_LINKS_EXTRACTION_JS = "els => els.map(a => ({ href: a.href, text: (a.textContent || '').trim() }))"
 
 
 class _ViolationTracker:
@@ -61,6 +74,7 @@ class _ViolationTracker:
 
     def fatal(self) -> str | None:
         return self._fatal
+
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +118,7 @@ class BrowserFetchResult:
 
 
 class BrowserFetcher(Protocol):
-    async def fetch(self, url: str) -> BrowserFetchResult: ...
+    async def fetch(self, url: str, *, render: str = RENDER_TEXT) -> BrowserFetchResult: ...
 
 
 def _is_binary_content_type(ct: str) -> bool:
@@ -186,14 +200,10 @@ class PlaywrightBrowserFetcher:
         acquired = 0
         try:
             for _ in range(self._max_concurrent):
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=_ACLOSE_DRAIN_TIMEOUT_S
-                )
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=_ACLOSE_DRAIN_TIMEOUT_S)
                 acquired += 1
         except TimeoutError:
-            logger.warning(
-                "browser_fetcher.aclose timed out waiting for in-flight fetches"
-            )
+            logger.warning("browser_fetcher.aclose timed out waiting for in-flight fetches")
         try:
             if self._browser is not None:
                 await self._browser.close()
@@ -207,25 +217,21 @@ class PlaywrightBrowserFetcher:
                 for _ in range(acquired):
                     self._semaphore.release()
 
-    async def fetch(self, url: str) -> BrowserFetchResult:
+    async def fetch(self, url: str, *, render: str = RENDER_TEXT) -> BrowserFetchResult:
         if self._closing:
             raise HTTPException(status_code=503, detail="browser fetcher shutting down")
         async with self._semaphore:
             if self._closing:
-                raise HTTPException(
-                    status_code=503, detail="browser fetcher shutting down"
-                )
-            return await self._fetch_impl(url)
+                raise HTTPException(status_code=503, detail="browser fetcher shutting down")
+            return await self._fetch_impl(url, render)
 
-    async def _fetch_impl(self, url: str) -> BrowserFetchResult:
+    async def _fetch_impl(self, url: str, render: str = RENDER_TEXT) -> BrowserFetchResult:
         from playwright.async_api import Download, Route
         from playwright.async_api import Error as PlaywrightError
         from playwright_stealth import stealth_async  # type: ignore[import-untyped]
 
         if self._browser is None:
-            raise RuntimeError(
-                "PlaywrightBrowserFetcher.start() must be awaited before fetch()"
-            )
+            raise RuntimeError("PlaywrightBrowserFetcher.start() must be awaited before fetch()")
 
         tracker = _ViolationTracker()
 
@@ -291,27 +297,18 @@ class PlaywrightBrowserFetcher:
             # 1) Initial grace window — Cloudflare and other JS challenges
             # frequently trigger downloads 200-500 ms after page.goto settles.
             # Always wait this regardless of response state.
-            await self._wait_for_download(
-                page, downloads, INITIAL_DOWNLOAD_GRACE_MS, _raise_if_violation
-            )
+            await self._wait_for_download(page, downloads, INITIAL_DOWNLOAD_GRACE_MS, _raise_if_violation)
 
             if not downloads:
                 # 2) If goto raised (download path with no response), keep waiting
                 # the full DOWNLOAD_WAIT_MS for the download event.
                 if response is None or nav_error is not None:
                     remaining = max(DOWNLOAD_WAIT_MS - INITIAL_DOWNLOAD_GRACE_MS, 0)
-                    await self._wait_for_download(
-                        page, downloads, remaining, _raise_if_violation
-                    )
+                    await self._wait_for_download(page, downloads, remaining, _raise_if_violation)
                 else:
                     # 3) Successful navigation with a response: only pay the
                     # secondary download window for binary content-types.
-                    ct_initial = (
-                        (response.headers.get("content-type") or "")
-                        .split(";")[0]
-                        .strip()
-                        .lower()
-                    )
+                    ct_initial = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
                     if _is_binary_content_type(ct_initial):
                         await self._wait_for_download(
                             page,
@@ -342,11 +339,7 @@ class PlaywrightBrowserFetcher:
                         )
                     _raise_if_violation()
                 captured = captured_responses.get(final_url)
-                content_type = (
-                    captured[0]
-                    if captured and captured[0]
-                    else "application/octet-stream"
-                )
+                content_type = captured[0] if captured and captured[0] else "application/octet-stream"
                 return BrowserFetchResult(
                     status=200,
                     content_type=content_type,
@@ -357,9 +350,7 @@ class PlaywrightBrowserFetcher:
                 )
 
             if nav_error is not None:
-                logger.warning(
-                    "playwright navigation error url=%s error=%s", url, nav_error
-                )
+                logger.warning("playwright navigation error url=%s error=%s", url, nav_error)
                 raise HTTPException(
                     status_code=502,
                     detail="upstream navigation failed",
@@ -380,13 +371,9 @@ class PlaywrightBrowserFetcher:
             # late sub-resources / late download triggers. JSON/XML/text get
             # zero settle. networkidle timeout is acceptable — we've already
             # waited the budgeted window.
-            if _is_binary_content_type(content_type) or content_type.startswith(
-                "text/html"
-            ):
+            if _is_binary_content_type(content_type) or content_type.startswith("text/html"):
                 try:
-                    await page.wait_for_load_state(
-                        "networkidle", timeout=POST_NAV_SETTLE_MS
-                    )
+                    await page.wait_for_load_state("networkidle", timeout=POST_NAV_SETTLE_MS)
                 except PlaywrightError:
                     pass
                 _raise_if_violation()
@@ -411,11 +398,7 @@ class PlaywrightBrowserFetcher:
                             )
                         _raise_if_violation()
                     captured = captured_responses.get(final_url)
-                    ct = (
-                        captured[0]
-                        if captured and captured[0]
-                        else "application/octet-stream"
-                    )
+                    ct = captured[0] if captured and captured[0] else "application/octet-stream"
                     return BrowserFetchResult(
                         status=200,
                         content_type=ct,
@@ -426,22 +409,57 @@ class PlaywrightBrowserFetcher:
                     )
 
             if content_type.startswith("text/html"):
-                # Return the rendered VISIBLE TEXT, not raw HTML: the publish
-                # gate rejects raw HTML, and every consumer reads the body as
-                # text. Reading the DOM also sidesteps the getResponseBody
-                # eviction that response.body() hits after the networkidle settle.
-                try:
-                    body = (await page.inner_text("body")).encode("utf-8")
-                except PlaywrightError as e:
-                    logger.warning(
-                        "page.inner_text('body') unavailable url=%s error=%s",
-                        url,
-                        e,
-                    )
-                    raise HTTPException(
-                        status_code=502,
-                        detail="upstream response body unavailable",
-                    ) from e
+                if render == RENDER_HTML:
+                    # Full serialized rendered DOM. Explicit opt-in: the publish
+                    # gate rejects raw HTML, so consumers asking for this know
+                    # they're bypassing the text-only default.
+                    try:
+                        body = (await page.content()).encode("utf-8")
+                    except PlaywrightError as e:
+                        logger.warning("page.content() unavailable url=%s error=%s", url, e)
+                        raise HTTPException(
+                            status_code=502,
+                            detail="upstream response body unavailable",
+                        ) from e
+                elif render == RENDER_LINKS:
+                    # Extract a[href] from the rendered DOM as JSON. Recovers doc
+                    # URLs (e.g. CivicPlus /DocumentCenter/View/...) that the
+                    # text-only render hides. Reads the DOM only — no extra
+                    # network fetch, and hrefs are NOT SSRF-validated here (that
+                    # would trigger a DNS lookup); the final page URL is still
+                    # validated below, exactly as the other render modes.
+                    try:
+                        raw_links = await page.eval_on_selector_all("a[href]", _LINKS_EXTRACTION_JS)
+                    except PlaywrightError as e:
+                        logger.warning(
+                            "page.eval_on_selector_all('a[href]') unavailable url=%s error=%s",
+                            url,
+                            e,
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail="upstream response body unavailable",
+                        ) from e
+                    body = json.dumps({"links": raw_links}, ensure_ascii=False).encode("utf-8")
+                    content_type = "application/json"
+                else:
+                    # RENDER_TEXT (default): rendered VISIBLE TEXT, not raw HTML.
+                    # The publish gate rejects raw HTML, and every consumer reads
+                    # the body as text. Reading the DOM also sidesteps the
+                    # getResponseBody eviction that response.body() hits after the
+                    # networkidle settle.
+                    try:
+                        body = (await page.inner_text("body")).encode("utf-8")
+                    except PlaywrightError as e:
+                        logger.warning(
+                            "page.inner_text('body') unavailable url=%s error=%s",
+                            url,
+                            e,
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail="upstream response body unavailable",
+                        ) from e
             else:
                 try:
                     body = await response.body()
@@ -520,9 +538,7 @@ async def _save_download_to_disk(download: object) -> tuple[str, int]:
             try:
                 await asyncio.to_thread(os.unlink, tmp_path)
             except OSError:
-                logger.warning(
-                    "failed to unlink oversized download tmp_path=%s", tmp_path
-                )
+                logger.warning("failed to unlink oversized download tmp_path=%s", tmp_path)
             raise HTTPException(
                 status_code=413,
                 detail=f"download exceeded {MAX_BYTES} bytes",

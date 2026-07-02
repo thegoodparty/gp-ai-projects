@@ -17,6 +17,7 @@ Fakes substitute for playwright runtime types — no real Chromium required.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any
 
@@ -90,6 +91,8 @@ class _FakePage:
         on_settle: Any = None,
         responses_to_emit: list[_FakeResponse] | None = None,
         inner_text_value: str | None = None,
+        content_value: str | None = None,
+        links_value: list[dict[str, str]] | None = None,
     ) -> None:
         self._response = response
         self.url = url
@@ -99,6 +102,12 @@ class _FakePage:
         self._responses_to_emit = responses_to_emit or []
         self._wait_calls = 0
         self._load_state_calls = 0
+        # render="html" reads page.content(); render="links" reads
+        # page.eval_on_selector_all('a[href]', ...). Tests that exercise those
+        # render modes configure these; other tests leave them None.
+        self._content_value = content_value
+        self._links_value = links_value
+        self.eval_calls: list[tuple[str, str]] = []
         # text/html now reads rendered visible text via inner_text("body"),
         # not raw response.body(). Default to the response body decoded as text
         # so existing HTML tests (which pass HTML-as-text bodies) round-trip.
@@ -133,6 +142,17 @@ class _FakePage:
 
     async def inner_text(self, selector: str) -> str:
         return self._inner_text_value
+
+    async def content(self) -> str:
+        if self._content_value is None:
+            raise AssertionError("test must configure content_value for html render")
+        return self._content_value
+
+    async def eval_on_selector_all(self, selector: str, expression: str) -> list[dict[str, str]]:
+        self.eval_calls.append((selector, expression))
+        if self._links_value is None:
+            raise AssertionError("test must configure links_value for links render")
+        return self._links_value
 
     def emit_download(self, download: _FakeDownload) -> None:
         for handler in self._download_listeners:
@@ -275,7 +295,7 @@ class TestConcurrencyCap:
 
 class TestUnifiedFetchSignature:
     @pytest.mark.asyncio
-    async def test_fetch_accepts_only_url_arg(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_fetch_accepts_url_and_render_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
         page = _FakePage(response=_FakeResponse(body=b"ok"), url="https://example.com/")
         fetcher = PlaywrightBrowserFetcher()
@@ -284,6 +304,10 @@ class TestUnifiedFetchSignature:
         monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
 
         result = await fetcher.fetch("https://example.com/")
+        assert isinstance(result, BrowserFetchResult)
+
+        # render is the only accepted keyword; anything else is a TypeError.
+        result = await fetcher.fetch("https://example.com/", render="text")
         assert isinstance(result, BrowserFetchResult)
 
         with pytest.raises(TypeError):
@@ -468,9 +492,7 @@ class TestDownloadPath:
                 os.unlink(result.body_path)
 
     @pytest.mark.asyncio
-    async def test_download_exceeding_max_bytes_raises_413_and_unlinks(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_download_exceeding_max_bytes_raises_413_and_unlinks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The fetcher enforces MAX_BYTES on download; oversized files must
         be unlinked immediately and a 413 raised."""
         _patch_playwright_types(monkeypatch)
@@ -517,9 +539,7 @@ class TestDownloadPath:
 
 class TestPageResponsePath:
     @pytest.mark.asyncio
-    async def test_returns_real_content_type_from_response_headers(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_returns_real_content_type_from_response_headers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         body = b"<html><body>ok</body></html>"
@@ -569,9 +589,7 @@ class TestPageResponsePath:
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_missing_content_type_defaults_to_octet_stream(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_missing_content_type_defaults_to_octet_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         page = _FakePage(
@@ -593,9 +611,7 @@ class TestPageResponsePath:
         assert result.content_type == "application/octet-stream"
 
     @pytest.mark.asyncio
-    async def test_page_response_exceeding_page_max_raises_413(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_page_response_exceeding_page_max_raises_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Page-response path enforces the tighter PAGE_RESPONSE_MAX_BYTES cap
         before buffering response.body() into RAM."""
         _patch_playwright_types(monkeypatch)
@@ -730,9 +746,7 @@ class TestHtmlBodyIsRenderedVisibleText:
 
 class TestNavigationFailure:
     @pytest.mark.asyncio
-    async def test_nav_error_with_no_download_raises_generic_502(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_nav_error_with_no_download_raises_generic_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         from playwright.async_api import Error as PlaywrightError
@@ -762,9 +776,7 @@ class TestDownloadGraceWindow:
     HTML back to the caller instead of the file."""
 
     @pytest.mark.asyncio
-    async def test_late_fired_download_after_successful_goto_is_captured(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_late_fired_download_after_successful_goto_is_captured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         download_url = "https://example.com/agenda.pdf"
@@ -808,9 +820,7 @@ class TestDownloadGraceWindow:
                 os.unlink(result.body_path)
 
     @pytest.mark.asyncio
-    async def test_textual_response_skips_binary_grace_and_settle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_textual_response_skips_binary_grace_and_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """For JSON/text responses (NOT HTML), the fetcher must skip both the
         secondary binary download grace AND the post-nav networkidle settle.
         That's the whole point of the content-type-conditional waits — JSON
@@ -835,9 +845,7 @@ class TestDownloadGraceWindow:
         result = await fetcher.fetch("https://example.com/api")
         assert result.body == body
         # JSON must never trigger the networkidle settle wait.
-        assert page._load_state_calls == 0, (
-            "JSON responses must not wait_for_load_state(networkidle)"
-        )
+        assert page._load_state_calls == 0, "JSON responses must not wait_for_load_state(networkidle)"
         # Only the initial download grace should fire (≤ 1 budget worth of slices).
         # Binary grace would add 3× more slices; that's the regression we guard against.
         from broker.browser_fetcher import (
@@ -855,9 +863,7 @@ class TestDownloadGraceWindow:
         )
 
     @pytest.mark.asyncio
-    async def test_nav_error_path_waits_full_download_window(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_nav_error_path_waits_full_download_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When goto raises (download path with no response), the loop should
         be willing to wait the full DOWNLOAD_WAIT_MS for the download event."""
         _patch_playwright_types(monkeypatch)
@@ -900,9 +906,7 @@ class TestPostNavSettleConditional:
     download triggers and pay up to POST_NAV_SETTLE_MS via networkidle wait."""
 
     @pytest.mark.asyncio
-    async def test_json_response_does_not_wait_for_networkidle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_json_response_does_not_wait_for_networkidle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         body = b'{"ok":true}'
@@ -922,15 +926,12 @@ class TestPostNavSettleConditional:
 
         result = await fetcher.fetch("https://example.com/api")
         assert result.body == body
-        assert page._load_state_calls == 0, (
-            "JSON response must not wait_for_load_state(networkidle) — "
-            "POST_NAV_SETTLE_MS should be conditional"
-        )
+        assert (
+            page._load_state_calls == 0
+        ), "JSON response must not wait_for_load_state(networkidle) — POST_NAV_SETTLE_MS should be conditional"
 
     @pytest.mark.asyncio
-    async def test_html_response_waits_for_networkidle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_html_response_waits_for_networkidle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         body = b"<html></html>"
@@ -950,9 +951,9 @@ class TestPostNavSettleConditional:
 
         result = await fetcher.fetch("https://example.com/")
         assert result.body == body
-        assert page._load_state_calls == 1, (
-            "HTML responses must wait_for_load_state(networkidle, timeout=POST_NAV_SETTLE_MS)"
-        )
+        assert (
+            page._load_state_calls == 1
+        ), "HTML responses must wait_for_load_state(networkidle, timeout=POST_NAV_SETTLE_MS)"
 
     @pytest.mark.asyncio
     async def test_networkidle_timeout_is_tolerated(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1022,6 +1023,7 @@ class TestSSRFRecheckAfterAwaits:
         # Earlier wait_for_timeout grace windows must remain no-ops so the
         # violation is specifically attributed to post-settle.
         page._on_settle = None
+
         async def wait_for_load_state(state: str, *, timeout: int) -> None:
             page._load_state_calls += 1
             await on_settle()
@@ -1094,9 +1096,7 @@ class TestContextLeakProtection:
             await fetcher.fetch("https://example.com/")
 
         assert len(browser.contexts) == 1
-        assert browser.contexts[0].closed, (
-            "context.close() must run even when new_page() raises"
-        )
+        assert browser.contexts[0].closed, "context.close() must run even when new_page() raises"
 
     @pytest.mark.asyncio
     async def test_context_closed_when_stealth_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1111,9 +1111,7 @@ class TestContextLeakProtection:
         with pytest.raises(RuntimeError):
             await fetcher.fetch("https://example.com/")
 
-        assert browser.contexts[0].closed, (
-            "context.close() must run even when stealth_async raises"
-        )
+        assert browser.contexts[0].closed, "context.close() must run even when stealth_async raises"
 
 
 class TestAcloseGate:
@@ -1134,9 +1132,7 @@ class TestAcloseGate:
         assert exc.value.status_code == 503
 
     @pytest.mark.asyncio
-    async def test_aclose_drains_in_flight_fetches_before_closing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_aclose_drains_in_flight_fetches_before_closing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
 
         gate = asyncio.Event()
@@ -1215,6 +1211,7 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         # Capture the path that gets written so we can assert it's unlinked.
         captured_paths: list[str] = []
         from broker import browser_fetcher as bf_module
+
         orig_save = bf_module._save_download_to_disk
 
         async def save_then_violate(download):
@@ -1227,9 +1224,7 @@ class TestDownloadTempFileLeakOnSSRFViolation:
             await handler(_FakeRoute("https://10.0.0.5/internal-subresource"))
             return path, size
 
-        monkeypatch.setattr(
-            "broker.browser_fetcher._save_download_to_disk", save_then_violate
-        )
+        monkeypatch.setattr("broker.browser_fetcher._save_download_to_disk", save_then_violate)
 
         browser = _FakeBrowser(lambda: page)
         browser_holder.append(browser)
@@ -1242,9 +1237,7 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         assert "SSRF blocked mid-fetch" in exc.value.detail
         assert len(captured_paths) == 1, "save was called exactly once"
         leaked = captured_paths[0]
-        assert not os.path.exists(leaked), (
-            f"download temp file leaked after post-save SSRF violation: {leaked}"
-        )
+        assert not os.path.exists(leaked), f"download temp file leaked after post-save SSRF violation: {leaked}"
 
     @pytest.mark.asyncio
     async def test_late_download_path_unlinks_on_post_save_ssrf_violation(
@@ -1267,28 +1260,34 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         browser_holder: list[_FakeBrowser] = []
         page = _FakePage(
             response=_FakeResponse(
-                url="https://example.com/", status=200,
-                headers={"content-type": "text/html"}, body=b"<html></html>",
+                url="https://example.com/",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"<html></html>",
             ),
             url="https://example.com/",
         )
+
         # Suppress download fires in the grace window so we end up on the
         # post-settle late-download path. Return the FakeResponse so we take
         # the page-response → settle branch (download will fire inside
         # wait_for_load_state below).
         async def goto(_url: str, *, timeout: int):
             return page._response
+
         page.goto = goto  # type: ignore[method-assign]
 
         # Fire the download from inside wait_for_load_state (the post-settle path).
         async def wait_for_load_state(state: str, *, timeout: int) -> None:
             page._load_state_calls += 1
             page.emit_download(_FakeDownload(download_url, payload))
+
         page.wait_for_load_state = wait_for_load_state  # type: ignore[method-assign]
         page._on_settle = None
 
         captured_paths: list[str] = []
         from broker import browser_fetcher as bf_module
+
         orig_save = bf_module._save_download_to_disk
 
         async def save_then_violate(download):
@@ -1298,9 +1297,7 @@ class TestDownloadTempFileLeakOnSSRFViolation:
             await handler(_FakeRoute("https://10.0.0.5/late-subresource"))
             return path, size
 
-        monkeypatch.setattr(
-            "broker.browser_fetcher._save_download_to_disk", save_then_violate
-        )
+        monkeypatch.setattr("broker.browser_fetcher._save_download_to_disk", save_then_violate)
 
         browser = _FakeBrowser(lambda: page)
         browser_holder.append(browser)
@@ -1312,9 +1309,7 @@ class TestDownloadTempFileLeakOnSSRFViolation:
         assert exc.value.status_code == 400
         assert len(captured_paths) == 1
         leaked = captured_paths[0]
-        assert not os.path.exists(leaked), (
-            f"late-download temp file leaked after post-save SSRF violation: {leaked}"
-        )
+        assert not os.path.exists(leaked), f"late-download temp file leaked after post-save SSRF violation: {leaked}"
 
 
 def _patch_playwright_async_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1351,9 +1346,7 @@ class TestSubResourceSSRFNonFatalDuringSettle:
     `tracker.record(...)`), which the _ViolationTracker-only tests bypass."""
 
     @pytest.mark.asyncio
-    async def test_subresource_ssrf_during_settle_resolves_page(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_subresource_ssrf_during_settle_resolves_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_playwright_types(monkeypatch)
         _patch_playwright_async_api(monkeypatch)
 
@@ -1471,8 +1464,8 @@ class TestSubResourceSSRFTolerance:
     @pytest.mark.parametrize(
         "subresource_url",
         [
-            "https://d31qbv1cthcecs.cloudfront.net/atrk.js",       # comScore/Alexa tracker
-            "https://launch.newsinc.com/js/embed.js",               # NewsInc video widget
+            "https://d31qbv1cthcecs.cloudfront.net/atrk.js",  # comScore/Alexa tracker
+            "https://launch.newsinc.com/js/embed.js",  # NewsInc video widget
         ],
     )
     def test_real_world_embedded_trackers_are_not_fatal(self, subresource_url):
@@ -1484,3 +1477,233 @@ class TestSubResourceSSRFTolerance:
             f"{subresource_url} is an embedded third-party resource; blocking it must "
             f"not fail the host news article it was cited from"
         )
+
+
+class TestRenderMode:
+    """The `render` param on fetch() selects how a text/html page is returned:
+      - "text"  (default): rendered VISIBLE TEXT via inner_text('body') — the
+        publish-gate-safe legacy behavior, byte-for-byte unchanged.
+      - "html": the full serialized rendered DOM via page.content().
+      - "links": a JSON body {"links": [{"href","text"}, ...]} extracted from
+        a[href] via eval_on_selector_all — hrefs absolute, anchor text trimmed.
+    Non-HTML content types (downloads, JSON, XML) ignore render entirely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_render_is_visible_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        visible = "Heading\nBody text"
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"<html><body><h1>Heading</h1><p>Body text</p><a href='/doc'>Doc</a></body></html>",
+            ),
+            url="https://town.gov/page",
+            inner_text_value=visible,
+        )
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        # No render arg -> default "text": unchanged legacy behavior.
+        result = await fetcher.fetch("https://town.gov/page")
+        assert result.content_type == "text/html"
+        assert result.body == visible.encode("utf-8")
+        assert result.byte_size == len(visible.encode("utf-8"))
+
+    @pytest.mark.asyncio
+    async def test_render_html_returns_full_serialized_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        raw_html = (
+            "<html><body><h1>By-Laws</h1>"
+            '<a href="https://town.gov/DocumentCenter/View/431">General Town By-Laws</a>'
+            "</body></html>"
+        )
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page/1449",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"<html><body>raw response body ignored for html render</body></html>",
+            ),
+            url="https://town.gov/page/1449",
+            inner_text_value="visible text only, href stripped",
+            content_value=raw_html,
+        )
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        result = await fetcher.fetch("https://town.gov/page/1449", render="html")
+        assert result.content_type == "text/html"
+        assert result.body == raw_html.encode("utf-8")
+        # the href that text mode hides is present in the markup
+        assert b'<a href="https://town.gov/DocumentCenter/View/431">' in result.body
+        # NOT the inner-text rendering
+        assert result.body != b"visible text only, href stripped"
+
+    @pytest.mark.asyncio
+    async def test_render_links_returns_json_of_absolute_links(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        # What a real browser's `a.href` (absolute) + textContent.trim() yields.
+        browser_links = [
+            {"href": "https://town.gov/DocumentCenter/View/431", "text": "General Town By-Laws"},
+            {"href": "https://town.gov/agendas", "text": "Agendas"},
+        ]
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page/1449",
+                status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=b"<html><body>...</body></html>",
+            ),
+            url="https://town.gov/page/1449",
+            links_value=browser_links,
+        )
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        result = await fetcher.fetch("https://town.gov/page/1449", render="links")
+        assert result.content_type == "application/json"
+        payload = json.loads(result.body.decode("utf-8"))
+        assert payload == {"links": browser_links}
+        # the CivicPlus DocumentCenter href hidden from text mode is recovered
+        hrefs = [link["href"] for link in payload["links"]]
+        assert "https://town.gov/DocumentCenter/View/431" in hrefs
+
+    @pytest.mark.asyncio
+    async def test_render_links_reads_dom_href_property_and_trims(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Guard the extraction MECHANISM: absolute-href + trimmed-text is
+        delivered by reading the DOM `.href` IDL property (which resolves
+        relative hrefs against the document base) and `.trim()` — never
+        getAttribute('href') (raw, possibly-relative)."""
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"<html></html>",
+            ),
+            url="https://town.gov/page",
+            links_value=[],
+        )
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        await fetcher.fetch("https://town.gov/page", render="links")
+        assert len(page.eval_calls) == 1, "links render must call eval_on_selector_all exactly once"
+        selector, expression = page.eval_calls[0]
+        assert selector == "a[href]"
+        assert ".href" in expression
+        assert "getAttribute" not in expression
+        assert "trim" in expression
+
+    @pytest.mark.asyncio
+    async def test_render_links_does_not_validate_or_fetch_hrefs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Link extraction must not trigger additional network activity: the
+        extracted hrefs are never passed to validate_url (a DNS lookup) nor
+        re-fetched. Only the landed page URL is validated, exactly as before."""
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        link_href = "https://other-domain.example/DocumentCenter/View/999"
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"<html></html>",
+            ),
+            url="https://town.gov/page",
+            links_value=[{"href": link_href, "text": "Doc"}],
+        )
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+
+        validated: list[str] = []
+
+        async def _record_validate(url: str) -> None:
+            validated.append(url)
+
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _record_validate)
+
+        result = await fetcher.fetch("https://town.gov/page", render="links")
+        assert result.content_type == "application/json"
+        assert (
+            link_href not in validated
+        ), "link hrefs must never reach validate_url — that DNS lookup would defeat the no-extra-network guarantee"
+        assert "https://town.gov/page" in validated, "the landed page URL is still validated"
+
+    @pytest.mark.asyncio
+    async def test_render_html_failure_raises_502(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """page.content() torn down under memory pressure -> clean 502."""
+        _patch_playwright_async_api(monkeypatch)
+        _patch_playwright_types(monkeypatch)
+
+        from playwright.async_api import Error as PlaywrightError
+
+        page = _FakePage(
+            response=_FakeResponse(
+                url="https://town.gov/page",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"<html></html>",
+            ),
+            url="https://town.gov/page",
+        )
+
+        async def content_torn_down() -> str:
+            raise PlaywrightError("Page.content: Target page, context or browser has been closed")
+
+        page.content = content_torn_down  # type: ignore[method-assign]
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        with pytest.raises(HTTPException) as exc:
+            await fetcher.fetch("https://town.gov/page", render="html")
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "upstream response body unavailable"
+
+    @pytest.mark.asyncio
+    async def test_download_path_ignores_render(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A PDF (download path) is unaffected by render: the file bytes come
+        back on disk regardless, never re-shaped into JSON."""
+        _patch_playwright_types(monkeypatch)
+
+        payload = b"%PDF-1.7 fake pdf bytes"
+        download_url = "https://town.gov/DocumentCenter/View/431.pdf"
+        page = _FakePage(response=None, url="https://town.gov/")
+
+        async def goto(_url: str, *, timeout: int) -> None:
+            page.emit_download(_FakeDownload(download_url, payload))
+            return None
+
+        page.goto = goto  # type: ignore[method-assign]
+        fetcher = PlaywrightBrowserFetcher()
+        fetcher._browser = _FakeBrowser(lambda: page)  # type: ignore[assignment]
+        monkeypatch.setattr("broker.browser_fetcher.validate_url", _allow_all)
+
+        result = await fetcher.fetch(download_url, render="links")
+        try:
+            assert result.body_path is not None
+            assert result.body is None
+            with open(result.body_path, "rb") as f:
+                assert f.read() == payload
+            assert result.content_type != "application/json"
+        finally:
+            if result.body_path and os.path.exists(result.body_path):
+                os.unlink(result.body_path)
