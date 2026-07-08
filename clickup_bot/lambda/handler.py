@@ -4,10 +4,8 @@ import json
 import os
 from typing import Any
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
 import boto3
-
 
 CLICKUP_BASE_URL = "https://api.clickup.com/api/v2"
 _secrets_cache = None
@@ -21,15 +19,10 @@ def get_secrets() -> dict:
     environment = os.environ.get("ENVIRONMENT", "prod").upper()
     secret_id = f"AI_SECRETS_{environment}"
 
-    try:
-        client = boto3.client("secretsmanager")
-        response = client.get_secret_value(SecretId=secret_id)
-        _secrets_cache = json.loads(response["SecretString"])
-        print(f"Loaded secrets from {secret_id}")
-    except Exception as e:
-        print(f"Failed to load secrets from {secret_id}: {e}")
-        _secrets_cache = {}
-
+    client = boto3.client("secretsmanager")
+    response = client.get_secret_value(SecretId=secret_id)
+    _secrets_cache = json.loads(response["SecretString"])
+    print(f"Loaded secrets from {secret_id}")
     return _secrets_cache
 
 
@@ -48,20 +41,43 @@ def verify_webhook_signature(body: str, signature: str) -> bool:
         return False
 
     expected = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
-    is_valid = hmac.compare_digest(expected, signature)
+    try:
+        is_valid = hmac.compare_digest(expected, signature)
+    except TypeError:
+        # compare_digest raises TypeError on non-ASCII str input. The header is
+        # attacker-controlled, so a malformed signature is an invalid signature
+        # (401) — it must never propagate to the handler's secrets-outage 500.
+        print("ERROR: Webhook signature verification failed: malformed signature header")
+        return False
 
     if not is_valid:
-        print("Webhook signature verification failed: signature mismatch")
+        # ERROR prefix is load-bearing: a rotated/mismatched CLICKUP_WEBHOOK_SECRET
+        # 401s every gpbot delivery until ClickUp suspends the webhook, and this
+        # log line is what fires the CloudWatch alarm (see the metric filter in
+        # infrastructure/modules/clickup-bot/main.tf).
+        print("ERROR: Webhook signature verification failed: signature mismatch")
 
     return is_valid
 
-BOT_PREFIX = "[GP-Bot]"
 
+BOT_PREFIX = "[GP-Bot]"
+PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
+
+# Repo guidance (omni monorepo, archived standalone repos) deliberately does
+# NOT live here: it is baked into the agent's capability prompt
+# (engineer_agent/agent/config.py, pinned by engineer_agent/tests). These
+# instructions carry only the per-task contract.
 ANALYZE_INSTRUCTION = """## YOUR TASK: Analyze and Report
 
 **Approach this ticket with healthy skepticism.** It may be out of date - the issue
 could have been fixed, the data may have changed, the description may be incomplete,
 or the reporter may have been incorrect.
+
+## VERIFICATION (required)
+
+- Verify every claim against the live code in omni and cite `file:line`.
+- Attempt to reproduce the issue before concluding anything about it.
+- State explicitly when something could not be verified.
 
 Post your analysis to ClickUp when done. Be concise.
 """
@@ -77,11 +93,26 @@ or the reporter may have been incorrect.
 2. Read each of those files to understand how they depend on it
 3. Consider if your change will break any of those usages
 
+## RED/GREEN TDD (required)
+
+Write a **failing test** that reproduces the bug or defines the feature contract
+FIRST, confirm it fails, then implement the minimum to make it pass. No production
+code without a driving test. Run the affected package's test suite and lint before
+opening the PR.
+
+## SELF-REVIEW (required, after the diff is green)
+
+Perform two self-review passes over the full diff using the rule files in the
+repo's `ai-rules/` directory (bugs, breaking-changes, security, test quality),
+fixing what they surface. The PR description MUST include the failing (red) test
+output and the passing (green) run.
+
 If you're unsure about the solution or the impact is too broad, post a comment explaining
 your findings and recommend a human handle the implementation.
 
 Branch naming: `<custom_id>/gp-bot_<description-slug>` (use the task's custom_id like ENG-1234, not the internal ID)
 PR title format: `[GP-Bot] <custom_id> <description>`
+PRs target omni's `develop` branch.
 
 Post the PR link to ClickUp when done.
 """
@@ -111,22 +142,61 @@ def get_task_comments(task_id: str) -> list[dict]:
     return result.get("comments", [])
 
 
-def has_bot_comment(comments: list[dict]) -> bool:
+def has_processing_started_comment(comments: list[dict]) -> bool:
+    # Only the success marker counts as 'already processed'. Failure comments
+    # ('[GP-Bot] Failed to start processing: ...') must NOT block a retry:
+    # removing and re-adding the tag after a failure has to re-trigger.
     for comment in comments:
         comment_text = ""
         for item in comment.get("comment", []):
             if item.get("type") == "text":
                 comment_text += item.get("text", "")
-        if comment_text.startswith(BOT_PREFIX):
+        if comment_text.startswith(PROCESSING_STARTED_PREFIX):
             return True
     return False
 
 
 def post_comment(task_id: str, text: str) -> None:
-    clickup_request("POST", f"/task/{task_id}/comment", {
-        "comment_text": text,
-        "notify_all": False,
-    })
+    clickup_request(
+        "POST",
+        f"/task/{task_id}/comment",
+        {
+            "comment_text": text,
+            "notify_all": False,
+        },
+    )
+
+
+def post_failure_comment(task_id: str, error_msg: str) -> None:
+    # A failed comment post must never change the handler's control flow.
+    try:
+        post_comment(
+            task_id,
+            f"{BOT_PREFIX} Failed to start processing: {error_msg}. Remove and re-add the tag to retry.",
+        )
+    except Exception as comment_err:
+        print(f"Failed to post failure comment to ClickUp: {comment_err}")
+
+
+def redact_signature(event: dict) -> dict:
+    # The x-signature header is the webhook's shared-secret HMAC; a copy of it
+    # in CloudWatch is a replayable credential. Return the event with only that
+    # header value replaced, leaving everything else intact for debugging.
+    # Case-insensitive: API Gateway / ClickUp may deliver any header casing.
+    # ALB also carries the same value under multiValueHeaders (values are lists),
+    # so redact that copy too — otherwise the debug log line leaks the secret.
+    redacted = {**event}
+    headers = event.get("headers", {})
+    redacted["headers"] = {
+        key: ("[redacted]" if key.lower() == "x-signature" else value) for key, value in headers.items()
+    }
+    multi_value_headers = event.get("multiValueHeaders")
+    if isinstance(multi_value_headers, dict):
+        redacted["multiValueHeaders"] = {
+            key: (["[redacted]"] if key.lower() == "x-signature" else value)
+            for key, value in multi_value_headers.items()
+        }
+    return redacted
 
 
 def get_header_case_insensitive(headers: dict, name: str, default: str = "") -> str:
@@ -137,85 +207,123 @@ def get_header_case_insensitive(headers: dict, name: str, default: str = "") -> 
     return default
 
 
+def find_matched_tag(history_items: Any) -> str | None:
+    # Runs BEFORE signature verification, so the shape is attacker-controlled:
+    # null/non-list history_items, non-dict entries, and non-dict tags must
+    # skip quietly instead of crashing into a runtime "[ERROR]" log that would
+    # fire the fail-loud alarm (see the log-poisoning guard in handler()).
+    if not isinstance(history_items, list):
+        return None
+    for item in history_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("field") == "tag" and item.get("after"):
+            after_tags = item["after"]
+            if isinstance(after_tags, list):
+                for tag in after_tags:
+                    if not isinstance(tag, dict):
+                        continue
+                    tag_name = (tag.get("name") or "").lower()
+                    if tag_name in TAG_CONFIG:
+                        return tag_name
+    return None
+
+
 def handler(event: dict, context: Any) -> dict:
-    print(f"Received webhook event: {json.dumps(event)}")
+    # LOG POISONING GUARD: the endpoint is public and the CloudWatch metric
+    # filter (infrastructure/modules/clickup-bot/main.tf) matches "ERROR" /
+    # "Failed to" anywhere in ANY log line in this log group. Never echo
+    # request content (body, headers, event type, history_items) before
+    # signature verification — an attacker could otherwise fire the fail-loud
+    # alarm, or drown it in false positives, straight from the request body.
+    print("Received webhook event")
 
     headers = event.get("headers", {})
     signature = get_header_case_insensitive(headers, "x-signature")
     raw_body = event.get("body", "{}")
 
-    if not verify_webhook_signature(raw_body, signature):
-        print("Webhook signature verification failed")
-        return {"statusCode": 401, "body": json.dumps({"error": "Unauthorized"})}
-
     body = raw_body
     if isinstance(body, str):
-        body = json.loads(body)
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            print("Invalid JSON in webhook body")
+            return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON body"})}
 
+    # Valid JSON that is not an object ("[]", "null", "42", '"x"') would crash
+    # body.get() below with an AttributeError BEFORE signature verification.
+    # The Lambda runtime logs unhandled exceptions as "[ERROR] ...", which the
+    # alarm metric filter matches — so an unauthenticated client could fire or
+    # drown the fail-loud alarm at will. Same quiet wording as the branch above.
+    if not isinstance(body, dict):
+        print("Invalid JSON in webhook body")
+        return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON body"})}
+
+    # Filter irrelevant deliveries BEFORE signature verification, which needs
+    # Secrets Manager: during a secrets outage only gpbot-tagged deliveries may
+    # fail. If every workspace delivery 500s, ClickUp's consecutive-failure
+    # tracking suspends the webhook and the bot stays dead even after the
+    # outage is fixed (see README, "After an outage"). Skipping these
+    # unverified is safe: the skip branches perform no action.
     event_type = body.get("event")
-    task_id = body.get("task_id")
-
     if event_type != "taskTagUpdated":
-        print(f"Skipping event type: {event_type}")
+        print("Skipping delivery: not a taskTagUpdated event")
         return {"statusCode": 200, "body": json.dumps({"skipped": "not a tag update"})}
 
+    matched_tag = find_matched_tag(body.get("history_items", []))
+    if not matched_tag:
+        print("Skipping delivery: no target tag in history_items")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "not a target tag"})}
+
+    # Direct invocations (console/tests) can pass body as an already-parsed
+    # dict; verifying a dict would raise AttributeError inside
+    # verify_webhook_signature and be misclassified below as a secrets outage.
+    # Re-serializing can never match the HMAC, so this ends in a clean 401.
+    if not isinstance(raw_body, str):
+        raw_body = json.dumps(raw_body)
+
+    try:
+        signature_valid = verify_webhook_signature(raw_body, signature)
+    except Exception as e:
+        # Secrets Manager failure (throttle, stripped IAM) must be loud and
+        # distinguishable from a signature mismatch, and must NOT be cached:
+        # the next invocation retries the fetch.
+        print(f"ERROR: Secrets unavailable, cannot verify webhook signature: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": "secrets unavailable"})}
+
+    if not signature_valid:
+        # ERROR prefix feeds the CloudWatch alarm (metric filter in
+        # infrastructure/modules/clickup-bot/main.tf): sustained 401s mean a
+        # rotated/mismatched CLICKUP_WEBHOOK_SECRET and end in ClickUp
+        # suspending the webhook — silently, unless this line alarms.
+        print("ERROR: Webhook signature verification failed")
+        return {"statusCode": 401, "body": json.dumps({"error": "Unauthorized"})}
+
+    # The request is now authenticated, so echoing its content can no longer let
+    # an attacker poison the alarm (see the log-poisoning guard above). Log the
+    # event for debugging, but redact the signature — see redact_signature.
+    print(f"Verified webhook event: {json.dumps(redact_signature(event), default=str)}")
+
+    task_id = body.get("task_id")
     if not task_id:
         print("Missing task_id in webhook payload")
         return {"statusCode": 400, "body": json.dumps({"error": "missing task_id"})}
 
-    history_items = body.get("history_items", [])
-    matched_tag = None
-    for item in history_items:
-        if item.get("field") == "tag" and item.get("after"):
-            after_tags = item["after"]
-            if isinstance(after_tags, list):
-                for tag in after_tags:
-                    tag_name = (tag.get("name") or "").lower()
-                    if tag_name in TAG_CONFIG:
-                        matched_tag = tag_name
-                        break
-            if matched_tag:
-                break
-
-    if not matched_tag:
-        print(f"No target tag found in history_items: {history_items}")
-        return {"statusCode": 200, "body": json.dumps({"skipped": "not a target tag"})}
-
     try:
         comments = get_task_comments(task_id)
-    except HTTPError as e:
+    except Exception as e:
+        # HTTPError is only raised for HTTP status errors; connection-phase
+        # failures (URLError, TimeoutError, RemoteDisconnected) must also
+        # produce the structured 500, not a Lambda crash.
         print(f"Failed to get comments for task {task_id}: {e}")
         return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
 
-    if has_bot_comment(comments):
-        print(f"Task {task_id} already has [GP-Bot] comment, skipping")
+    if has_processing_started_comment(comments):
+        print(f"Task {task_id} already has a {PROCESSING_STARTED_PREFIX} comment, skipping")
         return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
 
     config = TAG_CONFIG[matched_tag]
-    instruction = config["instruction"]
-
-    if os.environ.get("ENABLE_FARGATE") == "true":
-        return trigger_fargate_task(task_id, instruction, config["label"], config["model"])
-
-    handoff_data = {
-        "task_id": task_id,
-        "tag": matched_tag,
-        "label": config["label"],
-        "instruction_preview": instruction[:500] + "..." if len(instruction) > 500 else instruction,
-        "instruction_length": len(instruction),
-    }
-    print(f"HANDOFF_DATA: {json.dumps(handoff_data, indent=2)}")
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "status": "logged",
-            "task_id": task_id,
-            "tag": matched_tag,
-            "label": config["label"],
-            "message": "Handoff data logged to CloudWatch (Fargate trigger not enabled)"
-        })
-    }
+    return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
 
 
 def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str = "sonnet") -> dict:
@@ -227,15 +335,12 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
     security_group_id = os.environ.get("ECS_SECURITY_GROUP_ID")
 
     if not all([cluster_arn, task_definition, subnet_ids, security_group_id]):
-        print("ERROR: Missing ECS configuration")
-        return {"statusCode": 500, "body": json.dumps({"error": "missing ECS configuration"})}
+        error_msg = "ECS configuration is missing or incomplete; the bot is misconfigured and cannot start"
+        print(f"ERROR: {error_msg}")
+        post_failure_comment(task_id, error_msg)
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
     print(f"Triggering Fargate task for {task_id} with model={model}, label={label}")
-
-    try:
-        post_comment(task_id, f"{BOT_PREFIX} Processing started ({label}, model: {model})...")
-    except HTTPError as e:
-        print(f"Failed to post starting comment: {e}")
 
     try:
         response = ecs_client.run_task(
@@ -247,7 +352,7 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
                 "awsvpcConfiguration": {
                     "subnets": subnet_ids,
                     "securityGroups": [security_group_id],
-                    "assignPublicIp": "DISABLED"
+                    "assignPublicIp": "DISABLED",
                 }
             },
             overrides={
@@ -258,52 +363,54 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
                             {"name": "CLICKUP_TASK_ID", "value": task_id},
                             {"name": "INSTRUCTION", "value": instruction},
                             {"name": "AGENT_MODEL", "value": model},
-                        ]
+                        ],
                     }
                 ]
-            }
+            },
         )
 
         failures = response.get("failures", [])
         tasks = response.get("tasks", [])
 
         if failures:
+            # Raw failures[].reason strings can embed ARNs/account details:
+            # log them, but keep the comment and response generic (same
+            # treatment as the except path below).
             failure_reasons = [f.get("reason", "unknown") for f in failures]
-            error_msg = f"ECS task launch failed: {', '.join(failure_reasons)}"
-            print(f"ERROR: {error_msg}")
-            try:
-                post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
-            except HTTPError as comment_err:
-                print(f"Failed to post failure comment to ClickUp: {comment_err}")
+            print(f"ERROR: ECS task launch failed: {', '.join(failure_reasons)}")
+            error_msg = f"ECS task launch failed ({len(failures)} failure(s)); details in CloudWatch logs"
+            post_failure_comment(task_id, error_msg)
             return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
         if not tasks:
             error_msg = "ECS run_task returned no tasks and no failures"
             print(f"ERROR: {error_msg}")
-            try:
-                post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {error_msg}")
-            except HTTPError as comment_err:
-                print(f"Failed to post failure comment to ClickUp: {comment_err}")
+            post_failure_comment(task_id, error_msg)
             return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
         task_arn = tasks[0]["taskArn"]
         print(f"Started Fargate task: {task_arn}")
 
+        # Posted only AFTER a successful launch: this comment is the dedup
+        # marker, so it must never exist on a task whose launch failed. A
+        # failed ack post must not fail the invocation (the task is running).
+        try:
+            post_comment(task_id, f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})...")
+        except Exception as e:
+            print(f"Failed to post starting comment: {e}")
+
         return {
             "statusCode": 200,
-            "body": json.dumps({
-                "status": "triggered",
-                "task_id": task_id,
-                "label": label,
-                "fargate_task_arn": task_arn
-            })
+            "body": json.dumps(
+                {"status": "triggered", "task_id": task_id, "label": label, "fargate_task_arn": task_arn}
+            ),
         }
 
     except Exception as e:
+        # Raw boto3 exception text carries ARNs, request IDs, and sometimes
+        # credential context. Keep the full detail in the logs (CloudWatch), but
+        # put only the exception type into the public ClickUp comment and the
+        # HTTP response — a generic pointer, not the leak-prone message.
         print(f"Failed to start Fargate task: {e}")
-        try:
-            post_comment(task_id, f"{BOT_PREFIX} Failed to start processing: {str(e)}")
-        except HTTPError as comment_err:
-            print(f"Failed to post failure comment to ClickUp: {comment_err}")
-        return {"statusCode": 500, "body": json.dumps({"error": f"failed to start task: {str(e)}"})}
-
+        post_failure_comment(task_id, f"{type(e).__name__} (see CloudWatch logs for details)")
+        return {"statusCode": 500, "body": json.dumps({"error": f"failed to start task: {type(e).__name__}"})}

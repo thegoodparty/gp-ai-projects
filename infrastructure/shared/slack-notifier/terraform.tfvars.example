@@ -1,1 +1,6 @@
-slack_webhook_url = "YOUR_SLACK_WEBHOOK_URL_HERE"
+# Shared Slack Notifier Configuration
+# Copy this file to terraform.tfvars and update with actual values
+
+# Environment this deployment targets (dev/qa/prod)
+# Selects the AI_SECRETS_<ENV> secret the Lambda reads the Slack webhook from
+environment = "prod"

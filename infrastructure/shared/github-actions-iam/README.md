@@ -1,12 +1,40 @@
 # GitHub Actions IAM - OIDC Authentication
 
-This Terraform module creates AWS IAM resources for GitHub Actions to authenticate and push Docker images to ECR without long-lived credentials.
+This Terraform module creates AWS IAM resources for GitHub Actions to authenticate to AWS without long-lived credentials.
 
 ## What This Creates
 
 - **OIDC Provider**: GitHub Actions OIDC provider for AWS
-- **IAM Role**: `github-actions-ecr-push` role for GitHub Actions workflows
-- **IAM Policy**: ECR push permissions attached to the role
+- **IAM Role**: `github-actions-ecr-push` — ECR image push (assumable from any ref in the repo) plus broker ECS redeploys
+- **IAM Role**: `github-actions-lambda-deploy` — Lambda code deploys (`clickup-bot-*`, `campaign-plan-*`), assumable ONLY from the `develop`, `qa`, and `prod` branches
+- **IAM Policies**: ECR push / ECS deploy permissions on the ecr-push role, Lambda `UpdateFunctionCode` on the lambda-deploy role
+
+## Rollout ordering — lambda deploy role (read before applying)
+
+Nothing in CI applies this stack; it is applied manually. Two orderings matter
+when a change moves workflows onto `github-actions-lambda-deploy`:
+
+1. **Apply BEFORE merging workflow changes that reference the role.** The
+   deploy workflows (`deploy-clickup-bot.yml`, `deploy-campaign-plan-lambda.yml`)
+   assume `arn:aws:iam::333022194791:role/github-actions-lambda-deploy` at the
+   configure-aws-credentials step. If the role does not exist yet, the first
+   push that touches those workflows' paths fails with
+   `Not authorized to perform sts:AssumeRoleWithWebIdentity` and the Lambda
+   code deploy is stranded. Run `terraform apply` here first, then merge.
+2. **Promote the workflow change through develop, qa, and prod immediately
+   after the apply.** The apply that creates the new role also detaches
+   `lambda-deploy-policy` from `github-actions-ecr-push` (the policy resource
+   moved roles, which is ForceNew). GitHub Actions runs the workflow file at
+   the triggering ref, so until the new workflow files land on each long-lived
+   branch, that branch still runs the OLD workflow that assumes the ecr-push
+   role — its `update-function-code` call fails with AccessDenied and the
+   deploy silently does not ship. `deploy-campaign-plan-lambda.yml` deploys
+   from all three branches (`develop` → `campaign-plan-dev`, `qa`, `prod`), so
+   `develop` is affected too, not just qa/prod — its campaign-plan deploys stay
+   broken until this change lands on `develop`. (`deploy-clickup-bot.yml`
+   deploys from `prod` only, so it is unaffected on develop/qa.) Keep the
+   window short: apply, then merge/promote through develop → qa → prod in the
+   same sitting, and watch the first run of each deploy workflow succeed.
 
 ## Authentication Flow
 
@@ -85,15 +113,27 @@ No secrets needed in GitHub repository settings!
 | Resource Type | Name | Purpose |
 |---------------|------|---------|
 | OIDC Provider | `token.actions.githubusercontent.com` | Trust relationship with GitHub |
-| IAM Role | `github-actions-ecr-push` | Assumable by GitHub Actions |
+| IAM Role | `github-actions-ecr-push` | ECR push + broker ECS deploy, any ref |
+| IAM Role | `github-actions-lambda-deploy` | Lambda code deploys, develop/qa/prod refs only |
 | IAM Policy | `ecr-push-policy` | Permissions to push to ECR |
+| IAM Policy | `ecs-deploy-policy` | broker ECS force-new-deployment |
+| IAM Policy | `lambda-deploy-policy` | `lambda:UpdateFunctionCode` on `clickup-bot-*`, `campaign-plan-*` |
 
 ## Permissions Granted
 
-The role has permissions to:
-- Get ECR authorization token
-- Push Docker images to `gp-ai-projects` repository
-- List/describe images in ECR
+**`github-actions-ecr-push`** (assumable from any ref):
+- `ecr:GetAuthorizationToken` (account-wide — required by the ECR login step)
+- Push/pull layers and images on the `gp-ai-projects` ECR repository
+  (`InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`,
+  `BatchCheckLayerAvailability`, `GetDownloadUrlForLayer`, `BatchGetImage`, plus
+  `DescribeRepositories` / `ListImages` / `DescribeImages` / `GetRepositoryPolicy`)
+- `ecs:UpdateService` / `ecs:DescribeServices` on the `broker-{dev,qa,prod}` services
+  (force-new-deployment from the build-broker workflow)
+
+**`github-actions-lambda-deploy`** (assumable only from `develop` / `qa` / `prod`):
+- `lambda:UpdateFunctionCode`, `lambda:GetFunction`, `lambda:GetFunctionConfiguration`,
+  scoped to `clickup-bot-*` and `campaign-plan-*` functions only — never `function:*`,
+  so CI cannot overwrite the other prod Lambdas in this account.
 
 ## Troubleshooting
 
