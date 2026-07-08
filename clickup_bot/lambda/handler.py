@@ -63,32 +63,16 @@ def verify_webhook_signature(body: str, signature: str) -> bool:
 BOT_PREFIX = "[GP-Bot]"
 PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
 
-# Shared across both contracts: where the code actually lives now. GoodParty
-# migrated product code into the thegoodparty/omni monorepo; the old standalone
-# repos are archived (read-only). An agent that clones an archived repo burns
-# the whole run, so this guidance ships with every instruction.
-REPOSITORIES_SECTION = """## REPOSITORIES
-
-Product code lives in the **thegoodparty/omni** monorepo (default branch `develop`).
-Clone it and work inside the relevant package:
-```bash
-git clone --depth 1 https://oauth2:$GITHUB_TOKEN@github.com/thegoodparty/omni.git /workspace/omni
-```
-Packages live under `packages/`: gp-webapp, gp-api, election-api, people-api,
-gp-admin, candidate-sites, gp-sdk, contracts.
-
-The old standalone product repos (gp-webapp, gp-api, people-api, election-api)
-are **archived** (read-only as of June 2026) — never clone them and never open a
-PR against them. gp-ai-projects and gp-data-platform remain separate live repos.
-"""
-
-ANALYZE_INSTRUCTION = f"""## YOUR TASK: Analyze and Report
+# Repo guidance (omni monorepo, archived standalone repos) deliberately does
+# NOT live here: it is baked into the agent's capability prompt
+# (engineer_agent/agent/config.py, pinned by engineer_agent/tests). These
+# instructions carry only the per-task contract.
+ANALYZE_INSTRUCTION = """## YOUR TASK: Analyze and Report
 
 **Approach this ticket with healthy skepticism.** It may be out of date - the issue
 could have been fixed, the data may have changed, the description may be incomplete,
 or the reporter may have been incorrect.
 
-{REPOSITORIES_SECTION}
 ## VERIFICATION (required)
 
 - Verify every claim against the live code in omni and cite `file:line`.
@@ -98,13 +82,12 @@ or the reporter may have been incorrect.
 Post your analysis to ClickUp when done. Be concise.
 """
 
-IMPLEMENT_INSTRUCTION = f"""## YOUR TASK: Implement and Create PR
+IMPLEMENT_INSTRUCTION = """## YOUR TASK: Implement and Create PR
 
 **Approach this ticket with healthy skepticism.** It may be out of date - the issue
 could have been fixed, the data may have changed, the description may be incomplete,
 or the reporter may have been incorrect.
 
-{REPOSITORIES_SECTION}
 **BEFORE writing any code**, you MUST:
 1. Find all files that use/import the function or component you plan to modify
 2. Read each of those files to understand how they depend on it

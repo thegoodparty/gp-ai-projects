@@ -402,11 +402,9 @@ def test_gpbot_analyze_launches_fargate_task(fake_clickup, fake_ecs, ecs_env, ta
     # tags: gpbot-analyze must ship the analyze contract, not the implement one.
     assert "Analyze and Report" in container_env["INSTRUCTION"]
     assert "Implement and Create PR" not in container_env["INSTRUCTION"]
-    # Product code lives in the thegoodparty/omni monorepo; the old standalone
-    # product repos are archived. The agent must be told both, or it will clone
-    # a read-only archived repo and waste the whole run.
-    assert "thegoodparty/omni" in container_env["INSTRUCTION"]
-    assert "archived" in container_env["INSTRUCTION"]
+    # Repo guidance (omni monorepo / archived repos) is deliberately NOT in the
+    # INSTRUCTION: it is single-sourced in the agent's capability prompt and
+    # pinned by engineer_agent/tests/test_config.py.
 
     vpc_config = kwargs["networkConfiguration"]["awsvpcConfiguration"]
     assert vpc_config["subnets"] == ["subnet-aaa111", "subnet-bbb222"]
@@ -447,11 +445,10 @@ def test_gpbot_work_launches_with_implement_comment(fake_clickup, fake_ecs, ecs_
     assert "Implement and Create PR" in container_env["INSTRUCTION"]
     assert "gp-bot_" in container_env["INSTRUCTION"]
     assert "Analyze and Report" not in container_env["INSTRUCTION"]
-    # Same omni/archived repo guidance as the analyze contract...
-    assert "thegoodparty/omni" in container_env["INSTRUCTION"]
-    assert "archived" in container_env["INSTRUCTION"]
-    # ...plus the implement contract must drive every change with a failing
-    # test first (red/green TDD)...
+    # Repo guidance (omni/archived) lives in the agent's capability prompt
+    # (engineer_agent/agent/config.py — pinned by engineer_agent/tests), NOT
+    # here: single source. The implement contract must drive every change
+    # with a failing test first (red/green TDD)...
     assert "failing test" in container_env["INSTRUCTION"]
     # ...and self-review the finished diff against the repo's ai-rules files
     # before opening the PR.
