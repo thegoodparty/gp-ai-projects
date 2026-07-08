@@ -1,6 +1,5 @@
-from dataclasses import dataclass
 import os
-
+from dataclasses import dataclass
 
 BOT_PREFIX = "[GP-Bot]"
 
@@ -37,11 +36,20 @@ def build_capability_prompt() -> str:
 **CLI**: git, gh, aws, python, node, npm (can install more via apt-get/pip)
 
 **GitHub org**: thegoodparty
+
+Product code lives in the **thegoodparty/omni** monorepo (default branch `develop`):
+```bash
+git clone --depth 1 https://oauth2:$GITHUB_TOKEN@github.com/thegoodparty/omni.git /workspace/omni
+```
+Packages live under `packages/`: gp-webapp, gp-api, election-api, people-api,
+gp-admin, candidate-sites, gp-sdk, contracts. Open PRs against omni's `develop`.
+
+The old standalone product repos (gp-webapp, gp-api, people-api, election-api) are
+**archived** (read-only) — never clone them and never open a PR against them.
+gp-ai-projects and gp-data-platform remain separate live repos:
 ```bash
 git clone --depth 1 https://oauth2:$GITHUB_TOKEN@github.com/thegoodparty/{repo}.git /workspace/{repo}
 ```
-
-Common repos: gp-webapp (Next.js), gp-api (NestJS), gp-ai-projects, gp-people-api, gp-data-platform
 
 **Databricks** (read-only): `python -m engineer_agent.scripts.query_db --help`
 Default catalog: goodparty_data_catalog.dbt

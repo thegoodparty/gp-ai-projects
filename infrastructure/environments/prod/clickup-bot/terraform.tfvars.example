@@ -1,0 +1,20 @@
+# clickup-bot prod variables
+#
+# The defaults in main.tf are already correct for prod — you do NOT need a
+# terraform.tfvars file to apply this environment. This example exists only to
+# document the variables.
+#
+# History: the prod values used to live solely in a gitignored local
+# terraform.tfvars while main.tf defaulted enable_fargate_trigger to false.
+# An apply from a checkout without that file silently disabled the bot
+# (incident starting 2026-06-26). The defaults are now pinned in main.tf so a
+# bare `terraform apply` produces the correct prod configuration.
+
+# Whether the Lambda triggers the engineer-agent Fargate task.
+# Default: true (the prod value). Only override for a deliberate teardown.
+enable_fargate_trigger = true
+
+# Private subnet IDs the Fargate task runs in.
+# Default: the prod private subnets below (same ones pinned in
+# ../pmf-engine-control-plane/main.tf).
+private_subnet_ids = ["subnet-053357b931f0524d4", "subnet-0bb591861f72dcb7f"]
