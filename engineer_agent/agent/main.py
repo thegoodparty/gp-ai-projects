@@ -3,19 +3,19 @@ import os
 import sys
 
 from claude_agent_sdk import (
-    query,
-    ClaudeAgentOptions,
     AssistantMessage,
-    UserMessage,
-    TextBlock,
-    ToolUseBlock,
-    ToolResultBlock,
+    ClaudeAgentOptions,
     ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+    query,
 )
 
 from shared.logger import get_logger
-from .config import AgentConfig, CAPABILITIES, build_capability_prompt
 
+from .config import CAPABILITIES, AgentConfig, build_capability_prompt
 
 logger = get_logger(__name__)
 

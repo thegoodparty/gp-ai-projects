@@ -3,10 +3,9 @@ import asyncio
 import os
 import sys
 
-from shared.logger import get_logger
 from engineer_agent.agent import run_agent
 from engineer_agent.agent.config import AgentConfig
-
+from shared.logger import get_logger
 
 logger = get_logger(__name__)
 

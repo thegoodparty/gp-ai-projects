@@ -60,6 +60,26 @@ jobs:
             exit 1
           fi
 
+          # Branch guard: each environment deploys ONLY from its own long-lived
+          # branch. Without this, a workflow_dispatch run from develop could
+          # select environment=prod and ship develop's checkout to
+          # campaign-plan-prod: the github-actions-lambda-deploy IAM role
+          # trusts all three branches and its policy spans all campaign-plan-*
+          # functions, so IAM alone does not stop it.
+          case "${ENV}" in
+            prod) REQUIRED_REF="refs/heads/prod" ;;
+            qa)   REQUIRED_REF="refs/heads/qa" ;;
+            dev)  REQUIRED_REF="refs/heads/develop" ;;
+            *)
+              echo "ERROR: Unknown environment: ${ENV}"
+              exit 1
+              ;;
+          esac
+          if [[ "${{ github.ref }}" != "${REQUIRED_REF}" ]]; then
+            echo "ERROR: environment '${ENV}' deploys only from ${REQUIRED_REF}, not ${{ github.ref }}"
+            exit 1
+          fi
+
           FUNCTION_NAME="campaign-plan-${ENV}"
           echo "environment=${ENV}" >> $GITHUB_OUTPUT
           echo "function_name=${FUNCTION_NAME}" >> $GITHUB_OUTPUT
@@ -68,7 +88,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          # Dedicated Lambda deploy role: only assumable from develop/qa/prod
+          # refs and only allowed to update campaign-plan-* / clickup-bot-*.
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-lambda-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Build Lambda zip
