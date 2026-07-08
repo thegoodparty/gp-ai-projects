@@ -1053,3 +1053,18 @@ def test_ack_post_failure_still_200_but_logs_alarmable_line(fake_clickup, fake_e
     assert resp["statusCode"] == 200
     assert len(fake_ecs.run_task_calls) == 1
     assert "Failed to" in capsys.readouterr().out
+
+
+def test_ecs_failure_reasons_not_leaked_into_comment_or_response(fake_clickup, fake_ecs, ecs_env, capsys):
+    # ECS failures[].reason can embed ARNs and account details. The ClickUp
+    # comment and HTTP response must carry only a generic message; the raw
+    # reasons belong in CloudWatch logs.
+    marker = "arn:aws:iam::999999999999:role/secret-leak-marker"
+    fake_ecs.response = {"tasks": [], "failures": [{"reason": marker, "detail": "x"}]}
+    resp = handler.handler(make_event(tag_updated_body()), None)
+    assert resp["statusCode"] == 500
+    assert marker not in resp["body"]
+    failure_comments = [t for t in fake_clickup.posted_comment_texts if "Failed to start processing" in t]
+    assert len(failure_comments) == 1
+    assert marker not in failure_comments[0]
+    assert marker in capsys.readouterr().out

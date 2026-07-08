@@ -373,9 +373,12 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
         tasks = response.get("tasks", [])
 
         if failures:
+            # Raw failures[].reason strings can embed ARNs/account details:
+            # log them, but keep the comment and response generic (same
+            # treatment as the except path below).
             failure_reasons = [f.get("reason", "unknown") for f in failures]
-            error_msg = f"ECS task launch failed: {', '.join(failure_reasons)}"
-            print(f"ERROR: {error_msg}")
+            print(f"ERROR: ECS task launch failed: {', '.join(failure_reasons)}")
+            error_msg = f"ECS task launch failed ({len(failures)} failure(s)); details in CloudWatch logs"
             post_failure_comment(task_id, error_msg)
             return {"statusCode": 500, "body": json.dumps({"error": error_msg})}
 
