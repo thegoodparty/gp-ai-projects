@@ -1,8 +1,8 @@
 import argparse
 import sys
 
-from shared.clickup_client import ClickUpClient
 from engineer_agent.agent.config import BOT_PREFIX
+from shared.clickup_client import ClickUpClient
 
 
 def main():

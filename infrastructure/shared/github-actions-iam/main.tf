@@ -105,24 +105,58 @@ resource "aws_iam_role_policy" "github_actions_ecr_push" {
         Resource = [
           "arn:aws:ecr:us-west-2:${data.aws_caller_identity.current.account_id}:repository/gp-ai-projects"
         ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "lambda:UpdateFunctionCode"
-        ]
-        Resource = [
-          "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:clickup-bot-*"
-        ]
       }
     ]
   })
 }
 
-# Policy for Lambda deploy access (used by Lambda deploy workflows)
+# Dedicated role for Lambda code deploys, deliberately separate from the ECR
+# push role. The ECR push role is assumable from ANY ref in the repo (builds
+# run on feature branches and PRs), so it must never hold Lambda write access:
+# Lambda code deploys bypass terraform review (the clickup-bot module ignores
+# code drift via lifecycle.ignore_changes), which makes this role's policy the
+# only control on what CI can put into prod. Trust is therefore restricted to
+# the long-lived branches the deploy workflows run on, and the policy to the
+# exact functions those workflows deploy — never function:*, because this
+# account also hosts prod Lambdas (newrelic-log-forwarder, shared-slack-notifier,
+# serve-analyze-trigger, ...) that CI must not be able to overwrite.
+resource "aws_iam_role" "github_actions_lambda_deploy" {
+  name = "github-actions-lambda-deploy"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github_actions.arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+          StringLike = {
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:thegoodparty/gp-ai-projects:ref:refs/heads/prod",
+              "repo:thegoodparty/gp-ai-projects:ref:refs/heads/qa",
+              "repo:thegoodparty/gp-ai-projects:ref:refs/heads/develop"
+            ]
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name    = "GitHub Actions Lambda Deploy Role"
+    Purpose = "Allow Lambda deploy workflows on long-lived branches to update function code"
+  }
+}
+
 resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
   name = "lambda-deploy-policy"
-  role = aws_iam_role.github_actions_ecr_push.id
+  role = aws_iam_role.github_actions_lambda_deploy.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -134,7 +168,13 @@ resource "aws_iam_role_policy" "github_actions_lambda_deploy" {
           "lambda:GetFunction",
           "lambda:GetFunctionConfiguration"
         ]
-        Resource = "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:*"
+        # Only the functions whose code is CI-deployed:
+        # - clickup-bot-*   (.github/workflows/deploy-clickup-bot.yml)
+        # - campaign-plan-* (.github/workflows/deploy-campaign-plan-lambda.yml)
+        Resource = [
+          "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:clickup-bot-*",
+          "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:campaign-plan-*"
+        ]
       }
     ]
   })
@@ -168,4 +208,9 @@ resource "aws_iam_role_policy" "github_actions_ecs_deploy" {
 output "github_actions_role_arn" {
   value       = aws_iam_role.github_actions_ecr_push.arn
   description = "ARN of the IAM role for GitHub Actions to push to ECR"
+}
+
+output "github_actions_lambda_deploy_role_arn" {
+  value       = aws_iam_role.github_actions_lambda_deploy.arn
+  description = "ARN of the IAM role for GitHub Actions Lambda deploy workflows"
 }

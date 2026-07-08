@@ -1,30 +1,48 @@
 name: Deploy ClickUp Bot Lambda
 
+# Only clickup-bot-prod exists (there is no clickup-bot-dev Lambda and no
+# dev/qa terraform environment for it), so this workflow deploys prod only.
+# If a dev environment is ever created, add its branch and function here.
 on:
   push:
     branches:
-      - develop
       - prod
     paths:
-      - 'clickup_bot/lambda/**'
+      - 'clickup_bot/**'
       - '.github/workflows/deploy-clickup-bot.yml'
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment to deploy (dev/prod)'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - prod
 
 env:
   AWS_REGION: us-west-2
+  FUNCTION_NAME: clickup-bot-prod
 
 jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Run clickup_bot tests
+        run: uv run pytest clickup_bot/tests/ -v
+
   deploy:
     name: Deploy Lambda
+    needs: test
+    # Only code from the prod branch may reach clickup-bot-prod. Without this
+    # guard, a workflow_dispatch from any branch (the GitHub UI defaults to
+    # develop) would zip that branch's handler and silently replace prod code
+    # that terraform deliberately no longer tracks (lifecycle.ignore_changes).
+    if: github.ref == 'refs/heads/prod'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -34,29 +52,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Determine environment
-        id: env
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ENV="${{ github.event.inputs.environment }}"
-          elif [[ "${{ github.ref }}" == "refs/heads/prod" ]]; then
-            ENV="prod"
-          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
-            ENV="dev"
-          else
-            echo "ERROR: Unexpected branch: ${{ github.ref }}"
-            exit 1
-          fi
-
-          FUNCTION_NAME="clickup-bot-${ENV}"
-          echo "environment=${ENV}" >> $GITHUB_OUTPUT
-          echo "function_name=${FUNCTION_NAME}" >> $GITHUB_OUTPUT
-          echo "Deploying to: ${FUNCTION_NAME}"
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-push
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-lambda-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Package and deploy Lambda
@@ -65,8 +64,16 @@ jobs:
           zip -j /tmp/clickup-bot-lambda.zip handler.py
 
           aws lambda update-function-code \
-            --function-name ${{ steps.env.outputs.function_name }} \
+            --function-name ${{ env.FUNCTION_NAME }} \
             --zip-file fileb:///tmp/clickup-bot-lambda.zip \
             --region ${{ env.AWS_REGION }}
 
-          echo "Deployed ${{ steps.env.outputs.function_name }}"
+      # update-function-code returns as soon as Lambda ACCEPTS the request;
+      # without waiting, a failed update (corrupt zip, bad handler) exits 0
+      # and CI shows green while prod is broken.
+      - name: Wait for update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Deployed ${{ env.FUNCTION_NAME }}"

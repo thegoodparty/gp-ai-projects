@@ -1376,7 +1376,7 @@ requires-dist = [
 [[package]]
 name = "gp-clickup-bot"
 version = "0.1.0"
-source = { editable = "clickup_bot" }
+source = { virtual = "clickup_bot" }
 
 [[package]]
 name = "gp-ddhq-matcher"
