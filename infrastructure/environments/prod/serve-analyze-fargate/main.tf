@@ -38,10 +38,11 @@ variable "private_subnet_ids" {
   type        = list(string)
 }
 
+# pinned in git because the gitignored tfvars pattern silently dropped alerting on clean-checkout applies
 variable "failure_notification_email" {
   description = "Email for failure notifications (optional)"
   type        = string
-  default     = ""
+  default     = "collin@goodparty.org"
 }
 
 data "terraform_remote_state" "shared_ecr" {
@@ -67,15 +68,15 @@ data "terraform_remote_state" "shared_slack_notifier" {
 module "serve_analyze_fargate" {
   source = "../../../modules/serve-analyze-fargate"
 
-  environment                        = "prod"
-  vpc_id                             = var.vpc_id
-  private_subnet_ids                 = var.private_subnet_ids
-  ecr_repository_url                 = data.terraform_remote_state.shared_ecr.outputs.repository_url
-  docker_image_tag                   = "serve-analyze-prod"
-  sqs_queue_arn                      = "arn:aws:sqs:us-west-2:333022194791:master-Queue.fifo"
-  sqs_queue_url                      = "https://sqs.us-west-2.amazonaws.com/333022194791/master-Queue.fifo"
-  shared_slack_notifier_lambda_arn   = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
-  failure_notification_email         = var.failure_notification_email
+  environment                      = "prod"
+  vpc_id                           = var.vpc_id
+  private_subnet_ids               = var.private_subnet_ids
+  ecr_repository_url               = data.terraform_remote_state.shared_ecr.outputs.repository_url
+  docker_image_tag                 = "serve-analyze-prod"
+  sqs_queue_arn                    = "arn:aws:sqs:us-west-2:333022194791:master-Queue.fifo"
+  sqs_queue_url                    = "https://sqs.us-west-2.amazonaws.com/333022194791/master-Queue.fifo"
+  shared_slack_notifier_lambda_arn = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
+  failure_notification_email       = var.failure_notification_email
 }
 
 output "cluster_name" {

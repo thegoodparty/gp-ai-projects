@@ -7,12 +7,6 @@ variable "environment" {
   }
 }
 
-variable "allowed_sns_topic_arns" {
-  description = "List of SNS topic ARNs allowed to invoke this Lambda"
-  type        = list(string)
-  default     = []
-}
-
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
@@ -34,8 +28,8 @@ resource "aws_iam_role" "slack_notifier" {
   })
 
   tags = {
-    Name        = "Shared Slack Notifier"
-    ManagedBy   = "Terraform"
+    Name      = "Shared Slack Notifier"
+    ManagedBy = "Terraform"
   }
 }
 
@@ -64,24 +58,24 @@ resource "aws_iam_role_policy" "slack_notifier_secrets_access" {
 
 # Lambda Function
 resource "aws_lambda_function" "slack_notifier" {
-  filename      = "${path.module}/slack-notifier.zip"
-  function_name = "shared-slack-notifier"
-  role          = aws_iam_role.slack_notifier.arn
-  handler       = "index.handler"
-  runtime       = "nodejs22.x"
-  timeout       = 30
+  filename         = "${path.module}/slack-notifier.zip"
+  function_name    = "shared-slack-notifier"
+  role             = aws_iam_role.slack_notifier.arn
+  handler          = "index.handler"
+  runtime          = "nodejs22.x"
+  timeout          = 30
   source_code_hash = filebase64sha256("${path.module}/slack-notifier.zip")
 
   environment {
     variables = {
-      SECRET_NAME    = "AI_SECRETS_${upper(var.environment)}"
-      SECRET_REGION  = data.aws_region.current.name
+      SECRET_NAME   = "AI_SECRETS_${upper(var.environment)}"
+      SECRET_REGION = data.aws_region.current.name
     }
   }
 
   tags = {
-    Name        = "Shared Slack Notifier"
-    ManagedBy   = "Terraform"
+    Name      = "Shared Slack Notifier"
+    ManagedBy = "Terraform"
   }
 }
 
@@ -91,8 +85,8 @@ resource "aws_cloudwatch_log_group" "slack_notifier" {
   retention_in_days = 7
 
   tags = {
-    Name        = "Shared Slack Notifier Logs"
-    ManagedBy   = "Terraform"
+    Name      = "Shared Slack Notifier Logs"
+    ManagedBy = "Terraform"
   }
 }
 
@@ -103,7 +97,7 @@ resource "aws_lambda_permission" "allow_sns" {
   function_name = aws_lambda_function.slack_notifier.function_name
   principal     = "sns.amazonaws.com"
   # Allow any SNS topic in this account to invoke
-  source_arn    = "arn:aws:sns:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"
+  source_arn = "arn:aws:sns:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"
 }
 
 # Outputs

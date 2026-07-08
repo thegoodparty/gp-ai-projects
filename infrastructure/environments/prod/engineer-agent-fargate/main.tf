@@ -37,10 +37,11 @@ variable "private_subnet_ids" {
   type        = list(string)
 }
 
+# pinned in git because the gitignored tfvars pattern silently dropped alerting on clean-checkout applies
 variable "failure_notification_email" {
   description = "Email for failure notifications (optional)"
   type        = string
-  default     = ""
+  default     = "collin@goodparty.org"
 }
 
 data "terraform_remote_state" "shared_ecr" {
