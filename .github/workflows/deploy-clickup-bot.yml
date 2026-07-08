@@ -68,4 +68,12 @@ jobs:
             --zip-file fileb:///tmp/clickup-bot-lambda.zip \
             --region ${{ env.AWS_REGION }}
 
+      # update-function-code returns as soon as Lambda ACCEPTS the request;
+      # without waiting, a failed update (corrupt zip, bad handler) exits 0
+      # and CI shows green while prod is broken.
+      - name: Wait for update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.AWS_REGION }}
           echo "Deployed ${{ env.FUNCTION_NAME }}"

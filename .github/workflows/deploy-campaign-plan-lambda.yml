@@ -32,10 +32,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.13
+      # 3.12 on purpose: the Lambda artifact is built and deployed on 3.12
+      # (build.sh --python-version 3.12); testing on a newer Python could
+      # green-light 3.13-only behavior the artifact cannot run.
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.12'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
