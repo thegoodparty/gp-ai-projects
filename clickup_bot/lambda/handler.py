@@ -224,12 +224,22 @@ def get_header_case_insensitive(headers: dict, name: str, default: str = "") -> 
     return default
 
 
-def find_matched_tag(history_items: list) -> str | None:
+def find_matched_tag(history_items: Any) -> str | None:
+    # Runs BEFORE signature verification, so the shape is attacker-controlled:
+    # null/non-list history_items, non-dict entries, and non-dict tags must
+    # skip quietly instead of crashing into a runtime "[ERROR]" log that would
+    # fire the fail-loud alarm (see the log-poisoning guard in handler()).
+    if not isinstance(history_items, list):
+        return None
     for item in history_items:
+        if not isinstance(item, dict):
+            continue
         if item.get("field") == "tag" and item.get("after"):
             after_tags = item["after"]
             if isinstance(after_tags, list):
                 for tag in after_tags:
+                    if not isinstance(tag, dict):
+                        continue
                     tag_name = (tag.get("name") or "").lower()
                     if tag_name in TAG_CONFIG:
                         return tag_name
@@ -281,6 +291,13 @@ def handler(event: dict, context: Any) -> dict:
     if not matched_tag:
         print("Skipping delivery: no target tag in history_items")
         return {"statusCode": 200, "body": json.dumps({"skipped": "not a target tag"})}
+
+    # Direct invocations (console/tests) can pass body as an already-parsed
+    # dict; verifying a dict would raise AttributeError inside
+    # verify_webhook_signature and be misclassified below as a secrets outage.
+    # Re-serializing can never match the HMAC, so this ends in a clean 401.
+    if not isinstance(raw_body, str):
+        raw_body = json.dumps(raw_body)
 
     try:
         signature_valid = verify_webhook_signature(raw_body, signature)

@@ -182,7 +182,7 @@ resource "aws_lambda_function" "clickup_bot" {
   function_name    = "clickup-bot-${var.environment}"
   role             = aws_iam_role.clickup_bot.arn
   handler          = "handler.handler"
-  runtime          = "python3.12"
+  runtime          = "python3.13"
   timeout          = 30
   memory_size      = 128
 

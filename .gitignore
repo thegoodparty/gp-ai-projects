@@ -103,3 +103,7 @@ spot-testing/
 
 # Terraform lock files live in env wrappers, not in reusable modules
 infrastructure/modules/**/.terraform.lock.hcl
+
+# terraform plan files (any name variant) — binary, embed account/identity recon values
+**/*.tfplan
+**/tfplan-*

@@ -451,8 +451,11 @@ def test_gpbot_work_launches_with_implement_comment(fake_clickup, fake_ecs, ecs_
     assert "thegoodparty/omni" in container_env["INSTRUCTION"]
     assert "archived" in container_env["INSTRUCTION"]
     # ...plus the implement contract must drive every change with a failing
-    # test first (red/green TDD).
+    # test first (red/green TDD)...
     assert "failing test" in container_env["INSTRUCTION"]
+    # ...and self-review the finished diff against the repo's ai-rules files
+    # before opening the PR.
+    assert "ai-rules" in container_env["INSTRUCTION"]
 
 
 # ---------------------------------------------------------------------------
@@ -995,3 +998,61 @@ def test_clickup_requests_carry_authorization_header(fake_clickup, fake_ecs, ecs
     # Happy path hits both the GET comments and the POST ack-comment endpoints.
     assert len(fake_clickup.requests) >= 2
     assert all(auth == TEST_API_KEY for auth in fake_clickup.authorization_headers)
+
+
+# ---------------------------------------------------------------------------
+# PR-review findings: pre-auth payload-shape hardening
+# (cursor bugbot: null history_items; delegate-reviewer: dict body)
+# ---------------------------------------------------------------------------
+
+
+def test_null_history_items_returns_200_skipped_without_alarmable_log(fake_clickup, fake_ecs, ecs_env, capsys):
+    # "history_items": null is present-but-null, so .get(key, []) returns None.
+    # Must skip quietly pre-auth, not crash into a runtime [ERROR] log that an
+    # unauthenticated client could use to fire the fail-loud alarm.
+    body = {"event": "taskTagUpdated", "task_id": "abc123", "history_items": None}
+    resp = handler.handler(make_event(body, signature="junk"), None)
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "not a target tag"}
+    out = capsys.readouterr().out
+    assert "ERROR" not in out
+    assert "Failed to" not in out
+
+
+def test_non_dict_history_entries_and_tags_are_skipped(fake_clickup, fake_ecs, ecs_env, capsys):
+    # Attacker-shaped entries (strings, numbers, non-dict tags) must not crash
+    # pre-auth; a valid entry later in the list must still match.
+    history = ["junk-string", 42, {"field": "tag", "after": ["not-a-dict", {"name": "gpbot-analyze"}]}]
+    body = tag_updated_body(history_items=history)
+    event = make_event(body)
+    resp = handler.handler(event, None)
+    assert resp["statusCode"] == 200
+    assert len(fake_ecs.run_task_calls) == 1
+    out = capsys.readouterr().out
+    assert "Traceback" not in out
+
+
+def test_dict_body_direct_invocation_returns_401_not_secrets_error(fake_clickup, fake_ecs, ecs_env, capsys):
+    # Direct invocation (console/test) can pass body as an already-parsed dict.
+    # Signature can never match a re-serialized dict, so this must be a clean
+    # 401 — NOT an AttributeError misclassified as a Secrets Manager outage.
+    event = {"headers": {"x-signature": "junk"}, "body": tag_updated_body()}
+    resp = handler.handler(event, None)
+    assert resp["statusCode"] == 401
+    out = capsys.readouterr().out
+    assert "Secrets unavailable" not in out
+    assert len(fake_ecs.run_task_calls) == 0
+
+
+def test_ack_post_failure_still_200_but_logs_alarmable_line(fake_clickup, fake_ecs, ecs_env, capsys):
+    # If the "Processing started" ack fails AFTER a successful run_task, the
+    # Fargate agent is already running: a 500 would make ClickUp re-deliver
+    # and guarantee a duplicate launch, so the handler must return 200. The
+    # residual risk (a later manual re-tag re-launches because no dedup marker
+    # exists) is accepted and made visible: the log line must contain
+    # "Failed to" so the CloudWatch metric filter fires the fail-loud alarm.
+    fake_clickup.post_comment_error = HTTPError("http://x", 500, "err", {}, None)
+    resp = handler.handler(make_event(tag_updated_body()), None)
+    assert resp["statusCode"] == 200
+    assert len(fake_ecs.run_task_calls) == 1
+    assert "Failed to" in capsys.readouterr().out
