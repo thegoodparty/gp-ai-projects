@@ -1,14 +1,90 @@
 import hashlib
 import hmac
 import json
+import math
 import os
-from typing import Any
+import time
+from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 CLICKUP_BASE_URL = "https://api.clickup.com/api/v2"
 _secrets_cache = None
+
+# Module-level boto3 client cache. boto3.client() re-runs endpoint resolution
+# and session wiring on every call — in-path latency against the fast-ack
+# promise of an instant 200 — and Lambda freezes the execution environment
+# between invocations, so a cached client is free on every warm invocation.
+# Cached lazily (not at import) so tests can swap boto3.client for fakes; the
+# test suite resets these between tests.
+_lambda_client = None
+_ecs_client = None
+_dynamodb_client = None
+
+# FAST-ACK BUDGET for the self-invoke call: it sits on ClickUp's webhook
+# critical path, and botocore's defaults (60s connect + 60s read, with
+# retries) could blow the entire webhook timeout — the exact failure mode of
+# the 2026-07-14 incident — on a hung Lambda control plane. Tight timeouts,
+# single attempt: a provable control-plane rejection lands in
+# enqueue_async_processing's quiet synchronous fallback; anything else
+# (timeout, dropped connection) is treated as AMBIGUOUS — the Event may
+# already be queued — and 500s so ClickUp redelivers instead of the inline
+# path double-running the work (see enqueue_async_processing).
+#
+# total_max_attempts, NOT max_attempts — a botocore trap: in legacy retry
+# mode (the default) "max_attempts" counts RETRIES AFTER the initial call,
+# so {"max_attempts": 1} normalizes to total_max_attempts=2 — one silent
+# full retry on this budget-critical path. "total_max_attempts" counts the
+# initial call itself, so 1 here truly means a single attempt (pinned by a
+# resolved-config test against a real botocore client).
+LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
+
+# Same fast-path budget for the atomic-dedup DynamoDB calls: in the sync
+# fallback (the initial prod state, until the self-invoke IAM lands) the
+# conditional PutItem runs while ClickUp is still waiting on the webhook
+# response, so botocore's defaults could blow the whole webhook timeout there
+# too. Tight timeouts, single attempt (total_max_attempts — see the
+# max_attempts trap on LAMBDA_CLIENT_CONFIG): a timeout surfaces as an
+# exception in try_acquire_dedup_lock / release_dedup_lock, where the
+# existing fail-open handling already covers it (proceed without atomic
+# dedup, alarm-matching log line).
+DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
+
+# RunTask budget: RunTask has NO idempotency token, so a botocore retry after
+# an ambiguous failure (read timeout with the request already accepted
+# server-side) can DOUBLE-LAUNCH Fargate inside one dedup claim — the exact
+# duplicate class the claim exists to prevent, invisible to both dedup
+# layers. botocore defaults (60s timeouts, ~5 legacy attempts) must never
+# apply here: zero SDK retries is the correct trade because a genuine launch
+# failure already fails loud (failure comment + documented re-tag retry
+# path). 30s read stays within the worker's 120s budget; connect gets 5s
+# because a connect-phase failure is unambiguous (nothing launched) yet still
+# must not eat the budget.
+ECS_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=30, retries={"total_max_attempts": 1})
+
+
+def get_lambda_client() -> Any:
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda", config=LAMBDA_CLIENT_CONFIG)
+    return _lambda_client
+
+
+def get_ecs_client() -> Any:
+    global _ecs_client
+    if _ecs_client is None:
+        _ecs_client = boto3.client("ecs", config=ECS_CLIENT_CONFIG)
+    return _ecs_client
+
+
+def get_dynamodb_client() -> Any:
+    global _dynamodb_client
+    if _dynamodb_client is None:
+        _dynamodb_client = boto3.client("dynamodb", config=DYNAMODB_CLIENT_CONFIG)
+    return _dynamodb_client
 
 
 def get_secrets() -> dict:
@@ -62,6 +138,84 @@ def verify_webhook_signature(body: str, signature: str) -> bool:
 
 BOT_PREFIX = "[GP-Bot]"
 PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
+
+# How long a "Processing started" marker blocks re-triggering. The marker
+# exists to absorb webhook retry storms and double-tags (seconds-to-minutes
+# timescale — ClickUp retried one delivery 5x within ~45s in the 2026-07-14
+# incident). A human re-tagging a task hours later is a deliberate re-run and
+# must NOT be silently ignored: dedup had never actually fired before that
+# incident's fix, so "re-tag always re-runs" is the observed behavior users
+# know, and an unbounded marker would silently change it.
+DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
+
+# How far in the FUTURE a marker's timestamp may sit and still count toward
+# the dedup window. Sub-minute negative ages are expected in normal operation:
+# age is OUR clock minus CLICKUP's clock, so our own just-posted ack read back
+# through a ClickUp server whose clock runs slightly ahead of Lambda's shows
+# up seconds "in the future" — that marker is the exact retry-storm marker the
+# window exists for and MUST still block. Anything more future-dated than this
+# is clock/shape drift (frozen server clock, epoch-unit change): before this
+# guard, ANY future date made age_seconds negative and `age <= window`
+# trivially True, so drift would BLOCK re-triggering for skew+window —
+# inverting the documented fail-toward-not-blocking posture of every other
+# undatable-marker case (see the RECENCY note in has_processing_started_comment).
+CLOCK_SKEW_TOLERANCE_SECONDS = 60.0
+
+# Pause before retrying the "Processing started" ack post once. Applies ONLY
+# to the async worker (retry_ack=True): there ClickUp already has its 200, so
+# a brief wait is free and rides out transient ClickUp 5xxs/timeouts. The
+# synchronous fallback never sleeps or retries — it runs while ClickUp is
+# still waiting on the webhook response. Tests zero this out — the length is
+# not a behavioral contract.
+ACK_COMMENT_RETRY_DELAY_SECONDS = 2.0
+
+# How long an atomic dedup claim (DynamoDB item, see try_acquire_dedup_lock)
+# lives before its TTL expires it. Deliberately the same default as
+# DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS: both layers encode the same product
+# contract — retry storms (seconds-to-minutes) are absorbed, a deliberate
+# human re-tag ~15 minutes later re-runs.
+DEFAULT_DEDUP_TTL_SECONDS = 900.0
+
+
+def get_dedup_ttl_seconds() -> float:
+    raw = os.environ.get("DEDUP_TTL_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+        # Same contract as get_dedup_window_seconds, including the
+        # isfinite + positive check: float() happily parses 'nan'/'inf',
+        # which would crash at int(time.time() + ttl) inside the claim write.
+        # A typo'd env var must not crash deliveries in-path and must not
+        # spam the alarm on every trigger — quiet fallback (no
+        # "ERROR"/"Failed to").
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+        print("Invalid DEDUP_TTL_SECONDS env value; using default 900s")
+    return DEFAULT_DEDUP_TTL_SECONDS
+
+
+def get_dedup_window_seconds() -> float:
+    raw = os.environ.get("DEDUP_COMMENT_WINDOW_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+        # isfinite + positive, not just "float() parsed": float() happily
+        # accepts 'nan'/'inf'/'-inf', which escape a bare ValueError guard —
+        # NaN comparisons are always False (the window would silently never
+        # block) and inf breaks downstream int() arithmetic. A typo'd env var
+        # must not crash deliveries (this runs in-path, post-auth) and must
+        # not spam the alarm on every dedup check — fall back to the safe
+        # default with a quiet, non-alarm log line (no "ERROR"/"Failed to":
+        # see the metric-filter contract below).
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+        print("Invalid DEDUP_COMMENT_WINDOW_SECONDS env value; using default 900s")
+    return DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS
+
 
 # Repo guidance (omni monorepo, archived standalone repos) deliberately does
 # NOT live here: it is baked into the agent's capability prompt
@@ -142,16 +296,86 @@ def get_task_comments(task_id: str) -> list[dict]:
     return result.get("comments", [])
 
 
-def has_processing_started_comment(comments: list[dict]) -> bool:
+def has_processing_started_comment(comments: list[dict], label: str, now: float | None = None) -> bool:
     # Only the success marker counts as 'already processed'. Failure comments
     # ('[GP-Bot] Failed to start processing: ...') must NOT block a retry:
     # removing and re-adding the tag after a failure has to re-trigger.
+    #
+    # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
+    # {task_id}#{label} DynamoDB key. The ack text is
+    # '{PROCESSING_STARTED_PREFIX} ({label}, model: ...)', so matching the
+    # label-scoped prefix lets analyze and implement dedup independently — a
+    # fresh gpbot-analyze marker must not suppress a gpbot-work trigger
+    # (analyze-then-implement inside the window is the normal workflow).
+    #
+    # SHAPE CONTRACT (2026-07-14 incident): the real GET /task/{id}/comment
+    # response carries the full text in a top-level "comment_text" field, and
+    # its comment[] items have NO "type" key. The previous matcher required
+    # item["type"] == "text", so it matched 0 real comments — including the
+    # bot's own ack comments — and dedup never fired once in prod: one webhook
+    # delivery retried 6x launched 6 Fargate agents. Prefer comment_text; fall
+    # back to concatenating item["text"] WITHOUT filtering on "type" (tolerate
+    # its presence for forward-compat if ClickUp ever ships one).
+    #
+    # RECENCY: a marker only blocks while younger than the dedup window (see
+    # DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS for why). The real API's "date" is
+    # a STRING of epoch milliseconds; a missing/unparseable date does NOT
+    # block — blocking would have no age bound, so a ClickUp date-format
+    # drift would silently and permanently disable re-tag re-runs. Failing
+    # toward duplicate risk is bounded (the atomic DynamoDB layer still
+    # guards duplicates), and shape drift is an integration break an operator
+    # must see, so the line is deliberately alarm-matching ("ERROR").
+    # `now` is injectable so tests can pin exact boundaries.
+    if now is None:
+        now = time.time()
+    window_seconds = get_dedup_window_seconds()
+    label_scoped_prefix = f"{PROCESSING_STARTED_PREFIX} ({label}"
     for comment in comments:
-        comment_text = ""
-        for item in comment.get("comment", []):
-            if item.get("type") == "text":
-                comment_text += item.get("text", "")
-        if comment_text.startswith(PROCESSING_STARTED_PREFIX):
+        comment_text = comment.get("comment_text")
+        if not isinstance(comment_text, str) or not comment_text:
+            # comment_text is trusted only when it is a NON-EMPTY STRING. A
+            # non-string (null observed live; int/list conceivable under API
+            # drift) would crash .startswith() mid-webhook, and an empty ""
+            # carries no information — treating it as authoritative would
+            # hide a marker living only in the comment[] items. Both fall
+            # through to the item-concatenation fallback, matching the shared
+            # twin get_text()'s truthiness semantics.
+            #
+            # NULL SAFETY in the fallback: ClickUp can ship "text": null on a
+            # comment item, and item.get("text", "") returns that None — the
+            # default only covers a MISSING key — so a single null item made
+            # "".join() raise TypeError, crashing the whole dedup check
+            # mid-webhook. ANY non-string value must contribute "" rather
+            # than its str() form: stringifying (null → "None", 0 → "0")
+            # would prepend garbage to the concatenation and silently break
+            # the marker prefix match. The shared twin
+            # (shared/clickup_client.py get_text) implements the same
+            # contract — keep them aligned.
+            comment_text = "".join(
+                item["text"] if isinstance(item.get("text"), str) else ""
+                for item in comment.get("comment", [])
+                if isinstance(item, dict)
+            )
+        if not comment_text.startswith(label_scoped_prefix):
+            continue
+        try:
+            age_seconds = now - int(comment.get("date")) / 1000.0
+        except (TypeError, ValueError):
+            print("ERROR: ClickUp comment date unparseable — dedup window cannot be evaluated")
+            continue
+        if age_seconds < -CLOCK_SKEW_TOLERANCE_SECONDS:
+            # A parseable date this far in the future is as undatable as an
+            # unparseable one (see CLOCK_SKEW_TOLERANCE_SECONDS): fail toward
+            # NOT blocking, exactly like the branch above, and alarm — shape/
+            # clock drift is an integration break an operator must see. Only
+            # the delta is logged, never the raw value: a drifted raw date is
+            # noise, and the delta is what diagnoses the skew.
+            print(
+                "ERROR: ClickUp comment date is in the future — dedup window cannot be evaluated "
+                f"({-age_seconds:.0f}s ahead)"
+            )
+            continue
+        if age_seconds <= window_seconds:
             return True
     return False
 
@@ -229,7 +453,308 @@ def find_matched_tag(history_items: Any) -> str | None:
     return None
 
 
+# ClientError codes that PROVE the Lambda control plane REFUSED the Event
+# invoke — a structured rejection means nothing was queued, so processing
+# inline cannot double-run the work. Only provably-rejected failures may take
+# the synchronous fallback; see the ambiguous branch in
+# enqueue_async_processing for what happens to everything else.
+# AccessDeniedException is the expected initial-prod state (the self-invoke
+# IAM ships in a separate terraform PR), so its fallback must stay quiet.
+DETERMINISTIC_ENQUEUE_FAILURE_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "ResourceNotFoundException",
+        "InvalidParameterValueException",
+        "UnrecognizedClientException",
+    }
+)
+
+
+def enqueue_async_processing(task_id: str, matched_tag: str) -> Literal["accepted", "fallback", "ambiguous"]:
+    # FAST-ACK (2026-07-14 incident): ClickUp's webhook delivery has a short
+    # response timeout. When the handler did dedup GET + run_task + ack POST
+    # in-path (7.6-20.5s during a ClickUp slowdown), every delivery timed out:
+    # ClickUp retried one taskTagUpdated event 6x (6 Fargate launches) AND
+    # counted each timeout toward the ~100 consecutive failures after which it
+    # auto-disables the webhook — slow responses are an outage risk, not just
+    # a duplication risk. So the handler hands the work to an async self-invoke
+    # and answers ClickUp in milliseconds; the worker invocation does the
+    # ClickUp/ECS work off the critical path.
+    #
+    # Return contract (explicit strings, no boolean overload):
+    #   "accepted"  — the Event invoke succeeded; the worker owns the work.
+    #   "fallback"  — the invoke PROVABLY never enqueued anything (no function
+    #                 name, or a control-plane rejection code in
+    #                 DETERMINISTIC_ENQUEUE_FAILURE_CODES): process
+    #                 synchronously. AccessDenied is the initial prod state
+    #                 until the self-invoke IAM lands, so this path must be
+    #                 quiet (no "ERROR"/"Failed to" — see the alarm
+    #                 metric-filter contract in handler()) and must preserve
+    #                 exactly the old synchronous behavior.
+    #   "ambiguous" — the invoke MAY have been accepted server-side (read
+    #                 timeout, dropped connection, throttle, unknown
+    #                 ClientError code): the worker could already be queued,
+    #                 so a synchronous fallback would run BOTH the worker and
+    #                 the inline path for one delivery — the exact
+    #                 duplicate-launch bug this design exists to fix. The
+    #                 handler must 500 instead: ClickUp redelivers, and the
+    #                 dedup layers absorb the possible duplicate worker.
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        print("Async self-invoke unavailable, processing synchronously: AWS_LAMBDA_FUNCTION_NAME not set")
+        return "fallback"
+    try:
+        get_lambda_client().invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=json.dumps({"gpbot_async": True, "task_id": task_id, "matched_tag": matched_tag}),
+        )
+        return "accepted"
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in DETERMINISTIC_ENQUEUE_FAILURE_CODES:
+            # Error CODE only, never the message: this line fires on EVERY
+            # delivery until the IAM lands, and raw botocore messages can
+            # contain alarm-filter terms ("Failed to connect to endpoint...")
+            # — echoing the message would fire the fail-loud alarm on every
+            # delivery of the initial prod state. Same pattern as the ack
+            # first-failure line. The codes in the frozenset are known-safe.
+            print(f"Async self-invoke unavailable, processing synchronously: {error_code}")
+            return "fallback"
+        # Unknown ClientError code (throttle, internal error, anything new):
+        # cannot prove the Event was not queued — ambiguous. Alarm-matching
+        # ("Failed to"), TYPE only (the raw message is leak-prone noise).
+        # Real-SDK ClientError subclasses carry the code as their class name.
+        print(f"Failed to enqueue async processing: {type(e).__name__}")
+        return "ambiguous"
+    except Exception as e:
+        # Transport-phase failures (ReadTimeoutError, connection resets, ...):
+        # the request may have reached the control plane and been accepted
+        # after the client gave up — ambiguous by definition. Same alarm
+        # contract as above.
+        print(f"Failed to enqueue async processing: {type(e).__name__}")
+        return "ambiguous"
+
+
+def is_atomic_dedup_configured() -> bool:
+    # Single predicate for "the atomic DynamoDB dedup layer is available" —
+    # the same DEDUP_TABLE_NAME that try_acquire_dedup_lock and
+    # release_dedup_lock gate on. The async comment-fetch failure handling in
+    # dedup_check_then_trigger branches on it: with the table configured, the
+    # conditional write below still backstops a skipped comment check.
+    return bool(os.environ.get("DEDUP_TABLE_NAME"))
+
+
+def dedup_lock_pk(task_id: str, label: str) -> str:
+    return f"{task_id}#{label}"
+
+
+def try_acquire_dedup_lock(task_id: str, label: str) -> bool:
+    # ATOMIC DEDUP (2026-07-14 incident, layer 2): the comment-based check is
+    # best-effort — it reads through ClickUp's slow, eventually-consistent API,
+    # and concurrent invocations can ALL pass it before any ack comment becomes
+    # visible (six did, launching six Fargate agents). The authoritative dedup
+    # is this conditional PutItem: it does not depend on ClickUp at all, and
+    # DynamoDB serializes conditional writes, so exactly one caller per
+    # (task_id, label) wins. True = proceed with the launch.
+    #
+    # CRASH AFTER CLAIM: if this invocation dies between the PutItem and the
+    # launch (hard timeout, OOM), the claim strands and suppresses re-tags —
+    # but only until expires_at: the "OR #exp < :now" reclaim arm bounds the
+    # damage to the TTL window even before DynamoDB TTL deletion (which can
+    # lag hours) runs. The 120s function timeout (terraform) vs the ~45s
+    # worst-case in-flight blocking makes that window vanishingly small, and
+    # a hard timeout still alarms via the "Task timed out" metric-filter term.
+    table_name = os.environ.get("DEDUP_TABLE_NAME")
+    if not table_name:
+        # Initial prod state: code deploys first, the terraform that creates
+        # the table + this env var applies second (README "Deployment"). The
+        # unconfigured window must be a safe, QUIET no-op — same behavior as
+        # before this feature, no "ERROR"/"Failed to" (alarm contract).
+        print("Dedup table not configured; relying on comment-based dedup only")
+        return True
+
+    expires_at = int(time.time() + get_dedup_ttl_seconds())
+    try:
+        get_dynamodb_client().put_item(
+            TableName=table_name,
+            Item={
+                "pk": {"S": dedup_lock_pk(task_id, label)},
+                "task_id": {"S": task_id},
+                "label": {"S": label},
+                # DynamoDB TTL requires epoch SECONDS as a Number attribute.
+                "expires_at": {"N": str(expires_at)},
+            },
+            # "OR expired" matters: DynamoDB TTL only deletes expired items
+            # eventually (can lag hours). Without it, a lingering expired claim
+            # would silently suppress a deliberate re-tag after the window —
+            # exactly the contract the comment-dedup recency window protects.
+            # No race reopens here: conditional writes are serialized, so of
+            # two concurrent claimers of an expired item, the first refreshes
+            # expires_at and the second then fails the condition.
+            ConditionExpression="attribute_not_exists(pk) OR #exp < :now",
+            ExpressionAttributeNames={"#exp": "expires_at"},
+            ExpressionAttributeValues={":now": {"N": str(int(time.time()))}},
+        )
+        return True
+    except ClientError as e:
+        # Match on Error.Code, not the exception class: boto3 raises factory-
+        # generated subclasses, and the code string is the stable contract.
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        # FAIL-OPEN, deliberately: a broken/missing/throttled dedup table must
+        # never take the bot down — a duplicate agent launch costs a few
+        # dollars, a bot that cannot launch at all is an outage. But this is
+        # real infrastructure breakage an operator must fix, so the log line
+        # is alarm-matching (contains "ERROR") on purpose.
+        print(f"ERROR: dedup table unavailable, proceeding without atomic dedup: {e}")
+        return True
+    except Exception as e:
+        # Same fail-open rationale for non-ClientError failures (credentials,
+        # endpoint resolution, botocore internals).
+        print(f"ERROR: dedup table unavailable, proceeding without atomic dedup: {e}")
+        return True
+
+
+def release_dedup_lock(task_id: str, label: str) -> None:
+    # Called only after a FAILED launch: the retry contract is "remove and
+    # re-add the tag to retry", and a failure comment never blocks a retry —
+    # so the claim must not either, or the user's immediate retry would be
+    # silently suppressed for the whole TTL. (A SUCCESSFUL launch keeps its
+    # claim; DynamoDB TTL expires it.)
+    #
+    # ACCEPTED RACE (delayed-put): a client-side PutItem timeout in
+    # try_acquire_dedup_lock does NOT cancel the server-side write — DynamoDB
+    # can commit it after this DeleteItem runs, stranding a claim that
+    # suppresses re-tags with no launch behind it. Bounded: the claim's
+    # expires_at plus the "OR #exp < :now" reclaim arm caps the damage at the
+    # TTL window (15 min default). Fencing (conditional delete on an
+    # ownership token) would close it entirely but is deliberately not
+    # implemented — the operator runbook (README, "Stranded dedup claims")
+    # plus the TTL bound is the accepted trade.
+    table_name = os.environ.get("DEDUP_TABLE_NAME")
+    if not table_name:
+        return
+    try:
+        get_dynamodb_client().delete_item(
+            TableName=table_name,
+            Key={"pk": {"S": dedup_lock_pk(task_id, label)}},
+        )
+    except Exception as e:
+        # Must never change control flow — the caller is already returning a
+        # launch-failure 500 and has posted the failure comment. But a stuck
+        # claim suppresses the user's retry until the TTL expires, so the line
+        # is alarm-matching ("Failed to") on purpose.
+        print(f"Failed to release dedup lock for task {task_id}: {e}")
+
+
+def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: bool = False) -> dict:
+    # Shared by the async worker and the synchronous fallback so the two paths
+    # cannot drift: whichever path runs, the dedup semantics and the trigger
+    # behavior are identical. from_async_worker is the one deliberate
+    # divergence: it gates behavior that is only safe once ClickUp already has
+    # its 200 (ack retry with a pause; see trigger_fargate_task) and behavior
+    # that only makes sense when nobody receives the HTTP response (the
+    # comment-fetch failure handling below).
+    try:
+        comments = get_task_comments(task_id)
+    except Exception as e:
+        # HTTPError is only raised for HTTP status errors; connection-phase
+        # failures (URLError, TimeoutError, RemoteDisconnected) must also land
+        # here, never crash the Lambda. Alarm-matching ("Failed to") in every
+        # arm: a broken comments GET degrades or blocks dedup either way.
+        print(f"Failed to get comments for task {task_id}: {e}")
+        if not from_async_worker:
+            # SYNC: ClickUp receives this 500 and redelivers — self-healing
+            # at-least-once. Nothing more to do.
+            return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+        # ASYNC: ClickUp already got its 200 'accepted', so this return value
+        # goes NOWHERE — a bare 500 dict would permanently drop the tag event
+        # with zero feedback on the ticket.
+        if is_atomic_dedup_configured():
+            # The comment check is best-effort; the atomic conditional write
+            # still guards duplicates. Dropping verified work is worse than
+            # skipping a best-effort check: proceed with empty comments.
+            comments = []
+        else:
+            # No atomic backstop: launching blind is unbounded duplicate risk,
+            # so this is deliberately AT-MOST-ONCE — stop, and give the tagger
+            # a visible retry path (the standard failure comment ends in
+            # 'Remove and re-add the tag to retry.') instead of silence.
+            # Exception TYPE only in the public comment (leak guard, same as
+            # trigger_fargate_task); full detail is already in the logs above.
+            post_failure_comment(task_id, f"{type(e).__name__} fetching ClickUp comments (see CloudWatch logs)")
+            return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+
+    config = TAG_CONFIG[matched_tag]
+    if has_processing_started_comment(comments, config["label"]):
+        print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} ({config['label']}) comment, skipping")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
+
+    # Layer order is deliberate: the comment check runs FIRST so an
+    # already-acked task short-circuits without burning a claim (a claim
+    # written on a comment-deduped skip would outlive the marker and block a
+    # legitimate re-trigger). Only when the comment check passes do we race
+    # for the atomic claim. Losing the race is the dedup WORKING — quiet log
+    # (no "ERROR"/"Failed to"), no launch, no ack comment (the winner posts
+    # its own), 200 so ClickUp does not re-deliver.
+    if not try_acquire_dedup_lock(task_id, config["label"]):
+        print(f"Duplicate trigger for {task_id} suppressed by dedup table")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "duplicate suppressed"})}
+
+    result = trigger_fargate_task(
+        task_id, config["instruction"], config["label"], config["model"], retry_ack=from_async_worker
+    )
+    if result.get("statusCode") != 200:
+        # Launch failed: release the claim so the documented retry contract
+        # ("remove and re-add the tag") survives launch failures instead of
+        # being suppressed until the TTL expires.
+        release_dedup_lock(task_id, config["label"])
+    return result
+
+
+def handle_async_processing(event: dict) -> dict:
+    # Worker half of the fast-ack design: this invocation was enqueued by
+    # enqueue_async_processing AFTER signature verification, task_id validation
+    # and tag resolution, so the payload is trusted (see the dispatch guard in
+    # handler() for why it cannot be spoofed through the ALB).
+    task_id = None
+    try:
+        task_id = event.get("task_id")
+        matched_tag = event.get("matched_tag")
+        # Defensive re-validation: the payload is self-generated, so a miss
+        # here means a bug (or a direct invoke by something with AWS creds) —
+        # refuse loudly, never launch. ERROR prefix fires the alarm.
+        if not task_id or matched_tag not in TAG_CONFIG:
+            print("ERROR: Async processing failed: invalid internal payload (missing task_id or unknown matched_tag)")
+            return {"statusCode": 400, "body": json.dumps({"error": "invalid async payload"})}
+        return dedup_check_then_trigger(task_id, matched_tag, from_async_worker=True)
+    except Exception as e:
+        # The worker must NEVER raise: an unhandled exception in an async
+        # ("Event") invocation makes Lambda auto-RETRY it (2x by default),
+        # which would re-create exactly the duplicate-launch bug this design
+        # fixes. And since nobody receives an HTTP error from an async
+        # invocation, this alarm-matching ERROR log is the only fail-loud
+        # channel — plus a best-effort failure comment for the tagger.
+        print(f"ERROR: Async processing failed: {e}")
+        if task_id:
+            # Same leak guard as trigger_fargate_task: exception type only in
+            # the public comment, full detail stays in CloudWatch.
+            post_failure_comment(task_id, f"{type(e).__name__} (see CloudWatch logs for details)")
+        return {"statusCode": 500, "body": json.dumps({"error": "async processing failed"})}
+
+
 def handler(event: dict, context: Any) -> dict:
+    # INTERNAL ASYNC DISPATCH: the fast-ack path re-invokes this same function
+    # asynchronously with {"gpbot_async": true, ...}. Only dispatch to the
+    # trusted worker path when the marker is top-level AND the event carries
+    # no ALB envelope keys: an ALB-wrapped attacker request ALWAYS has
+    # "headers"/"requestContext", and its JSON body lands in event["body"] as
+    # a string — so top-level keys are unspoofable through the ALB, and a body
+    # containing gpbot_async falls through to normal signature verification.
+    if event.get("gpbot_async") and "headers" not in event and "requestContext" not in event:
+        return handle_async_processing(event)
+
     # LOG POISONING GUARD: the endpoint is public and the CloudWatch metric
     # filter (infrastructure/modules/clickup-bot/main.tf) matches "ERROR" /
     # "Failed to" anywhere in ANY log line in this log group. Never echo
@@ -309,25 +834,41 @@ def handler(event: dict, context: Any) -> dict:
         print("Missing task_id in webhook payload")
         return {"statusCode": 400, "body": json.dumps({"error": "missing task_id"})}
 
-    try:
-        comments = get_task_comments(task_id)
-    except Exception as e:
-        # HTTPError is only raised for HTTP status errors; connection-phase
-        # failures (URLError, TimeoutError, RemoteDisconnected) must also
-        # produce the structured 500, not a Lambda crash.
-        print(f"Failed to get comments for task {task_id}: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+    # FAST-ACK: the request is authenticated and the work item is validated
+    # (task_id present, matched_tag in TAG_CONFIG) — answer ClickUp NOW, with
+    # zero ClickUp API calls in-path, and let the async worker do the rest.
+    # See enqueue_async_processing for the incident rationale.
+    enqueue_outcome = enqueue_async_processing(task_id, matched_tag)
+    if enqueue_outcome == "accepted":
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "accepted", "task_id": task_id, "label": TAG_CONFIG[matched_tag]["label"]}),
+        }
 
-    if has_processing_started_comment(comments):
-        print(f"Task {task_id} already has a {PROCESSING_STARTED_PREFIX} comment, skipping")
-        return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
+    if enqueue_outcome == "ambiguous":
+        # The Event MAY already be queued (see enqueue_async_processing):
+        # processing inline could double-launch, so do nothing more here.
+        # 500 makes ClickUp redeliver — self-healing at-least-once, the same
+        # contract as the sync comments-GET-failure 500 — and the dedup
+        # layers absorb the possible duplicate worker on the redelivery.
+        # enqueue_async_processing already logged the alarm-matching line.
+        return {"statusCode": 500, "body": json.dumps({"error": "failed to enqueue async processing"})}
 
-    config = TAG_CONFIG[matched_tag]
-    return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
+    # Deterministic rejection ("fallback", the initial prod state until the
+    # self-invoke IAM lands): nothing was queued, so run the same shared
+    # dedup-then-trigger path the async worker uses — synchronously.
+    return dedup_check_then_trigger(task_id, matched_tag)
 
 
-def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str = "sonnet") -> dict:
-    ecs_client = boto3.client("ecs")
+def trigger_fargate_task(
+    task_id: str, instruction: str, label: str, model: str = "sonnet", retry_ack: bool = False
+) -> dict:
+    # retry_ack: True ONLY from the async worker, where ClickUp already has
+    # its 200. The synchronous fallback (the guaranteed initial prod state
+    # until the self-invoke IAM lands) runs while ClickUp is still waiting on
+    # the webhook response — the exact path whose slowness caused the
+    # 2026-07-14 retry storm — so it must never sleep or double-post.
+    ecs_client = get_ecs_client()
 
     cluster_arn = os.environ.get("ECS_CLUSTER_ARN")
     task_definition = os.environ.get("ECS_TASK_DEFINITION")
@@ -394,10 +935,42 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
         # Posted only AFTER a successful launch: this comment is the dedup
         # marker, so it must never exist on a task whose launch failed. A
         # failed ack post must not fail the invocation (the task is running).
+        # RETRY ONCE, ASYNC WORKER ONLY (2026-07-14): a missing marker leaves
+        # the retry-storm window open, and in the async worker ClickUp already
+        # has its 200, so a brief pause + one retry is free there. In the
+        # synchronous fallback ClickUp is STILL WAITING — a sleep + second 10s
+        # POST would add up to 12s to a path that already exceeded ClickUp's
+        # webhook timeout (the incident's root cause) — so it posts exactly
+        # once, like the pre-fast-ack handler did. Only the FINAL failure logs
+        # the alarm-matching line — swallowed ack failures are exactly what
+        # the alarm exists for (it alarmed correctly during the incident).
+        # The async first-attempt line is deliberately quiet: only the
+        # exception TYPE is logged (a message could contain alarm terms).
+        # The cooldown suffix is the ONLY place users can learn the dedup
+        # window exists: a deliberate re-tag inside it is otherwise suppressed
+        # with zero feedback. Derived from the configured window, never
+        # hardcoded. Ceil, not round: round(89/60) says "1 minute" while the
+        # marker still blocks at 89s — the hint must never promise an earlier
+        # re-run than the window enforces. Safe to append: the dedup matcher
+        # matches the label-scoped PREFIX (has_processing_started_comment),
+        # pinned by a round-trip test.
+        window_minutes = math.ceil(get_dedup_window_seconds() / 60)
+        ack_text = (
+            f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})... "
+            f"(re-tag after {window_minutes} minutes to re-run)"
+        )
         try:
-            post_comment(task_id, f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})...")
-        except Exception as e:
-            print(f"Failed to post starting comment: {e}")
+            post_comment(task_id, ack_text)
+        except Exception as first_err:
+            if retry_ack:
+                print(f"Starting-comment post hit {type(first_err).__name__}, retrying once")
+                time.sleep(ACK_COMMENT_RETRY_DELAY_SECONDS)
+                try:
+                    post_comment(task_id, ack_text)
+                except Exception as e:
+                    print(f"Failed to post starting comment: {e}")
+            else:
+                print(f"Failed to post starting comment: {first_err}")
 
         return {
             "statusCode": 200,
