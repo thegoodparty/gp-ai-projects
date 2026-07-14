@@ -107,15 +107,34 @@ class FakeECSClient:
         return self.response
 
 
-class FakeBoto3ClientFactory:
-    """Stands in for boto3.client; hands back the fake ECS client."""
+class FakeLambdaClient:
+    def __init__(self):
+        self.invoke_calls = []
+        self.exception = None
 
-    def __init__(self, ecs_client: FakeECSClient):
+    def invoke(self, **kwargs):
+        self.invoke_calls.append(kwargs)
+        if self.exception is not None:
+            raise self.exception
+        return {"StatusCode": 202}
+
+    @property
+    def invoke_payloads(self) -> list[dict]:
+        return [json.loads(call["Payload"]) for call in self.invoke_calls]
+
+
+class FakeBoto3ClientFactory:
+    """Stands in for boto3.client; routes each service to its fake."""
+
+    def __init__(self, ecs_client: FakeECSClient, lambda_client: FakeLambdaClient | None = None):
         self._ecs_client = ecs_client
+        self._lambda_client = lambda_client if lambda_client is not None else FakeLambdaClient()
         self.requested_services = []
 
     def __call__(self, service_name, *args, **kwargs):
         self.requested_services.append(service_name)
+        if service_name == "lambda":
+            return self._lambda_client
         return self._ecs_client
 
 
@@ -148,10 +167,30 @@ def fake_clickup(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def fake_ecs(monkeypatch):
+def fake_lambda():
+    return FakeLambdaClient()
+
+
+@pytest.fixture(autouse=True)
+def fake_ecs(monkeypatch, fake_lambda):
     ecs = FakeECSClient()
-    monkeypatch.setattr(handler.boto3, "client", FakeBoto3ClientFactory(ecs))
+    monkeypatch.setattr(handler.boto3, "client", FakeBoto3ClientFactory(ecs, fake_lambda))
     return ecs
+
+
+@pytest.fixture(autouse=True)
+def clean_self_invoke_env(monkeypatch):
+    # Tests run outside Lambda, but a developer shell (or the Lambda runtime,
+    # which always sets AWS_LAMBDA_FUNCTION_NAME) must not flip tests between
+    # the fast-ack and synchronous paths. Default: sync fallback.
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    monkeypatch.delenv("DEDUP_COMMENT_WINDOW_SECONDS", raising=False)
+
+
+@pytest.fixture
+def self_invoke_env(monkeypatch):
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "clickup-bot-prod")
+    return "clickup-bot-prod"
 
 
 @pytest.fixture
@@ -604,6 +643,187 @@ def test_stale_marker_allows_deliberate_re_tag_to_retrigger(fake_clickup, fake_e
     assert resp["statusCode"] == 200
     assert response_body(resp)["fargate_task_arn"] == TASK_ARN
     assert len(fake_ecs.run_task_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 9c. Fast-ack via async self-invoke. ClickUp's webhook delivery has a short
+# response timeout; in the 2026-07-14 incident every invocation ran 7.6-20.5s
+# of serial ClickUp API calls, every delivery timed out, and ClickUp retried
+# one event 5x (6 Fargate launches) while counting each timeout toward the
+# ~100 consecutive failures that auto-disable the webhook. The handler must
+# therefore 200 BEFORE any ClickUp API call: it self-invokes asynchronously
+# and the worker invocation does dedup + trigger + ack off the critical path.
+# Until the self-invoke IAM lands (separate terraform PR), the invoke fails
+# and the handler must fall back to exactly the old synchronous flow.
+# ---------------------------------------------------------------------------
+
+
+def test_fast_ack_returns_accepted_and_self_invokes(fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env):
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["status"] == "accepted"
+    # Exactly one async self-invoke carrying the validated work item.
+    assert len(fake_lambda.invoke_calls) == 1
+    call = fake_lambda.invoke_calls[0]
+    assert call["FunctionName"] == self_invoke_env
+    assert call["InvocationType"] == "Event"
+    assert fake_lambda.invoke_payloads[0] == {
+        "gpbot_async": True,
+        "task_id": "abc123",
+        "matched_tag": "gpbot-analyze",
+    }
+    # THE point of fast-ack: zero ClickUp API calls and zero ECS calls in-path.
+    assert fake_clickup.calls == []
+    assert fake_ecs.run_task_calls == []
+
+
+def test_missing_function_name_env_falls_back_to_sync_quietly(fake_clickup, fake_ecs, fake_lambda, ecs_env, capsys):
+    # clean_self_invoke_env (autouse) removed AWS_LAMBDA_FUNCTION_NAME: the
+    # handler must not attempt an invoke and must run the full synchronous
+    # flow, logging only a quiet (non-alarm) line about the fallback.
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert fake_lambda.invoke_calls == []
+    assert len(fake_ecs.run_task_calls) == 1
+    assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "Async self-invoke unavailable" in out
+
+
+def test_invoke_failure_falls_back_to_full_sync_flow(
+    fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
+):
+    # Initial prod state: the self-invoke IAM permission ships in a later
+    # terraform PR, so lambda:InvokeFunction is denied. The fallback must
+    # preserve exactly today's synchronous behavior (dedup GET + run_task +
+    # ack) and the fallback itself must NOT fire the alarm — it is expected.
+    fake_lambda.exception = RuntimeError("AccessDeniedException: not authorized to perform lambda:InvokeFunction")
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_lambda.invoke_calls) == 1
+    # Dedup GET ran...
+    assert any(method == "GET" and "/comment" in url for method, url, _ in fake_clickup.calls)
+    # ...the task launched, and the ack comment was posted.
+    assert len(fake_ecs.run_task_calls) == 1
+    assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    assert_no_alarm_log_emitted(capsys)
+
+
+def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):
+    event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "gpbot-analyze"}
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    # The worker owns the ClickUp work: dedup GET, launch, ack comment.
+    assert any(method == "GET" and "/comment" in url for method, url, _ in fake_clickup.calls)
+    assert len(fake_ecs.run_task_calls) == 1
+    assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    # The worker must not re-enqueue itself.
+    assert fake_lambda.invoke_calls == []
+
+
+def test_async_event_with_recent_marker_skips(fake_clickup, fake_ecs, ecs_env):
+    # The retry-storm case the whole design exists for: a duplicate delivery's
+    # worker sees the first worker's recent ack comment and stops.
+    fake_clickup.comments_response = existing_gpbot_comment_response()
+    event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "gpbot-analyze"}
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "already processed"}
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+
+
+def test_async_worker_exception_returns_dict_and_alarms(fake_clickup, fake_ecs, ecs_env, monkeypatch, capsys):
+    # An unhandled exception in an async ("Event") invocation makes Lambda
+    # auto-RETRY it — recreating exactly the duplicate-launch bug this design
+    # fixes. The worker must ALWAYS return a dict; the alarm-matching ERROR
+    # log is the only fail-loud channel (nobody receives an HTTP error), and
+    # a best-effort failure comment tells the tagger.
+    def explode(task_id, matched_tag):
+        raise RuntimeError("unexpected worker crash")
+
+    monkeypatch.setattr(handler, "dedup_check_then_trigger", explode)
+    event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "gpbot-analyze"}
+
+    resp = handler.handler(event, None)
+
+    assert isinstance(resp, dict)
+    assert resp["statusCode"] == 500
+    out = assert_alarm_log_emitted(capsys)
+    assert "ERROR: Async processing failed" in out
+    failure_comments = [
+        text for text in fake_clickup.posted_comment_texts if text.startswith("[GP-Bot] Failed to start processing")
+    ]
+    assert len(failure_comments) == 1
+
+
+def test_async_event_with_unknown_tag_returns_dict_without_side_effects(fake_clickup, fake_ecs, ecs_env, capsys):
+    # Defensive: the payload is self-generated, so an unknown tag means a bug
+    # (or a direct invoke with AWS creds) — refuse loudly, never launch.
+    event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "not-a-tag"}
+
+    resp = handler.handler(event, None)
+
+    assert isinstance(resp, dict)
+    assert resp["statusCode"] == 400
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.calls == []
+    assert_alarm_log_emitted(capsys)
+
+
+def test_alb_body_gpbot_async_is_not_async_dispatch(
+    fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
+):
+    # SPOOF GUARD: an attacker POSTing {"gpbot_async": true, ...} through the
+    # ALB lands in event["body"] as a string — top-level event keys are
+    # unspoofable. The delivery must be treated as a normal webhook (signature
+    # verified, 401 on mismatch), never dispatched to the trusted worker path.
+    body = tag_updated_body()
+    body["gpbot_async"] = True
+    event = {"headers": {"x-signature": "0" * 64}, "body": json.dumps(body)}
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 401
+    assert fake_clickup.calls == []
+    assert fake_ecs.run_task_calls == []
+    assert fake_lambda.invoke_calls == []
+    assert_alarm_log_emitted(capsys)  # signature-mismatch 401s must still alarm
+
+
+def test_top_level_gpbot_async_with_alb_keys_is_not_async_dispatch(fake_clickup, fake_ecs, fake_lambda, ecs_env):
+    # Belt-and-braces for the same guard: even a top-level gpbot_async key is
+    # ignored when the event carries ALB markers (headers/requestContext) —
+    # an ALB-wrapped request always has those, an internal self-invoke never does.
+    body = tag_updated_body()
+    event = make_event(body)  # valid signature
+    event["gpbot_async"] = True
+    event["requestContext"] = {"elb": {"targetGroupArn": "arn:aws:elasticloadbalancing:..."}}
+
+    resp = handler.handler(event, None)
+
+    # Processed as a normal webhook: with no AWS_LAMBDA_FUNCTION_NAME... but
+    # self_invoke fixture not used here, so sync flow runs end-to-end.
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    assert fake_lambda.invoke_calls == []
 
 
 # ---------------------------------------------------------------------------

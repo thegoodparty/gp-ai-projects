@@ -279,7 +279,101 @@ def find_matched_tag(history_items: Any) -> str | None:
     return None
 
 
+def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
+    # FAST-ACK (2026-07-14 incident): ClickUp's webhook delivery has a short
+    # response timeout. When the handler did dedup GET + run_task + ack POST
+    # in-path (7.6-20.5s during a ClickUp slowdown), every delivery timed out:
+    # ClickUp retried one taskTagUpdated event 6x (6 Fargate launches) AND
+    # counted each timeout toward the ~100 consecutive failures after which it
+    # auto-disables the webhook — slow responses are an outage risk, not just
+    # a duplication risk. So the handler hands the work to an async self-invoke
+    # and answers ClickUp in milliseconds; the worker invocation does the
+    # ClickUp/ECS work off the critical path.
+    #
+    # False = "process synchronously instead". The self-invoke IAM permission
+    # ships in a separate terraform PR, so AccessDenied here is the initial
+    # prod state: the fallback must be quiet (no "ERROR"/"Failed to" — see the
+    # alarm metric-filter contract in handler()) and must preserve exactly the
+    # old synchronous behavior.
+    function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    if not function_name:
+        print("Async self-invoke unavailable, processing synchronously: AWS_LAMBDA_FUNCTION_NAME not set")
+        return False
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=json.dumps({"gpbot_async": True, "task_id": task_id, "matched_tag": matched_tag}),
+        )
+        return True
+    except Exception as e:
+        print(f"Async self-invoke unavailable, processing synchronously: {e}")
+        return False
+
+
+def dedup_check_then_trigger(task_id: str, matched_tag: str) -> dict:
+    # Shared by the async worker and the synchronous fallback so the two paths
+    # cannot drift: whichever path runs, the dedup semantics and the trigger
+    # behavior are identical.
+    try:
+        comments = get_task_comments(task_id)
+    except Exception as e:
+        # HTTPError is only raised for HTTP status errors; connection-phase
+        # failures (URLError, TimeoutError, RemoteDisconnected) must also
+        # produce the structured 500, not a Lambda crash.
+        print(f"Failed to get comments for task {task_id}: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+
+    if has_processing_started_comment(comments):
+        print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} comment, skipping")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
+
+    config = TAG_CONFIG[matched_tag]
+    return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
+
+
+def handle_async_processing(event: dict) -> dict:
+    # Worker half of the fast-ack design: this invocation was enqueued by
+    # enqueue_async_processing AFTER signature verification, task_id validation
+    # and tag resolution, so the payload is trusted (see the dispatch guard in
+    # handler() for why it cannot be spoofed through the ALB).
+    task_id = None
+    try:
+        task_id = event.get("task_id")
+        matched_tag = event.get("matched_tag")
+        # Defensive re-validation: the payload is self-generated, so a miss
+        # here means a bug (or a direct invoke by something with AWS creds) —
+        # refuse loudly, never launch. ERROR prefix fires the alarm.
+        if not task_id or matched_tag not in TAG_CONFIG:
+            print("ERROR: Async processing failed: invalid internal payload (missing task_id or unknown matched_tag)")
+            return {"statusCode": 400, "body": json.dumps({"error": "invalid async payload"})}
+        return dedup_check_then_trigger(task_id, matched_tag)
+    except Exception as e:
+        # The worker must NEVER raise: an unhandled exception in an async
+        # ("Event") invocation makes Lambda auto-RETRY it (2x by default),
+        # which would re-create exactly the duplicate-launch bug this design
+        # fixes. And since nobody receives an HTTP error from an async
+        # invocation, this alarm-matching ERROR log is the only fail-loud
+        # channel — plus a best-effort failure comment for the tagger.
+        print(f"ERROR: Async processing failed: {e}")
+        if task_id:
+            # Same leak guard as trigger_fargate_task: exception type only in
+            # the public comment, full detail stays in CloudWatch.
+            post_failure_comment(task_id, f"{type(e).__name__} (see CloudWatch logs for details)")
+        return {"statusCode": 500, "body": json.dumps({"error": "async processing failed"})}
+
+
 def handler(event: dict, context: Any) -> dict:
+    # INTERNAL ASYNC DISPATCH: the fast-ack path re-invokes this same function
+    # asynchronously with {"gpbot_async": true, ...}. Only dispatch to the
+    # trusted worker path when the marker is top-level AND the event carries
+    # no ALB envelope keys: an ALB-wrapped attacker request ALWAYS has
+    # "headers"/"requestContext", and its JSON body lands in event["body"] as
+    # a string — so top-level keys are unspoofable through the ALB, and a body
+    # containing gpbot_async falls through to normal signature verification.
+    if event.get("gpbot_async") and "headers" not in event and "requestContext" not in event:
+        return handle_async_processing(event)
+
     # LOG POISONING GUARD: the endpoint is public and the CloudWatch metric
     # filter (infrastructure/modules/clickup-bot/main.tf) matches "ERROR" /
     # "Failed to" anywhere in ANY log line in this log group. Never echo
@@ -359,21 +453,19 @@ def handler(event: dict, context: Any) -> dict:
         print("Missing task_id in webhook payload")
         return {"statusCode": 400, "body": json.dumps({"error": "missing task_id"})}
 
-    try:
-        comments = get_task_comments(task_id)
-    except Exception as e:
-        # HTTPError is only raised for HTTP status errors; connection-phase
-        # failures (URLError, TimeoutError, RemoteDisconnected) must also
-        # produce the structured 500, not a Lambda crash.
-        print(f"Failed to get comments for task {task_id}: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+    # FAST-ACK: the request is authenticated and the work item is validated
+    # (task_id present, matched_tag in TAG_CONFIG) — answer ClickUp NOW, with
+    # zero ClickUp API calls in-path, and let the async worker do the rest.
+    # See enqueue_async_processing for the incident rationale.
+    if enqueue_async_processing(task_id, matched_tag):
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "accepted", "task_id": task_id, "label": TAG_CONFIG[matched_tag]["label"]}),
+        }
 
-    if has_processing_started_comment(comments):
-        print(f"Task {task_id} already has a {PROCESSING_STARTED_PREFIX} comment, skipping")
-        return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
-
-    config = TAG_CONFIG[matched_tag]
-    return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
+    # Synchronous fallback (initial prod state until the self-invoke IAM
+    # lands): same shared dedup-then-trigger path the async worker uses.
+    return dedup_check_then_trigger(task_id, matched_tag)
 
 
 def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str = "sonnet") -> dict:
