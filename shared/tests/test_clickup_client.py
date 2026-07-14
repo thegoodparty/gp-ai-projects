@@ -81,7 +81,11 @@ class TestGetText:
     def test_text_content_alias_populates_comment_text(self) -> None:
         # Some ClickUp responses carry the text under "text_content"; the
         # model aliases it onto comment_text and get_text() must honor it.
-        comment = ClickUpComment(**{"id": "1", "text_content": "aliased text"})
+        # Direct keyword call (alias keywords are valid __init__ params on a
+        # pydantic v2 model), NOT an inline **{...} unpack: mypy infers an
+        # all-str dict literal as dict[str, str], which strict mode rejects
+        # against the model's typed params.
+        comment = ClickUpComment(id="1", text_content="aliased text")
         assert comment.get_text() == "aliased text"
 
     def test_items_without_text_keys_are_skipped(self) -> None:
