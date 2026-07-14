@@ -57,7 +57,8 @@ class FakeUrlopen:
         self.requests = []  # raw Request objects, for header assertions
         self.comments_response = {"comments": []}
         self.get_comments_error = None  # exception to raise on GET .../comment
-        self.post_comment_error = None  # exception to raise on POST .../comment
+        self.post_comment_error = None  # exception to raise on EVERY POST .../comment
+        self.post_comment_error_queue = []  # one-shot exceptions, consumed per POST
 
     def __call__(self, request, timeout=None, **kwargs):
         method = request.get_method()
@@ -71,6 +72,8 @@ class FakeUrlopen:
                 raise self.get_comments_error
             return FakeHTTPResponse(self.comments_response)
         if method == "POST" and "/comment" in url:
+            if self.post_comment_error_queue:
+                raise self.post_comment_error_queue.pop(0)
             if self.post_comment_error is not None:
                 raise self.post_comment_error
             return FakeHTTPResponse({"id": "new-comment-1"})
@@ -191,6 +194,14 @@ def clean_self_invoke_env(monkeypatch):
 def self_invoke_env(monkeypatch):
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "clickup-bot-prod")
     return "clickup-bot-prod"
+
+
+@pytest.fixture(autouse=True)
+def no_ack_retry_delay(monkeypatch):
+    # The ack-retry pause's real length is not a behavioral contract and would
+    # add wall-clock seconds to every ack-failure test; zero it. raising=False
+    # keeps this inert before the constant exists (red phase of its TDD cycle).
+    monkeypatch.setattr(handler, "ACK_COMMENT_RETRY_DELAY_SECONDS", 0, raising=False)
 
 
 @pytest.fixture
@@ -1055,6 +1066,42 @@ def test_ack_comment_failure_does_not_prevent_launch(fake_clickup, fake_ecs, ecs
     # The swallowed ack-post failure is invisible to the caller (200), so the
     # alarm log line is its ONLY operational signal.
     assert_alarm_log_emitted(capsys)
+
+
+def test_ack_comment_transient_failure_is_retried_and_succeeds(fake_clickup, fake_ecs, ecs_env, capsys):
+    # The ack comment is the dedup marker: without it, the retry-storm window
+    # stays open. It now posts off ClickUp's webhook critical path (fast-ack),
+    # so a transient ClickUp 5xx on the first attempt must be retried once —
+    # and a successful retry is a non-event: no alarm.
+    fake_clickup.post_comment_error_queue = [HTTPError("http://x", 502, "bad gateway", {}, None)]
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    # Two POST attempts: the failed one and the successful retry.
+    assert len(fake_clickup.posted_comments) == 2
+    assert fake_clickup.posted_comments[-1]["comment_text"].startswith("[GP-Bot] Processing started")
+    assert_no_alarm_log_emitted(capsys)
+
+
+def test_ack_comment_double_failure_alarms_after_second_attempt(fake_clickup, fake_ecs, ecs_env, capsys):
+    # Only the SECOND failure logs the alarm-matching line — swallowed ack
+    # failures are exactly what the alarm exists for (it alarmed correctly
+    # during the 2026-07-14 incident). Exactly two attempts: unbounded retries
+    # against a down ClickUp would just burn the worker invocation.
+    fake_clickup.post_comment_error = HTTPError("http://x", 500, "err", {}, None)
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert len(fake_ecs.run_task_calls) == 1
+    assert len(fake_clickup.posted_comments) == 2
+    out = assert_alarm_log_emitted(capsys)
+    assert "Failed to post starting comment" in out
 
 
 def test_missing_config_failure_comment_urlerror_still_returns_500(fake_clickup, fake_ecs, capsys):

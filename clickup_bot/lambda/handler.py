@@ -73,6 +73,12 @@ PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
 # know, and an unbounded marker would silently change it.
 DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
 
+# Pause before retrying the "Processing started" ack post once. The ack now
+# runs off ClickUp's webhook critical path (fast-ack / async worker), so a
+# brief wait is free and rides out transient ClickUp 5xxs/timeouts. Tests
+# zero this out — the length is not a behavioral contract.
+ACK_COMMENT_RETRY_DELAY_SECONDS = 2.0
+
 
 def get_dedup_window_seconds() -> float:
     raw = os.environ.get("DEDUP_COMMENT_WINDOW_SECONDS")
@@ -536,10 +542,23 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
         # Posted only AFTER a successful launch: this comment is the dedup
         # marker, so it must never exist on a task whose launch failed. A
         # failed ack post must not fail the invocation (the task is running).
+        # RETRY ONCE (2026-07-14): a missing marker leaves the retry-storm
+        # window open, and this post no longer sits on ClickUp's webhook
+        # critical path, so a brief pause + one retry is free. Only the SECOND
+        # failure logs the alarm-matching line — swallowed ack failures are
+        # exactly what the alarm exists for (it alarmed correctly during the
+        # incident). The first-attempt line is deliberately quiet: only the
+        # exception TYPE is logged (a message could contain alarm terms).
+        ack_text = f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})..."
         try:
-            post_comment(task_id, f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})...")
-        except Exception as e:
-            print(f"Failed to post starting comment: {e}")
+            post_comment(task_id, ack_text)
+        except Exception as first_err:
+            print(f"Starting-comment post hit {type(first_err).__name__}, retrying once")
+            time.sleep(ACK_COMMENT_RETRY_DELAY_SECONDS)
+            try:
+                post_comment(task_id, ack_text)
+            except Exception as e:
+                print(f"Failed to post starting comment: {e}")
 
         return {
             "statusCode": 200,
