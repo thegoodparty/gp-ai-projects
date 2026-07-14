@@ -452,6 +452,14 @@ def try_acquire_dedup_lock(task_id: str, label: str) -> bool:
     # is this conditional PutItem: it does not depend on ClickUp at all, and
     # DynamoDB serializes conditional writes, so exactly one caller per
     # (task_id, label) wins. True = proceed with the launch.
+    #
+    # CRASH AFTER CLAIM: if this invocation dies between the PutItem and the
+    # launch (hard timeout, OOM), the claim strands and suppresses re-tags —
+    # but only until expires_at: the "OR #exp < :now" reclaim arm bounds the
+    # damage to the TTL window even before DynamoDB TTL deletion (which can
+    # lag hours) runs. The 120s function timeout (terraform) vs the ~45s
+    # worst-case in-flight blocking makes that window vanishingly small, and
+    # a hard timeout still alarms via the "Task timed out" metric-filter term.
     table_name = os.environ.get("DEDUP_TABLE_NAME")
     if not table_name:
         # Initial prod state: code deploys first, the terraform that creates

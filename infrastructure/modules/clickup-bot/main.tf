@@ -264,8 +264,17 @@ resource "aws_lambda_function" "clickup_bot" {
   role             = aws_iam_role.clickup_bot.arn
   handler          = "handler.handler"
   runtime          = "python3.13"
-  timeout          = 30
-  memory_size      = 128
+  # 120s, NOT the old 30s: the webhook-facing path answers ClickUp in
+  # milliseconds either way — this long budget exists for the ASYNC WORKER
+  # invocation, whose worst-case in-flight blocking is documented at ~45s
+  # (comments GET 10s + PutItem + run_task on botocore defaults + ack 10s +
+  # 2s pause + retry ack 10s). At 30s a worker could be killed mid-flight:
+  # silently (the runtime's "Task timed out" is matched by the metric filter
+  # below precisely for this), unretried (maximum_retry_attempts = 0), and
+  # possibly stranding a dedup claim written before run_task. The hard
+  # timeout is a backstop, not a target.
+  timeout     = 120
+  memory_size = 128
 
   # Terraform manages config and IAM only. GitHub Actions is the single code
   # writer; without this, any `terraform apply` would upload the applier's
@@ -340,10 +349,21 @@ resource "aws_lambda_function_event_invoke_config" "clickup_bot" {
 # "ERROR" in a request body. Both sides of the contract are locked by
 # clickup_bot/tests/test_handler.py (ALARM_FILTER_TERMS and the alarm-log
 # poisoning tests); change the pattern and those tests together.
+#
+# "Task timed out" is the THIRD term, and it is runtime-emitted, not
+# handler-emitted: when the function hits its hard timeout the Lambda runtime
+# prints "... Task timed out after N seconds" and the handler never gets to
+# log anything. Nobody receives an HTTP error (the worker is an async
+# invocation), maximum_retry_attempts = 0 stops platform retries, and the
+# runtime message contains neither "ERROR" nor "Failed to" — without this
+# term a timed-out worker would die with NO alarm. It is deliberately absent
+# from ALARM_FILTER_TERMS in test_handler.py: handler code never emits that
+# string, so the test-side contract (which polices handler log lines) has
+# nothing to check for it.
 resource "aws_cloudwatch_log_metric_filter" "handler_errors" {
   name           = "clickup-bot-handler-errors-${var.environment}"
   log_group_name = aws_cloudwatch_log_group.clickup_bot.name
-  pattern        = "?\"ERROR\" ?\"Failed to\""
+  pattern        = "?\"ERROR\" ?\"Failed to\" ?\"Task timed out\""
 
   metric_transformation {
     name          = "HandlerErrors"

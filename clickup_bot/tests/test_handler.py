@@ -367,15 +367,21 @@ def assert_no_side_effects(fake_clickup: FakeUrlopen, fake_ecs: FakeECSClient):
 
 
 # The CloudWatch alarm leg of fail-loud: infrastructure/modules/clickup-bot/main.tf
-# creates a log metric filter with pattern ?"ERROR" ?"Failed to" and alarms on any
-# match in this Lambda's log group. These helpers are the test-side half of that
-# contract:
+# creates a log metric filter with pattern ?"ERROR" ?"Failed to" ?"Task timed out"
+# and alarms on any match in this Lambda's log group. These helpers are the
+# test-side half of that contract:
 #   - every failure path must emit a line containing one of those terms, or the
 #     alarm never fires and the failure is operationally silent;
 #   - unauthenticated request content must never be echoed to the logs, or any
 #     internet client could fire (or drown) the alarm by sending "ERROR" in a body.
 # If a handler log line is reworded, update the terraform pattern and these terms
 # together.
+#
+# "Task timed out" is deliberately NOT in ALARM_FILTER_TERMS: it is emitted by
+# the Lambda RUNTIME at the hard timeout, never by handler code, so these
+# helpers (which police handler-controlled log lines) have nothing to assert
+# about it. It exists in the terraform pattern so a hard-timed-out async
+# worker — no HTTP caller, zero platform retries — still fires the alarm.
 ALARM_FILTER_TERMS = ("ERROR", "Failed to")
 
 # Marker an attacker would embed in a request to poison the alarm log filter.
@@ -2130,7 +2136,9 @@ class ConditionEvaluatingFakeDynamoDB(FakeDynamoDBClient):
         return {}
 
 
-def test_expired_claim_is_reclaimed_and_launch_proceeds(fake_clickup, fake_ecs, boto3_factory, ecs_env, dedup_table_env):
+def test_expired_claim_is_reclaimed_and_launch_proceeds(
+    fake_clickup, fake_ecs, boto3_factory, ecs_env, dedup_table_env
+):
     # DynamoDB TTL deletion can lag hours, so an expired-but-undeleted claim
     # must be reclaimable — otherwise a deliberate re-tag after the window
     # would be silently suppressed until TTL cleanup happens to run.
