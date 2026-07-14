@@ -669,6 +669,21 @@ def test_marker_with_unparseable_date_does_not_block_and_alarms(capsys):
     assert "date unparseable" in out
 
 
+@pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "0", "-60", "junk"])
+def test_non_finite_or_non_positive_window_falls_back_to_default_quietly(monkeypatch, capsys, bad_value):
+    # float() happily parses 'nan'/'inf'/'-inf', which escape a bare
+    # ValueError guard: NaN comparisons are always False (window silently
+    # disabled) and inf breaks later arithmetic. Any non-finite or
+    # non-positive value must fall back to the default with the existing
+    # quiet (non-alarm) line — this runs in-path on every dedup check.
+    monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", bad_value)
+
+    assert handler.get_dedup_window_seconds() == handler.DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS
+
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "Invalid DEDUP_COMMENT_WINDOW_SECONDS" in out
+
+
 def test_window_is_configurable_via_env(monkeypatch):
     monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "60")
     recent = processing_started_comments(epoch_ms_str(PINNED_NOW, 30))

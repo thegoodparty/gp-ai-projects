@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
 from typing import Any
@@ -86,13 +87,20 @@ def get_dedup_window_seconds() -> float:
     raw = os.environ.get("DEDUP_COMMENT_WINDOW_SECONDS")
     if raw:
         try:
-            return float(raw)
+            value = float(raw)
         except ValueError:
-            # A typo'd env var must not crash deliveries (this runs in-path,
-            # post-auth) and must not spam the alarm on every dedup check —
-            # fall back to the safe default with a quiet, non-alarm log line
-            # (no "ERROR"/"Failed to": see the metric-filter contract below).
-            print("Invalid DEDUP_COMMENT_WINDOW_SECONDS env value; using default 900s")
+            value = None
+        # isfinite + positive, not just "float() parsed": float() happily
+        # accepts 'nan'/'inf'/'-inf', which escape a bare ValueError guard —
+        # NaN comparisons are always False (the window would silently never
+        # block) and inf breaks downstream int() arithmetic. A typo'd env var
+        # must not crash deliveries (this runs in-path, post-auth) and must
+        # not spam the alarm on every dedup check — fall back to the safe
+        # default with a quiet, non-alarm log line (no "ERROR"/"Failed to":
+        # see the metric-filter contract below).
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+        print("Invalid DEDUP_COMMENT_WINDOW_SECONDS env value; using default 900s")
     return DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS
 
 
