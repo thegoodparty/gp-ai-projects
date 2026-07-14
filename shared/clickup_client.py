@@ -67,10 +67,24 @@ class ClickUpComment(BaseModel):
         extra = "allow"
 
     def get_text(self) -> str:
+        # SHAPE CONTRACT (2026-07-14 incident, verified against a live
+        # GET /task/{id}/comment capture): plain text items carry NO "type"
+        # key — "type" appears only on rich items such as "tag" mentions —
+        # so the old `type == "text"` filter matched zero real items and the
+        # fallback silently returned "". Prefer the top-level comment_text;
+        # otherwise concatenate every item's "text" WITHOUT type filtering
+        # (mention items contribute their rendered text, matching what
+        # comment_text itself contains for the same comment).
         if self.comment_text:
             return self.comment_text
         if self.comment:
-            return "".join(c.get("text", "") for c in self.comment if c.get("type") == "text")
+            # Only str values contribute; ANY non-string -> "" (not its str()
+            # form): stringifying null to "None" or 0 to "0" would corrupt
+            # prefix-matched markers downstream, e.g. the clickup_bot dedup
+            # marker "[GP-Bot] Processing started". Same contract as the
+            # matcher fallback twin in clickup_bot/lambda/handler.py
+            # (has_processing_started_comment) — keep them aligned.
+            return "".join(c["text"] if isinstance(c.get("text"), str) else "" for c in self.comment)
         return ""
 
 
