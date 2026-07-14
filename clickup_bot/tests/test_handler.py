@@ -633,6 +633,62 @@ def test_null_text_item_neither_crashes_dedup_nor_hides_the_marker():
     assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
 
 
+def test_non_string_comment_text_neither_crashes_nor_hides_the_marker():
+    # ClickUp's top-level comment_text is attacker-of-drift territory: only a
+    # null has been observed, but a non-string (int, list, dict) must not
+    # crash .startswith() mid-webhook. Anything that isn't a str must fall
+    # through to the item-concatenation fallback — which here carries the
+    # marker, so the matcher must still block.
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment_text": 123,
+            "comment": [{"text": text}],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_empty_comment_text_falls_through_to_item_concatenation():
+    # An empty top-level comment_text carries no information — treating it as
+    # authoritative would hide a marker that only lives in the comment[] items.
+    # "" must fall through to the fallback, converging with the shared
+    # get_text() twin's truthiness semantics (shared/clickup_client.py).
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment_text": "",
+            "comment": [{"text": text}],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_non_string_item_text_contributes_empty_not_str_wrapped():
+    # ANY non-string item text (not just null) must contribute "" to the
+    # concatenation: str-wrapping 0 to "0" would prepend garbage ahead of the
+    # marker and silently break the prefix match — this test fails as False
+    # if the fallback ever str()-wraps instead of dropping.
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment": [
+                {"text": 0},
+                {"text": "[GP-Bot] Processing started (analyze, model: opus)..."},
+            ],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
 def test_recent_analyze_marker_does_not_block_gpbot_work(fake_clickup, fake_ecs, ecs_env):
     # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
     # {task_id}#{label} key. A fresh gpbot-analyze ack marker must NOT
@@ -838,6 +894,19 @@ def test_ack_cooldown_minutes_derive_from_configured_window(fake_clickup, fake_e
     assert resp["statusCode"] == 200
     ack = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
     assert "(re-tag after 10 minutes to re-run)" in ack
+
+
+def test_ack_cooldown_minutes_round_up_never_understate(fake_clickup, fake_ecs, ecs_env, monkeypatch):
+    # The hint must never promise an earlier re-run than the window enforces:
+    # round(89/60) would say "1 minute" while the marker still blocks at 89s.
+    # Ceil is the only rounding that keeps the promise honest.
+    monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "89")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    ack = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
+    assert "(re-tag after 2 minutes to re-run)" in ack
 
 
 def test_full_ack_text_with_suffix_matches_label_scoped_matcher(fake_clickup, fake_ecs, ecs_env):

@@ -251,19 +251,27 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
     label_scoped_prefix = f"{PROCESSING_STARTED_PREFIX} ({label}"
     for comment in comments:
         comment_text = comment.get("comment_text")
-        if comment_text is None:
-            # NULL SAFETY: ClickUp can ship "text": null on a comment item, and
-            # item.get("text", "") returns that None — the default only covers
-            # a MISSING key — so a single null item made "".join() raise
-            # TypeError, crashing the whole dedup check mid-webhook. A null
-            # (or any non-string) value must contribute "" rather than its
-            # str() form: stringifying null to "None" would prepend garbage to
-            # the concatenation and silently break the marker prefix match.
-            # (shared/clickup_client.py's get_text() has the same fallback but
-            # str-wraps null to "None" — these should converge on this
-            # None-to-"" behavior.)
+        if not isinstance(comment_text, str) or not comment_text:
+            # comment_text is trusted only when it is a NON-EMPTY STRING. A
+            # non-string (null observed live; int/list conceivable under API
+            # drift) would crash .startswith() mid-webhook, and an empty ""
+            # carries no information — treating it as authoritative would
+            # hide a marker living only in the comment[] items. Both fall
+            # through to the item-concatenation fallback, matching the shared
+            # twin get_text()'s truthiness semantics.
+            #
+            # NULL SAFETY in the fallback: ClickUp can ship "text": null on a
+            # comment item, and item.get("text", "") returns that None — the
+            # default only covers a MISSING key — so a single null item made
+            # "".join() raise TypeError, crashing the whole dedup check
+            # mid-webhook. ANY non-string value must contribute "" rather
+            # than its str() form: stringifying (null → "None", 0 → "0")
+            # would prepend garbage to the concatenation and silently break
+            # the marker prefix match. The shared twin
+            # (shared/clickup_client.py get_text) implements the same
+            # contract — keep them aligned.
             comment_text = "".join(
-                "" if item.get("text") is None else str(item.get("text"))
+                item["text"] if isinstance(item.get("text"), str) else ""
                 for item in comment.get("comment", [])
                 if isinstance(item, dict)
             )
@@ -673,10 +681,12 @@ def trigger_fargate_task(
         # The cooldown suffix is the ONLY place users can learn the dedup
         # window exists: a deliberate re-tag inside it is otherwise suppressed
         # with zero feedback. Derived from the configured window, never
-        # hardcoded. Safe to append: the dedup matcher matches the
-        # label-scoped PREFIX (has_processing_started_comment), pinned by a
-        # round-trip test.
-        window_minutes = round(get_dedup_window_seconds() / 60)
+        # hardcoded. Ceil, not round: round(89/60) says "1 minute" while the
+        # marker still blocks at 89s — the hint must never promise an earlier
+        # re-run than the window enforces. Safe to append: the dedup matcher
+        # matches the label-scoped PREFIX (has_processing_started_comment),
+        # pinned by a round-trip test.
+        window_minutes = math.ceil(get_dedup_window_seconds() / 60)
         ack_text = (
             f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})... "
             f"(re-tag after {window_minutes} minutes to re-run)"
