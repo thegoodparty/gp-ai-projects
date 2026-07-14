@@ -327,6 +327,17 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
         return False
 
 
+def is_atomic_dedup_configured() -> bool:
+    # Branch-point predicate for the comment-fetch failure handling below:
+    # whether the atomic DynamoDB dedup layer (conditional PutItem keyed
+    # {task_id}#{label}) is available as a backstop. The atomic layer itself
+    # ships in the stacked atomic-dedup PR, so in THIS PR the env var is never
+    # set in prod and the configured arm is dead code — the branch point is
+    # defined and tested now so that PR only has to slot its conditional-write
+    # check into the proceed path.
+    return bool(os.environ.get("DEDUP_TABLE_NAME"))
+
+
 def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: bool = False) -> dict:
     # Shared by the async worker and the synchronous fallback so the two paths
     # cannot drift: whichever path runs, the dedup semantics and the trigger
@@ -339,10 +350,31 @@ def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: 
         comments = get_task_comments(task_id)
     except Exception as e:
         # HTTPError is only raised for HTTP status errors; connection-phase
-        # failures (URLError, TimeoutError, RemoteDisconnected) must also
-        # produce the structured 500, not a Lambda crash.
+        # failures (URLError, TimeoutError, RemoteDisconnected) must also land
+        # here, never crash the Lambda. Alarm-matching ("Failed to") in every
+        # arm: a broken comments GET degrades or blocks dedup either way.
         print(f"Failed to get comments for task {task_id}: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+        if not from_async_worker:
+            # SYNC: ClickUp receives this 500 and redelivers — self-healing
+            # at-least-once. Nothing more to do.
+            return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
+        # ASYNC: ClickUp already got its 200 'accepted', so this return value
+        # goes NOWHERE — a bare 500 dict would permanently drop the tag event
+        # with zero feedback on the ticket.
+        if is_atomic_dedup_configured():
+            # The comment check is best-effort; the atomic conditional write
+            # still guards duplicates. Dropping verified work is worse than
+            # skipping a best-effort check: proceed with empty comments.
+            comments = []
+        else:
+            # No atomic backstop: launching blind is unbounded duplicate risk,
+            # so this is deliberately AT-MOST-ONCE — stop, and give the tagger
+            # a visible retry path (the standard failure comment ends in
+            # 'Remove and re-add the tag to retry.') instead of silence.
+            # Exception TYPE only in the public comment (leak guard, same as
+            # trigger_fargate_task); full detail is already in the logs above.
+            post_failure_comment(task_id, f"{type(e).__name__} fetching ClickUp comments (see CloudWatch logs)")
+            return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
 
     config = TAG_CONFIG[matched_tag]
     if has_processing_started_comment(comments, config["label"]):

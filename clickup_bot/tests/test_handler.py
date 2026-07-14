@@ -188,6 +188,11 @@ def clean_self_invoke_env(monkeypatch):
     # the fast-ack and synchronous paths. Default: sync fallback.
     monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
     monkeypatch.delenv("DEDUP_COMMENT_WINDOW_SECONDS", raising=False)
+    # DEDUP_TABLE_NAME is the branch-point predicate for the async
+    # comment-fetch failure handling (is_atomic_dedup_configured); a value
+    # set in a developer shell must not flip the suite onto the
+    # atomic-backstop arm.
+    monkeypatch.delenv("DEDUP_TABLE_NAME", raising=False)
 
 
 @pytest.fixture
@@ -865,6 +870,8 @@ def test_top_level_gpbot_async_with_alb_keys_is_not_async_dispatch(fake_clickup,
 
 
 def test_comment_fetch_http_error_returns_500(fake_clickup, fake_ecs, ecs_env, capsys):
+    # SYNC path pinned: ClickUp receives the 500 and redelivers, so failing
+    # the delivery is self-healing at-least-once — keep exactly as is.
     fake_clickup.get_comments_error = HTTPError("http://x", 500, "err", {}, None)
     event = make_event(tag_updated_body())
 
@@ -873,6 +880,61 @@ def test_comment_fetch_http_error_returns_500(fake_clickup, fake_ecs, ecs_env, c
     assert resp["statusCode"] == 500
     assert fake_ecs.run_task_calls == []
     assert_alarm_log_emitted(capsys)
+
+
+def test_async_comment_fetch_failure_with_atomic_backstop_still_launches(
+    fake_clickup, fake_ecs, ecs_env, monkeypatch, capsys
+):
+    # ASYNC path + DEDUP_TABLE_NAME configured: ClickUp already got its 200
+    # 'accepted', so a 500 dict returned here goes NOWHERE — the tag event
+    # would be permanently dropped. The comment layer is best-effort (the
+    # atomic conditional write still guards duplicates), so a comment-fetch
+    # failure must skip the best-effort check and PROCEED to launch. The
+    # degraded state is alarm-worthy: 'Failed to get comments' must fire.
+    monkeypatch.setenv("DEDUP_TABLE_NAME", "clickup-bot-dedup-test")
+    fake_clickup.get_comments_error = HTTPError("http://x", 500, "err", {}, None)
+
+    resp = handler.handler(async_worker_event(), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    out = assert_alarm_log_emitted(capsys)
+    assert "Failed to get comments" in out
+
+
+def test_async_comment_fetch_failure_without_backstop_posts_failure_comment(fake_clickup, fake_ecs, ecs_env, capsys):
+    # ASYNC path, NO atomic backstop configured: launching blind would be
+    # unbounded duplicate risk, and returning a 500 dict would silently drop
+    # the delivery. The user must get a visible retry path instead: the
+    # standard failure comment ('Remove and re-add the tag to retry.'), no
+    # launch, no raise.
+    fake_clickup.get_comments_error = URLError("connection refused")
+
+    resp = handler.handler(async_worker_event(), None)
+
+    assert isinstance(resp, dict)
+    assert resp["statusCode"] == 500
+    assert fake_ecs.run_task_calls == []
+    failure_comments = [
+        text for text in fake_clickup.posted_comment_texts if text.startswith("[GP-Bot] Failed to start processing")
+    ]
+    assert len(failure_comments) == 1
+    assert "Remove and re-add the tag to retry" in failure_comments[0]
+    assert_alarm_log_emitted(capsys)
+
+
+def test_is_atomic_dedup_configured_reads_dedup_table_env(monkeypatch):
+    # Unit-level pin for the branch-point predicate: in this PR the env var is
+    # never set in prod (the atomic layer ships in the stacked PR), so the
+    # configured arm is dead code at the handler level — the predicate itself
+    # must still be locked down.
+    monkeypatch.delenv("DEDUP_TABLE_NAME", raising=False)
+    assert handler.is_atomic_dedup_configured() is False
+    monkeypatch.setenv("DEDUP_TABLE_NAME", "")
+    assert handler.is_atomic_dedup_configured() is False
+    monkeypatch.setenv("DEDUP_TABLE_NAME", "clickup-bot-dedup-prod")
+    assert handler.is_atomic_dedup_configured() is True
 
 
 # ---------------------------------------------------------------------------
