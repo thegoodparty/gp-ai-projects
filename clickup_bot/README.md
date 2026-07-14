@@ -42,6 +42,9 @@ ClickUp comment OR GitHub PR
    `event["body"]`):
    - Dedup check: does the task already have a **recent** `[GP-Bot] Processing
      started` comment? → Skip. See "Dedup semantics" below.
+   - Atomic dedup claim: conditional DynamoDB write on `{task_id}#{label}` —
+     exactly one concurrent worker wins; losers skip quietly. See "Dedup
+     semantics" below.
    - Triggers Fargate, passing `CLICKUP_TASK_ID`, `INSTRUCTION`, and
      `AGENT_MODEL` as container-override env vars (the instruction encodes the
      analyze-vs-implement contract; there is no `OUTPUT_ACTION`)
@@ -78,8 +81,27 @@ comments never block a retry, regardless of age.
 
 Comment-based dedup is best-effort: two deliveries processed close enough together
 both see "no marker yet" and both launch (the check and the comment post are not
-atomic). The follow-up (PR2) adds a DynamoDB conditional-write claim per
-`(task_id, tag)` so exactly one worker wins even under concurrent deliveries.
+atomic). The authoritative layer is an **atomic DynamoDB claim**: after the comment
+check passes, the worker does a conditional `PutItem` on `{task_id}#{label}` into
+`DEDUP_TABLE_NAME` — DynamoDB serializes conditional writes, so exactly one worker
+wins even under fully concurrent deliveries; losers skip quietly with a 200. Claim
+details:
+
+- The claim carries an `expires_at` of now + `DEDUP_TTL_SECONDS` (default 900,
+  matching the comment window: same product contract, retry storms are absorbed and
+  a deliberate re-tag ~15 minutes later re-runs). DynamoDB TTL garbage-collects old
+  claims, and because TTL deletion can lag hours, the conditional write also treats
+  an expired-but-not-yet-deleted claim as free.
+- A failed launch releases its claim (`DeleteItem`), so the remove-and-re-add-the-tag
+  retry contract survives launch failures. A successful launch keeps its claim until
+  the TTL expires.
+- If `DEDUP_TABLE_NAME` is unset (the state between a code deploy and the terraform
+  apply that creates the table), the claim step is a quiet no-op and only
+  comment-based dedup applies.
+- If the table is broken (throttled, deleted, IAM stripped), the handler **fails
+  open** — the launch still happens — and logs an alarm-matching
+  `ERROR: dedup table unavailable` line: a duplicate agent costs a few dollars, a
+  bot that cannot launch at all is an outage, but an operator must see the breakage.
 
 ### 2026-07-14 incident
 
@@ -136,10 +158,15 @@ delivery failures per webhook and auto-suspends the webhook after sustained fail
 A suspended webhook stays suspended after the outage is fixed: the bot receives
 nothing, logs nothing, and looks healthy.
 
-After ANY sustained failure outage (500s or 401s), check and re-enable the webhook:
+After ANY sustained failure outage (500s or 401s), check and re-enable the webhook.
+Check `health.fail_count` even when `health.status` is still `active`: ClickUp counts
+consecutive failures toward auto-disable (~100), and slow responses count too — after
+the 2026-07-14 incident the webhook sat at `failing` / `fail_count: 6` from a single
+retried delivery. A nonzero fail_count that keeps climbing means deliveries are still
+failing (or timing out) and the webhook is walking toward suspension:
 
 ```bash
-# health.status must be "active"; look at health.fail_count too
+# health.status must be "active"; a climbing health.fail_count is a warning even before suspension
 curl -s -H "Authorization: $CLICKUP_API_KEY" \
   "https://api.clickup.com/api/v2/team/<team_id>/webhook" | jq '.webhooks[] | {id, endpoint, health}'
 
@@ -161,6 +188,8 @@ Set by terraform (`infrastructure/environments/prod/clickup-bot/`), not by hand.
 | `ECS_SECURITY_GROUP_ID` | Security group for the task |
 | `ENVIRONMENT` | Selects the `AI_SECRETS_<ENV>` secret that provides `CLICKUP_API_KEY` and `CLICKUP_WEBHOOK_SECRET` |
 | `DEDUP_COMMENT_WINDOW_SECONDS` | Optional (default 900): how long a `Processing started` comment blocks re-triggering — see "Dedup semantics" |
+| `DEDUP_TABLE_NAME` | DynamoDB table for atomic dedup claims (`clickup-bot-dedup-<env>`). Unset = quiet no-op, comment-based dedup only — see "Dedup semantics" |
+| `DEDUP_TTL_SECONDS` | Optional (default 900): lifetime of an atomic dedup claim — see "Dedup semantics" |
 | `ENABLE_FARGATE` | Transition compatibility only: the current handler ignores it, but the previous handler silently no-ops without it. Remove from the module only after the fail-loud handler is confirmed live. |
 
 ## Adding New Tags
@@ -200,6 +229,19 @@ BEFORE running `terraform apply`. The previous (pre-fail-loud) handler gates on
 out-of-order apply cannot re-create the silent no-op, but do not rely on that:
 terraform cannot deploy code anymore (`lifecycle.ignore_changes`), so an apply alone
 never ships a handler fix.
+
+The fast-ack + atomic-dedup rollout follows exactly that ordering, and the handler
+is written so each half is safe alone:
+
+1. Merge/deploy the code first. Without the terraform it is a safe no-op on both
+   new paths: the async self-invoke lacks IAM and quietly falls back to the old
+   synchronous flow, and `DEDUP_TABLE_NAME` is unset so the atomic claim is a quiet
+   no-op (comment-based dedup only).
+2. Then `terraform apply` in `infrastructure/environments/prod/clickup-bot`. This
+   creates the dedup table, grants `dynamodb:PutItem`/`DeleteItem` and the
+   self-invoke `lambda:InvokeFunction`, sets `DEDUP_TABLE_NAME` on the Lambda, and
+   pins async `maximum_retry_attempts = 0`. The apply is what ACTIVATES both
+   fast-ack and atomic dedup — until then the bot runs exactly the old flow.
 
 **Code** deploys automatically via `.github/workflows/deploy-clickup-bot.yml` on push
 to `prod` (paths: `clickup_bot/**`). The workflow runs `clickup_bot/tests/` first and
