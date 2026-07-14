@@ -173,10 +173,17 @@ def get_task_comments(task_id: str) -> list[dict]:
     return result.get("comments", [])
 
 
-def has_processing_started_comment(comments: list[dict], now: float | None = None) -> bool:
+def has_processing_started_comment(comments: list[dict], label: str, now: float | None = None) -> bool:
     # Only the success marker counts as 'already processed'. Failure comments
     # ('[GP-Bot] Failed to start processing: ...') must NOT block a retry:
     # removing and re-adding the tag after a failure has to re-trigger.
+    #
+    # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
+    # {task_id}#{label} DynamoDB key. The ack text is
+    # '{PROCESSING_STARTED_PREFIX} ({label}, model: ...)', so matching the
+    # label-scoped prefix lets analyze and implement dedup independently — a
+    # fresh gpbot-analyze marker must not suppress a gpbot-work trigger
+    # (analyze-then-implement inside the window is the normal workflow).
     #
     # SHAPE CONTRACT (2026-07-14 incident): the real GET /task/{id}/comment
     # response carries the full text in a top-level "comment_text" field, and
@@ -195,13 +202,14 @@ def has_processing_started_comment(comments: list[dict], now: float | None = Non
     if now is None:
         now = time.time()
     window_seconds = get_dedup_window_seconds()
+    label_scoped_prefix = f"{PROCESSING_STARTED_PREFIX} ({label}"
     for comment in comments:
         comment_text = comment.get("comment_text")
         if comment_text is None:
             comment_text = "".join(
                 item.get("text", "") for item in comment.get("comment", []) if isinstance(item, dict)
             )
-        if not comment_text.startswith(PROCESSING_STARTED_PREFIX):
+        if not comment_text.startswith(label_scoped_prefix):
             continue
         try:
             age_seconds = now - int(comment.get("date")) / 1000.0
@@ -330,11 +338,11 @@ def dedup_check_then_trigger(task_id: str, matched_tag: str) -> dict:
         print(f"Failed to get comments for task {task_id}: {e}")
         return {"statusCode": 500, "body": json.dumps({"error": "failed to get comments"})}
 
-    if has_processing_started_comment(comments):
-        print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} comment, skipping")
+    config = TAG_CONFIG[matched_tag]
+    if has_processing_started_comment(comments, config["label"]):
+        print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} ({config['label']}) comment, skipping")
         return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
 
-    config = TAG_CONFIG[matched_tag]
     return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
 
 

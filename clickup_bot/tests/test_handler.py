@@ -581,6 +581,28 @@ def test_dedup_tolerates_type_keyed_items_forward_compat(fake_clickup, fake_ecs,
     assert fake_clickup.posted_comments == []
 
 
+def test_recent_analyze_marker_does_not_block_gpbot_work(fake_clickup, fake_ecs, ecs_env):
+    # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
+    # {task_id}#{label} key. A fresh gpbot-analyze ack marker must NOT
+    # suppress a gpbot-work trigger on the same task — analyze-then-implement
+    # within 15 minutes is the normal workflow, not a duplicate.
+    fake_clickup.comments_response = existing_gpbot_comment_response()  # analyze marker, 30s old
+    event = make_event(tag_updated_body(tags=("gpbot-work",)))
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+
+
+def test_recent_same_label_marker_still_blocks_at_unit_level():
+    # The label-scoped prefix must still match its OWN label's marker.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, 30))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "implement", now=PINNED_NOW) is False
+
+
 # ---------------------------------------------------------------------------
 # 9b. Dedup recency window: a "Processing started" marker only blocks while it
 # is RECENT (DEDUP_COMMENT_WINDOW_SECONDS, default 900). The marker exists to
@@ -615,32 +637,32 @@ def epoch_ms_str(now: float, age_seconds: float) -> str:
 
 def test_marker_899s_old_blocks_at_default_window():
     comments = processing_started_comments(epoch_ms_str(PINNED_NOW, 899))
-    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
 
 
 def test_marker_901s_old_does_not_block_at_default_window():
     comments = processing_started_comments(epoch_ms_str(PINNED_NOW, 901))
-    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is False
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
 
 
 def test_marker_with_missing_date_blocks():
     # Conservative against retry storms: an undatable marker is treated as
     # recent (block) rather than allowing a possible duplicate launch.
     comments = processing_started_comments(None)
-    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
 
 
 def test_marker_with_unparseable_date_blocks():
     comments = processing_started_comments("not-a-number")
-    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
 
 
 def test_window_is_configurable_via_env(monkeypatch):
     monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "60")
     recent = processing_started_comments(epoch_ms_str(PINNED_NOW, 30))
     stale = processing_started_comments(epoch_ms_str(PINNED_NOW, 120))
-    assert handler.has_processing_started_comment(recent, now=PINNED_NOW) is True
-    assert handler.has_processing_started_comment(stale, now=PINNED_NOW) is False
+    assert handler.has_processing_started_comment(recent, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(stale, "analyze", now=PINNED_NOW) is False
 
 
 def test_stale_marker_allows_deliberate_re_tag_to_retrigger(fake_clickup, fake_ecs, ecs_env):
