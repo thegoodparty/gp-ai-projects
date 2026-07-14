@@ -240,9 +240,11 @@ def reset_boto3_client_cache():
     # client cached by one test must never leak into the next.
     handler._lambda_client = None
     handler._ecs_client = None
+    handler._dynamodb_client = None
     yield
     handler._lambda_client = None
     handler._ecs_client = None
+    handler._dynamodb_client = None
 
 
 @pytest.fixture(autouse=True)
@@ -1061,6 +1063,36 @@ def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_fact
     lambda_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "lambda"]
     assert len(lambda_calls) == 1
     config = lambda_calls[0]["config"]
+    assert config.connect_timeout == 2
+    assert config.read_timeout == 5
+    assert config.retries == {"max_attempts": 1}
+
+
+def test_dynamodb_client_is_cached_across_invocations(
+    fake_clickup, fake_ecs, fake_dynamodb, boto3_factory, ecs_env, dedup_table_env
+):
+    # Same caching contract for the DynamoDB client used by the atomic dedup
+    # claim: in the sync fallback (the initial prod state) the conditional
+    # PutItem sits inside ClickUp's webhook timeout budget, so per-call
+    # boto3.client() endpoint resolution is in-path latency there too.
+    handler.handler(make_event(tag_updated_body()), None)
+    handler.handler(make_event(tag_updated_body()), None)
+
+    assert boto3_factory.requested_services.count("dynamodb") == 1
+
+
+def test_dynamodb_client_uses_fast_path_timeouts(
+    fake_clickup, fake_ecs, fake_dynamodb, boto3_factory, ecs_env, dedup_table_env
+):
+    # botocore defaults (60s connect + 60s read, with retries) on the dedup
+    # PutItem could blow ClickUp's webhook timeout in the sync fallback — the
+    # same fast-path budget as the self-invoke call. Tight timeouts, single
+    # attempt: a timeout lands in try_acquire_dedup_lock's existing fail-open.
+    handler.handler(make_event(tag_updated_body()), None)
+
+    dynamodb_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "dynamodb"]
+    assert len(dynamodb_calls) == 1
+    config = dynamodb_calls[0]["config"]
     assert config.connect_timeout == 2
     assert config.read_timeout == 5
     assert config.retries == {"max_attempts": 1}
