@@ -431,7 +431,7 @@ resource "aws_lambda_permission" "allow_sns_invoke_slack" {
 
 resource "aws_cloudwatch_metric_alarm" "handler_errors" {
   alarm_name          = "clickup-bot-handler-errors-${var.environment}"
-  alarm_description   = "clickup-bot ${var.environment} logged handler errors (fail-loud 500s, swallowed ClickUp comment failures, or an async worker hard timeout — 'Task timed out': work possibly lost, check for stranded dedup claims). Check /aws/lambda/clickup-bot-${var.environment} logs. After any sustained outage, also check the ClickUp webhook health status (see clickup_bot/README.md, 'After an outage')."
+  alarm_description   = "clickup-bot ${var.environment} logged handler errors (fail-loud 500s, swallowed ClickUp comment failures, or an async worker hard timeout — 'Task timed out': work possibly lost, check for stranded dedup claims). Check /aws/lambda/clickup-bot-${var.environment} logs. Stranded claim: scan table clickup-bot-dedup-${var.environment} (aws dynamodb scan) and delete-item the pk '{task_id}#{label}' to unblock re-tag (see clickup_bot/README.md, 'Stranded dedup claims'). After any sustained outage, also check the ClickUp webhook health status (see clickup_bot/README.md, 'After an outage')."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "HandlerErrors"

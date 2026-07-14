@@ -30,17 +30,37 @@ _dynamodb_client = None
 # the 2026-07-14 incident — on a hung Lambda control plane. Tight timeouts,
 # single attempt: any failure lands in enqueue_async_processing's quiet
 # synchronous fallback, which is always safe.
-LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+#
+# total_max_attempts, NOT max_attempts — a botocore trap: in legacy retry
+# mode (the default) "max_attempts" counts RETRIES AFTER the initial call,
+# so {"max_attempts": 1} normalizes to total_max_attempts=2 — one silent
+# full retry on this budget-critical path. "total_max_attempts" counts the
+# initial call itself, so 1 here truly means a single attempt (pinned by a
+# resolved-config test against a real botocore client).
+LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
 
 # Same fast-path budget for the atomic-dedup DynamoDB calls: in the sync
 # fallback (the initial prod state, until the self-invoke IAM lands) the
 # conditional PutItem runs while ClickUp is still waiting on the webhook
 # response, so botocore's defaults could blow the whole webhook timeout there
-# too. Tight timeouts, single attempt: a timeout surfaces as an exception in
-# try_acquire_dedup_lock / release_dedup_lock, where the existing fail-open
-# handling already covers it (proceed without atomic dedup, alarm-matching
-# log line).
-DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+# too. Tight timeouts, single attempt (total_max_attempts — see the
+# max_attempts trap on LAMBDA_CLIENT_CONFIG): a timeout surfaces as an
+# exception in try_acquire_dedup_lock / release_dedup_lock, where the
+# existing fail-open handling already covers it (proceed without atomic
+# dedup, alarm-matching log line).
+DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
+
+# RunTask budget: RunTask has NO idempotency token, so a botocore retry after
+# an ambiguous failure (read timeout with the request already accepted
+# server-side) can DOUBLE-LAUNCH Fargate inside one dedup claim — the exact
+# duplicate class the claim exists to prevent, invisible to both dedup
+# layers. botocore defaults (60s timeouts, ~5 legacy attempts) must never
+# apply here: zero SDK retries is the correct trade because a genuine launch
+# failure already fails loud (failure comment + documented re-tag retry
+# path). 30s read stays within the worker's 120s budget; connect gets 5s
+# because a connect-phase failure is unambiguous (nothing launched) yet still
+# must not eat the budget.
+ECS_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=30, retries={"total_max_attempts": 1})
 
 
 def get_lambda_client() -> Any:
@@ -53,7 +73,7 @@ def get_lambda_client() -> Any:
 def get_ecs_client() -> Any:
     global _ecs_client
     if _ecs_client is None:
-        _ecs_client = boto3.client("ecs")
+        _ecs_client = boto3.client("ecs", config=ECS_CLIENT_CONFIG)
     return _ecs_client
 
 
@@ -296,19 +316,27 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
     label_scoped_prefix = f"{PROCESSING_STARTED_PREFIX} ({label}"
     for comment in comments:
         comment_text = comment.get("comment_text")
-        if comment_text is None:
-            # NULL SAFETY: ClickUp can ship "text": null on a comment item, and
-            # item.get("text", "") returns that None — the default only covers
-            # a MISSING key — so a single null item made "".join() raise
-            # TypeError, crashing the whole dedup check mid-webhook. A null
-            # (or any non-string) value must contribute "" rather than its
-            # str() form: stringifying null to "None" would prepend garbage to
-            # the concatenation and silently break the marker prefix match.
-            # (shared/clickup_client.py's get_text() has the same fallback but
-            # str-wraps null to "None" — these should converge on this
-            # None-to-"" behavior.)
+        if not isinstance(comment_text, str) or not comment_text:
+            # comment_text is trusted only when it is a NON-EMPTY STRING. A
+            # non-string (null observed live; int/list conceivable under API
+            # drift) would crash .startswith() mid-webhook, and an empty ""
+            # carries no information — treating it as authoritative would
+            # hide a marker living only in the comment[] items. Both fall
+            # through to the item-concatenation fallback, matching the shared
+            # twin get_text()'s truthiness semantics.
+            #
+            # NULL SAFETY in the fallback: ClickUp can ship "text": null on a
+            # comment item, and item.get("text", "") returns that None — the
+            # default only covers a MISSING key — so a single null item made
+            # "".join() raise TypeError, crashing the whole dedup check
+            # mid-webhook. ANY non-string value must contribute "" rather
+            # than its str() form: stringifying (null → "None", 0 → "0")
+            # would prepend garbage to the concatenation and silently break
+            # the marker prefix match. The shared twin
+            # (shared/clickup_client.py get_text) implements the same
+            # contract — keep them aligned.
             comment_text = "".join(
-                "" if item.get("text") is None else str(item.get("text"))
+                item["text"] if isinstance(item.get("text"), str) else ""
                 for item in comment.get("comment", [])
                 if isinstance(item, dict)
             )
@@ -520,6 +548,16 @@ def release_dedup_lock(task_id: str, label: str) -> None:
     # so the claim must not either, or the user's immediate retry would be
     # silently suppressed for the whole TTL. (A SUCCESSFUL launch keeps its
     # claim; DynamoDB TTL expires it.)
+    #
+    # ACCEPTED RACE (delayed-put): a client-side PutItem timeout in
+    # try_acquire_dedup_lock does NOT cancel the server-side write — DynamoDB
+    # can commit it after this DeleteItem runs, stranding a claim that
+    # suppresses re-tags with no launch behind it. Bounded: the claim's
+    # expires_at plus the "OR #exp < :now" reclaim arm caps the damage at the
+    # TTL window (15 min default). Fencing (conditional delete on an
+    # ownership token) would close it entirely but is deliberately not
+    # implemented — the operator runbook (README, "Stranded dedup claims")
+    # plus the TTL bound is the accepted trade.
     table_name = os.environ.get("DEDUP_TABLE_NAME")
     if not table_name:
         return
@@ -826,10 +864,12 @@ def trigger_fargate_task(
         # The cooldown suffix is the ONLY place users can learn the dedup
         # window exists: a deliberate re-tag inside it is otherwise suppressed
         # with zero feedback. Derived from the configured window, never
-        # hardcoded. Safe to append: the dedup matcher matches the
-        # label-scoped PREFIX (has_processing_started_comment), pinned by a
-        # round-trip test.
-        window_minutes = round(get_dedup_window_seconds() / 60)
+        # hardcoded. Ceil, not round: round(89/60) says "1 minute" while the
+        # marker still blocks at 89s — the hint must never promise an earlier
+        # re-run than the window enforces. Safe to append: the dedup matcher
+        # matches the label-scoped PREFIX (has_processing_started_comment),
+        # pinned by a round-trip test.
+        window_minutes = math.ceil(get_dedup_window_seconds() / 60)
         ack_text = (
             f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})... "
             f"(re-tag after {window_minutes} minutes to re-run)"

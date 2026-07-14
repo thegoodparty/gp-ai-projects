@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 
 import handler
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 
 TEST_SECRET = "test-secret"
 TEST_API_KEY = "test-key"
@@ -694,6 +694,62 @@ def test_null_text_item_neither_crashes_dedup_nor_hides_the_marker():
     assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
 
 
+def test_non_string_comment_text_neither_crashes_nor_hides_the_marker():
+    # ClickUp's top-level comment_text is attacker-of-drift territory: only a
+    # null has been observed, but a non-string (int, list, dict) must not
+    # crash .startswith() mid-webhook. Anything that isn't a str must fall
+    # through to the item-concatenation fallback — which here carries the
+    # marker, so the matcher must still block.
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment_text": 123,
+            "comment": [{"text": text}],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_empty_comment_text_falls_through_to_item_concatenation():
+    # An empty top-level comment_text carries no information — treating it as
+    # authoritative would hide a marker that only lives in the comment[] items.
+    # "" must fall through to the fallback, converging with the shared
+    # get_text() twin's truthiness semantics (shared/clickup_client.py).
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment_text": "",
+            "comment": [{"text": text}],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_non_string_item_text_contributes_empty_not_str_wrapped():
+    # ANY non-string item text (not just null) must contribute "" to the
+    # concatenation: str-wrapping 0 to "0" would prepend garbage ahead of the
+    # marker and silently break the prefix match — this test fails as False
+    # if the fallback ever str()-wraps instead of dropping.
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment": [
+                {"text": 0},
+                {"text": "[GP-Bot] Processing started (analyze, model: opus)..."},
+            ],
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
 def test_recent_analyze_marker_does_not_block_gpbot_work(fake_clickup, fake_ecs, ecs_env):
     # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
     # {task_id}#{label} key. A fresh gpbot-analyze ack marker must NOT
@@ -901,6 +957,19 @@ def test_ack_cooldown_minutes_derive_from_configured_window(fake_clickup, fake_e
     assert "(re-tag after 10 minutes to re-run)" in ack
 
 
+def test_ack_cooldown_minutes_round_up_never_understate(fake_clickup, fake_ecs, ecs_env, monkeypatch):
+    # The hint must never promise an earlier re-run than the window enforces:
+    # round(89/60) would say "1 minute" while the marker still blocks at 89s.
+    # Ceil is the only rounding that keeps the promise honest.
+    monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "89")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    ack = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
+    assert "(re-tag after 2 minutes to re-run)" in ack
+
+
 def test_full_ack_text_with_suffix_matches_label_scoped_matcher(fake_clickup, fake_ecs, ecs_env):
     # Round-trip: the exact text the handler posts (including the cooldown
     # suffix) must still be recognized by the dedup matcher — the matcher
@@ -1057,7 +1126,10 @@ def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_fact
     # botocore defaults are 60s connect + 60s read with retries: a hung Lambda
     # control plane would blow ClickUp's whole webhook timeout in-path. The
     # fast-ack budget demands tight timeouts and a single attempt — on any
-    # failure the quiet sync fallback takes over.
+    # failure the quiet sync fallback takes over. total_max_attempts, NOT
+    # max_attempts: legacy-mode botocore reads max_attempts as retries AFTER
+    # the initial call, so {"max_attempts": 1} silently means 2 attempts (see
+    # test_lambda_client_config_resolves_to_a_single_total_attempt).
     handler.handler(make_event(tag_updated_body()), None)
 
     lambda_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "lambda"]
@@ -1065,7 +1137,29 @@ def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_fact
     config = lambda_calls[0]["config"]
     assert config.connect_timeout == 2
     assert config.read_timeout == 5
-    assert config.retries == {"max_attempts": 1}
+    assert config.retries == {"total_max_attempts": 1}
+
+
+def test_lambda_client_config_resolves_to_a_single_total_attempt():
+    # BEHAVIORAL, not just a dict pin: build a REAL botocore client from the
+    # handler's constant and assert the RESOLVED retry budget. botocore's
+    # legacy mode normalizes retries into {"total_max_attempts": N, "mode":
+    # "legacy"} where N counts the initial call — the previous
+    # {"max_attempts": 1} config resolved to total_max_attempts=2 (one full
+    # SDK retry on the fast-ack path), which this test would have caught.
+    # The fakes intercept boto3.client (not the transport), so the module-
+    # level boto3.session path below deliberately bypasses the patched
+    # boto3.client to reach real botocore config resolution. No network I/O:
+    # client construction only resolves endpoints/config locally.
+    import boto3.session
+
+    real_client = boto3.session.Session(
+        region_name="us-west-2",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    ).client("lambda", config=handler.LAMBDA_CLIENT_CONFIG)
+
+    assert real_client.meta.config.retries["total_max_attempts"] == 1
 
 
 def test_dynamodb_client_is_cached_across_invocations(
@@ -1088,6 +1182,9 @@ def test_dynamodb_client_uses_fast_path_timeouts(
     # PutItem could blow ClickUp's webhook timeout in the sync fallback — the
     # same fast-path budget as the self-invoke call. Tight timeouts, single
     # attempt: a timeout lands in try_acquire_dedup_lock's existing fail-open.
+    # total_max_attempts, NOT max_attempts — legacy-mode botocore reads
+    # max_attempts as retries AFTER the initial call (see
+    # test_dynamodb_client_config_resolves_to_a_single_total_attempt).
     handler.handler(make_event(tag_updated_body()), None)
 
     dynamodb_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "dynamodb"]
@@ -1095,7 +1192,43 @@ def test_dynamodb_client_uses_fast_path_timeouts(
     config = dynamodb_calls[0]["config"]
     assert config.connect_timeout == 2
     assert config.read_timeout == 5
-    assert config.retries == {"max_attempts": 1}
+    assert config.retries == {"total_max_attempts": 1}
+
+
+def test_dynamodb_client_config_resolves_to_a_single_total_attempt():
+    # Same resolved-config contract as the lambda client (see
+    # test_lambda_client_config_resolves_to_a_single_total_attempt for the
+    # legacy-mode max_attempts trap this guards against): the dedup PutItem
+    # must make exactly ONE attempt — an SDK retry after an ambiguous failure
+    # would double the fast-path budget, and the fail-open handling already
+    # owns the failure. Real botocore client; no network I/O.
+    import boto3.session
+
+    real_client = boto3.session.Session(
+        region_name="us-west-2",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    ).client("dynamodb", config=handler.DYNAMODB_CLIENT_CONFIG)
+
+    assert real_client.meta.config.retries["total_max_attempts"] == 1
+
+
+def test_ecs_client_uses_single_attempt_run_task_budget(fake_clickup, fake_ecs, boto3_factory, ecs_env):
+    # RunTask has NO idempotency token: an SDK retry after an ambiguous
+    # failure (read timeout with the request already accepted server-side)
+    # can double-launch Fargate INSIDE one dedup claim — the exact class of
+    # duplicate the claim exists to prevent, invisible to both dedup layers.
+    # botocore defaults (60s timeouts, ~5 legacy attempts) must never apply:
+    # bounded timeouts, exactly one attempt. A genuine failure already fails
+    # loud (failure comment + re-tag retry path).
+    handler.handler(make_event(tag_updated_body()), None)
+
+    ecs_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "ecs"]
+    assert len(ecs_calls) == 1
+    config = ecs_calls[0]["config"]
+    assert config.connect_timeout == 5
+    assert config.read_timeout == 30
+    assert config.retries == {"total_max_attempts": 1}
 
 
 def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):
@@ -2170,6 +2303,28 @@ def test_dynamo_outage_fails_open_and_alarms(
     assert response_body(resp)["fargate_task_arn"] == TASK_ARN
     assert len(fake_ecs.run_task_calls) == 1
     assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    out = assert_alarm_log_emitted(capsys)
+    assert "dedup table unavailable" in out
+
+
+def test_dynamo_read_timeout_fails_open_and_alarms(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
+):
+    # CONTRACT PIN, expected to pass against the current broad except: the
+    # exception a read timeout ACTUALLY raises is botocore's ReadTimeoutError,
+    # which is NOT a ClientError (it subclasses HTTPClientError/BotoCoreError)
+    # — so the single-attempt read_timeout budget lands in the generic
+    # except-Exception arm, not the ClientError one. This test exists so that
+    # anyone narrowing that except later (e.g. to ClientError only) turns the
+    # most likely real-world failure shape from fail-open into an unhandled
+    # crash and finds out here instead of in prod.
+    fake_dynamodb.put_item_exception = ReadTimeoutError(endpoint_url="https://dynamodb.us-west-2.amazonaws.com/")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
     out = assert_alarm_log_emitted(capsys)
     assert "dedup table unavailable" in out
 
