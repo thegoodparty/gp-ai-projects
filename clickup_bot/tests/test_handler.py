@@ -715,6 +715,86 @@ def test_window_is_configurable_via_env(monkeypatch):
     assert handler.has_processing_started_comment(stale, "analyze", now=PINNED_NOW) is False
 
 
+def incident_shaped_comments(marker_ages_seconds: list[float], now: float) -> list[dict]:
+    """Comment list mirroring the REAL captured DATA-2108 incident payload
+    (13 comments): one human comment whose items carry "type": "tag" user
+    mentions and "attributes", six non-marker bot analysis comments, and six
+    'Processing started' markers — newest first, string epoch-ms dates, no
+    "type" key on plain text items. Marker ages are injectable so tests can
+    place them inside/outside the dedup window.
+    """
+    marker_text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comments: list[dict] = [
+        {
+            "id": "90130291057993",
+            "comment": [
+                {"type": "tag", "user": {"id": 105985351, "username": "Hugh Karimi"}, "text": "@Hugh Karimi"},
+                {
+                    "text": " BR's data is out of date here. Anything you need before you can escalate?",
+                    "attributes": {},
+                },
+                {"text": "\n", "attributes": {"block-id": "block-42H9Q2cBDM"}},
+            ],
+            "comment_text": "@Hugh Karimi BR's data is out of date here. Anything you need before you can escalate?\n",
+            "user": {"id": 111932291, "username": "Chadwyck"},
+            "date": epoch_ms_str(now, 10),
+            "reply_count": 0,
+        }
+    ]
+    analysis_texts = [
+        "[GP-Bot] Analysis\n\n## Reproduction / verified facts\n- Confirmed the customer-reported 83k voter count",
+        "[GP-Bot] Analysis — reproduces the report, root cause is upstream data",
+        "[GP-Bot] Analysis\n\n**Reproduced.** The 83k voter count is real",
+        "[GP-Bot] **Analysis — DATA-2108 / Montebello Unified School Board**",
+        "[GP-Bot] Re-verified — findings unchanged from prior investigation",
+        "[GP-Bot] Investigation summary — Montebello USD school-board race",
+    ]
+    for i, text in enumerate(analysis_texts):
+        comments.append(
+            {
+                "id": f"9013029104{i:04d}",
+                "comment": [{"text": text}],
+                "comment_text": text,
+                "user": {"id": 105985359, "username": "Collin Park"},
+                "date": epoch_ms_str(now, 60 + i),
+                "reply_count": 0,
+            }
+        )
+    for i, age in enumerate(marker_ages_seconds):
+        comments.append(
+            {
+                "id": f"9013029105{i:04d}",
+                "comment": [{"text": marker_text}],
+                "comment_text": marker_text,
+                "user": {"id": 105985359, "username": "Collin Park"},
+                "date": epoch_ms_str(now, age),
+                "reply_count": 0,
+            }
+        )
+    return comments
+
+
+def test_incident_payload_recent_same_label_marker_blocks():
+    # Realistic 13-comment payload (real captured incident shape): human
+    # comment, six bot analyses, six markers — one marker inside the window.
+    # The matcher must pick the marker out of the noise and block analyze,
+    # while implement (different label) stays unblocked.
+    ages = [30.0, 200.0, 400.0, 1000.0, 2000.0, 3600.0]
+    comments = incident_shaped_comments(ages, PINNED_NOW)
+
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "implement", now=PINNED_NOW) is False
+
+
+def test_incident_payload_only_stale_markers_do_not_block():
+    # All six markers older than the window: analysis comments and the human
+    # comment must not be mistaken for markers, so nothing blocks.
+    ages = [1000.0, 1200.0, 1800.0, 2400.0, 3000.0, 3600.0]
+    comments = incident_shaped_comments(ages, PINNED_NOW)
+
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
+
+
 def test_ack_comment_mentions_retag_cooldown(fake_clickup, fake_ecs, ecs_env):
     # UX: a deliberate re-tag inside the dedup window is suppressed with zero
     # feedback — the ack comment is the only place users can learn the
