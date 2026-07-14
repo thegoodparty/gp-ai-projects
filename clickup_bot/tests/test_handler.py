@@ -650,16 +650,23 @@ def test_marker_901s_old_does_not_block_at_default_window():
     assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
 
 
-def test_marker_with_missing_date_blocks():
-    # Conservative against retry storms: an undatable marker is treated as
-    # recent (block) rather than allowing a possible duplicate launch.
+def test_marker_with_missing_date_does_not_block_and_alarms(capsys):
+    # An undatable marker must NOT block: blocking would have no age bound, so
+    # a ClickUp date-format drift would silently and permanently disable
+    # re-tag re-runs. Failing toward duplicate risk is bounded (the atomic
+    # DynamoDB layer still guards duplicates), and the shape drift is an
+    # integration break an operator must see — the line is alarm-matching.
     comments = processing_started_comments(None)
-    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
+    out = assert_alarm_log_emitted(capsys)
+    assert "date unparseable" in out
 
 
-def test_marker_with_unparseable_date_blocks():
+def test_marker_with_unparseable_date_does_not_block_and_alarms(capsys):
     comments = processing_started_comments("not-a-number")
-    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
+    out = assert_alarm_log_emitted(capsys)
+    assert "date unparseable" in out
 
 
 def test_window_is_configurable_via_env(monkeypatch):

@@ -198,9 +198,13 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
     #
     # RECENCY: a marker only blocks while younger than the dedup window (see
     # DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS for why). The real API's "date" is
-    # a STRING of epoch milliseconds; a missing/unparseable date is treated as
-    # recent (block) — conservative against retry storms. `now` is injectable
-    # so tests can pin exact boundaries.
+    # a STRING of epoch milliseconds; a missing/unparseable date does NOT
+    # block — blocking would have no age bound, so a ClickUp date-format
+    # drift would silently and permanently disable re-tag re-runs. Failing
+    # toward duplicate risk is bounded (the atomic DynamoDB layer still
+    # guards duplicates), and shape drift is an integration break an operator
+    # must see, so the line is deliberately alarm-matching ("ERROR").
+    # `now` is injectable so tests can pin exact boundaries.
     if now is None:
         now = time.time()
     window_seconds = get_dedup_window_seconds()
@@ -216,7 +220,8 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
         try:
             age_seconds = now - int(comment.get("date")) / 1000.0
         except (TypeError, ValueError):
-            return True
+            print("ERROR: ClickUp comment date unparseable — dedup window cannot be evaluated")
+            continue
         if age_seconds <= window_seconds:
             return True
     return False
