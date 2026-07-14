@@ -46,11 +46,24 @@ LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total
 # fallback (the initial prod state, until the self-invoke IAM lands) the
 # conditional PutItem runs while ClickUp is still waiting on the webhook
 # response, so botocore's defaults could blow the whole webhook timeout there
-# too. Tight timeouts, single attempt: a timeout surfaces as an exception in
-# try_acquire_dedup_lock / release_dedup_lock, where the existing fail-open
-# handling already covers it (proceed without atomic dedup, alarm-matching
-# log line).
-DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+# too. Tight timeouts, single attempt (total_max_attempts — see the
+# max_attempts trap on LAMBDA_CLIENT_CONFIG): a timeout surfaces as an
+# exception in try_acquire_dedup_lock / release_dedup_lock, where the
+# existing fail-open handling already covers it (proceed without atomic
+# dedup, alarm-matching log line).
+DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
+
+# RunTask budget: RunTask has NO idempotency token, so a botocore retry after
+# an ambiguous failure (read timeout with the request already accepted
+# server-side) can DOUBLE-LAUNCH Fargate inside one dedup claim — the exact
+# duplicate class the claim exists to prevent, invisible to both dedup
+# layers. botocore defaults (60s timeouts, ~5 legacy attempts) must never
+# apply here: zero SDK retries is the correct trade because a genuine launch
+# failure already fails loud (failure comment + documented re-tag retry
+# path). 30s read stays within the worker's 120s budget; connect gets 5s
+# because a connect-phase failure is unambiguous (nothing launched) yet still
+# must not eat the budget.
+ECS_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=30, retries={"total_max_attempts": 1})
 
 
 def get_lambda_client() -> Any:
@@ -63,7 +76,7 @@ def get_lambda_client() -> Any:
 def get_ecs_client() -> Any:
     global _ecs_client
     if _ecs_client is None:
-        _ecs_client = boto3.client("ecs")
+        _ecs_client = boto3.client("ecs", config=ECS_CLIENT_CONFIG)
     return _ecs_client
 
 
@@ -609,6 +622,16 @@ def release_dedup_lock(task_id: str, label: str) -> None:
     # so the claim must not either, or the user's immediate retry would be
     # silently suppressed for the whole TTL. (A SUCCESSFUL launch keeps its
     # claim; DynamoDB TTL expires it.)
+    #
+    # ACCEPTED RACE (delayed-put): a client-side PutItem timeout in
+    # try_acquire_dedup_lock does NOT cancel the server-side write — DynamoDB
+    # can commit it after this DeleteItem runs, stranding a claim that
+    # suppresses re-tags with no launch behind it. Bounded: the claim's
+    # expires_at plus the "OR #exp < :now" reclaim arm caps the damage at the
+    # TTL window (15 min default). Fencing (conditional delete on an
+    # ownership token) would close it entirely but is deliberately not
+    # implemented — the operator runbook (README, "Stranded dedup claims")
+    # plus the TTL bound is the accepted trade.
     table_name = os.environ.get("DEDUP_TABLE_NAME")
     if not table_name:
         return
