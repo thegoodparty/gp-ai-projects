@@ -74,14 +74,14 @@ module "clickup_bot" {
 
   environment = "prod"
 
-  enable_fargate_trigger       = var.enable_fargate_trigger
-  ecs_cluster_arn              = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.cluster_arn : ""
-  ecs_task_definition_arn      = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_definition_arn : ""
-  ecs_task_definition_family   = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_definition_family : ""
-  ecs_subnet_ids               = var.private_subnet_ids
-  ecs_security_group_id        = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.security_group_id : ""
-  ecs_task_execution_role_arn  = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_execution_role_arn : ""
-  ecs_task_role_arn            = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_role_arn : ""
+  enable_fargate_trigger      = var.enable_fargate_trigger
+  ecs_cluster_arn             = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.cluster_arn : ""
+  ecs_task_definition_arn     = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_definition_arn : ""
+  ecs_task_definition_family  = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_definition_family : ""
+  ecs_subnet_ids              = var.private_subnet_ids
+  ecs_security_group_id       = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.security_group_id : ""
+  ecs_task_execution_role_arn = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_execution_role_arn : ""
+  ecs_task_role_arn           = var.enable_fargate_trigger ? data.terraform_remote_state.engineer_agent_fargate[0].outputs.task_role_arn : ""
 
   shared_slack_notifier_lambda_arn = data.terraform_remote_state.shared_slack_notifier.outputs.lambda_function_arn
 }
