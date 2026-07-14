@@ -166,6 +166,87 @@ resource "aws_iam_role_policy" "clickup_bot_ecs" {
   })
 }
 
+# Atomic dedup claims (2026-07-14 incident). Comment-based dedup reads through
+# ClickUp's slow, eventually-consistent API, so concurrent worker invocations
+# can all pass it before any ack comment is visible — one retried webhook
+# delivery launched six Fargate agents. The handler's authoritative dedup is a
+# conditional PutItem into this table keyed "{task_id}#{label}"; DynamoDB
+# serializes conditional writes, so exactly one invocation wins the claim.
+# expires_at (epoch seconds, written by the handler) lets DynamoDB TTL garbage-
+# collect old claims; the handler additionally treats an expired-but-not-yet-
+# deleted claim as free, because TTL deletion can lag hours. PAY_PER_REQUEST:
+# traffic is a handful of writes per gpbot tag event — provisioning capacity
+# would cost more than the requests.
+resource "aws_dynamodb_table" "dedup" {
+  name         = "clickup-bot-dedup-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = {
+    Environment = var.environment
+    Service     = "clickup-bot"
+  }
+}
+
+# PutItem acquires a claim, DeleteItem releases it after a failed launch (so
+# the remove-and-re-add-the-tag retry contract survives launch failures).
+# Nothing else: the handler never reads the table, so no GetItem/Query.
+resource "aws_iam_role_policy" "clickup_bot_dedup" {
+  name = "dedup-table-access"
+  role = aws_iam_role.clickup_bot.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem"
+        ]
+        Resource = aws_dynamodb_table.dedup.arn
+      }
+    ]
+  })
+}
+
+# Self-invoke permission for the fast-ack flow: the webhook invocation answers
+# ClickUp in milliseconds and re-invokes this same function asynchronously to
+# do the ClickUp/ECS work off the critical path (ClickUp's webhook response
+# timeout is what turned one slow delivery into six retries on 2026-07-14).
+# Until this policy is applied, the handler quietly falls back to the old
+# synchronous flow — applying this grant is what activates fast-ack.
+# The ARN is CONSTRUCTED from the data sources rather than referencing
+# aws_lambda_function.clickup_bot.arn: the function depends on the role, so a
+# role policy referencing the function would be a dependency cycle.
+resource "aws_iam_role_policy" "clickup_bot_self_invoke" {
+  name = "self-invoke"
+  role = aws_iam_role.clickup_bot.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:clickup-bot-${var.environment}"
+      }
+    ]
+  })
+}
+
 # Seeds the function code at creation time ONLY. After creation, code deploys
 # exclusively via .github/workflows/deploy-clickup-bot.yml (aws lambda
 # update-function-code); the lifecycle block below stops terraform from
@@ -197,6 +278,11 @@ resource "aws_lambda_function" "clickup_bot" {
     variables = merge(
       {
         ENVIRONMENT = var.environment
+        # Always present (not fargate-gated): the handler treats an unset
+        # DEDUP_TABLE_NAME as "comment-based dedup only", so this var going
+        # missing would silently disable atomic dedup — the same failure shape
+        # as the 2026-06-26 tfvars incident. Keep it in the unconditional map.
+        DEDUP_TABLE_NAME = aws_dynamodb_table.dedup.name
       },
       var.enable_fargate_trigger ? {
         # Transition compatibility — do NOT remove until the fail-loud handler
@@ -222,6 +308,17 @@ resource "aws_lambda_function" "clickup_bot" {
     Environment = var.environment
     Service     = "clickup-bot"
   }
+}
+
+# Defense in depth for the fast-ack worker: Lambda retries a FAILED async
+# ("Event") invocation twice by default, and a retried worker would re-run
+# dedup+trigger — recreating exactly the duplicate-launch bug this design
+# fixes if the first attempt crashed after acquiring nothing. The handler
+# already never lets an exception escape the worker path by design; this
+# pins the platform side to zero retries in case that invariant ever slips.
+resource "aws_lambda_function_event_invoke_config" "clickup_bot" {
+  function_name          = aws_lambda_function.clickup_bot.function_name
+  maximum_retry_attempts = 0
 }
 
 # Fail-loud is only loud if someone hears it. The handler's failures are
