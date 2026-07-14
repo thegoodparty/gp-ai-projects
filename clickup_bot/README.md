@@ -7,7 +7,9 @@ Webhook handler that triggers engineer_agent based on ClickUp task tags.
 ```
 ClickUp (tag added)
     ↓ webhook POST
-ALB → Lambda (validate, check comments, trigger)
+ALB → Lambda (verify signature, validate task_id/tag, fast-ack 200)
+    ↓ lambda:InvokeFunction (async self-invoke; falls back to inline until IAM lands)
+Lambda worker invocation (dedup check, trigger, ack comment)
     ↓ ecs:runTask (CLICKUP_TASK_ID, INSTRUCTION, AGENT_MODEL overrides)
 Fargate (engineer_agent)
     ↓ based on the instruction
@@ -25,17 +27,33 @@ ClickUp comment OR GitHub PR
 
 1. User adds tag to a ClickUp task (e.g., `gpbot-analyze`)
 2. ClickUp sends `taskTagUpdated` webhook to Lambda
-3. Lambda checks:
-   - Is this a configured tag? → Look up in `TAG_CONFIG`
-   - Does the task already have a `[GP-Bot] Processing started` comment? → Skip.
-     Only that success marker counts as processed; `[GP-Bot] Failed to start
-     processing` comments never block a retry.
-4. Lambda triggers Fargate, passing `CLICKUP_TASK_ID`, `INSTRUCTION`, and
-   `AGENT_MODEL` as container-override env vars (the instruction encodes the
-   analyze-vs-implement contract; there is no `OUTPUT_ACTION`)
-5. Lambda posts the `[GP-Bot] Processing started (...)` comment, only after the
-   Fargate task actually launched
-6. engineer_agent executes based on action type
+3. Webhook invocation (ClickUp's critical path — must answer in well under
+   ClickUp's webhook response timeout):
+   - Verify the signature, validate `task_id`, resolve the tag in `TAG_CONFIG`
+   - Self-invoke the same Lambda asynchronously with
+     `{"gpbot_async": true, "task_id": ..., "matched_tag": ...}` and return
+     `200 {"status": "accepted"}` immediately — zero ClickUp API calls in-path
+   - If the self-invoke is unavailable (missing IAM — the initial state until
+     the follow-up terraform lands — or any invoke error), fall back to running
+     the worker steps inline, exactly the pre-fast-ack behavior
+4. Worker invocation (async self-invoke; internal payloads are recognized only
+   by a top-level `gpbot_async` key with no ALB envelope keys, which an
+   internet request cannot produce — an ALB-wrapped body stays a string inside
+   `event["body"]`):
+   - Dedup check: does the task already have a **recent** `[GP-Bot] Processing
+     started` comment? → Skip. See "Dedup semantics" below.
+   - Triggers Fargate, passing `CLICKUP_TASK_ID`, `INSTRUCTION`, and
+     `AGENT_MODEL` as container-override env vars (the instruction encodes the
+     analyze-vs-implement contract; there is no `OUTPUT_ACTION`)
+   - Posts the `[GP-Bot] Processing started (...)` comment, only after the
+     Fargate task actually launched (retried once on failure — this comment is
+     the dedup marker, and it no longer sits on ClickUp's timeout budget)
+   - Never lets an exception escape: an unhandled exception in an async
+     invocation makes Lambda auto-retry it, which would duplicate the launch.
+     Failures log an alarm-matching `ERROR: Async processing failed` line (the
+     only fail-loud channel — no caller receives an HTTP error) and attempt a
+     failure comment.
+5. engineer_agent executes based on action type
 
 There is no feature flag and no logging-only mode. A matched tag always attempts the
 Fargate trigger. If the trigger fails for any reason (missing `ECS_*` env vars, IAM
@@ -44,6 +62,40 @@ on the task and returns HTTP 500.
 
 To retry after a failure (e.g. once the config is fixed): remove and re-add the tag.
 Failure comments do not mark the task as processed, so the retry re-triggers.
+
+## Dedup semantics
+
+Only the `[GP-Bot] Processing started` success marker counts as processed, and only
+while it is recent: within `DEDUP_COMMENT_WINDOW_SECONDS` (default 900) of the
+comment's `date`. The marker exists to absorb webhook retry storms and double-tags,
+which play out over seconds to minutes. A human re-tagging a task hours later is a
+deliberate re-run and must not be silently ignored — dedup had never actually fired
+before the 2026-07-14 fix (see below), so "re-tag always re-runs" is the behavior
+users already know; an unbounded marker would have silently changed it. Markers with
+a missing or unparseable `date` are treated as recent (block), which is the
+conservative direction during a retry storm. `[GP-Bot] Failed to start processing`
+comments never block a retry, regardless of age.
+
+Comment-based dedup is best-effort: two deliveries processed close enough together
+both see "no marker yet" and both launch (the check and the comment post are not
+atomic). The follow-up (PR2) adds a DynamoDB conditional-write claim per
+`(task_id, tag)` so exactly one worker wins even under concurrent deliveries.
+
+### 2026-07-14 incident
+
+ClickUp delivered ONE `taskTagUpdated` event (gpbot-analyze) six times — the
+original plus five timeout retries — and all six launched a Fargate opus agent.
+Two bugs compounded. First, every invocation ran 7.6–20.5s of serial synchronous
+ClickUp API calls in the webhook path during a ClickUp slowdown, exceeding
+ClickUp's webhook response timeout, so ClickUp kept retrying (and counted every
+timeout toward the ~100 consecutive failures after which it auto-disables the
+webhook — slow responses are an outage risk, not just a duplication risk; the
+fast-ack flow above is the fix). Second, the dedup matcher required a
+`"type": "text"` key on comment items that the real
+`GET /task/{id}/comment` response does not have — verified live, it matched 0 of
+13 real comments, including six of the bot's own ack comments — so dedup had
+never fired since the feature shipped. The old test fixture had invented the
+`type` field (oracle problem); fixtures now use the live-captured shape.
 
 ## Monitoring
 
@@ -55,9 +107,14 @@ covers the `ERROR` / `Failed to` log lines — not literally every failure path.
 operationally significant failures each emit one and alarm within ~5 minutes: the
 fail-loud 500s (missing `ECS_*` config, `ecs:RunTask` failure, comment-fetch failure,
 secrets outage), the failure-comment and ack-comment posts the handler deliberately
-swallows (ClickUp API down or a rotated `CLICKUP_API_KEY`), and signature-verification
+swallows (ClickUp API down or a rotated `CLICKUP_API_KEY`), signature-verification
 401s on gpbot-tagged deliveries (rotated or mismatched `CLICKUP_WEBHOOK_SECRET`), which
-would otherwise silently end in ClickUp suspending the webhook. The deliberately quiet
+would otherwise silently end in ClickUp suspending the webhook, and any failure inside
+the async worker invocation (`ERROR: Async processing failed`), whose caller is Lambda's
+async plumbing rather than ClickUp, so the alarm is its only fail-loud channel. The
+expected fast-ack fallback while self-invoke IAM is absent logs a deliberately quiet
+`Async self-invoke unavailable, processing synchronously` line and does NOT alarm.
+The deliberately quiet
 400s do NOT alarm: a missing `task_id`, malformed JSON, and non-object JSON all log
 without `ERROR` / `Failed to` on purpose, so a client cannot fire the alarm through the
 public endpoint by echoing those terms in a request.
@@ -103,6 +160,7 @@ Set by terraform (`infrastructure/environments/prod/clickup-bot/`), not by hand.
 | `ECS_SUBNET_IDS` | Comma-separated private subnet IDs for the task |
 | `ECS_SECURITY_GROUP_ID` | Security group for the task |
 | `ENVIRONMENT` | Selects the `AI_SECRETS_<ENV>` secret that provides `CLICKUP_API_KEY` and `CLICKUP_WEBHOOK_SECRET` |
+| `DEDUP_COMMENT_WINDOW_SECONDS` | Optional (default 900): how long a `Processing started` comment blocks re-triggering — see "Dedup semantics" |
 | `ENABLE_FARGATE` | Transition compatibility only: the current handler ignores it, but the previous handler silently no-ops without it. Remove from the module only after the fail-loud handler is confirmed live. |
 
 ## Adding New Tags
