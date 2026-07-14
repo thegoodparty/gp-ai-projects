@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 
 import handler
 import pytest
+from botocore.exceptions import ClientError
 
 TEST_SECRET = "test-secret"
 TEST_API_KEY = "test-key"
@@ -126,6 +127,33 @@ class FakeLambdaClient:
         return [json.loads(call["Payload"]) for call in self.invoke_calls]
 
 
+class FakeDynamoDBClient:
+    """Fake for the atomic-dedup DynamoDB client. Records every call.
+
+    put_item_exception / delete_item_exception raise on the corresponding call
+    (set put_item_exception to conditional_check_failed() to simulate a lost
+    claim race).
+    """
+
+    def __init__(self):
+        self.put_item_calls = []
+        self.delete_item_calls = []
+        self.put_item_exception = None
+        self.delete_item_exception = None
+
+    def put_item(self, **kwargs):
+        self.put_item_calls.append(kwargs)
+        if self.put_item_exception is not None:
+            raise self.put_item_exception
+        return {}
+
+    def delete_item(self, **kwargs):
+        self.delete_item_calls.append(kwargs)
+        if self.delete_item_exception is not None:
+            raise self.delete_item_exception
+        return {}
+
+
 class FakeBoto3ClientFactory:
     """Stands in for boto3.client; routes each service to its fake.
 
@@ -133,9 +161,15 @@ class FakeBoto3ClientFactory:
     Config the handler constructs clients with.
     """
 
-    def __init__(self, ecs_client: FakeECSClient, lambda_client: FakeLambdaClient | None = None):
+    def __init__(
+        self,
+        ecs_client: FakeECSClient,
+        lambda_client: FakeLambdaClient | None = None,
+        dynamodb_client: FakeDynamoDBClient | None = None,
+    ):
         self.ecs_client = ecs_client
         self.lambda_client = lambda_client if lambda_client is not None else FakeLambdaClient()
+        self.dynamodb_client = dynamodb_client if dynamodb_client is not None else FakeDynamoDBClient()
         self.requested_services = []
         self.client_calls = []
 
@@ -144,6 +178,8 @@ class FakeBoto3ClientFactory:
         self.client_calls.append((service_name, kwargs))
         if service_name == "lambda":
             return self.lambda_client
+        if service_name == "dynamodb":
+            return self.dynamodb_client
         return self.ecs_client
 
 
@@ -181,8 +217,13 @@ def fake_lambda():
 
 
 @pytest.fixture(autouse=True)
-def boto3_factory(monkeypatch, fake_lambda):
-    factory = FakeBoto3ClientFactory(FakeECSClient(), fake_lambda)
+def fake_dynamodb():
+    return FakeDynamoDBClient()
+
+
+@pytest.fixture(autouse=True)
+def boto3_factory(monkeypatch, fake_lambda, fake_dynamodb):
+    factory = FakeBoto3ClientFactory(FakeECSClient(), fake_lambda, fake_dynamodb)
     monkeypatch.setattr(handler.boto3, "client", factory)
     return factory
 
@@ -211,11 +252,23 @@ def clean_self_invoke_env(monkeypatch):
     # the fast-ack and synchronous paths. Default: sync fallback.
     monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
     monkeypatch.delenv("DEDUP_COMMENT_WINDOW_SECONDS", raising=False)
-    # DEDUP_TABLE_NAME is the branch-point predicate for the async
-    # comment-fetch failure handling (is_atomic_dedup_configured); a value
-    # set in a developer shell must not flip the suite onto the
-    # atomic-backstop arm.
+
+
+@pytest.fixture(autouse=True)
+def clean_dedup_table_env(monkeypatch):
+    # Default state is the pre-terraform prod state: no dedup table configured,
+    # comment-based dedup only. A DEDUP_TABLE_NAME set in a developer shell must
+    # not silently flip the whole suite onto the atomic-dedup path — it gates
+    # both the lock functions and the is_atomic_dedup_configured branch point
+    # in the async comment-fetch failure handling.
     monkeypatch.delenv("DEDUP_TABLE_NAME", raising=False)
+    monkeypatch.delenv("DEDUP_TTL_SECONDS", raising=False)
+
+
+@pytest.fixture
+def dedup_table_env(monkeypatch):
+    monkeypatch.setenv("DEDUP_TABLE_NAME", "clickup-bot-dedup-test")
+    return "clickup-bot-dedup-test"
 
 
 @pytest.fixture
@@ -1853,3 +1906,243 @@ def test_ecs_failure_reasons_not_leaked_into_comment_or_response(fake_clickup, f
     assert len(failure_comments) == 1
     assert marker not in failure_comments[0]
     assert marker in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 24. Atomic dedup lock (DynamoDB conditional write). Comment-based dedup is
+# best-effort: it reads through ClickUp's slow, eventually-consistent API, and
+# concurrent worker invocations can ALL pass the comment check before any ack
+# comment is visible — exactly how one retried delivery launched 6 Fargate
+# agents on 2026-07-14. The authoritative dedup is an atomic conditional
+# PutItem claim on (task_id, label) that does not depend on ClickUp at all:
+# exactly one worker wins.
+# Prod-state contract: DEDUP_TABLE_NAME is unset between the code deploy and
+# the terraform apply that creates the table, so the unconfigured state must be
+# a quiet no-op — every test outside this section runs in that state.
+# ---------------------------------------------------------------------------
+
+
+def conditional_check_failed() -> ClientError:
+    # Built the way boto3 raises it: a botocore ClientError whose Error.Code is
+    # "ConditionalCheckFailedException". The handler must match on that code,
+    # never on the exception class name.
+    return ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "The conditional request failed"}},
+        "PutItem",
+    )
+
+
+def test_lock_acquired_writes_claim_item_and_launches(fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env):
+    before = int(time.time())
+    resp = handler.handler(make_event(tag_updated_body()), None)
+    after = int(time.time())
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+
+    # Exactly one conditional claim write, keyed on task#label, refusing to
+    # overwrite a live (unexpired) claim.
+    assert len(fake_dynamodb.put_item_calls) == 1
+    call = fake_dynamodb.put_item_calls[0]
+    assert call["TableName"] == dedup_table_env
+    assert call["ConditionExpression"] == "attribute_not_exists(pk) OR #exp < :now"
+    assert call["ExpressionAttributeNames"] == {"#exp": "expires_at"}
+    item = call["Item"]
+    assert item["pk"] == {"S": "abc123#analyze"}
+    assert item["task_id"] == {"S": "abc123"}
+    assert item["label"] == {"S": "analyze"}
+    # DynamoDB TTL requires epoch SECONDS as a Number attribute.
+    expires_at = int(item["expires_at"]["N"])
+    assert before + 900 <= expires_at <= after + 900
+
+    # A successful launch KEEPS the claim (DynamoDB TTL expires it); deleting
+    # it here would reopen the retry-storm window immediately.
+    assert fake_dynamodb.delete_item_calls == []
+
+
+def test_lock_ttl_configurable_via_env(fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, monkeypatch):
+    monkeypatch.setenv("DEDUP_TTL_SECONDS", "60")
+    before = int(time.time())
+    resp = handler.handler(make_event(tag_updated_body()), None)
+    after = int(time.time())
+
+    assert resp["statusCode"] == 200
+    expires_at = int(fake_dynamodb.put_item_calls[0]["Item"]["expires_at"]["N"])
+    assert before + 60 <= expires_at <= after + 60
+
+
+def test_invalid_lock_ttl_falls_back_to_default_quietly(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, monkeypatch, capsys
+):
+    # Same contract as DEDUP_COMMENT_WINDOW_SECONDS: a typo'd env var must not
+    # crash in-path and must not fire the alarm on every trigger — quiet
+    # fallback to the 900s default.
+    monkeypatch.setenv("DEDUP_TTL_SECONDS", "not-a-number")
+    before = int(time.time())
+    resp = handler.handler(make_event(tag_updated_body()), None)
+    after = int(time.time())
+
+    assert resp["statusCode"] == 200
+    expires_at = int(fake_dynamodb.put_item_calls[0]["Item"]["expires_at"]["N"])
+    assert before + 900 <= expires_at <= after + 900
+    assert_no_alarm_log_emitted(capsys)
+
+
+def test_duplicate_claim_suppresses_launch_quietly_sync_path(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
+):
+    # A lost claim race is the dedup WORKING, not a failure: quiet log, no
+    # launch, no ack comment (the winner posts its own), 200 skipped so
+    # ClickUp does not re-deliver.
+    fake_dynamodb.put_item_exception = conditional_check_failed()
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "duplicate suppressed"}
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+    assert fake_dynamodb.delete_item_calls == []
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "suppressed by dedup table" in out
+
+
+def test_duplicate_claim_suppresses_launch_async_worker(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
+):
+    # Same suppression through the async worker path — the concurrent-delivery
+    # case the lock exists for (both workers pass the comment check; only one
+    # wins the conditional write).
+    fake_dynamodb.put_item_exception = conditional_check_failed()
+    event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "gpbot-analyze"}
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "duplicate suppressed"}
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+    assert_no_alarm_log_emitted(capsys)
+
+
+@pytest.mark.parametrize(
+    "dynamo_error",
+    [
+        ClientError({"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow"}}, "PutItem"),
+        RuntimeError("socket timeout talking to dynamodb"),
+    ],
+    ids=["client-error-other-code", "non-client-error"],
+)
+def test_dynamo_outage_fails_open_and_alarms(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys, dynamo_error
+):
+    # FAIL-OPEN: a broken dedup table must not take the bot down — the launch
+    # still happens — but this is real infrastructure breakage an operator
+    # must see, so the log line is deliberately alarm-matching.
+    fake_dynamodb.put_item_exception = dynamo_error
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    out = assert_alarm_log_emitted(capsys)
+    assert "dedup table unavailable" in out
+
+
+def test_unconfigured_table_skips_dynamo_entirely(
+    fake_clickup, fake_ecs, fake_dynamodb, boto3_factory, ecs_env, capsys
+):
+    # clean_dedup_table_env (autouse) removed DEDUP_TABLE_NAME: the initial
+    # prod state between the code deploy and the terraform apply. Everything
+    # must work exactly as before — no dynamodb client, no calls, quiet log.
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    assert "dynamodb" not in boto3_factory.requested_services
+    assert fake_dynamodb.put_item_calls == []
+    assert fake_dynamodb.delete_item_calls == []
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "Dedup table not configured" in out
+
+
+def test_recent_comment_marker_skips_before_any_lock_attempt(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env
+):
+    # Layer order is a contract: the cheap comment check runs FIRST, and a
+    # recent marker must short-circuit without ever writing a claim — a
+    # comment-deduped skip that also burned a lock would block a legitimate
+    # re-trigger for the whole TTL after the marker expires.
+    fake_clickup.comments_response = existing_gpbot_comment_response()
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "already processed"}
+    assert fake_dynamodb.put_item_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 24b. Claim release on launch failure. The documented retry contract is
+# "remove and re-add the tag to retry" — failure comments never block it, so
+# a failed launch's claim must not either, or the user's retry would be
+# silently suppressed until the TTL expires.
+# ---------------------------------------------------------------------------
+
+
+def assert_claim_released(fake_dynamodb: FakeDynamoDBClient, table_name: str, pk: str = "abc123#analyze"):
+    assert len(fake_dynamodb.delete_item_calls) == 1
+    call = fake_dynamodb.delete_item_calls[0]
+    assert call["TableName"] == table_name
+    assert call["Key"] == {"pk": {"S": pk}}
+
+
+def test_launch_exception_releases_claim(fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys):
+    fake_ecs.exception = RuntimeError("ECS exploded")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 500
+    assert len(fake_dynamodb.put_item_calls) == 1
+    assert_claim_released(fake_dynamodb, dedup_table_env)
+    assert_alarm_log_emitted(capsys)
+
+
+def test_launch_failures_response_releases_claim(fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env):
+    fake_ecs.response = {"tasks": [], "failures": [{"reason": "RESOURCE:MEMORY"}]}
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 500
+    assert_claim_released(fake_dynamodb, dedup_table_env)
+
+
+def test_missing_ecs_config_releases_claim(fake_clickup, fake_ecs, fake_dynamodb, dedup_table_env):
+    # No ecs_env fixture: trigger_fargate_task 500s before run_task. The claim
+    # must still be released so the retry after ops fixes the config works.
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 500
+    assert fake_ecs.run_task_calls == []
+    assert_claim_released(fake_dynamodb, dedup_table_env)
+
+
+def test_release_failure_alarms_but_does_not_change_response(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
+):
+    # A failed DeleteItem leaves a stuck claim that suppresses the user's
+    # retry until the TTL expires — alarm-worthy — but it must not change
+    # control flow: the launch-failure 500 and its failure comment stand.
+    fake_ecs.exception = RuntimeError("ECS exploded")
+    fake_dynamodb.delete_item_exception = RuntimeError("dynamodb down")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 500
+    assert any("Failed to start processing" in text for text in fake_clickup.posted_comment_texts)
+    out = assert_alarm_log_emitted(capsys)
+    assert "Failed to release dedup lock" in out
