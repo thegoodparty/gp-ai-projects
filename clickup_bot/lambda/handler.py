@@ -146,11 +146,21 @@ def has_processing_started_comment(comments: list[dict]) -> bool:
     # Only the success marker counts as 'already processed'. Failure comments
     # ('[GP-Bot] Failed to start processing: ...') must NOT block a retry:
     # removing and re-adding the tag after a failure has to re-trigger.
+    #
+    # SHAPE CONTRACT (2026-07-14 incident): the real GET /task/{id}/comment
+    # response carries the full text in a top-level "comment_text" field, and
+    # its comment[] items have NO "type" key. The previous matcher required
+    # item["type"] == "text", so it matched 0 real comments — including the
+    # bot's own ack comments — and dedup never fired once in prod: one webhook
+    # delivery retried 6x launched 6 Fargate agents. Prefer comment_text; fall
+    # back to concatenating item["text"] WITHOUT filtering on "type" (tolerate
+    # its presence for forward-compat if ClickUp ever ships one).
     for comment in comments:
-        comment_text = ""
-        for item in comment.get("comment", []):
-            if item.get("type") == "text":
-                comment_text += item.get("text", "")
+        comment_text = comment.get("comment_text")
+        if comment_text is None:
+            comment_text = "".join(
+                item.get("text", "") for item in comment.get("comment", []) if isinstance(item, dict)
+            )
         if comment_text.startswith(PROCESSING_STARTED_PREFIX):
             return True
     return False

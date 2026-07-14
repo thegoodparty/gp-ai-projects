@@ -7,6 +7,7 @@ reads the source). Each test encodes one numbered behavior from the spec.
 import hashlib
 import hmac
 import json
+import time
 from urllib.error import HTTPError, URLError
 
 import handler
@@ -197,8 +198,36 @@ def engineer_agent_env(run_task_kwargs: dict) -> dict:
     return {entry["name"]: entry["value"] for entry in matches[0]["environment"]}
 
 
-def existing_gpbot_comment_response() -> dict:
-    return {"comments": [{"comment": [{"type": "text", "text": "[GP-Bot] Processing started: analyze"}]}]}
+def existing_gpbot_comment_response(
+    age_seconds: float = 30.0,
+    include_comment_text: bool = True,
+    with_type_key: bool = False,
+) -> dict:
+    """REAL ClickUp GET /task/{id}/comment shape, captured live during the
+    2026-07-14 duplicate-launch incident (task DATA-2108): comment[] items have
+    NO "type" key, and "date" is a STRING of epoch milliseconds. The previous
+    fixture invented a "type": "text" field the real API never sends, so the
+    dedup matcher passed its test while matching 0 real comments in prod
+    (oracle problem). Never add fields here that a live capture doesn't show.
+
+    with_type_key adds the (fabricated) "type" key back to prove forward-compat
+    if ClickUp ever ships one; include_comment_text=False exercises the
+    item-concatenation fallback path.
+    """
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    item: dict = {"text": text}
+    if with_type_key:
+        item["type"] = "text"
+    comment: dict = {
+        "id": "90130291038679",
+        "comment": [item],
+        "user": {"id": 105985359, "username": "Collin Park"},
+        "date": str(int((time.time() - age_seconds) * 1000)),
+        "reply_count": 0,
+    }
+    if include_comment_text:
+        comment["comment_text"] = text
+    return {"comments": [comment]}
 
 
 def assert_no_side_effects(fake_clickup: FakeUrlopen, fake_ecs: FakeECSClient):
@@ -461,7 +490,38 @@ def test_gpbot_work_launches_with_implement_comment(fake_clickup, fake_ecs, ecs_
 
 
 def test_existing_gpbot_comment_skips_processing(fake_clickup, fake_ecs, ecs_env):
+    # Fixture is the REAL API shape (no "type" key on comment items). During the
+    # 2026-07-14 incident the matcher required item["type"] == "text" and so
+    # matched 0 of 13 real comments — including 6 of the bot's own ack comments —
+    # letting one retried webhook delivery launch 6 Fargate agents.
     fake_clickup.comments_response = existing_gpbot_comment_response()
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+
+
+def test_dedup_matches_via_item_concatenation_when_comment_text_absent(fake_clickup, fake_ecs, ecs_env):
+    # Defensive fallback: if ClickUp ever omits the top-level comment_text, the
+    # matcher must derive the text by concatenating item["text"] WITHOUT
+    # filtering on a "type" key the real API does not send.
+    fake_clickup.comments_response = existing_gpbot_comment_response(include_comment_text=False)
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+
+
+def test_dedup_tolerates_type_keyed_items_forward_compat(fake_clickup, fake_ecs, ecs_env):
+    # Forward-compat: if ClickUp ever ADDS a "type" key to comment items, its
+    # presence must not break the matcher either.
+    fake_clickup.comments_response = existing_gpbot_comment_response(include_comment_text=False, with_type_key=True)
     event = make_event(tag_updated_body())
 
     resp = handler.handler(event, None)
@@ -595,7 +655,20 @@ def test_tag_removed_before_tag_added_still_triggers(fake_clickup, fake_ecs, ecs
 
 
 def failure_comment_response(reason: str = "ECS configuration is missing or incomplete") -> dict:
-    return {"comments": [{"comment": [{"type": "text", "text": f"[GP-Bot] Failed to start processing: {reason}"}]}]}
+    # Real API shape: no "type" key on items, comment_text present, string epoch-ms date.
+    text = f"[GP-Bot] Failed to start processing: {reason}"
+    return {
+        "comments": [
+            {
+                "id": "90130291038680",
+                "comment": [{"text": text}],
+                "comment_text": text,
+                "user": {"id": 105985359, "username": "Collin Park"},
+                "date": str(int((time.time() - 30) * 1000)),
+                "reply_count": 0,
+            }
+        ]
+    }
 
 
 def test_prior_failure_comment_does_not_block_retry(fake_clickup, fake_ecs, ecs_env):
@@ -626,7 +699,18 @@ def test_retry_after_config_fixed_processes_task(fake_clickup, fake_ecs, monkeyp
     # re-adds the tag. The retry must process, not skip as 'already processed'.
     for key, value in ECS_ENV.items():
         monkeypatch.setenv(key, value)
-    fake_clickup.comments_response = {"comments": [{"comment": [{"type": "text", "text": failure_texts[0]}]}]}
+    fake_clickup.comments_response = {
+        "comments": [
+            {
+                "id": "90130291038681",
+                "comment": [{"text": failure_texts[0]}],
+                "comment_text": failure_texts[0],
+                "user": {"id": 105985359, "username": "Collin Park"},
+                "date": str(int((time.time() - 30) * 1000)),
+                "reply_count": 0,
+            }
+        ]
+    }
 
     resp = handler.handler(event, None)
 
