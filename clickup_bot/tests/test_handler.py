@@ -609,6 +609,30 @@ def test_dedup_tolerates_type_keyed_items_forward_compat(fake_clickup, fake_ecs,
     assert fake_clickup.posted_comments == []
 
 
+def test_null_text_item_neither_crashes_dedup_nor_hides_the_marker():
+    # ClickUp can ship "text": null on a comment item (JSON null survives
+    # item.get("text", "") — the default only covers a MISSING key). The
+    # fallback's "".join() then raised TypeError, crashing the whole dedup
+    # check mid-webhook. A null item must contribute "" — NOT the string
+    # "None" (str-wrapping alone would prepend "None" to the concatenation
+    # and silently break the marker prefix match, which this test would
+    # catch as a False). So this single assertion pins both contracts:
+    # no crash, and null items are invisible to the matcher.
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment": [
+                {"text": None},
+                {"text": "[GP-Bot] Processing started (analyze, model: opus)..."},
+            ],
+            "user": {"id": 105985359, "username": "Collin Park"},
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
 def test_recent_analyze_marker_does_not_block_gpbot_work(fake_clickup, fake_ecs, ecs_env):
     # LABEL SCOPE: dedup is per (task, label), mirroring the atomic layer's
     # {task_id}#{label} key. A fresh gpbot-analyze ack marker must NOT

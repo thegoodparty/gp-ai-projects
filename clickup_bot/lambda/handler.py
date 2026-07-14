@@ -252,8 +252,20 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
     for comment in comments:
         comment_text = comment.get("comment_text")
         if comment_text is None:
+            # NULL SAFETY: ClickUp can ship "text": null on a comment item, and
+            # item.get("text", "") returns that None — the default only covers
+            # a MISSING key — so a single null item made "".join() raise
+            # TypeError, crashing the whole dedup check mid-webhook. A null
+            # (or any non-string) value must contribute "" rather than its
+            # str() form: stringifying null to "None" would prepend garbage to
+            # the concatenation and silently break the marker prefix match.
+            # (shared/clickup_client.py's get_text() has the same fallback but
+            # str-wraps null to "None" — these should converge on this
+            # None-to-"" behavior.)
             comment_text = "".join(
-                item.get("text", "") for item in comment.get("comment", []) if isinstance(item, dict)
+                "" if item.get("text") is None else str(item.get("text"))
+                for item in comment.get("comment", [])
+                if isinstance(item, dict)
             )
         if not comment_text.startswith(label_scoped_prefix):
             continue
