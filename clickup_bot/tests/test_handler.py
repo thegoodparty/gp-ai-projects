@@ -1956,6 +1956,14 @@ def test_lock_acquired_writes_claim_item_and_launches(fake_clickup, fake_ecs, fa
     expires_at = int(item["expires_at"]["N"])
     assert before + 900 <= expires_at <= after + 900
 
+    # UNITS CONTRACT for the reclaim arm ('#exp < :now'): :now must be epoch
+    # SECONDS — the same units as expires_at above. If :now were ever written
+    # in milliseconds, every live claim would compare as expired and the
+    # dedup lock would silently never hold.
+    now_value = call["ExpressionAttributeValues"][":now"]
+    assert set(now_value.keys()) == {"N"}
+    assert before <= int(now_value["N"]) <= after
+
     # A successful launch KEEPS the claim (DynamoDB TTL expires it); deleting
     # it here would reopen the retry-storm window immediately.
     assert fake_dynamodb.delete_item_calls == []
@@ -2002,6 +2010,65 @@ def test_non_finite_or_non_positive_ttl_falls_back_to_default_quietly(monkeypatc
 
     out = assert_no_alarm_log_emitted(capsys)
     assert "Invalid DEDUP_TTL_SECONDS" in out
+
+
+class ConditionEvaluatingFakeDynamoDB(FakeDynamoDBClient):
+    """Fake that EVALUATES the claim condition against a stored item the way
+    DynamoDB would, instead of blindly succeeding. Locks in the reclaim arm
+    ('attribute_not_exists(pk) OR #exp < :now') behaviorally: both sides must
+    be epoch-second numbers or the comparison is meaningless.
+    """
+
+    def __init__(self, stored_item: dict | None = None):
+        super().__init__()
+        self.stored_item = stored_item
+
+    def put_item(self, **kwargs):
+        self.put_item_calls.append(kwargs)
+        assert kwargs["ConditionExpression"] == "attribute_not_exists(pk) OR #exp < :now"
+        if self.stored_item is not None:
+            exp_attribute = kwargs["ExpressionAttributeNames"]["#exp"]
+            stored_expires_at = int(self.stored_item[exp_attribute]["N"])
+            now = int(kwargs["ExpressionAttributeValues"][":now"]["N"])
+            if not stored_expires_at < now:
+                raise conditional_check_failed()
+        self.stored_item = kwargs["Item"]
+        return {}
+
+
+def test_expired_claim_is_reclaimed_and_launch_proceeds(fake_clickup, fake_ecs, boto3_factory, ecs_env, dedup_table_env):
+    # DynamoDB TTL deletion can lag hours, so an expired-but-undeleted claim
+    # must be reclaimable — otherwise a deliberate re-tag after the window
+    # would be silently suppressed until TTL cleanup happens to run.
+    expired = {"pk": {"S": "abc123#analyze"}, "expires_at": {"N": str(int(time.time()) - 10)}}
+    evaluating_fake = ConditionEvaluatingFakeDynamoDB(stored_item=expired)
+    boto3_factory.dynamodb_client = evaluating_fake
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+    # The reclaim refreshed the claim: the stored item now carries a future
+    # expires_at, so a concurrent second claimer fails the condition.
+    assert int(evaluating_fake.stored_item["expires_at"]["N"]) > int(time.time())
+
+
+def test_live_claim_is_not_reclaimed_and_suppresses_launch(
+    fake_clickup, fake_ecs, boto3_factory, ecs_env, dedup_table_env, capsys
+):
+    # The mirror case: an UNexpired claim must fail the condition and suppress
+    # the launch — quiet skip, no launch, no ack comment.
+    live = {"pk": {"S": "abc123#analyze"}, "expires_at": {"N": str(int(time.time()) + 500)}}
+    boto3_factory.dynamodb_client = ConditionEvaluatingFakeDynamoDB(stored_item=live)
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp) == {"skipped": "duplicate suppressed"}
+    assert fake_ecs.run_task_calls == []
+    assert fake_clickup.posted_comments == []
+    assert_no_alarm_log_emitted(capsys)
 
 
 def test_duplicate_claim_suppresses_launch_quietly_sync_path(
