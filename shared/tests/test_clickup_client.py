@@ -99,6 +99,18 @@ class TestGetText:
         comment = ClickUpComment(**payload)
         assert comment.get_text() == "[GP-Bot] Processing started"
 
+    def test_non_string_text_items_contribute_nothing(self) -> None:
+        # ANY non-string "text" value (not just null) must contribute "" —
+        # str-wrapping 0 to "0" would prepend garbage ahead of prefix-matched
+        # markers exactly like "None" would. Same contract as the clickup_bot
+        # handler's matcher fallback twin; keep them aligned.
+        payload: dict[str, Any] = {
+            "id": "1",
+            "comment": [{"text": 0}, {"text": "[GP-Bot] Processing started"}],
+        }
+        comment = ClickUpComment(**payload)
+        assert comment.get_text() == "[GP-Bot] Processing started"
+
     def test_items_without_text_keys_are_skipped(self) -> None:
         # Rich items (images, attachments) may carry no "text" at all; they
         # must contribute nothing rather than crash.

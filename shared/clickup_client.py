@@ -78,10 +78,13 @@ class ClickUpComment(BaseModel):
         if self.comment_text:
             return self.comment_text
         if self.comment:
-            # None -> "" (not str(None) == "None"): a "None" contribution
-            # would corrupt prefix-matched markers downstream, e.g. the
-            # clickup_bot dedup marker "[GP-Bot] Processing started".
-            return "".join("" if c.get("text") is None else str(c.get("text")) for c in self.comment)
+            # Only str values contribute; ANY non-string -> "" (not its str()
+            # form): stringifying null to "None" or 0 to "0" would corrupt
+            # prefix-matched markers downstream, e.g. the clickup_bot dedup
+            # marker "[GP-Bot] Processing started". Same contract as the
+            # matcher fallback twin in clickup_bot/lambda/handler.py
+            # (has_processing_started_comment) — keep them aligned.
+            return "".join(c["text"] if isinstance(c.get("text"), str) else "" for c in self.comment)
         return ""
 
 
