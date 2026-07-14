@@ -115,6 +115,34 @@ details:
   `ERROR: dedup table unavailable` line: a duplicate agent costs a few dollars, a
   bot that cannot launch at all is an outage, but an operator must see the breakage.
 
+### Stranded dedup claims
+
+**Symptom:** re-tagging a task does nothing (no ack comment, no Fargate launch, no
+failure comment) and the handler-errors alarm fired earlier — e.g. a worker hard
+timeout (`Task timed out`) or a `Failed to release dedup lock` line. A claim was
+written but the launch behind it died (or a delayed PutItem landed after the
+release `DeleteItem` — an accepted race, see `release_dedup_lock` in the handler),
+so the claim now suppresses every re-tag until its TTL expires.
+
+**Check:** scan the table for the task's claim:
+
+```bash
+aws dynamodb scan --table-name clickup-bot-dedup-prod \
+  --filter-expression "contains(pk, :t)" \
+  --expression-attribute-values '{":t": {"S": "<task_id>"}}'
+```
+
+**Fix:** delete the stranded claim (key is `pk = "{task_id}#{label}"`, label is
+`analyze` or `implement`), then re-tag:
+
+```bash
+aws dynamodb delete-item --table-name clickup-bot-dedup-prod \
+  --key '{"pk": {"S": "<task_id>#<label>"}}'
+```
+
+Or just wait: the claim's `expires_at` bounds the suppression at
+`DEDUP_TTL_SECONDS` (15 minutes by default) — after that a re-tag reclaims it.
+
 ### 2026-07-14 incident
 
 ClickUp delivered ONE `taskTagUpdated` event (gpbot-analyze) six times — the
