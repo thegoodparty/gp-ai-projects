@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 
 import handler
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 
 TEST_SECRET = "test-secret"
 TEST_API_KEY = "test-key"
@@ -1182,6 +1182,9 @@ def test_dynamodb_client_uses_fast_path_timeouts(
     # PutItem could blow ClickUp's webhook timeout in the sync fallback — the
     # same fast-path budget as the self-invoke call. Tight timeouts, single
     # attempt: a timeout lands in try_acquire_dedup_lock's existing fail-open.
+    # total_max_attempts, NOT max_attempts — legacy-mode botocore reads
+    # max_attempts as retries AFTER the initial call (see
+    # test_dynamodb_client_config_resolves_to_a_single_total_attempt).
     handler.handler(make_event(tag_updated_body()), None)
 
     dynamodb_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "dynamodb"]
@@ -1189,7 +1192,43 @@ def test_dynamodb_client_uses_fast_path_timeouts(
     config = dynamodb_calls[0]["config"]
     assert config.connect_timeout == 2
     assert config.read_timeout == 5
-    assert config.retries == {"max_attempts": 1}
+    assert config.retries == {"total_max_attempts": 1}
+
+
+def test_dynamodb_client_config_resolves_to_a_single_total_attempt():
+    # Same resolved-config contract as the lambda client (see
+    # test_lambda_client_config_resolves_to_a_single_total_attempt for the
+    # legacy-mode max_attempts trap this guards against): the dedup PutItem
+    # must make exactly ONE attempt — an SDK retry after an ambiguous failure
+    # would double the fast-path budget, and the fail-open handling already
+    # owns the failure. Real botocore client; no network I/O.
+    import boto3.session
+
+    real_client = boto3.session.Session(
+        region_name="us-west-2",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    ).client("dynamodb", config=handler.DYNAMODB_CLIENT_CONFIG)
+
+    assert real_client.meta.config.retries["total_max_attempts"] == 1
+
+
+def test_ecs_client_uses_single_attempt_run_task_budget(fake_clickup, fake_ecs, boto3_factory, ecs_env):
+    # RunTask has NO idempotency token: an SDK retry after an ambiguous
+    # failure (read timeout with the request already accepted server-side)
+    # can double-launch Fargate INSIDE one dedup claim — the exact class of
+    # duplicate the claim exists to prevent, invisible to both dedup layers.
+    # botocore defaults (60s timeouts, ~5 legacy attempts) must never apply:
+    # bounded timeouts, exactly one attempt. A genuine failure already fails
+    # loud (failure comment + re-tag retry path).
+    handler.handler(make_event(tag_updated_body()), None)
+
+    ecs_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "ecs"]
+    assert len(ecs_calls) == 1
+    config = ecs_calls[0]["config"]
+    assert config.connect_timeout == 5
+    assert config.read_timeout == 30
+    assert config.retries == {"total_max_attempts": 1}
 
 
 def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):
@@ -2264,6 +2303,28 @@ def test_dynamo_outage_fails_open_and_alarms(
     assert response_body(resp)["fargate_task_arn"] == TASK_ARN
     assert len(fake_ecs.run_task_calls) == 1
     assert any(text.startswith("[GP-Bot] Processing started") for text in fake_clickup.posted_comment_texts)
+    out = assert_alarm_log_emitted(capsys)
+    assert "dedup table unavailable" in out
+
+
+def test_dynamo_read_timeout_fails_open_and_alarms(
+    fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
+):
+    # CONTRACT PIN, expected to pass against the current broad except: the
+    # exception a read timeout ACTUALLY raises is botocore's ReadTimeoutError,
+    # which is NOT a ClientError (it subclasses HTTPClientError/BotoCoreError)
+    # — so the single-attempt read_timeout budget lands in the generic
+    # except-Exception arm, not the ClientError one. This test exists so that
+    # anyone narrowing that except later (e.g. to ClientError only) turns the
+    # most likely real-world failure shape from fail-open into an unhandled
+    # crash and finds out here instead of in prod.
+    fake_dynamodb.put_item_exception = ReadTimeoutError(endpoint_url="https://dynamodb.us-west-2.amazonaws.com/")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
     out = assert_alarm_log_emitted(capsys)
     assert "dedup table unavailable" in out
 
