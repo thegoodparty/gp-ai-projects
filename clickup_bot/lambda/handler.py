@@ -323,7 +323,12 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
         )
         return True
     except Exception as e:
-        print(f"Async self-invoke unavailable, processing synchronously: {e}")
+        # Exception TYPE only: this line fires on EVERY delivery until the
+        # IAM lands, and raw botocore messages can contain alarm-filter terms
+        # ("Failed to connect to endpoint ...") — echoing the message would
+        # fire the fail-loud alarm on every delivery of the initial prod
+        # state. Same pattern as the ack first-failure line.
+        print(f"Async self-invoke unavailable, processing synchronously: {type(e).__name__}")
         return False
 
 

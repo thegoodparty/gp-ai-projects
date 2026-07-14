@@ -758,6 +758,27 @@ def test_invoke_failure_falls_back_to_full_sync_flow(
     assert_no_alarm_log_emitted(capsys)
 
 
+def test_invoke_failure_with_alarm_terms_in_message_stays_quiet(
+    fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
+):
+    # The sync-fallback line fires on EVERY delivery until the self-invoke IAM
+    # lands, and raw botocore messages can contain alarm-filter terms — e.g.
+    # "Failed to connect to endpoint". Echoing the message would fire the
+    # fail-loud alarm on every single delivery of the initial prod state.
+    # Only the exception TYPE may be logged (same pattern as the ack
+    # first-failure line).
+    fake_lambda.exception = RuntimeError("ERROR: Failed to connect to lambda endpoint")
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "Async self-invoke unavailable" in out
+    assert "RuntimeError" in out
+
+
 def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):
     event = {"gpbot_async": True, "task_id": "abc123", "matched_tag": "gpbot-analyze"}
 
