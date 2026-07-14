@@ -8,9 +8,41 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 import boto3
+from botocore.config import Config
 
 CLICKUP_BASE_URL = "https://api.clickup.com/api/v2"
 _secrets_cache = None
+
+# Module-level boto3 client cache. boto3.client() re-runs endpoint resolution
+# and session wiring on every call — in-path latency against the fast-ack
+# promise of an instant 200 — and Lambda freezes the execution environment
+# between invocations, so a cached client is free on every warm invocation.
+# Cached lazily (not at import) so tests can swap boto3.client for fakes; the
+# test suite resets these between tests.
+_lambda_client = None
+_ecs_client = None
+
+# FAST-ACK BUDGET for the self-invoke call: it sits on ClickUp's webhook
+# critical path, and botocore's defaults (60s connect + 60s read, with
+# retries) could blow the entire webhook timeout — the exact failure mode of
+# the 2026-07-14 incident — on a hung Lambda control plane. Tight timeouts,
+# single attempt: any failure lands in enqueue_async_processing's quiet
+# synchronous fallback, which is always safe.
+LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+
+
+def get_lambda_client() -> Any:
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda", config=LAMBDA_CLIENT_CONFIG)
+    return _lambda_client
+
+
+def get_ecs_client() -> Any:
+    global _ecs_client
+    if _ecs_client is None:
+        _ecs_client = boto3.client("ecs")
+    return _ecs_client
 
 
 def get_secrets() -> dict:
@@ -329,7 +361,7 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
         print("Async self-invoke unavailable, processing synchronously: AWS_LAMBDA_FUNCTION_NAME not set")
         return False
     try:
-        boto3.client("lambda").invoke(
+        get_lambda_client().invoke(
             FunctionName=function_name,
             InvocationType="Event",
             Payload=json.dumps({"gpbot_async": True, "task_id": task_id, "matched_tag": matched_tag}),
@@ -548,7 +580,7 @@ def trigger_fargate_task(
     # until the self-invoke IAM lands) runs while ClickUp is still waiting on
     # the webhook response — the exact path whose slowness caused the
     # 2026-07-14 retry storm — so it must never sleep or double-post.
-    ecs_client = boto3.client("ecs")
+    ecs_client = get_ecs_client()
 
     cluster_arn = os.environ.get("ECS_CLUSTER_ARN")
     task_definition = os.environ.get("ECS_TASK_DEFINITION")

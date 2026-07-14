@@ -127,18 +127,24 @@ class FakeLambdaClient:
 
 
 class FakeBoto3ClientFactory:
-    """Stands in for boto3.client; routes each service to its fake."""
+    """Stands in for boto3.client; routes each service to its fake.
+
+    client_calls records (service_name, kwargs) so tests can pin the botocore
+    Config the handler constructs clients with.
+    """
 
     def __init__(self, ecs_client: FakeECSClient, lambda_client: FakeLambdaClient | None = None):
-        self._ecs_client = ecs_client
-        self._lambda_client = lambda_client if lambda_client is not None else FakeLambdaClient()
+        self.ecs_client = ecs_client
+        self.lambda_client = lambda_client if lambda_client is not None else FakeLambdaClient()
         self.requested_services = []
+        self.client_calls = []
 
     def __call__(self, service_name, *args, **kwargs):
         self.requested_services.append(service_name)
+        self.client_calls.append((service_name, kwargs))
         if service_name == "lambda":
-            return self._lambda_client
-        return self._ecs_client
+            return self.lambda_client
+        return self.ecs_client
 
 
 # ---------------------------------------------------------------------------
@@ -175,10 +181,27 @@ def fake_lambda():
 
 
 @pytest.fixture(autouse=True)
-def fake_ecs(monkeypatch, fake_lambda):
-    ecs = FakeECSClient()
-    monkeypatch.setattr(handler.boto3, "client", FakeBoto3ClientFactory(ecs, fake_lambda))
-    return ecs
+def boto3_factory(monkeypatch, fake_lambda):
+    factory = FakeBoto3ClientFactory(FakeECSClient(), fake_lambda)
+    monkeypatch.setattr(handler.boto3, "client", factory)
+    return factory
+
+
+@pytest.fixture(autouse=True)
+def fake_ecs(boto3_factory):
+    return boto3_factory.ecs_client
+
+
+@pytest.fixture(autouse=True)
+def reset_boto3_client_cache():
+    # The handler caches boto3 clients at module level (fast-ack in-path
+    # budget); each test monkeypatches boto3.client with its own fakes, so a
+    # client cached by one test must never leak into the next.
+    handler._lambda_client = None
+    handler._ecs_client = None
+    yield
+    handler._lambda_client = None
+    handler._ecs_client = None
 
 
 @pytest.fixture(autouse=True)
@@ -799,6 +822,43 @@ def test_invoke_failure_with_alarm_terms_in_message_stays_quiet(
     out = assert_no_alarm_log_emitted(capsys)
     assert "Async self-invoke unavailable" in out
     assert "RuntimeError" in out
+
+
+def test_boto3_clients_are_cached_across_invocations(
+    fake_clickup, fake_ecs, fake_lambda, boto3_factory, ecs_env, self_invoke_env
+):
+    # boto3.client() re-runs endpoint resolution and session wiring on every
+    # call — in-path latency against the fast-ack promise of an instant 200.
+    # Each service client must be constructed once per execution environment
+    # and reused across invocations (warm Lambda containers).
+    handler.handler(make_event(tag_updated_body()), None)
+    handler.handler(make_event(tag_updated_body()), None)
+
+    assert boto3_factory.requested_services.count("lambda") == 1
+
+
+def test_ecs_client_is_cached_across_invocations(fake_clickup, fake_ecs, boto3_factory, ecs_env):
+    # Same caching contract for the ECS client used by the sync fallback /
+    # async worker.
+    handler.handler(make_event(tag_updated_body()), None)
+    handler.handler(make_event(tag_updated_body()), None)
+
+    assert boto3_factory.requested_services.count("ecs") == 1
+
+
+def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_factory, ecs_env, self_invoke_env):
+    # botocore defaults are 60s connect + 60s read with retries: a hung Lambda
+    # control plane would blow ClickUp's whole webhook timeout in-path. The
+    # fast-ack budget demands tight timeouts and a single attempt — on any
+    # failure the quiet sync fallback takes over.
+    handler.handler(make_event(tag_updated_body()), None)
+
+    lambda_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "lambda"]
+    assert len(lambda_calls) == 1
+    config = lambda_calls[0]["config"]
+    assert config.connect_timeout == 2
+    assert config.read_timeout == 5
+    assert config.retries == {"max_attempts": 1}
 
 
 def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):
