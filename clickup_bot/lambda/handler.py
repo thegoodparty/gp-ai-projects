@@ -22,6 +22,7 @@ _secrets_cache = None
 # test suite resets these between tests.
 _lambda_client = None
 _ecs_client = None
+_dynamodb_client = None
 
 # FAST-ACK BUDGET for the self-invoke call: it sits on ClickUp's webhook
 # critical path, and botocore's defaults (60s connect + 60s read, with
@@ -41,6 +42,29 @@ _ecs_client = None
 # resolved-config test against a real botocore client).
 LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
 
+# Same fast-path budget for the atomic-dedup DynamoDB calls: in the sync
+# fallback (the initial prod state, until the self-invoke IAM lands) the
+# conditional PutItem runs while ClickUp is still waiting on the webhook
+# response, so botocore's defaults could blow the whole webhook timeout there
+# too. Tight timeouts, single attempt (total_max_attempts — see the
+# max_attempts trap on LAMBDA_CLIENT_CONFIG): a timeout surfaces as an
+# exception in try_acquire_dedup_lock / release_dedup_lock, where the
+# existing fail-open handling already covers it (proceed without atomic
+# dedup, alarm-matching log line).
+DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
+
+# RunTask budget: RunTask has NO idempotency token, so a botocore retry after
+# an ambiguous failure (read timeout with the request already accepted
+# server-side) can DOUBLE-LAUNCH Fargate inside one dedup claim — the exact
+# duplicate class the claim exists to prevent, invisible to both dedup
+# layers. botocore defaults (60s timeouts, ~5 legacy attempts) must never
+# apply here: zero SDK retries is the correct trade because a genuine launch
+# failure already fails loud (failure comment + documented re-tag retry
+# path). 30s read stays within the worker's 120s budget; connect gets 5s
+# because a connect-phase failure is unambiguous (nothing launched) yet still
+# must not eat the budget.
+ECS_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=30, retries={"total_max_attempts": 1})
+
 
 def get_lambda_client() -> Any:
     global _lambda_client
@@ -52,8 +76,15 @@ def get_lambda_client() -> Any:
 def get_ecs_client() -> Any:
     global _ecs_client
     if _ecs_client is None:
-        _ecs_client = boto3.client("ecs")
+        _ecs_client = boto3.client("ecs", config=ECS_CLIENT_CONFIG)
     return _ecs_client
+
+
+def get_dynamodb_client() -> Any:
+    global _dynamodb_client
+    if _dynamodb_client is None:
+        _dynamodb_client = boto3.client("dynamodb", config=DYNAMODB_CLIENT_CONFIG)
+    return _dynamodb_client
 
 
 def get_secrets() -> dict:
@@ -137,6 +168,32 @@ CLOCK_SKEW_TOLERANCE_SECONDS = 60.0
 # still waiting on the webhook response. Tests zero this out — the length is
 # not a behavioral contract.
 ACK_COMMENT_RETRY_DELAY_SECONDS = 2.0
+
+# How long an atomic dedup claim (DynamoDB item, see try_acquire_dedup_lock)
+# lives before its TTL expires it. Deliberately the same default as
+# DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS: both layers encode the same product
+# contract — retry storms (seconds-to-minutes) are absorbed, a deliberate
+# human re-tag ~15 minutes later re-runs.
+DEFAULT_DEDUP_TTL_SECONDS = 900.0
+
+
+def get_dedup_ttl_seconds() -> float:
+    raw = os.environ.get("DEDUP_TTL_SECONDS")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = None
+        # Same contract as get_dedup_window_seconds, including the
+        # isfinite + positive check: float() happily parses 'nan'/'inf',
+        # which would crash at int(time.time() + ttl) inside the claim write.
+        # A typo'd env var must not crash deliveries in-path and must not
+        # spam the alarm on every trigger — quiet fallback (no
+        # "ERROR"/"Failed to").
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+        print("Invalid DEDUP_TTL_SECONDS env value; using default 900s")
+    return DEFAULT_DEDUP_TTL_SECONDS
 
 
 def get_dedup_window_seconds() -> float:
@@ -480,14 +537,115 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> Literal["accepte
 
 
 def is_atomic_dedup_configured() -> bool:
-    # Branch-point predicate for the comment-fetch failure handling below:
-    # whether the atomic DynamoDB dedup layer (conditional PutItem keyed
-    # {task_id}#{label}) is available as a backstop. The atomic layer itself
-    # ships in the stacked atomic-dedup PR, so in THIS PR the env var is never
-    # set in prod and the configured arm is dead code — the branch point is
-    # defined and tested now so that PR only has to slot its conditional-write
-    # check into the proceed path.
+    # Single predicate for "the atomic DynamoDB dedup layer is available" —
+    # the same DEDUP_TABLE_NAME that try_acquire_dedup_lock and
+    # release_dedup_lock gate on. The async comment-fetch failure handling in
+    # dedup_check_then_trigger branches on it: with the table configured, the
+    # conditional write below still backstops a skipped comment check.
     return bool(os.environ.get("DEDUP_TABLE_NAME"))
+
+
+def dedup_lock_pk(task_id: str, label: str) -> str:
+    return f"{task_id}#{label}"
+
+
+def try_acquire_dedup_lock(task_id: str, label: str) -> bool:
+    # ATOMIC DEDUP (2026-07-14 incident, layer 2): the comment-based check is
+    # best-effort — it reads through ClickUp's slow, eventually-consistent API,
+    # and concurrent invocations can ALL pass it before any ack comment becomes
+    # visible (six did, launching six Fargate agents). The authoritative dedup
+    # is this conditional PutItem: it does not depend on ClickUp at all, and
+    # DynamoDB serializes conditional writes, so exactly one caller per
+    # (task_id, label) wins. True = proceed with the launch.
+    #
+    # CRASH AFTER CLAIM: if this invocation dies between the PutItem and the
+    # launch (hard timeout, OOM), the claim strands and suppresses re-tags —
+    # but only until expires_at: the "OR #exp < :now" reclaim arm bounds the
+    # damage to the TTL window even before DynamoDB TTL deletion (which can
+    # lag hours) runs. The 120s function timeout (terraform) vs the ~45s
+    # worst-case in-flight blocking makes that window vanishingly small, and
+    # a hard timeout still alarms via the "Task timed out" metric-filter term.
+    table_name = os.environ.get("DEDUP_TABLE_NAME")
+    if not table_name:
+        # Initial prod state: code deploys first, the terraform that creates
+        # the table + this env var applies second (README "Deployment"). The
+        # unconfigured window must be a safe, QUIET no-op — same behavior as
+        # before this feature, no "ERROR"/"Failed to" (alarm contract).
+        print("Dedup table not configured; relying on comment-based dedup only")
+        return True
+
+    expires_at = int(time.time() + get_dedup_ttl_seconds())
+    try:
+        get_dynamodb_client().put_item(
+            TableName=table_name,
+            Item={
+                "pk": {"S": dedup_lock_pk(task_id, label)},
+                "task_id": {"S": task_id},
+                "label": {"S": label},
+                # DynamoDB TTL requires epoch SECONDS as a Number attribute.
+                "expires_at": {"N": str(expires_at)},
+            },
+            # "OR expired" matters: DynamoDB TTL only deletes expired items
+            # eventually (can lag hours). Without it, a lingering expired claim
+            # would silently suppress a deliberate re-tag after the window —
+            # exactly the contract the comment-dedup recency window protects.
+            # No race reopens here: conditional writes are serialized, so of
+            # two concurrent claimers of an expired item, the first refreshes
+            # expires_at and the second then fails the condition.
+            ConditionExpression="attribute_not_exists(pk) OR #exp < :now",
+            ExpressionAttributeNames={"#exp": "expires_at"},
+            ExpressionAttributeValues={":now": {"N": str(int(time.time()))}},
+        )
+        return True
+    except ClientError as e:
+        # Match on Error.Code, not the exception class: boto3 raises factory-
+        # generated subclasses, and the code string is the stable contract.
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        # FAIL-OPEN, deliberately: a broken/missing/throttled dedup table must
+        # never take the bot down — a duplicate agent launch costs a few
+        # dollars, a bot that cannot launch at all is an outage. But this is
+        # real infrastructure breakage an operator must fix, so the log line
+        # is alarm-matching (contains "ERROR") on purpose.
+        print(f"ERROR: dedup table unavailable, proceeding without atomic dedup: {e}")
+        return True
+    except Exception as e:
+        # Same fail-open rationale for non-ClientError failures (credentials,
+        # endpoint resolution, botocore internals).
+        print(f"ERROR: dedup table unavailable, proceeding without atomic dedup: {e}")
+        return True
+
+
+def release_dedup_lock(task_id: str, label: str) -> None:
+    # Called only after a FAILED launch: the retry contract is "remove and
+    # re-add the tag to retry", and a failure comment never blocks a retry —
+    # so the claim must not either, or the user's immediate retry would be
+    # silently suppressed for the whole TTL. (A SUCCESSFUL launch keeps its
+    # claim; DynamoDB TTL expires it.)
+    #
+    # ACCEPTED RACE (delayed-put): a client-side PutItem timeout in
+    # try_acquire_dedup_lock does NOT cancel the server-side write — DynamoDB
+    # can commit it after this DeleteItem runs, stranding a claim that
+    # suppresses re-tags with no launch behind it. Bounded: the claim's
+    # expires_at plus the "OR #exp < :now" reclaim arm caps the damage at the
+    # TTL window (15 min default). Fencing (conditional delete on an
+    # ownership token) would close it entirely but is deliberately not
+    # implemented — the operator runbook (README, "Stranded dedup claims")
+    # plus the TTL bound is the accepted trade.
+    table_name = os.environ.get("DEDUP_TABLE_NAME")
+    if not table_name:
+        return
+    try:
+        get_dynamodb_client().delete_item(
+            TableName=table_name,
+            Key={"pk": {"S": dedup_lock_pk(task_id, label)}},
+        )
+    except Exception as e:
+        # Must never change control flow — the caller is already returning a
+        # launch-failure 500 and has posted the failure comment. But a stuck
+        # claim suppresses the user's retry until the TTL expires, so the line
+        # is alarm-matching ("Failed to") on purpose.
+        print(f"Failed to release dedup lock for task {task_id}: {e}")
 
 
 def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: bool = False) -> dict:
@@ -533,9 +691,26 @@ def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: 
         print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} ({config['label']}) comment, skipping")
         return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
 
-    return trigger_fargate_task(
+    # Layer order is deliberate: the comment check runs FIRST so an
+    # already-acked task short-circuits without burning a claim (a claim
+    # written on a comment-deduped skip would outlive the marker and block a
+    # legitimate re-trigger). Only when the comment check passes do we race
+    # for the atomic claim. Losing the race is the dedup WORKING — quiet log
+    # (no "ERROR"/"Failed to"), no launch, no ack comment (the winner posts
+    # its own), 200 so ClickUp does not re-deliver.
+    if not try_acquire_dedup_lock(task_id, config["label"]):
+        print(f"Duplicate trigger for {task_id} suppressed by dedup table")
+        return {"statusCode": 200, "body": json.dumps({"skipped": "duplicate suppressed"})}
+
+    result = trigger_fargate_task(
         task_id, config["instruction"], config["label"], config["model"], retry_ack=from_async_worker
     )
+    if result.get("statusCode") != 200:
+        # Launch failed: release the claim so the documented retry contract
+        # ("remove and re-add the tag") survives launch failures instead of
+        # being suppressed until the TTL expires.
+        release_dedup_lock(task_id, config["label"])
+    return result
 
 
 def handle_async_processing(event: dict) -> dict:
