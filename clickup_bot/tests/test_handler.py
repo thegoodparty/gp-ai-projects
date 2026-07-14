@@ -1065,7 +1065,10 @@ def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_fact
     # botocore defaults are 60s connect + 60s read with retries: a hung Lambda
     # control plane would blow ClickUp's whole webhook timeout in-path. The
     # fast-ack budget demands tight timeouts and a single attempt — on any
-    # failure the quiet sync fallback takes over.
+    # failure the quiet sync fallback takes over. total_max_attempts, NOT
+    # max_attempts: legacy-mode botocore reads max_attempts as retries AFTER
+    # the initial call, so {"max_attempts": 1} silently means 2 attempts (see
+    # test_lambda_client_config_resolves_to_a_single_total_attempt).
     handler.handler(make_event(tag_updated_body()), None)
 
     lambda_calls = [kwargs for service, kwargs in boto3_factory.client_calls if service == "lambda"]
@@ -1073,7 +1076,29 @@ def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_fact
     config = lambda_calls[0]["config"]
     assert config.connect_timeout == 2
     assert config.read_timeout == 5
-    assert config.retries == {"max_attempts": 1}
+    assert config.retries == {"total_max_attempts": 1}
+
+
+def test_lambda_client_config_resolves_to_a_single_total_attempt():
+    # BEHAVIORAL, not just a dict pin: build a REAL botocore client from the
+    # handler's constant and assert the RESOLVED retry budget. botocore's
+    # legacy mode normalizes retries into {"total_max_attempts": N, "mode":
+    # "legacy"} where N counts the initial call — the previous
+    # {"max_attempts": 1} config resolved to total_max_attempts=2 (one full
+    # SDK retry on the fast-ack path), which this test would have caught.
+    # The fakes intercept boto3.client (not the transport), so the module-
+    # level boto3.session path below deliberately bypasses the patched
+    # boto3.client to reach real botocore config resolution. No network I/O:
+    # client construction only resolves endpoints/config locally.
+    import boto3.session
+
+    real_client = boto3.session.Session(
+        region_name="us-west-2",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    ).client("lambda", config=handler.LAMBDA_CLIENT_CONFIG)
+
+    assert real_client.meta.config.retries["total_max_attempts"] == 1
 
 
 def test_async_event_runs_dedup_and_triggers(fake_clickup, fake_ecs, fake_lambda, ecs_env):

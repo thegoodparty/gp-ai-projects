@@ -28,7 +28,14 @@ _ecs_client = None
 # the 2026-07-14 incident — on a hung Lambda control plane. Tight timeouts,
 # single attempt: any failure lands in enqueue_async_processing's quiet
 # synchronous fallback, which is always safe.
-LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+#
+# total_max_attempts, NOT max_attempts — a botocore trap: in legacy retry
+# mode (the default) "max_attempts" counts RETRIES AFTER the initial call,
+# so {"max_attempts": 1} normalizes to total_max_attempts=2 — one silent
+# full retry on this budget-critical path. "total_max_attempts" counts the
+# initial call itself, so 1 here truly means a single attempt (pinned by a
+# resolved-config test against a real botocore client).
+LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
 
 
 def get_lambda_client() -> Any:
