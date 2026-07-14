@@ -88,6 +88,17 @@ class TestGetText:
         comment = ClickUpComment(id="1", text_content="aliased text")
         assert comment.get_text() == "aliased text"
 
+    def test_null_text_items_contribute_nothing(self) -> None:
+        # A null "text" value must neither crash nor inject the string "None"
+        # into the reconstructed text — a "None" prefix would corrupt
+        # prefix-matched markers like "[GP-Bot] Processing started".
+        payload: dict[str, Any] = {
+            "id": "1",
+            "comment": [{"text": None}, {"text": "[GP-Bot] Processing started"}],
+        }
+        comment = ClickUpComment(**payload)
+        assert comment.get_text() == "[GP-Bot] Processing started"
+
     def test_items_without_text_keys_are_skipped(self) -> None:
         # Rich items (images, attachments) may carry no "text" at all; they
         # must contribute nothing rather than crash.

@@ -78,7 +78,10 @@ class ClickUpComment(BaseModel):
         if self.comment_text:
             return self.comment_text
         if self.comment:
-            return "".join(str(c.get("text", "")) for c in self.comment)
+            # None -> "" (not str(None) == "None"): a "None" contribution
+            # would corrupt prefix-matched markers downstream, e.g. the
+            # clickup_bot dedup marker "[GP-Bot] Processing started".
+            return "".join("" if c.get("text") is None else str(c.get("text")) for c in self.comment)
         return ""
 
 
