@@ -1090,15 +1090,20 @@ def test_ack_comment_failure_does_not_prevent_launch(fake_clickup, fake_ecs, ecs
     assert_alarm_log_emitted(capsys)
 
 
-def test_ack_comment_transient_failure_is_retried_and_succeeds(fake_clickup, fake_ecs, ecs_env, capsys):
-    # The ack comment is the dedup marker: without it, the retry-storm window
-    # stays open. It now posts off ClickUp's webhook critical path (fast-ack),
-    # so a transient ClickUp 5xx on the first attempt must be retried once —
-    # and a successful retry is a non-event: no alarm.
-    fake_clickup.post_comment_error_queue = [HTTPError("http://x", 502, "bad gateway", {}, None)]
-    event = make_event(tag_updated_body())
+def async_worker_event(task_id: str = "abc123", matched_tag: str = "gpbot-analyze") -> dict:
+    """Trusted internal payload the fast-ack path self-invokes with."""
+    return {"gpbot_async": True, "task_id": task_id, "matched_tag": matched_tag}
 
-    resp = handler.handler(event, None)
+
+def test_async_ack_transient_failure_is_retried_and_succeeds(fake_clickup, fake_ecs, ecs_env, capsys):
+    # The ack comment is the dedup marker: without it, the retry-storm window
+    # stays open. In the ASYNC WORKER, ClickUp already got its 200, so this
+    # post is off the webhook critical path: a transient ClickUp 5xx on the
+    # first attempt must be retried once — and a successful retry is a
+    # non-event: no alarm.
+    fake_clickup.post_comment_error_queue = [HTTPError("http://x", 502, "bad gateway", {}, None)]
+
+    resp = handler.handler(async_worker_event(), None)
 
     assert resp["statusCode"] == 200
     assert response_body(resp)["fargate_task_arn"] == TASK_ARN
@@ -1109,19 +1114,40 @@ def test_ack_comment_transient_failure_is_retried_and_succeeds(fake_clickup, fak
     assert_no_alarm_log_emitted(capsys)
 
 
-def test_ack_comment_double_failure_alarms_after_second_attempt(fake_clickup, fake_ecs, ecs_env, capsys):
+def test_async_ack_double_failure_alarms_after_second_attempt(fake_clickup, fake_ecs, ecs_env, capsys):
     # Only the SECOND failure logs the alarm-matching line — swallowed ack
     # failures are exactly what the alarm exists for (it alarmed correctly
     # during the 2026-07-14 incident). Exactly two attempts: unbounded retries
     # against a down ClickUp would just burn the worker invocation.
     fake_clickup.post_comment_error = HTTPError("http://x", 500, "err", {}, None)
-    event = make_event(tag_updated_body())
 
-    resp = handler.handler(event, None)
+    resp = handler.handler(async_worker_event(), None)
 
     assert resp["statusCode"] == 200
     assert len(fake_ecs.run_task_calls) == 1
     assert len(fake_clickup.posted_comments) == 2
+    out = assert_alarm_log_emitted(capsys)
+    assert "Failed to post starting comment" in out
+
+
+def test_sync_fallback_ack_failure_posts_once_without_sleep(fake_clickup, fake_ecs, ecs_env, capsys, monkeypatch):
+    # The SYNC FALLBACK is the guaranteed initial prod state (self-invoke IAM
+    # ships in a later terraform PR) and runs while ClickUp is still waiting
+    # on the webhook response — the exact path whose slowness caused the
+    # 2026-07-14 retry storm. The ack must be a single attempt with NO sleep
+    # and NO retry: adding up to 12s here would guarantee webhook timeouts.
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(handler.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    fake_clickup.post_comment_error = HTTPError("http://x", 500, "err", {}, None)
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    assert len(fake_ecs.run_task_calls) == 1
+    started_posts = [t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started")]
+    assert len(started_posts) == 1
+    assert sleep_calls == []
+    # The swallowed ack failure is still alarm-worthy (missing dedup marker).
     out = assert_alarm_log_emitted(capsys)
     assert "Failed to post starting comment" in out
 

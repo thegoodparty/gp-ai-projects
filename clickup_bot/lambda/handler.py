@@ -73,10 +73,12 @@ PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
 # know, and an unbounded marker would silently change it.
 DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
 
-# Pause before retrying the "Processing started" ack post once. The ack now
-# runs off ClickUp's webhook critical path (fast-ack / async worker), so a
-# brief wait is free and rides out transient ClickUp 5xxs/timeouts. Tests
-# zero this out — the length is not a behavioral contract.
+# Pause before retrying the "Processing started" ack post once. Applies ONLY
+# to the async worker (retry_ack=True): there ClickUp already has its 200, so
+# a brief wait is free and rides out transient ClickUp 5xxs/timeouts. The
+# synchronous fallback never sleeps or retries — it runs while ClickUp is
+# still waiting on the webhook response. Tests zero this out — the length is
+# not a behavioral contract.
 ACK_COMMENT_RETRY_DELAY_SECONDS = 2.0
 
 
@@ -325,10 +327,14 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
         return False
 
 
-def dedup_check_then_trigger(task_id: str, matched_tag: str) -> dict:
+def dedup_check_then_trigger(task_id: str, matched_tag: str, from_async_worker: bool = False) -> dict:
     # Shared by the async worker and the synchronous fallback so the two paths
     # cannot drift: whichever path runs, the dedup semantics and the trigger
-    # behavior are identical.
+    # behavior are identical. from_async_worker is the one deliberate
+    # divergence: it gates behavior that is only safe once ClickUp already has
+    # its 200 (ack retry with a pause; see trigger_fargate_task) and behavior
+    # that only makes sense when nobody receives the HTTP response (the
+    # comment-fetch failure handling below).
     try:
         comments = get_task_comments(task_id)
     except Exception as e:
@@ -343,7 +349,9 @@ def dedup_check_then_trigger(task_id: str, matched_tag: str) -> dict:
         print(f"Task {task_id} already has a recent {PROCESSING_STARTED_PREFIX} ({config['label']}) comment, skipping")
         return {"statusCode": 200, "body": json.dumps({"skipped": "already processed"})}
 
-    return trigger_fargate_task(task_id, config["instruction"], config["label"], config["model"])
+    return trigger_fargate_task(
+        task_id, config["instruction"], config["label"], config["model"], retry_ack=from_async_worker
+    )
 
 
 def handle_async_processing(event: dict) -> dict:
@@ -361,7 +369,7 @@ def handle_async_processing(event: dict) -> dict:
         if not task_id or matched_tag not in TAG_CONFIG:
             print("ERROR: Async processing failed: invalid internal payload (missing task_id or unknown matched_tag)")
             return {"statusCode": 400, "body": json.dumps({"error": "invalid async payload"})}
-        return dedup_check_then_trigger(task_id, matched_tag)
+        return dedup_check_then_trigger(task_id, matched_tag, from_async_worker=True)
     except Exception as e:
         # The worker must NEVER raise: an unhandled exception in an async
         # ("Event") invocation makes Lambda auto-RETRY it (2x by default),
@@ -482,7 +490,14 @@ def handler(event: dict, context: Any) -> dict:
     return dedup_check_then_trigger(task_id, matched_tag)
 
 
-def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str = "sonnet") -> dict:
+def trigger_fargate_task(
+    task_id: str, instruction: str, label: str, model: str = "sonnet", retry_ack: bool = False
+) -> dict:
+    # retry_ack: True ONLY from the async worker, where ClickUp already has
+    # its 200. The synchronous fallback (the guaranteed initial prod state
+    # until the self-invoke IAM lands) runs while ClickUp is still waiting on
+    # the webhook response — the exact path whose slowness caused the
+    # 2026-07-14 retry storm — so it must never sleep or double-post.
     ecs_client = boto3.client("ecs")
 
     cluster_arn = os.environ.get("ECS_CLUSTER_ARN")
@@ -550,23 +565,30 @@ def trigger_fargate_task(task_id: str, instruction: str, label: str, model: str 
         # Posted only AFTER a successful launch: this comment is the dedup
         # marker, so it must never exist on a task whose launch failed. A
         # failed ack post must not fail the invocation (the task is running).
-        # RETRY ONCE (2026-07-14): a missing marker leaves the retry-storm
-        # window open, and this post no longer sits on ClickUp's webhook
-        # critical path, so a brief pause + one retry is free. Only the SECOND
-        # failure logs the alarm-matching line — swallowed ack failures are
-        # exactly what the alarm exists for (it alarmed correctly during the
-        # incident). The first-attempt line is deliberately quiet: only the
+        # RETRY ONCE, ASYNC WORKER ONLY (2026-07-14): a missing marker leaves
+        # the retry-storm window open, and in the async worker ClickUp already
+        # has its 200, so a brief pause + one retry is free there. In the
+        # synchronous fallback ClickUp is STILL WAITING — a sleep + second 10s
+        # POST would add up to 12s to a path that already exceeded ClickUp's
+        # webhook timeout (the incident's root cause) — so it posts exactly
+        # once, like the pre-fast-ack handler did. Only the FINAL failure logs
+        # the alarm-matching line — swallowed ack failures are exactly what
+        # the alarm exists for (it alarmed correctly during the incident).
+        # The async first-attempt line is deliberately quiet: only the
         # exception TYPE is logged (a message could contain alarm terms).
         ack_text = f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})..."
         try:
             post_comment(task_id, ack_text)
         except Exception as first_err:
-            print(f"Starting-comment post hit {type(first_err).__name__}, retrying once")
-            time.sleep(ACK_COMMENT_RETRY_DELAY_SECONDS)
-            try:
-                post_comment(task_id, ack_text)
-            except Exception as e:
-                print(f"Failed to post starting comment: {e}")
+            if retry_ack:
+                print(f"Starting-comment post hit {type(first_err).__name__}, retrying once")
+                time.sleep(ACK_COMMENT_RETRY_DELAY_SECONDS)
+                try:
+                    post_comment(task_id, ack_text)
+                except Exception as e:
+                    print(f"Failed to post starting comment: {e}")
+            else:
+                print(f"Failed to post starting comment: {first_err}")
 
         return {
             "statusCode": 200,
