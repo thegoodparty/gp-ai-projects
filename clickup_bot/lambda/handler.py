@@ -658,7 +658,17 @@ def trigger_fargate_task(
         # the alarm exists for (it alarmed correctly during the incident).
         # The async first-attempt line is deliberately quiet: only the
         # exception TYPE is logged (a message could contain alarm terms).
-        ack_text = f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})..."
+        # The cooldown suffix is the ONLY place users can learn the dedup
+        # window exists: a deliberate re-tag inside it is otherwise suppressed
+        # with zero feedback. Derived from the configured window, never
+        # hardcoded. Safe to append: the dedup matcher matches the
+        # label-scoped PREFIX (has_processing_started_comment), pinned by a
+        # round-trip test.
+        window_minutes = round(get_dedup_window_seconds() / 60)
+        ack_text = (
+            f"{PROCESSING_STARTED_PREFIX} ({label}, model: {model})... "
+            f"(re-tag after {window_minutes} minutes to re-run)"
+        )
         try:
             post_comment(task_id, ack_text)
         except Exception as first_err:

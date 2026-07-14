@@ -715,6 +715,48 @@ def test_window_is_configurable_via_env(monkeypatch):
     assert handler.has_processing_started_comment(stale, "analyze", now=PINNED_NOW) is False
 
 
+def test_ack_comment_mentions_retag_cooldown(fake_clickup, fake_ecs, ecs_env):
+    # UX: a deliberate re-tag inside the dedup window is suppressed with zero
+    # feedback — the ack comment is the only place users can learn the
+    # cooldown exists. The number derives from the configured window.
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    ack = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
+    assert "(re-tag after 15 minutes to re-run)" in ack
+
+
+def test_ack_cooldown_minutes_derive_from_configured_window(fake_clickup, fake_ecs, ecs_env, monkeypatch):
+    monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "600")
+
+    resp = handler.handler(make_event(tag_updated_body()), None)
+
+    assert resp["statusCode"] == 200
+    ack = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
+    assert "(re-tag after 10 minutes to re-run)" in ack
+
+
+def test_full_ack_text_with_suffix_matches_label_scoped_matcher(fake_clickup, fake_ecs, ecs_env):
+    # Round-trip: the exact text the handler posts (including the cooldown
+    # suffix) must still be recognized by the dedup matcher — the matcher
+    # matches the label-scoped PREFIX, so appending is safe. This test breaks
+    # if anyone ever inserts text between the label and the prefix.
+    handler.handler(make_event(tag_updated_body()), None)
+    ack_text = next(t for t in fake_clickup.posted_comment_texts if t.startswith("[GP-Bot] Processing started"))
+
+    comments = [
+        {
+            "id": "90130291038679",
+            "comment": [{"text": ack_text}],
+            "comment_text": ack_text,
+            "date": epoch_ms_str(PINNED_NOW, 30),
+            "reply_count": 0,
+        }
+    ]
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(comments, "implement", now=PINNED_NOW) is False
+
+
 def test_stale_marker_allows_deliberate_re_tag_to_retrigger(fake_clickup, fake_ecs, ecs_env):
     # Handler-level: a marker from hours ago must NOT block a fresh tag event —
     # a human re-tagging later is a deliberate re-run, not a retry storm.
