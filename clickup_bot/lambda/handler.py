@@ -22,6 +22,7 @@ _secrets_cache = None
 # test suite resets these between tests.
 _lambda_client = None
 _ecs_client = None
+_dynamodb_client = None
 
 # FAST-ACK BUDGET for the self-invoke call: it sits on ClickUp's webhook
 # critical path, and botocore's defaults (60s connect + 60s read, with
@@ -38,6 +39,16 @@ _ecs_client = None
 # resolved-config test against a real botocore client).
 LAMBDA_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 1})
 
+# Same fast-path budget for the atomic-dedup DynamoDB calls: in the sync
+# fallback (the initial prod state, until the self-invoke IAM lands) the
+# conditional PutItem runs while ClickUp is still waiting on the webhook
+# response, so botocore's defaults could blow the whole webhook timeout there
+# too. Tight timeouts, single attempt: a timeout surfaces as an exception in
+# try_acquire_dedup_lock / release_dedup_lock, where the existing fail-open
+# handling already covers it (proceed without atomic dedup, alarm-matching
+# log line).
+DYNAMODB_CLIENT_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"max_attempts": 1})
+
 
 def get_lambda_client() -> Any:
     global _lambda_client
@@ -51,6 +62,13 @@ def get_ecs_client() -> Any:
     if _ecs_client is None:
         _ecs_client = boto3.client("ecs")
     return _ecs_client
+
+
+def get_dynamodb_client() -> Any:
+    global _dynamodb_client
+    if _dynamodb_client is None:
+        _dynamodb_client = boto3.client("dynamodb", config=DYNAMODB_CLIENT_CONFIG)
+    return _dynamodb_client
 
 
 def get_secrets() -> dict:
@@ -471,7 +489,7 @@ def try_acquire_dedup_lock(task_id: str, label: str) -> bool:
 
     expires_at = int(time.time() + get_dedup_ttl_seconds())
     try:
-        boto3.client("dynamodb").put_item(
+        get_dynamodb_client().put_item(
             TableName=table_name,
             Item={
                 "pk": {"S": dedup_lock_pk(task_id, label)},
@@ -521,7 +539,7 @@ def release_dedup_lock(task_id: str, label: str) -> None:
     if not table_name:
         return
     try:
-        boto3.client("dynamodb").delete_item(
+        get_dynamodb_client().delete_item(
             TableName=table_name,
             Key={"pk": {"S": dedup_lock_pk(task_id, label)}},
         )
