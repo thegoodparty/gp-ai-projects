@@ -113,6 +113,19 @@ PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
 # know, and an unbounded marker would silently change it.
 DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
 
+# How far in the FUTURE a marker's timestamp may sit and still count toward
+# the dedup window. Sub-minute negative ages are expected in normal operation:
+# age is OUR clock minus CLICKUP's clock, so our own just-posted ack read back
+# through a ClickUp server whose clock runs slightly ahead of Lambda's shows
+# up seconds "in the future" — that marker is the exact retry-storm marker the
+# window exists for and MUST still block. Anything more future-dated than this
+# is clock/shape drift (frozen server clock, epoch-unit change): before this
+# guard, ANY future date made age_seconds negative and `age <= window`
+# trivially True, so drift would BLOCK re-triggering for skew+window —
+# inverting the documented fail-toward-not-blocking posture of every other
+# undatable-marker case (see the RECENCY note in has_processing_started_comment).
+CLOCK_SKEW_TOLERANCE_SECONDS = 60.0
+
 # Pause before retrying the "Processing started" ack post once. Applies ONLY
 # to the async worker (retry_ack=True): there ClickUp already has its 200, so
 # a brief wait is free and rides out transient ClickUp 5xxs/timeouts. The
@@ -288,6 +301,18 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
             age_seconds = now - int(comment.get("date")) / 1000.0
         except (TypeError, ValueError):
             print("ERROR: ClickUp comment date unparseable — dedup window cannot be evaluated")
+            continue
+        if age_seconds < -CLOCK_SKEW_TOLERANCE_SECONDS:
+            # A parseable date this far in the future is as undatable as an
+            # unparseable one (see CLOCK_SKEW_TOLERANCE_SECONDS): fail toward
+            # NOT blocking, exactly like the branch above, and alarm — shape/
+            # clock drift is an integration break an operator must see. Only
+            # the delta is logged, never the raw value: a drifted raw date is
+            # noise, and the delta is what diagnoses the skew.
+            print(
+                "ERROR: ClickUp comment date is in the future — dedup window cannot be evaluated "
+                f"({-age_seconds:.0f}s ahead)"
+            )
             continue
         if age_seconds <= window_seconds:
             return True

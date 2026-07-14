@@ -772,6 +772,36 @@ def test_marker_with_unparseable_date_does_not_block_and_alarms(capsys):
     assert "date unparseable" in out
 
 
+def test_marker_59s_in_the_future_still_blocks_within_skew_tolerance():
+    # Sub-minute NEGATIVE ages are expected in normal operation: the age is
+    # OUR clock minus CLICKUP's clock, so the bot's own just-posted ack read
+    # back through a ClickUp server whose clock runs slightly ahead shows up
+    # seconds "in the future". That marker is the exact retry-storm marker the
+    # dedup window exists for — it MUST still block.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -59))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_marker_exactly_at_skew_tolerance_boundary_blocks():
+    # Boundary is inclusive: age == -CLOCK_SKEW_TOLERANCE_SECONDS still blocks.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -60))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_marker_61s_in_the_future_does_not_block_and_alarms(capsys):
+    # Beyond the skew tolerance the date is clock/shape drift, and the window
+    # cannot be evaluated. Before the skew guard, ANY future date made
+    # age_seconds negative and `age <= window` trivially True — drift would
+    # BLOCK re-triggering for skew+window, inverting the documented
+    # fail-toward-not-blocking posture of every other undatable-marker case.
+    # Like the unparseable-date case, this is an integration break an operator
+    # must see: the line is alarm-matching.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -61))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
+    out = assert_alarm_log_emitted(capsys)
+    assert "date is in the future" in out
+
+
 @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "0", "-60", "junk"])
 def test_non_finite_or_non_positive_window_falls_back_to_default_quietly(monkeypatch, capsys, bad_value):
     # float() happily parses 'nan'/'inf'/'-inf', which escape a bare
