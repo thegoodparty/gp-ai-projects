@@ -833,6 +833,36 @@ def test_marker_with_unparseable_date_does_not_block_and_alarms(capsys):
     assert "date unparseable" in out
 
 
+def test_marker_59s_in_the_future_still_blocks_within_skew_tolerance():
+    # Sub-minute NEGATIVE ages are expected in normal operation: the age is
+    # OUR clock minus CLICKUP's clock, so the bot's own just-posted ack read
+    # back through a ClickUp server whose clock runs slightly ahead shows up
+    # seconds "in the future". That marker is the exact retry-storm marker the
+    # dedup window exists for — it MUST still block.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -59))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_marker_exactly_at_skew_tolerance_boundary_blocks():
+    # Boundary is inclusive: age == -CLOCK_SKEW_TOLERANCE_SECONDS still blocks.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -60))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is True
+
+
+def test_marker_61s_in_the_future_does_not_block_and_alarms(capsys):
+    # Beyond the skew tolerance the date is clock/shape drift, and the window
+    # cannot be evaluated. Before the skew guard, ANY future date made
+    # age_seconds negative and `age <= window` trivially True — drift would
+    # BLOCK re-triggering for skew+window, inverting the documented
+    # fail-toward-not-blocking posture of every other undatable-marker case.
+    # Like the unparseable-date case, this is an integration break an operator
+    # must see: the line is alarm-matching.
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, -61))
+    assert handler.has_processing_started_comment(comments, "analyze", now=PINNED_NOW) is False
+    out = assert_alarm_log_emitted(capsys)
+    assert "date is in the future" in out
+
+
 @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "0", "-60", "junk"])
 def test_non_finite_or_non_positive_window_falls_back_to_default_quietly(monkeypatch, capsys, bad_value):
     # float() happily parses 'nan'/'inf'/'-inf', which escape a bare
@@ -1056,14 +1086,23 @@ def test_missing_function_name_env_falls_back_to_sync_quietly(fake_clickup, fake
     assert "Async self-invoke unavailable" in out
 
 
-def test_invoke_failure_falls_back_to_full_sync_flow(
+def make_invoke_client_error(code: str, message: str = "denied") -> ClientError:
+    """Real botocore ClientError shape for lambda.invoke failures."""
+    return ClientError({"Error": {"Code": code, "Message": message}}, "Invoke")
+
+
+def test_invoke_access_denied_falls_back_to_full_sync_flow(
     fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
 ):
     # Initial prod state: the self-invoke IAM permission ships in a later
-    # terraform PR, so lambda:InvokeFunction is denied. The fallback must
-    # preserve exactly today's synchronous behavior (dedup GET + run_task +
-    # ack) and the fallback itself must NOT fire the alarm — it is expected.
-    fake_lambda.exception = RuntimeError("AccessDeniedException: not authorized to perform lambda:InvokeFunction")
+    # terraform PR, so lambda:InvokeFunction is denied. AccessDenied is a
+    # DETERMINISTIC "the Event was NOT accepted" rejection, so the fallback
+    # must preserve exactly today's synchronous behavior (dedup GET +
+    # run_task + ack) and the fallback itself must NOT fire the alarm — it
+    # is expected on every delivery until the IAM lands.
+    fake_lambda.exception = make_invoke_client_error(
+        "AccessDeniedException", "not authorized to perform lambda:InvokeFunction"
+    )
     event = make_event(tag_updated_body())
 
     resp = handler.handler(event, None)
@@ -1079,16 +1118,16 @@ def test_invoke_failure_falls_back_to_full_sync_flow(
     assert_no_alarm_log_emitted(capsys)
 
 
-def test_invoke_failure_with_alarm_terms_in_message_stays_quiet(
+def test_deterministic_invoke_rejection_with_alarm_terms_in_message_stays_quiet(
     fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
 ):
     # The sync-fallback line fires on EVERY delivery until the self-invoke IAM
     # lands, and raw botocore messages can contain alarm-filter terms — e.g.
     # "Failed to connect to endpoint". Echoing the message would fire the
     # fail-loud alarm on every single delivery of the initial prod state.
-    # Only the exception TYPE may be logged (same pattern as the ack
-    # first-failure line).
-    fake_lambda.exception = RuntimeError("ERROR: Failed to connect to lambda endpoint")
+    # Only the exception type / error code may be logged (same pattern as the
+    # ack first-failure line).
+    fake_lambda.exception = make_invoke_client_error("AccessDeniedException", "ERROR: Failed to invoke lambda")
     event = make_event(tag_updated_body())
 
     resp = handler.handler(event, None)
@@ -1097,7 +1136,77 @@ def test_invoke_failure_with_alarm_terms_in_message_stays_quiet(
     assert response_body(resp)["fargate_task_arn"] == TASK_ARN
     out = assert_no_alarm_log_emitted(capsys)
     assert "Async self-invoke unavailable" in out
-    assert "RuntimeError" in out
+    assert "AccessDeniedException" in out
+
+
+def test_ambiguous_invoke_read_timeout_returns_500_without_sync_processing(
+    fake_clickup, fake_ecs, fake_lambda, ecs_env, self_invoke_env, capsys
+):
+    # DOUBLE-LAUNCH GUARD: an async Event invoke can fail CLIENT-side after
+    # being accepted SERVER-side (read timeout, dropped connection) — the
+    # worker may already be queued. Falling back would then run BOTH the
+    # worker and the inline path for one delivery. Ambiguous failures must
+    # NOT fall back: 500 (ClickUp redelivers; the dedup layers absorb the
+    # possible duplicate worker), zero ClickUp API calls, zero ECS launches,
+    # and an alarm-matching line — this is a genuine failure, unlike the
+    # expected deterministic rejection above.
+    fake_lambda.exception = ReadTimeoutError(endpoint_url="https://lambda.us-west-2.amazonaws.com/")
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 500
+    assert fake_clickup.calls == []
+    assert fake_ecs.run_task_calls == []
+    out = assert_alarm_log_emitted(capsys)
+    assert "Failed to enqueue async processing: ReadTimeoutError" in out
+    # Type only, never the raw message (the endpoint URL adds nothing and raw
+    # botocore messages are what the quiet deterministic path guards against).
+    assert "lambda.us-west-2.amazonaws.com" not in out
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "AccessDeniedException",
+        "ResourceNotFoundException",
+        "InvalidParameterValueException",
+        "UnrecognizedClientException",
+    ],
+)
+def test_enqueue_returns_fallback_for_deterministic_rejection_codes(fake_lambda, self_invoke_env, code):
+    # Unit pin of the determinism split: these codes mean the control plane
+    # REFUSED the Event (never queued), so inline processing cannot double-run.
+    fake_lambda.exception = make_invoke_client_error(code)
+    assert handler.enqueue_async_processing("abc123", "gpbot-analyze") == "fallback"
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        make_invoke_client_error("TooManyRequestsException", "Rate exceeded"),  # throttle: retry may have landed
+        make_invoke_client_error("ServiceException", "internal error"),  # unknown code: can't prove not-queued
+        ReadTimeoutError(endpoint_url="https://lambda.us-west-2.amazonaws.com/"),
+        ConnectionResetError("connection reset by peer"),
+    ],
+)
+def test_enqueue_returns_ambiguous_for_everything_else(fake_lambda, self_invoke_env, capsys, exception):
+    # Any failure that cannot PROVE the Event was rejected is ambiguous — the
+    # invoke may have been accepted server-side before the client gave up.
+    fake_lambda.exception = exception
+    assert handler.enqueue_async_processing("abc123", "gpbot-analyze") == "ambiguous"
+    assert_alarm_log_emitted(capsys)
+
+
+def test_enqueue_returns_accepted_on_success(fake_lambda, self_invoke_env):
+    assert handler.enqueue_async_processing("abc123", "gpbot-analyze") == "accepted"
+
+
+def test_enqueue_returns_fallback_when_function_name_missing(fake_lambda):
+    # clean_self_invoke_env (autouse) removed AWS_LAMBDA_FUNCTION_NAME:
+    # deterministic — no invoke was even attempted, nothing can be queued.
+    assert handler.enqueue_async_processing("abc123", "gpbot-analyze") == "fallback"
+    assert fake_lambda.invoke_calls == []
 
 
 def test_boto3_clients_are_cached_across_invocations(
@@ -1125,8 +1234,9 @@ def test_ecs_client_is_cached_across_invocations(fake_clickup, fake_ecs, boto3_f
 def test_lambda_client_uses_fast_ack_timeouts(fake_clickup, fake_ecs, boto3_factory, ecs_env, self_invoke_env):
     # botocore defaults are 60s connect + 60s read with retries: a hung Lambda
     # control plane would blow ClickUp's whole webhook timeout in-path. The
-    # fast-ack budget demands tight timeouts and a single attempt — on any
-    # failure the quiet sync fallback takes over. total_max_attempts, NOT
+    # fast-ack budget demands tight timeouts and a single attempt — a provable
+    # rejection takes the quiet sync fallback, anything ambiguous 500s so
+    # ClickUp redelivers (no inline double-run). total_max_attempts, NOT
     # max_attempts: legacy-mode botocore reads max_attempts as retries AFTER
     # the initial call, so {"max_attempts": 1} silently means 2 attempts (see
     # test_lambda_client_config_resolves_to_a_single_total_attempt).

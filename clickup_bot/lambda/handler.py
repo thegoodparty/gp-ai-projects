@@ -4,7 +4,7 @@ import json
 import math
 import os
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import boto3
@@ -28,8 +28,11 @@ _dynamodb_client = None
 # critical path, and botocore's defaults (60s connect + 60s read, with
 # retries) could blow the entire webhook timeout — the exact failure mode of
 # the 2026-07-14 incident — on a hung Lambda control plane. Tight timeouts,
-# single attempt: any failure lands in enqueue_async_processing's quiet
-# synchronous fallback, which is always safe.
+# single attempt: a provable control-plane rejection lands in
+# enqueue_async_processing's quiet synchronous fallback; anything else
+# (timeout, dropped connection) is treated as AMBIGUOUS — the Event may
+# already be queued — and 500s so ClickUp redelivers instead of the inline
+# path double-running the work (see enqueue_async_processing).
 #
 # total_max_attempts, NOT max_attempts — a botocore trap: in legacy retry
 # mode (the default) "max_attempts" counts RETRIES AFTER the initial call,
@@ -144,6 +147,19 @@ PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
 # incident's fix, so "re-tag always re-runs" is the observed behavior users
 # know, and an unbounded marker would silently change it.
 DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
+
+# How far in the FUTURE a marker's timestamp may sit and still count toward
+# the dedup window. Sub-minute negative ages are expected in normal operation:
+# age is OUR clock minus CLICKUP's clock, so our own just-posted ack read back
+# through a ClickUp server whose clock runs slightly ahead of Lambda's shows
+# up seconds "in the future" — that marker is the exact retry-storm marker the
+# window exists for and MUST still block. Anything more future-dated than this
+# is clock/shape drift (frozen server clock, epoch-unit change): before this
+# guard, ANY future date made age_seconds negative and `age <= window`
+# trivially True, so drift would BLOCK re-triggering for skew+window —
+# inverting the documented fail-toward-not-blocking posture of every other
+# undatable-marker case (see the RECENCY note in has_processing_started_comment).
+CLOCK_SKEW_TOLERANCE_SECONDS = 60.0
 
 # Pause before retrying the "Processing started" ack post once. Applies ONLY
 # to the async worker (retry_ack=True): there ClickUp already has its 200, so
@@ -347,6 +363,18 @@ def has_processing_started_comment(comments: list[dict], label: str, now: float 
         except (TypeError, ValueError):
             print("ERROR: ClickUp comment date unparseable — dedup window cannot be evaluated")
             continue
+        if age_seconds < -CLOCK_SKEW_TOLERANCE_SECONDS:
+            # A parseable date this far in the future is as undatable as an
+            # unparseable one (see CLOCK_SKEW_TOLERANCE_SECONDS): fail toward
+            # NOT blocking, exactly like the branch above, and alarm — shape/
+            # clock drift is an integration break an operator must see. Only
+            # the delta is logged, never the raw value: a drifted raw date is
+            # noise, and the delta is what diagnoses the skew.
+            print(
+                "ERROR: ClickUp comment date is in the future — dedup window cannot be evaluated "
+                f"({-age_seconds:.0f}s ahead)"
+            )
+            continue
         if age_seconds <= window_seconds:
             return True
     return False
@@ -425,7 +453,24 @@ def find_matched_tag(history_items: Any) -> str | None:
     return None
 
 
-def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
+# ClientError codes that PROVE the Lambda control plane REFUSED the Event
+# invoke — a structured rejection means nothing was queued, so processing
+# inline cannot double-run the work. Only provably-rejected failures may take
+# the synchronous fallback; see the ambiguous branch in
+# enqueue_async_processing for what happens to everything else.
+# AccessDeniedException is the expected initial-prod state (the self-invoke
+# IAM ships in a separate terraform PR), so its fallback must stay quiet.
+DETERMINISTIC_ENQUEUE_FAILURE_CODES = frozenset(
+    {
+        "AccessDeniedException",
+        "ResourceNotFoundException",
+        "InvalidParameterValueException",
+        "UnrecognizedClientException",
+    }
+)
+
+
+def enqueue_async_processing(task_id: str, matched_tag: str) -> Literal["accepted", "fallback", "ambiguous"]:
     # FAST-ACK (2026-07-14 incident): ClickUp's webhook delivery has a short
     # response timeout. When the handler did dedup GET + run_task + ack POST
     # in-path (7.6-20.5s during a ClickUp slowdown), every delivery timed out:
@@ -436,30 +481,59 @@ def enqueue_async_processing(task_id: str, matched_tag: str) -> bool:
     # and answers ClickUp in milliseconds; the worker invocation does the
     # ClickUp/ECS work off the critical path.
     #
-    # False = "process synchronously instead". The self-invoke IAM permission
-    # ships in a separate terraform PR, so AccessDenied here is the initial
-    # prod state: the fallback must be quiet (no "ERROR"/"Failed to" — see the
-    # alarm metric-filter contract in handler()) and must preserve exactly the
-    # old synchronous behavior.
+    # Return contract (explicit strings, no boolean overload):
+    #   "accepted"  — the Event invoke succeeded; the worker owns the work.
+    #   "fallback"  — the invoke PROVABLY never enqueued anything (no function
+    #                 name, or a control-plane rejection code in
+    #                 DETERMINISTIC_ENQUEUE_FAILURE_CODES): process
+    #                 synchronously. AccessDenied is the initial prod state
+    #                 until the self-invoke IAM lands, so this path must be
+    #                 quiet (no "ERROR"/"Failed to" — see the alarm
+    #                 metric-filter contract in handler()) and must preserve
+    #                 exactly the old synchronous behavior.
+    #   "ambiguous" — the invoke MAY have been accepted server-side (read
+    #                 timeout, dropped connection, throttle, unknown
+    #                 ClientError code): the worker could already be queued,
+    #                 so a synchronous fallback would run BOTH the worker and
+    #                 the inline path for one delivery — the exact
+    #                 duplicate-launch bug this design exists to fix. The
+    #                 handler must 500 instead: ClickUp redelivers, and the
+    #                 dedup layers absorb the possible duplicate worker.
     function_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
     if not function_name:
         print("Async self-invoke unavailable, processing synchronously: AWS_LAMBDA_FUNCTION_NAME not set")
-        return False
+        return "fallback"
     try:
         get_lambda_client().invoke(
             FunctionName=function_name,
             InvocationType="Event",
             Payload=json.dumps({"gpbot_async": True, "task_id": task_id, "matched_tag": matched_tag}),
         )
-        return True
+        return "accepted"
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in DETERMINISTIC_ENQUEUE_FAILURE_CODES:
+            # Error CODE only, never the message: this line fires on EVERY
+            # delivery until the IAM lands, and raw botocore messages can
+            # contain alarm-filter terms ("Failed to connect to endpoint...")
+            # — echoing the message would fire the fail-loud alarm on every
+            # delivery of the initial prod state. Same pattern as the ack
+            # first-failure line. The codes in the frozenset are known-safe.
+            print(f"Async self-invoke unavailable, processing synchronously: {error_code}")
+            return "fallback"
+        # Unknown ClientError code (throttle, internal error, anything new):
+        # cannot prove the Event was not queued — ambiguous. Alarm-matching
+        # ("Failed to"), TYPE only (the raw message is leak-prone noise).
+        # Real-SDK ClientError subclasses carry the code as their class name.
+        print(f"Failed to enqueue async processing: {type(e).__name__}")
+        return "ambiguous"
     except Exception as e:
-        # Exception TYPE only: this line fires on EVERY delivery until the
-        # IAM lands, and raw botocore messages can contain alarm-filter terms
-        # ("Failed to connect to endpoint ...") — echoing the message would
-        # fire the fail-loud alarm on every delivery of the initial prod
-        # state. Same pattern as the ack first-failure line.
-        print(f"Async self-invoke unavailable, processing synchronously: {type(e).__name__}")
-        return False
+        # Transport-phase failures (ReadTimeoutError, connection resets, ...):
+        # the request may have reached the control plane and been accepted
+        # after the client gave up — ambiguous by definition. Same alarm
+        # contract as above.
+        print(f"Failed to enqueue async processing: {type(e).__name__}")
+        return "ambiguous"
 
 
 def is_atomic_dedup_configured() -> bool:
@@ -764,14 +838,25 @@ def handler(event: dict, context: Any) -> dict:
     # (task_id present, matched_tag in TAG_CONFIG) — answer ClickUp NOW, with
     # zero ClickUp API calls in-path, and let the async worker do the rest.
     # See enqueue_async_processing for the incident rationale.
-    if enqueue_async_processing(task_id, matched_tag):
+    enqueue_outcome = enqueue_async_processing(task_id, matched_tag)
+    if enqueue_outcome == "accepted":
         return {
             "statusCode": 200,
             "body": json.dumps({"status": "accepted", "task_id": task_id, "label": TAG_CONFIG[matched_tag]["label"]}),
         }
 
-    # Synchronous fallback (initial prod state until the self-invoke IAM
-    # lands): same shared dedup-then-trigger path the async worker uses.
+    if enqueue_outcome == "ambiguous":
+        # The Event MAY already be queued (see enqueue_async_processing):
+        # processing inline could double-launch, so do nothing more here.
+        # 500 makes ClickUp redeliver — self-healing at-least-once, the same
+        # contract as the sync comments-GET-failure 500 — and the dedup
+        # layers absorb the possible duplicate worker on the redelivery.
+        # enqueue_async_processing already logged the alarm-matching line.
+        return {"statusCode": 500, "body": json.dumps({"error": "failed to enqueue async processing"})}
+
+    # Deterministic rejection ("fallback", the initial prod state until the
+    # self-invoke IAM lands): nothing was queued, so run the same shared
+    # dedup-then-trigger path the async worker uses — synchronously.
     return dedup_check_then_trigger(task_id, matched_tag)
 
 
