@@ -2083,6 +2083,21 @@ def test_invalid_lock_ttl_falls_back_to_default_quietly(
     assert_no_alarm_log_emitted(capsys)
 
 
+@pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "0", "-60", "junk"])
+def test_non_finite_or_non_positive_ttl_falls_back_to_default_quietly(monkeypatch, capsys, bad_value):
+    # Same guard as DEDUP_COMMENT_WINDOW_SECONDS: float() happily parses
+    # 'nan'/'inf'/'-inf', which escape a bare ValueError guard and then crash
+    # at int(time.time() + ttl) inside the claim write — in-path, on every
+    # trigger. Non-finite or non-positive values must fall back to the
+    # default with the existing quiet (non-alarm) line.
+    monkeypatch.setenv("DEDUP_TTL_SECONDS", bad_value)
+
+    assert handler.get_dedup_ttl_seconds() == handler.DEFAULT_DEDUP_TTL_SECONDS
+
+    out = assert_no_alarm_log_emitted(capsys)
+    assert "Invalid DEDUP_TTL_SECONDS" in out
+
+
 def test_duplicate_claim_suppresses_launch_quietly_sync_path(
     fake_clickup, fake_ecs, fake_dynamodb, ecs_env, dedup_table_env, capsys
 ):

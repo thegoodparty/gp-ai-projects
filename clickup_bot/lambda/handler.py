@@ -134,12 +134,18 @@ def get_dedup_ttl_seconds() -> float:
     raw = os.environ.get("DEDUP_TTL_SECONDS")
     if raw:
         try:
-            return float(raw)
+            value = float(raw)
         except ValueError:
-            # Same contract as get_dedup_window_seconds: a typo'd env var must
-            # not crash deliveries in-path and must not spam the alarm on
-            # every trigger — quiet fallback (no "ERROR"/"Failed to").
-            print("Invalid DEDUP_TTL_SECONDS env value; using default 900s")
+            value = None
+        # Same contract as get_dedup_window_seconds, including the
+        # isfinite + positive check: float() happily parses 'nan'/'inf',
+        # which would crash at int(time.time() + ttl) inside the claim write.
+        # A typo'd env var must not crash deliveries in-path and must not
+        # spam the alarm on every trigger — quiet fallback (no
+        # "ERROR"/"Failed to").
+        if value is not None and math.isfinite(value) and value > 0:
+            return value
+        print("Invalid DEDUP_TTL_SECONDS env value; using default 900s")
     return DEFAULT_DEDUP_TTL_SECONDS
 
 
