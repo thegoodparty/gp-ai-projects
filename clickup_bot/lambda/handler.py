@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from typing import Any
 from urllib.request import Request, urlopen
 
@@ -62,6 +63,30 @@ def verify_webhook_signature(body: str, signature: str) -> bool:
 
 BOT_PREFIX = "[GP-Bot]"
 PROCESSING_STARTED_PREFIX = f"{BOT_PREFIX} Processing started"
+
+# How long a "Processing started" marker blocks re-triggering. The marker
+# exists to absorb webhook retry storms and double-tags (seconds-to-minutes
+# timescale — ClickUp retried one delivery 5x within ~45s in the 2026-07-14
+# incident). A human re-tagging a task hours later is a deliberate re-run and
+# must NOT be silently ignored: dedup had never actually fired before that
+# incident's fix, so "re-tag always re-runs" is the observed behavior users
+# know, and an unbounded marker would silently change it.
+DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS = 900.0
+
+
+def get_dedup_window_seconds() -> float:
+    raw = os.environ.get("DEDUP_COMMENT_WINDOW_SECONDS")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            # A typo'd env var must not crash deliveries (this runs in-path,
+            # post-auth) and must not spam the alarm on every dedup check —
+            # fall back to the safe default with a quiet, non-alarm log line
+            # (no "ERROR"/"Failed to": see the metric-filter contract below).
+            print("Invalid DEDUP_COMMENT_WINDOW_SECONDS env value; using default 900s")
+    return DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS
+
 
 # Repo guidance (omni monorepo, archived standalone repos) deliberately does
 # NOT live here: it is baked into the agent's capability prompt
@@ -142,7 +167,7 @@ def get_task_comments(task_id: str) -> list[dict]:
     return result.get("comments", [])
 
 
-def has_processing_started_comment(comments: list[dict]) -> bool:
+def has_processing_started_comment(comments: list[dict], now: float | None = None) -> bool:
     # Only the success marker counts as 'already processed'. Failure comments
     # ('[GP-Bot] Failed to start processing: ...') must NOT block a retry:
     # removing and re-adding the tag after a failure has to re-trigger.
@@ -155,13 +180,28 @@ def has_processing_started_comment(comments: list[dict]) -> bool:
     # delivery retried 6x launched 6 Fargate agents. Prefer comment_text; fall
     # back to concatenating item["text"] WITHOUT filtering on "type" (tolerate
     # its presence for forward-compat if ClickUp ever ships one).
+    #
+    # RECENCY: a marker only blocks while younger than the dedup window (see
+    # DEFAULT_DEDUP_COMMENT_WINDOW_SECONDS for why). The real API's "date" is
+    # a STRING of epoch milliseconds; a missing/unparseable date is treated as
+    # recent (block) — conservative against retry storms. `now` is injectable
+    # so tests can pin exact boundaries.
+    if now is None:
+        now = time.time()
+    window_seconds = get_dedup_window_seconds()
     for comment in comments:
         comment_text = comment.get("comment_text")
         if comment_text is None:
             comment_text = "".join(
                 item.get("text", "") for item in comment.get("comment", []) if isinstance(item, dict)
             )
-        if comment_text.startswith(PROCESSING_STARTED_PREFIX):
+        if not comment_text.startswith(PROCESSING_STARTED_PREFIX):
+            continue
+        try:
+            age_seconds = now - int(comment.get("date")) / 1000.0
+        except (TypeError, ValueError):
+            return True
+        if age_seconds <= window_seconds:
             return True
     return False
 

@@ -532,6 +532,81 @@ def test_dedup_tolerates_type_keyed_items_forward_compat(fake_clickup, fake_ecs,
 
 
 # ---------------------------------------------------------------------------
+# 9b. Dedup recency window: a "Processing started" marker only blocks while it
+# is RECENT (DEDUP_COMMENT_WINDOW_SECONDS, default 900). The marker exists to
+# absorb webhook retry storms and double-tags (seconds-to-minutes); a human
+# re-tagging a task hours later to deliberately re-run must not be silently
+# ignored. (Dedup never actually fired before the 2026-07-14 fix, so
+# "re-tag always re-runs" is the behavior users know; an unbounded marker
+# would silently change it.)
+# ---------------------------------------------------------------------------
+
+PINNED_NOW = 1784040000.0  # arbitrary fixed epoch so boundary math is exact
+
+
+def processing_started_comments(date_value) -> list[dict]:
+    """Real-shape comment list whose marker carries an explicit raw date value."""
+    text = "[GP-Bot] Processing started (analyze, model: opus)..."
+    comment = {
+        "id": "90130291038679",
+        "comment": [{"text": text}],
+        "comment_text": text,
+        "user": {"id": 105985359, "username": "Collin Park"},
+        "reply_count": 0,
+    }
+    if date_value is not None:
+        comment["date"] = date_value
+    return [comment]
+
+
+def epoch_ms_str(now: float, age_seconds: float) -> str:
+    return str(int((now - age_seconds) * 1000))
+
+
+def test_marker_899s_old_blocks_at_default_window():
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, 899))
+    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+
+
+def test_marker_901s_old_does_not_block_at_default_window():
+    comments = processing_started_comments(epoch_ms_str(PINNED_NOW, 901))
+    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is False
+
+
+def test_marker_with_missing_date_blocks():
+    # Conservative against retry storms: an undatable marker is treated as
+    # recent (block) rather than allowing a possible duplicate launch.
+    comments = processing_started_comments(None)
+    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+
+
+def test_marker_with_unparseable_date_blocks():
+    comments = processing_started_comments("not-a-number")
+    assert handler.has_processing_started_comment(comments, now=PINNED_NOW) is True
+
+
+def test_window_is_configurable_via_env(monkeypatch):
+    monkeypatch.setenv("DEDUP_COMMENT_WINDOW_SECONDS", "60")
+    recent = processing_started_comments(epoch_ms_str(PINNED_NOW, 30))
+    stale = processing_started_comments(epoch_ms_str(PINNED_NOW, 120))
+    assert handler.has_processing_started_comment(recent, now=PINNED_NOW) is True
+    assert handler.has_processing_started_comment(stale, now=PINNED_NOW) is False
+
+
+def test_stale_marker_allows_deliberate_re_tag_to_retrigger(fake_clickup, fake_ecs, ecs_env):
+    # Handler-level: a marker from hours ago must NOT block a fresh tag event —
+    # a human re-tagging later is a deliberate re-run, not a retry storm.
+    fake_clickup.comments_response = existing_gpbot_comment_response(age_seconds=3600)
+    event = make_event(tag_updated_body())
+
+    resp = handler.handler(event, None)
+
+    assert resp["statusCode"] == 200
+    assert response_body(resp)["fargate_task_arn"] == TASK_ARN
+    assert len(fake_ecs.run_task_calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # 10. Comment fetch failure -> 500
 # ---------------------------------------------------------------------------
 
