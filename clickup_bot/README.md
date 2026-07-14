@@ -41,16 +41,20 @@ ClickUp comment OR GitHub PR
    internet request cannot produce — an ALB-wrapped body stays a string inside
    `event["body"]`):
    - Dedup check: does the task already have a **recent** `[GP-Bot] Processing
-     started` comment? → Skip. See "Dedup semantics" below.
+     started` comment **for the same label**? → Skip. Analyze and implement
+     dedup independently. See "Dedup semantics" below.
    - Atomic dedup claim: conditional DynamoDB write on `{task_id}#{label}` —
      exactly one concurrent worker wins; losers skip quietly. See "Dedup
      semantics" below.
    - Triggers Fargate, passing `CLICKUP_TASK_ID`, `INSTRUCTION`, and
      `AGENT_MODEL` as container-override env vars (the instruction encodes the
      analyze-vs-implement contract; there is no `OUTPUT_ACTION`)
-   - Posts the `[GP-Bot] Processing started (...)` comment, only after the
-     Fargate task actually launched (retried once on failure — this comment is
-     the dedup marker, and it no longer sits on ClickUp's timeout budget)
+   - Posts the `[GP-Bot] Processing started (...)` comment — which also tells
+     the user the re-tag cooldown — only after the Fargate task actually
+     launched. In the async worker it is retried once on failure (this comment
+     is the dedup marker, and the worker is off ClickUp's timeout budget); the
+     inline fallback posts it exactly once, because there ClickUp is still
+     waiting on the webhook response.
    - Never lets an exception escape: an unhandled exception in an async
      invocation makes Lambda auto-retry it, which would duplicate the launch.
      Failures log an alarm-matching `ERROR: Async processing failed` line (the
@@ -68,20 +72,28 @@ Failure comments do not mark the task as processed, so the retry re-triggers.
 
 ## Dedup semantics
 
-Only the `[GP-Bot] Processing started` success marker counts as processed, and only
-while it is recent: within `DEDUP_COMMENT_WINDOW_SECONDS` (default 900) of the
+Only the `[GP-Bot] Processing started` success marker **for the same label**
+counts as processed (mirroring the atomic layer's `{task_id}#{label}` key: a fresh
+analyze marker never suppresses a gpbot-work trigger), and only while it is recent: within `DEDUP_COMMENT_WINDOW_SECONDS` (default 900) of the
 comment's `date`. The marker exists to absorb webhook retry storms and double-tags,
 which play out over seconds to minutes. A human re-tagging a task hours later is a
 deliberate re-run and must not be silently ignored — dedup had never actually fired
 before the 2026-07-14 fix (see below), so "re-tag always re-runs" is the behavior
 users already know; an unbounded marker would have silently changed it. Markers with
-a missing or unparseable `date` are treated as recent (block), which is the
-conservative direction during a retry storm. `[GP-Bot] Failed to start processing`
+a missing or unparseable `date` do NOT block — blocking would have no age bound,
+so a ClickUp date-format drift would permanently disable re-tag re-runs — and log an
+alarm-matching `ERROR` line, because that shape drift is an integration break an
+operator must see; the duplicate risk it fails toward is bounded by the atomic
+DynamoDB layer. `[GP-Bot] Failed to start processing`
 comments never block a retry, regardless of age.
 
 Comment-based dedup is best-effort: two deliveries processed close enough together
 both see "no marker yet" and both launch (the check and the comment post are not
-atomic). The authoritative layer is an **atomic DynamoDB claim**: after the comment
+atomic). Because it is best-effort, a comments GET failure in the async worker does
+not drop the delivery: with `DEDUP_TABLE_NAME` configured the worker proceeds (the
+atomic claim still guards duplicates); without it the worker stops and posts the
+standard failure comment so the tagger has a visible remove-and-re-add retry path.
+The synchronous path instead returns 500 and lets ClickUp redeliver. The authoritative layer is an **atomic DynamoDB claim**: after the comment
 check passes, the worker does a conditional `PutItem` on `{task_id}#{label}` into
 `DEDUP_TABLE_NAME` — DynamoDB serializes conditional writes, so exactly one worker
 wins even under fully concurrent deliveries; losers skip quietly with a 200. Claim
@@ -123,9 +135,11 @@ never fired since the feature shipped. The old test fixture had invented the
 
 Handled 500s and 401s do not fire the Lambda `Errors` metric, so terraform
 (`infrastructure/modules/clickup-bot/`) creates a CloudWatch log metric filter on the
-handler's `ERROR` / `Failed to` log lines, an alarm on that metric, and a
+handler's `ERROR` / `Failed to` log lines (plus the runtime-emitted
+`Task timed out`, so a hard-timed-out async worker — which no caller observes and
+which Lambda never retries — still alarms), an alarm on that metric, and a
 `clickup-bot-failures-prod` SNS topic wired to the shared Slack notifier. The alarm
-covers the `ERROR` / `Failed to` log lines — not literally every failure path. The
+covers those log lines — not literally every failure path. The
 operationally significant failures each emit one and alarm within ~5 minutes: the
 fail-loud 500s (missing `ECS_*` config, `ecs:RunTask` failure, comment-fetch failure,
 secrets outage), the failure-comment and ack-comment posts the handler deliberately
