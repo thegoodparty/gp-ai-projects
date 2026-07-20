@@ -12,7 +12,7 @@ dependencies = [
     "kmapper>=2.0.0",
     "ripser>=0.6.0",
     "networkx>=3.0",
-    "fastapi>=0.116.0",
+    "fastapi>=0.139.2",
     "uvicorn>=0.35.0",
     "sqlglot>=30.4.3",
 ]
