@@ -59,6 +59,53 @@ EVALUATOR_ALLOWED_TOOLS = ["Bash"]
 
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
+# Live cost accumulator for the primary run_agent loop. A timeout or SIGTERM
+# cancels the loop before the terminal ResultMessage arrives, so its
+# total_cost_usd is lost and the run is reported with cost 0.0. We instead sum
+# each turn's real token usage into module-level state (mirrors main.py's
+# _current_task / _shutdown_requested) that the kill handlers can read after
+# cancellation. On a clean finish (or a max_turns error, which DOES emit a
+# ResultMessage) we overwrite the estimate with the authoritative figure.
+_accumulated_cost_usd = 0.0
+
+# $ per million tokens, keyed by substring of the AssistantMessage.model string
+# (matches bare "claude-sonnet-..." and Bedrock "anthropic.claude-sonnet-...").
+# cache_read ≈ 0.1x input, cache_write (5m) ≈ 1.25x input. Only used to price
+# the timeout estimate; the ResultMessage figure is authoritative otherwise.
+_PRICE_PER_MTOK = {
+    "opus": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25},
+    "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    "haiku": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+}
+
+
+def _price_turn(model: str, usage: dict) -> float:
+    """Dollar cost of one turn from its per-call token usage. Each token class
+    is priced at its own rate and summed — never sum raw input tokens across
+    turns, since prompt caching re-bills the growing context as cheap
+    cache-reads each turn."""
+    rates = next((v for k, v in _PRICE_PER_MTOK.items() if k in (model or "").lower()), None)
+    if rates is None:
+        return 0.0
+    tokens = usage or {}
+    return (
+        tokens.get("input_tokens", 0) * rates["input"]
+        + tokens.get("output_tokens", 0) * rates["output"]
+        + tokens.get("cache_read_input_tokens", 0) * rates["cache_read"]
+        + tokens.get("cache_creation_input_tokens", 0) * rates["cache_write"]
+    ) / 1_000_000
+
+
+def reset_accumulated_cost() -> None:
+    global _accumulated_cost_usd
+    _accumulated_cost_usd = 0.0
+
+
+def get_accumulated_cost() -> float:
+    """Real cost spent so far in the primary loop. Read by main.py's kill
+    handlers to bill timed-out/cancelled runs instead of reporting 0.0."""
+    return _accumulated_cost_usd
+
 # Subagent fan-out (runtime.max_parallel_subagents). The SDK's subagent
 # dispatch tool is named "Agent" in claude-agent-sdk 0.2.x (it was "Task" in
 # 0.1.x). The parent calls it to spawn one researcher per independent item.
@@ -316,6 +363,9 @@ async def run_agent(
 ) -> dict:
     logger.info(f"Starting Claude SDK harness (model: {model}, max_turns: {max_turns})")
 
+    global _accumulated_cost_usd
+    reset_accumulated_cost()
+
     output_dir = os.path.join(workspace_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -430,6 +480,7 @@ async def run_agent(
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             message_count += 1
+            _accumulated_cost_usd += _price_turn(message.model, message.usage or {})
             content_blocks = []
             for block in message.content:
                 if isinstance(block, TextBlock):
@@ -481,6 +532,11 @@ async def run_agent(
             total_cost = message.total_cost_usd or 0.0
             num_turns = message.num_turns
             session_id = message.session_id
+
+            # Authoritative figure — supersedes the per-turn estimate for every
+            # path that reaches a ResultMessage, including the max_turns error
+            # raised just below (which the runner's generic kill handler bills).
+            _accumulated_cost_usd = total_cost
 
             _log_jsonl({"type": "result", "total_cost_usd": total_cost, "num_turns": num_turns, "session_id": session_id})
 
