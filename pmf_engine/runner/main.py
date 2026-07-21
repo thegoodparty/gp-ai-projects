@@ -159,6 +159,7 @@ def _send_failed_to_sqs_directly(
     experiment_id: str,
     reason_code: str,
     detail: str,
+    cost_usd: float | None = None,
 ) -> bool:
     """Last-resort failed callback when the broker is unreachable.
 
@@ -186,6 +187,8 @@ def _send_failed_to_sqs_directly(
             "reason_code": reason_code,
             "detail": detail,
         }
+        if cost_usd is not None:
+            body["cost_usd"] = cost_usd
         sqs.send_message(
             QueueUrl=queue_url,
             MessageBody=json.dumps(body),
@@ -201,6 +204,18 @@ def _send_failed_to_sqs_directly(
         return False
 
 
+def _accumulated_agent_cost() -> float | None:
+    """Real cost the primary agent loop spent before it was killed, so a
+    timed-out / cancelled run bills its actual spend instead of 0.0. Returns
+    None (report no cost, today's behavior) if the harness never ran or the
+    accumulator can't be read."""
+    try:
+        from .harness.claude_sdk import get_accumulated_cost
+        return get_accumulated_cost()
+    except Exception:
+        return None
+
+
 def _report_failed_or_fallback(
     *,
     run_id: str,
@@ -208,6 +223,7 @@ def _report_failed_or_fallback(
     reason_code: str,
     detail: str,
     duration_seconds: float,
+    cost_usd: float | None = None,
 ) -> None:
     """Send a terminal "failed" status via the broker; if the broker is
     unreachable (report_status raises), fall back to a direct SQS failed
@@ -220,6 +236,7 @@ def _report_failed_or_fallback(
             reason_code=reason_code,
             detail=detail,
             duration_seconds=duration_seconds,
+            cost_usd=cost_usd,
         )
     except Exception as report_err:
         logger.exception(
@@ -231,6 +248,7 @@ def _report_failed_or_fallback(
             experiment_id=experiment_id,
             reason_code=reason_code,
             detail=detail,
+            cost_usd=cost_usd,
         )
 
 
@@ -1093,6 +1111,7 @@ async def main():
             reason_code="Timeout",
             detail=f"Experiment timed out after {config.timeout_seconds}s",
             duration_seconds=time.monotonic() - main_start_time,
+            cost_usd=_accumulated_agent_cost(),
         )
         _hard_exit(1)
 
@@ -1105,6 +1124,7 @@ async def main():
             reason_code="Signal",
             detail="Task terminated by signal",
             duration_seconds=time.monotonic() - main_start_time,
+            cost_usd=_accumulated_agent_cost(),
         )
         _hard_exit(1)
 
@@ -1120,6 +1140,7 @@ async def main():
                 reason_code="Signal",
                 detail="Task terminated by signal",
                 duration_seconds=time.monotonic() - main_start_time,
+                cost_usd=_accumulated_agent_cost(),
             )
             _hard_exit(1)
 
@@ -1131,6 +1152,7 @@ async def main():
                 reason_code=type(e).__name__,
                 detail=f"Unhandled error: {e}",
                 duration_seconds=time.monotonic() - main_start_time,
+                cost_usd=_accumulated_agent_cost(),
             )
         raise
 
