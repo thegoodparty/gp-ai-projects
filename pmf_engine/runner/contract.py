@@ -41,7 +41,54 @@ def collect_contract_errors(artifact_bytes: bytes, schema: dict | None) -> list[
     if not isinstance(data, dict):
         return ["Artifact must be a JSON object"]
 
-    return _collect_jsonschema_errors(data, schema)
+    branch = _select_oneof_branch(data, schema)
+    return _collect_jsonschema_errors(data, branch or schema)
+
+
+def _select_oneof_branch(data: dict, schema: dict) -> dict | None:
+    """For a top-level ``oneOf`` discriminated by a shared enum property, return
+    the single branch the artifact's discriminator value selects — otherwise
+    ``None`` (validate against the whole ``oneOf``).
+
+    A bare ``oneOf`` makes jsonschema report the merged errors of *every* branch
+    when the artifact is slightly wrong, so an artifact that is a near-miss for
+    its intended branch drowns in irrelevant errors from the branches it never
+    meant to match. Picking the branch up front (e.g. meeting_briefing's
+    ``briefing_status``: briefing_ready vs the awaiting/no-meeting placeholder)
+    yields errors the agent can act on. The root ``definitions`` are carried
+    into the branch so its ``$ref: "#/definitions/..."`` still resolve.
+    """
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list) or len(branches) < 2:
+        return None
+    if not all(isinstance(b, dict) for b in branches):
+        return None
+
+    def _enum(branch: dict, field: str) -> list | None:
+        vals = branch.get("properties", {}).get(field, {}).get("enum")
+        return vals if isinstance(vals, list) else None
+
+    discriminators: set[str] | None = None
+    for branch in branches:
+        props = branch.get("properties", {})
+        enum_fields = {
+            k for k, v in props.items()
+            if isinstance(v, dict) and isinstance(v.get("enum"), list)
+        }
+        discriminators = enum_fields if discriminators is None else discriminators & enum_fields
+
+    for field in discriminators or ():
+        value = data.get(field)
+        if not isinstance(value, (str, int, bool)):
+            continue
+        matches = [b for b in branches if value in (_enum(b, field) or [])]
+        if len(matches) == 1:
+            selected = dict(matches[0])
+            for defs_key in ("definitions", "$defs"):
+                if defs_key in schema and defs_key not in selected:
+                    selected[defs_key] = schema[defs_key]
+            return selected
+    return None
 
 
 def _collect_jsonschema_errors(data: dict, schema: dict) -> list[str]:

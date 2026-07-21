@@ -252,6 +252,85 @@ class TestFormatContractForPrompt:
         assert "done" in rendered
 
 
+class TestDiscriminatedOneOf:
+    """A top-level oneOf discriminated by a shared enum property validates only
+    the branch the discriminator selects, so a near-miss artifact gets that
+    branch's errors instead of the merged noise of every branch."""
+
+    # Mirrors meeting_briefing: two branches keyed by `status`, branch refs
+    # resolve through the root `definitions`.
+    SCHEMA = {
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status", "items"],
+                "properties": {
+                    "status": {"enum": ["ready", "provided"]},
+                    "items": {"type": "array", "minItems": 1, "items": {"$ref": "#/definitions/item"}},
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["status", "items"],
+                "properties": {
+                    "status": {"enum": ["awaiting", "no_meeting"]},
+                    "items": {"type": "array", "maxItems": 0},
+                },
+            },
+        ],
+        "definitions": {
+            "item": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": "string"}},
+            }
+        },
+    }
+
+    def test_valid_ready_branch_passes(self):
+        artifact = {"status": "ready", "items": [{"id": "i1"}]}
+        assert collect_contract_errors(json.dumps(artifact).encode(), self.SCHEMA) == []
+
+    def test_valid_placeholder_branch_passes(self):
+        artifact = {"status": "awaiting", "items": []}
+        assert collect_contract_errors(json.dumps(artifact).encode(), self.SCHEMA) == []
+
+    def test_near_miss_reports_only_selected_branch_errors(self):
+        # status=ready selects branch 0; the item is missing `id`. Errors must
+        # be about the item, NOT branch 1's "items should be empty" complaint.
+        artifact = {"status": "ready", "items": [{}]}
+        errors = collect_contract_errors(json.dumps(artifact).encode(), self.SCHEMA)
+        assert errors
+        joined = " | ".join(errors)
+        assert "id" in joined
+        assert "maxItems" not in joined and "0" not in joined.replace("items[0]", "")
+
+    def test_branch_ref_resolves_through_root_definitions(self):
+        # If root `definitions` weren't carried into the selected branch, the
+        # $ref would fail to resolve and raise instead of returning errors.
+        artifact = {"status": "ready", "items": [{"id": 5}]}
+        errors = collect_contract_errors(json.dumps(artifact).encode(), self.SCHEMA)
+        assert any("items[0].id" in e for e in errors)
+
+    def test_unknown_discriminator_value_falls_back_to_full_oneof(self):
+        # No branch matches → validate against the whole oneOf (which fails).
+        artifact = {"status": "bogus", "items": []}
+        errors = collect_contract_errors(json.dumps(artifact).encode(), self.SCHEMA)
+        assert errors
+
+    def test_non_discriminated_oneof_falls_back(self):
+        # No shared enum property across branches → no selection, whole oneOf.
+        schema = {
+            "oneOf": [
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {"type": "object", "required": ["b"], "properties": {"b": {"type": "number"}}},
+            ]
+        }
+        assert collect_contract_errors(b'{"a": "x"}', schema) == []
+
+
 class TestPrimitiveTypeChecks:
     def _wrap(self, field_schema: dict, required: bool = True) -> dict:
         s = {"type": "object", "properties": {"score": field_schema}}
