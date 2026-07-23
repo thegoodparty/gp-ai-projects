@@ -224,8 +224,8 @@ resource "aws_ecs_task_definition" "agent" {
           valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:CLICKUP_API_KEY::"
         },
         {
-          name      = "GITHUB_TOKEN"
-          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:GITHUB_TOKEN::"
+          name      = "GITHUB_APP_PRIVATE_KEY"
+          valueFrom = "arn:aws:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:AI_SECRETS_${upper(var.environment)}:GITHUB_APP_PRIVATE_KEY::"
         },
         {
           name      = "DATABRICKS_API_KEY"

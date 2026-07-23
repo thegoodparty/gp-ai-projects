@@ -80,7 +80,7 @@ Injected from Secrets Manager:
 |--------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `CLICKUP_API_KEY` | ClickUp API key |
-| `GITHUB_TOKEN` | For cloning private repos |
+| `GITHUB_APP_PRIVATE_KEY` | Delegate GitHub App key; an installation token is minted at startup and exported as `GITHUB_TOKEN` for cloning private repos (fallback: pre-set `GITHUB_TOKEN`) |
 | `DATABRICKS_API_KEY` | Databricks access |
 | `SLACK_BOT_TOKEN` | Slack notifications |
 
