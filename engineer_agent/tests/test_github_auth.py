@@ -1,4 +1,5 @@
 import json
+import time
 
 import httpx
 import jwt
@@ -67,6 +68,7 @@ class TestSetupGithubAuth:
         captured: list[httpx.Request] = []
         env = {"GITHUB_APP_PRIVATE_KEY": flattened_secrets_manager_pem(pem)}
 
+        now = int(time.time())
         mode = setup_github_auth(env, client=make_github_fake("ghs_minted123", captured))
 
         assert mode == "app"
@@ -75,7 +77,9 @@ class TestSetupGithubAuth:
         bearer = captured[0].headers["Authorization"].removeprefix("Bearer ")
         claims = jwt.decode(bearer, public_pem, algorithms=["RS256"])
         assert claims["iss"] == GITHUB_APP_ID
-        assert claims["exp"] > claims["iat"]
+        assert claims["exp"] - claims["iat"] == 600
+        assert abs(claims["iat"] - (now - 60)) <= 5
+        assert claims["iat"] < now
 
     def test_app_id_and_installation_id_overridable_via_env(self, rsa_key):
         pem, public_pem = rsa_key
