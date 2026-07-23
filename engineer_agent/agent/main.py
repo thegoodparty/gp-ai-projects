@@ -16,6 +16,7 @@ from claude_agent_sdk import (
 from shared.logger import get_logger
 
 from .config import CAPABILITIES, AgentConfig, build_capability_prompt
+from .github_auth import setup_github_auth
 
 logger = get_logger(__name__)
 
@@ -37,11 +38,7 @@ async def run_agent(config: AgentConfig) -> dict:
 
     if not config.instruction:
         logger.error("No INSTRUCTION provided")
-        return {
-            "status": "error",
-            "task_id": config.task_id,
-            "error": "No INSTRUCTION provided"
-        }
+        return {"status": "error", "task_id": config.task_id, "error": "No INSTRUCTION provided"}
 
     options = ClaudeAgentOptions(
         system_prompt=build_system_prompt(config.instruction),
@@ -89,17 +86,19 @@ async def run_agent(config: AgentConfig) -> dict:
                         "error": result_text,
                         "cost_usd": total_cost,
                         "num_turns": num_turns,
-                        "session_id": session_id
+                        "session_id": session_id,
                     }
 
-                logger.info(f"Agent completed: {num_turns} turns, {message_count} messages. Cost: ${total_cost:.4f}. Session: {session_id}")
+                logger.info(
+                    f"Agent completed: {num_turns} turns, {message_count} messages. Cost: ${total_cost:.4f}. Session: {session_id}"
+                )
                 return {
                     "status": "success",
                     "task_id": config.task_id,
                     "result": result_text,
                     "cost_usd": total_cost,
                     "num_turns": num_turns,
-                    "session_id": session_id
+                    "session_id": session_id,
                 }
 
         logger.error("Agent stream ended without ResultMessage")
@@ -107,17 +106,12 @@ async def run_agent(config: AgentConfig) -> dict:
             "status": "error",
             "task_id": config.task_id,
             "error": "Stream ended unexpectedly without result",
-            "session_id": session_id
+            "session_id": session_id,
         }
 
     except Exception as e:
         logger.exception(f"Agent failed: {e}")
-        return {
-            "status": "error",
-            "task_id": config.task_id,
-            "error": str(e),
-            "session_id": session_id
-        }
+        return {"status": "error", "task_id": config.task_id, "error": str(e), "session_id": session_id}
 
 
 async def main():
@@ -132,6 +126,12 @@ async def main():
         sys.exit(1)
 
     os.makedirs(config.workspace_dir, exist_ok=True)
+
+    auth_mode = setup_github_auth(os.environ)
+    logger.info(f"GitHub auth mode: {auth_mode}")
+    if auth_mode == "error":
+        logger.error("GitHub App key present but token minting failed and no fallback PAT — aborting before agent run")
+        sys.exit(1)
 
     result = await run_agent(config)
 
