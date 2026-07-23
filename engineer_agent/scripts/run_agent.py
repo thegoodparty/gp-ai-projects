@@ -5,6 +5,7 @@ import sys
 
 from engineer_agent.agent import run_agent
 from engineer_agent.agent.config import AgentConfig
+from engineer_agent.agent.github_auth import setup_github_auth
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
@@ -12,29 +13,11 @@ logger = get_logger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="Run the engineer agent locally")
+    parser.add_argument("--task-id", type=str, required=True, help="ClickUp task ID to analyze")
+    parser.add_argument("--instruction", type=str, default=None, help="Instruction text (or use --instruction-file)")
+    parser.add_argument("--instruction-file", type=str, default=None, help="Path to file containing instruction")
     parser.add_argument(
-        "--task-id",
-        type=str,
-        required=True,
-        help="ClickUp task ID to analyze"
-    )
-    parser.add_argument(
-        "--instruction",
-        type=str,
-        default=None,
-        help="Instruction text (or use --instruction-file)"
-    )
-    parser.add_argument(
-        "--instruction-file",
-        type=str,
-        default=None,
-        help="Path to file containing instruction"
-    )
-    parser.add_argument(
-        "--workspace",
-        type=str,
-        default="/tmp/engineer-workspace",
-        help="Workspace directory for cloning repos"
+        "--workspace", type=str, default="/tmp/engineer-workspace", help="Workspace directory for cloning repos"
     )
 
     args = parser.parse_args()
@@ -55,6 +38,12 @@ def main():
         environment="development",
         workspace_dir=args.workspace,
     )
+
+    auth_mode = setup_github_auth(os.environ)
+    logger.info(f"GitHub auth mode: {auth_mode}")
+    if auth_mode == "error":
+        logger.error("GitHub App key present but token minting failed and no fallback PAT — aborting")
+        sys.exit(1)
 
     logger.info(f"Running agent for task: {config.task_id}")
     logger.info(f"Workspace: {config.workspace_dir}")

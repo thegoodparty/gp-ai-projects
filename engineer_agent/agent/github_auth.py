@@ -16,7 +16,7 @@ GITHUB_APP_INSTALLATION_ID = "117364330"
 PEM_HEADER = "-----BEGIN RSA PRIVATE KEY-----"
 PEM_FOOTER = "-----END RSA PRIVATE KEY-----"
 
-AuthMode = Literal["app", "pat", "none"]
+AuthMode = Literal["app", "pat", "error", "none"]
 
 
 def normalize_private_key(raw: str) -> str:
@@ -70,6 +70,8 @@ def setup_github_auth(env: MutableMapping[str, str], client: httpx.Client | None
         finally:
             if owns_client:
                 client.close()
+        if not env.get("GITHUB_TOKEN"):
+            return "error"
 
     if env.get("GITHUB_TOKEN"):
         logger.warning("Using pre-provisioned GITHUB_TOKEN (PAT) for GitHub auth")

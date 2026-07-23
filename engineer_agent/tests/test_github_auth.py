@@ -114,6 +114,20 @@ class TestSetupGithubAuth:
         assert mode == "pat"
         assert env["GITHUB_TOKEN"] == "ghp_fallback"
 
+    def test_mint_failure_without_pat_returns_error_mode(self, rsa_key):
+        pem, _ = rsa_key
+
+        def failing(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"message": "bad jwt"})
+
+        client = httpx.Client(transport=httpx.MockTransport(failing), base_url="https://api.github.com")
+        env = {"GITHUB_APP_PRIVATE_KEY": pem}
+
+        mode = setup_github_auth(env, client=client)
+
+        assert mode == "error"
+        assert "GITHUB_TOKEN" not in env
+
     def test_no_credentials_at_all_returns_none_mode(self):
         env: dict[str, str] = {}
 

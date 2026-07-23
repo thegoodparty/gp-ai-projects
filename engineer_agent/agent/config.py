@@ -39,7 +39,7 @@ def build_capability_prompt() -> str:
 
 Product code lives in the **thegoodparty/omni** monorepo (default branch `develop`):
 ```bash
-git clone --depth 1 https://oauth2:$GITHUB_TOKEN@github.com/thegoodparty/omni.git /workspace/omni
+git clone --depth 1 https://x-access-token:$GITHUB_TOKEN@github.com/thegoodparty/omni.git /workspace/omni
 ```
 Packages live under `packages/`: gp-webapp, gp-api, election-api, people-api,
 gp-admin, candidate-sites, gp-sdk, contracts. Open PRs against omni's `develop`.

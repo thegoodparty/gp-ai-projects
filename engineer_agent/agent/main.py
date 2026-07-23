@@ -129,6 +129,9 @@ async def main():
 
     auth_mode = setup_github_auth(os.environ)
     logger.info(f"GitHub auth mode: {auth_mode}")
+    if auth_mode == "error":
+        logger.error("GitHub App key present but token minting failed and no fallback PAT — aborting before agent run")
+        sys.exit(1)
 
     result = await run_agent(config)
 
