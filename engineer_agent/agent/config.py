@@ -48,7 +48,7 @@ The old standalone product repos (gp-webapp, gp-api, people-api, election-api) a
 **archived** (read-only) — never clone them and never open a PR against them.
 gp-ai-projects and gp-data-platform remain separate live repos:
 ```bash
-git clone --depth 1 https://oauth2:$GITHUB_TOKEN@github.com/thegoodparty/{repo}.git /workspace/{repo}
+git clone --depth 1 https://x-access-token:$GITHUB_TOKEN@github.com/thegoodparty/{repo}.git /workspace/{repo}
 ```
 
 **Databricks** (read-only): `python -m engineer_agent.scripts.query_db --help`

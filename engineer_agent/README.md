@@ -56,7 +56,8 @@ Create `.env` in `engineer_agent/`:
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
 CLICKUP_API_KEY=pk_...
-GITHUB_TOKEN=ghp_...
+GITHUB_APP_PRIVATE_KEY=<delegate GitHub App RSA key; installation token minted at startup>
+# GITHUB_TOKEN=ghp_...  # optional fallback when no App key is provided
 CLICKUP_TASK_ID=<task-id-to-process>
 TAG_TYPE=production-bug
 ENVIRONMENT=development
