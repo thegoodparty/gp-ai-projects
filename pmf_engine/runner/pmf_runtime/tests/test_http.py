@@ -18,6 +18,7 @@ def _inject_client(handler):
 
 def _reset_config():
     import pmf_engine.runner.pmf_runtime.config as config_mod
+
     config_mod._config = None
 
 
@@ -580,6 +581,136 @@ class TestDownload:
         _inject_client(handler)
         result = download("https://city.gov/x.pdf", dest=str(tmp_path / "x.pdf"))
         assert result["byte_size"] == 9999
+
+
+class TestGetRender:
+    def setup_method(self):
+        _reset_config()
+
+    def test_omits_render_from_payload_by_default(self):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                content=b"ok",
+                headers={
+                    "content-type": "text/html",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/p",
+                    "x-byte-size": "2",
+                },
+            )
+
+        _inject_client(handler)
+        get("https://town.gov/p")
+        assert "render" not in captured["body"], "render must be omitted so the broker default (text) applies"
+
+    def test_passes_render_when_provided(self):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                content=b'{"links": []}',
+                headers={
+                    "content-type": "application/json",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/p",
+                    "x-byte-size": "13",
+                },
+            )
+
+        _inject_client(handler)
+        get("https://town.gov/p", render="links")
+        assert captured["body"]["render"] == "links"
+
+    def test_returns_links_json_body_for_links_render(self):
+        links_json = b'{"links": [{"href": "https://town.gov/DocumentCenter/View/431", "text": "By-Laws"}]}'
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=links_json,
+                headers={
+                    "content-type": "application/json",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/p/1449",
+                    "x-byte-size": str(len(links_json)),
+                },
+            )
+
+        _inject_client(handler)
+        result = get("https://town.gov/p/1449", render="links")
+        assert result["content_type"] == "application/json"
+        parsed = json.loads(result["body"])
+        assert parsed["links"][0]["href"] == "https://town.gov/DocumentCenter/View/431"
+
+    def test_returns_full_markup_for_html_render(self):
+        markup = b'<html><body><a href="https://town.gov/DocumentCenter/View/431">Doc</a></body></html>'
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=markup,
+                headers={
+                    "content-type": "text/html; charset=utf-8",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/p",
+                    "x-byte-size": str(len(markup)),
+                },
+            )
+
+        _inject_client(handler)
+        result = get("https://town.gov/p", render="html")
+        assert '<a href="https://town.gov/DocumentCenter/View/431">' in result["body"]
+
+
+class TestDownloadRender:
+    def setup_method(self):
+        _reset_config()
+
+    def test_omits_render_from_payload_by_default(self, tmp_path):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                content=b"%PDF",
+                headers={
+                    "content-type": "application/pdf",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/x.pdf",
+                    "x-byte-size": "4",
+                },
+            )
+
+        _inject_client(handler)
+        download("https://town.gov/x.pdf", dest=str(tmp_path / "x.pdf"))
+        assert "render" not in captured["body"]
+
+    def test_passes_render_when_provided(self, tmp_path):
+        captured = {}
+
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                content=b"%PDF",
+                headers={
+                    "content-type": "application/pdf",
+                    "x-upstream-status": "200",
+                    "x-source-url": "https://town.gov/x.pdf",
+                    "x-byte-size": "4",
+                },
+            )
+
+        _inject_client(handler)
+        download("https://town.gov/x.pdf", dest=str(tmp_path / "x.pdf"), render="html")
+        assert captured["body"]["render"] == "html"
 
 
 class TestHead:

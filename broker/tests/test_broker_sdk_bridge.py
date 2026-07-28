@@ -70,9 +70,11 @@ class _FakeFetcher:
     result: BrowserFetchResult | None = None
     raise_exc: Exception | None = None
     calls: list[str] = field(default_factory=list)
+    render_calls: list[str] = field(default_factory=list)
 
-    async def fetch(self, url: str) -> BrowserFetchResult:
+    async def fetch(self, url: str, *, render: str = "text") -> BrowserFetchResult:
         self.calls.append(url)
+        self.render_calls.append(render)
         if self.raise_exc is not None:
             raise self.raise_exc
         assert self.result is not None, "test must configure result or raise_exc"

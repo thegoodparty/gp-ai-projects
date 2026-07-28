@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -82,9 +83,11 @@ class _FakeFetcher:
 
     result: BrowserFetchResult
     calls: list[str] = field(default_factory=list)
+    render_calls: list[str] = field(default_factory=list)
 
-    async def fetch(self, url: str) -> BrowserFetchResult:
+    async def fetch(self, url: str, *, render: str = "text") -> BrowserFetchResult:
         self.calls.append(url)
+        self.render_calls.append(render)
         return self.result
 
 
